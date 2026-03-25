@@ -35,15 +35,15 @@ tracing-subscriber = { version = "0.3.18", features = ["env-filter", "fmt", "jso
 hex = "0.4.3"
 ractor = { version = "0.14.6", default-features = false, features = ["async-trait", "tokio_runtime"] }
 bytes = "1.9.0"
-informalsystems-malachitebft-core-consensus = { path = "../malachite/code/crates/core-consensus" }
-informalsystems-malachitebft-engine = { path = "../malachite/code/crates/engine" }
-informalsystems-malachitebft-network = { path = "../malachite/code/crates/network" }
-informalsystems-malachitebft-sync = { path = "../malachite/code/crates/sync" }
-informalsystems-malachitebft-core-types = { path = "../malachite/code/crates/core-types" }
-informalsystems-malachitebft-config = { path = "../malachite/code/crates/config" }
-informalsystems-malachitebft-codec = { path = "../malachite/code/crates/codec" }
-informalsystems-malachitebft-metrics = { path = "../malachite/code/crates/metrics" }
-informalsystems-malachitebft-wal = { path = "../malachite/code/crates/wal" }
+informalsystems-malachitebft-core-consensus = { git = "https://github.com/informalsystems/malachite.git", rev = "13bca14cd209d985c3adf101a02924acde8723a5" }
+informalsystems-malachitebft-engine = { git = "https://github.com/informalsystems/malachite.git", rev = "13bca14cd209d985c3adf101a02924acde8723a5" }
+informalsystems-malachitebft-network = { git = "https://github.com/informalsystems/malachite.git", rev = "13bca14cd209d985c3adf101a02924acde8723a5" }
+informalsystems-malachitebft-sync = { git = "https://github.com/informalsystems/malachite.git", rev = "13bca14cd209d985c3adf101a02924acde8723a5" }
+informalsystems-malachitebft-core-types = { git = "https://github.com/informalsystems/malachite.git", rev = "13bca14cd209d985c3adf101a02924acde8723a5" }
+informalsystems-malachitebft-config = { git = "https://github.com/informalsystems/malachite.git", rev = "13bca14cd209d985c3adf101a02924acde8723a5" }
+informalsystems-malachitebft-codec = { git = "https://github.com/informalsystems/malachite.git", rev = "13bca14cd209d985c3adf101a02924acde8723a5" }
+informalsystems-malachitebft-metrics = { git = "https://github.com/informalsystems/malachite.git", rev = "13bca14cd209d985c3adf101a02924acde8723a5" }
+informalsystems-malachitebft-wal = { git = "https://github.com/informalsystems/malachite.git", rev = "13bca14cd209d985c3adf101a02924acde8723a5" }
 blake3 = "1.4.1"
 tracing = "0.1.40"
 thiserror = "1.0.66"
@@ -81,7 +81,7 @@ chrono = "0.4.39"
 tar = "0.4.40"
 gzp = "0.11.3"
 flate2 = "1.0.28"
-eth-signature-verifier = { version = "0.3.7", path = "../eth-signature-verifier" }
+eth-signature-verifier = { git = "https://github.com/CassOnMars/eth-signature-verifier.git", rev = "8deb4a091982c345949dc66bf8684489d9f11889" }
 fancy-regex = "0.14.0"
 aws-config = { version = "1.1.7", features = ["behavior-version-latest"] }
 aws-sdk-s3 = { version = "1.71.0", features = ["behavior-version-latest"] }

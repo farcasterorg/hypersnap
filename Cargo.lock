@@ -3001,6 +3001,7 @@ dependencies = [
 [[package]]
 name = "eth-signature-verifier"
 version = "0.3.7"
+source = "git+https://github.com/CassOnMars/eth-signature-verifier.git?rev=8deb4a091982c345949dc66bf8684489d9f11889#8deb4a091982c345949dc66bf8684489d9f11889"
 dependencies = [
  "alloy",
  "alloy-contract",
@@ -4191,6 +4192,121 @@ dependencies = [
 ]
 
 [[package]]
+name = "snapchain"
+version = "0.11.5"
+dependencies = [
+ "alloy-contract",
+ "alloy-dyn-abi",
+ "alloy-primitives",
+ "alloy-provider",
+ "alloy-rlp",
+ "alloy-rpc-types",
+ "alloy-signer",
+ "alloy-signer-local",
+ "alloy-sol-types",
+ "alloy-transport",
+ "alloy-transport-http",
+ "async-trait",
+ "atty",
+ "aws-config",
+ "aws-sdk-s3",
+ "base64 0.22.1",
+ "blake3",
+ "bs58",
+ "bytes",
+ "cadence",
+ "chrono",
+ "clap",
+ "ed25519-dalek",
+ "eth-signature-verifier",
+ "fancy-regex",
+ "figment",
+ "flate2",
+ "foundry-common",
+ "futures",
+ "futures-core",
+ "futures-util",
+ "governor",
+ "gzp",
+ "hex",
+ "http-body-util",
+ "humantime",
+ "humantime-serde",
+ "hyper 1.6.0",
+ "hyper-util",
+ "snapchain-proto",
+ "indicatif",
+ "informalsystems-malachitebft-codec",
+ "informalsystems-malachitebft-config",
+ "informalsystems-malachitebft-core-consensus",
+ "informalsystems-malachitebft-core-types",
+ "informalsystems-malachitebft-engine",
+ "informalsystems-malachitebft-metrics",
+ "informalsystems-malachitebft-network",
+ "informalsystems-malachitebft-sync",
+ "informalsystems-malachitebft-wal",
+ "insta",
+ "itertools 0.13.0",
+ "libp2p",
+ "libp2p-connection-limits",
+ "moka",
+ "nix 0.29.0",
+ "once_cell",
+ "parking_lot",
+ "pre-commit",
+ "prost 0.13.5",
+ "ractor",
+ "rand 0.8.5",
+ "reqwest",
+ "rocksdb",
+ "rustls 0.23.29",
+ "serde",
+ "serde_json",
+ "serde_qs",
+ "serial_test",
+ "sha2",
+ "solar-ast",
+ "solar-config",
+ "solar-data-structures",
+ "solar-interface",
+ "solar-macros",
+ "strum 0.27.2",
+ "strum_macros 0.27.2",
+ "svm-rs-builds",
+ "tantivy",
+ "tar",
+ "tempfile",
+ "thiserror 1.0.69",
+ "threadpool",
+ "tikv-jemallocator",
+ "tokio",
+ "tokio-cron-scheduler",
+ "tokio-retry2",
+ "tokio-stream",
+ "toml 0.8.23",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "tracing-test",
+ "url",
+ "urlencoding",
+ "walkdir",
+]
+
+[[package]]
+name = "snapchain-proto"
+version = "0.11.0"
+dependencies = [
+ "futures-core",
+ "hex",
+ "informalsystems-malachitebft-core-types",
+ "prost 0.13.5",
+ "serde",
+ "tonic",
+ "tonic-build",
+]
+
+[[package]]
 name = "iana-time-zone"
 version = "0.1.63"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4451,6 +4567,7 @@ dependencies = [
 [[package]]
 name = "informalsystems-malachitebft-codec"
 version = "0.0.1"
+source = "git+https://github.com/informalsystems/malachite.git?rev=13bca14cd209d985c3adf101a02924acde8723a5#13bca14cd209d985c3adf101a02924acde8723a5"
 dependencies = [
  "bytes",
 ]
@@ -4458,6 +4575,7 @@ dependencies = [
 [[package]]
 name = "informalsystems-malachitebft-config"
 version = "0.0.1"
+source = "git+https://github.com/informalsystems/malachite.git?rev=13bca14cd209d985c3adf101a02924acde8723a5#13bca14cd209d985c3adf101a02924acde8723a5"
 dependencies = [
  "bytesize",
  "config",
@@ -4470,6 +4588,7 @@ dependencies = [
 [[package]]
 name = "informalsystems-malachitebft-core-consensus"
 version = "0.0.1"
+source = "git+https://github.com/informalsystems/malachite.git?rev=13bca14cd209d985c3adf101a02924acde8723a5#13bca14cd209d985c3adf101a02924acde8723a5"
 dependencies = [
  "async-recursion",
  "derive-where",
@@ -4486,6 +4605,7 @@ dependencies = [
 [[package]]
 name = "informalsystems-malachitebft-core-driver"
 version = "0.0.1"
+source = "git+https://github.com/informalsystems/malachite.git?rev=13bca14cd209d985c3adf101a02924acde8723a5#13bca14cd209d985c3adf101a02924acde8723a5"
 dependencies = [
  "derive-where",
  "informalsystems-malachitebft-core-state-machine",
@@ -4497,6 +4617,7 @@ dependencies = [
 [[package]]
 name = "informalsystems-malachitebft-core-state-machine"
 version = "0.0.1"
+source = "git+https://github.com/informalsystems/malachite.git?rev=13bca14cd209d985c3adf101a02924acde8723a5#13bca14cd209d985c3adf101a02924acde8723a5"
 dependencies = [
  "derive-where",
  "displaydoc",
@@ -4506,6 +4627,7 @@ dependencies = [
 [[package]]
 name = "informalsystems-malachitebft-core-types"
 version = "0.0.1"
+source = "git+https://github.com/informalsystems/malachite.git?rev=13bca14cd209d985c3adf101a02924acde8723a5#13bca14cd209d985c3adf101a02924acde8723a5"
 dependencies = [
  "bytes",
  "derive-where",
@@ -4515,6 +4637,7 @@ dependencies = [
 [[package]]
 name = "informalsystems-malachitebft-core-votekeeper"
 version = "0.0.1"
+source = "git+https://github.com/informalsystems/malachite.git?rev=13bca14cd209d985c3adf101a02924acde8723a5#13bca14cd209d985c3adf101a02924acde8723a5"
 dependencies = [
  "derive-where",
  "informalsystems-malachitebft-core-types",
@@ -4524,6 +4647,7 @@ dependencies = [
 [[package]]
 name = "informalsystems-malachitebft-discovery"
 version = "0.0.1"
+source = "git+https://github.com/informalsystems/malachite.git?rev=13bca14cd209d985c3adf101a02924acde8723a5#13bca14cd209d985c3adf101a02924acde8723a5"
 dependencies = [
  "either",
  "informalsystems-malachitebft-metrics",
@@ -4537,6 +4661,7 @@ dependencies = [
 [[package]]
 name = "informalsystems-malachitebft-engine"
 version = "0.0.1"
+source = "git+https://github.com/informalsystems/malachite.git?rev=13bca14cd209d985c3adf101a02924acde8723a5#13bca14cd209d985c3adf101a02924acde8723a5"
 dependencies = [
  "async-recursion",
  "async-trait",
@@ -4562,6 +4687,7 @@ dependencies = [
 [[package]]
 name = "informalsystems-malachitebft-metrics"
 version = "0.0.1"
+source = "git+https://github.com/informalsystems/malachite.git?rev=13bca14cd209d985c3adf101a02924acde8723a5#13bca14cd209d985c3adf101a02924acde8723a5"
 dependencies = [
  "informalsystems-malachitebft-core-state-machine",
  "prometheus-client",
@@ -4570,6 +4696,7 @@ dependencies = [
 [[package]]
 name = "informalsystems-malachitebft-network"
 version = "0.0.1"
+source = "git+https://github.com/informalsystems/malachite.git?rev=13bca14cd209d985c3adf101a02924acde8723a5#13bca14cd209d985c3adf101a02924acde8723a5"
 dependencies = [
  "bytes",
  "either",
@@ -4590,6 +4717,7 @@ dependencies = [
 [[package]]
 name = "informalsystems-malachitebft-peer"
 version = "0.0.1"
+source = "git+https://github.com/informalsystems/malachite.git?rev=13bca14cd209d985c3adf101a02924acde8723a5#13bca14cd209d985c3adf101a02924acde8723a5"
 dependencies = [
  "bs58",
  "multihash",
@@ -4599,6 +4727,7 @@ dependencies = [
 [[package]]
 name = "informalsystems-malachitebft-sync"
 version = "0.0.1"
+source = "git+https://github.com/informalsystems/malachite.git?rev=13bca14cd209d985c3adf101a02924acde8723a5#13bca14cd209d985c3adf101a02924acde8723a5"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4619,6 +4748,7 @@ dependencies = [
 [[package]]
 name = "informalsystems-malachitebft-wal"
 version = "0.0.1"
+source = "git+https://github.com/informalsystems/malachite.git?rev=13bca14cd209d985c3adf101a02924acde8723a5#13bca14cd209d985c3adf101a02924acde8723a5"
 dependencies = [
  "advisory-lock",
  "bytes",
@@ -7863,121 +7993,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 dependencies = [
  "serde",
-]
-
-[[package]]
-name = "snapchain"
-version = "0.11.5"
-dependencies = [
- "alloy-contract",
- "alloy-dyn-abi",
- "alloy-primitives",
- "alloy-provider",
- "alloy-rlp",
- "alloy-rpc-types",
- "alloy-signer",
- "alloy-signer-local",
- "alloy-sol-types",
- "alloy-transport",
- "alloy-transport-http",
- "async-trait",
- "atty",
- "aws-config",
- "aws-sdk-s3",
- "base64 0.22.1",
- "blake3",
- "bs58",
- "bytes",
- "cadence",
- "chrono",
- "clap",
- "ed25519-dalek",
- "eth-signature-verifier",
- "fancy-regex",
- "figment",
- "flate2",
- "foundry-common",
- "futures",
- "futures-core",
- "futures-util",
- "governor",
- "gzp",
- "hex",
- "http-body-util",
- "humantime",
- "humantime-serde",
- "hyper 1.6.0",
- "hyper-util",
- "indicatif",
- "informalsystems-malachitebft-codec",
- "informalsystems-malachitebft-config",
- "informalsystems-malachitebft-core-consensus",
- "informalsystems-malachitebft-core-types",
- "informalsystems-malachitebft-engine",
- "informalsystems-malachitebft-metrics",
- "informalsystems-malachitebft-network",
- "informalsystems-malachitebft-sync",
- "informalsystems-malachitebft-wal",
- "insta",
- "itertools 0.13.0",
- "libp2p",
- "libp2p-connection-limits",
- "moka",
- "nix 0.29.0",
- "once_cell",
- "parking_lot",
- "pre-commit",
- "prost 0.13.5",
- "ractor",
- "rand 0.8.5",
- "reqwest",
- "rocksdb",
- "rustls 0.23.29",
- "serde",
- "serde_json",
- "serde_qs",
- "serial_test",
- "sha2",
- "snapchain-proto",
- "solar-ast",
- "solar-config",
- "solar-data-structures",
- "solar-interface",
- "solar-macros",
- "strum 0.27.2",
- "strum_macros 0.27.2",
- "svm-rs-builds",
- "tantivy",
- "tar",
- "tempfile",
- "thiserror 1.0.69",
- "threadpool",
- "tikv-jemallocator",
- "tokio",
- "tokio-cron-scheduler",
- "tokio-retry2",
- "tokio-stream",
- "toml 0.8.23",
- "tonic",
- "tracing",
- "tracing-subscriber",
- "tracing-test",
- "url",
- "urlencoding",
- "walkdir",
-]
-
-[[package]]
-name = "snapchain-proto"
-version = "0.11.0"
-dependencies = [
- "futures-core",
- "hex",
- "informalsystems-malachitebft-core-types",
- "prost 0.13.5",
- "serde",
- "tonic",
- "tonic-build",
 ]
 
 [[package]]

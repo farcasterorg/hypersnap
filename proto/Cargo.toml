@@ -11,7 +11,7 @@ tonic = { version = "0.12.3", features = ["tls", "tls-native-roots"] }
 serde = { version = "1.0", features = ["derive"] }
 futures-core = "0.3.31"
 hex = "0.4.3"
-informalsystems-malachitebft-core-types = { path = "../../malachite/code/crates/core-types" }
+informalsystems-malachitebft-core-types = { git = "https://github.com/informalsystems/malachite.git", rev = "13bca14cd209d985c3adf101a02924acde8723a5" }
 
 [build-dependencies]
 tonic-build = "0.9.2"
