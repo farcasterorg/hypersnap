@@ -4,10 +4,13 @@ use crate::api::config::ApiConfig;
 use crate::api::events::IndexEvent;
 use crate::api::indexer::{Indexer, IndexerError};
 use crate::proto::{hub_event, HubEvent};
+use crate::storage::db::{PageOptions, RocksDB};
+use crate::storage::store::stores::Stores;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Statistics from a backfill operation.
 #[derive(Debug, Clone, PartialEq)]
@@ -62,6 +65,89 @@ pub trait EventSource: Send + Sync {
     async fn get_latest_event_id(&self) -> Result<u64, IndexerError>;
 }
 
+/// Production event source that reads from a shard's Stores.
+pub struct ShardEventSource {
+    stores: Stores,
+}
+
+impl ShardEventSource {
+    pub fn new(stores: Stores) -> Self {
+        Self { stores }
+    }
+}
+
+#[async_trait::async_trait]
+impl EventSource for ShardEventSource {
+    async fn get_events(
+        &self,
+        from_event_id: u64,
+        limit: usize,
+    ) -> Result<Vec<HubEvent>, IndexerError> {
+        let page_options = Some(PageOptions {
+            page_size: Some(limit),
+            page_token: None,
+            reverse: false,
+        });
+        let page = self
+            .stores
+            .get_events(from_event_id, None, page_options)
+            .map_err(|e| IndexerError::Storage(e.to_string()))?;
+        Ok(page.events)
+    }
+
+    async fn get_latest_event_id(&self) -> Result<u64, IndexerError> {
+        let page_options = Some(PageOptions {
+            page_size: Some(1),
+            page_token: None,
+            reverse: true,
+        });
+        let page = self
+            .stores
+            .get_events(0, None, page_options)
+            .map_err(|e| IndexerError::Storage(e.to_string()))?;
+        Ok(page.events.first().map(|e| e.id).unwrap_or(0))
+    }
+}
+
+// --- Per-shard checkpoint storage ---
+//
+// Events are per-shard with overlapping ID spaces. We store per-shard
+// checkpoints in the API DB under prefix 0xE3:
+//   Key: [0xE3][name_len:1][indexer_name:N][shard_id:4_BE]
+//   Value: [event_id:8_BE]
+
+const BACKFILL_CHECKPOINT_PREFIX: u8 = 0xE3;
+
+fn make_shard_checkpoint_key(indexer_name: &str, shard_id: u32) -> Vec<u8> {
+    let name_bytes = indexer_name.as_bytes();
+    let mut key = Vec::with_capacity(1 + 1 + name_bytes.len() + 4);
+    key.push(BACKFILL_CHECKPOINT_PREFIX);
+    key.push(name_bytes.len() as u8);
+    key.extend_from_slice(name_bytes);
+    key.extend_from_slice(&shard_id.to_be_bytes());
+    key
+}
+
+pub fn load_shard_checkpoint(db: &RocksDB, indexer_name: &str, shard_id: u32) -> u64 {
+    let key = make_shard_checkpoint_key(indexer_name, shard_id);
+    match db.get(&key) {
+        Ok(Some(bytes)) if bytes.len() == 8 => u64::from_be_bytes(bytes[..8].try_into().unwrap()),
+        _ => 0,
+    }
+}
+
+pub fn save_shard_checkpoint(
+    db: &RocksDB,
+    indexer_name: &str,
+    shard_id: u32,
+    event_id: u64,
+) -> Result<(), IndexerError> {
+    let key = make_shard_checkpoint_key(indexer_name, shard_id);
+    let value = event_id.to_be_bytes().to_vec();
+    db.put(&key, &value)
+        .map_err(|e| IndexerError::Storage(e.to_string()))
+}
+
 /// Manager for running backfill operations.
 pub struct BackfillManager {
     config: ApiConfig,
@@ -83,10 +169,18 @@ impl BackfillManager {
         self.status.read().await.clone()
     }
 
-    /// Run backfill for a specific indexer.
-    ///
-    /// Returns stats on completion, or error if backfill fails.
+    /// Run backfill for a specific indexer, starting from its last checkpoint.
     pub async fn run_backfill(&self, indexer: &dyn Indexer) -> Result<BackfillStats, IndexerError> {
+        let cursor = indexer.last_checkpoint();
+        self.run_backfill_from(indexer, cursor).await
+    }
+
+    /// Run backfill for a specific indexer from an explicit starting cursor.
+    pub async fn run_backfill_from(
+        &self,
+        indexer: &dyn Indexer,
+        starting_cursor: u64,
+    ) -> Result<BackfillStats, IndexerError> {
         let indexer_name = indexer.name().to_string();
         info!("Starting backfill for indexer: {}", indexer_name);
 
@@ -95,7 +189,7 @@ impl BackfillManager {
         }
 
         let start_time = Instant::now();
-        let mut cursor = indexer.last_checkpoint();
+        let mut cursor = starting_cursor;
         let mut events_processed: u64 = 0;
         let mut events_matched: u64 = 0;
 
@@ -125,9 +219,12 @@ impl BackfillManager {
                 break;
             }
 
-            let batch_len = events.len() as u64;
+            // Fix: advance cursor to one past the last event ID, not cursor + batch_len.
+            // Event IDs are encoded as (block_height << 14) | sequence, not sequential.
+            let last_event_id = events.last().unwrap().id;
 
             // Convert hub events to index events
+            let batch_len = events.len() as u64;
             let index_events: Vec<IndexEvent> = events
                 .into_iter()
                 .filter_map(|e| self.hub_event_to_index_event(e))
@@ -143,8 +240,8 @@ impl BackfillManager {
             events_processed += batch_len;
             events_matched += matched_count;
 
-            // Update cursor
-            cursor += batch_len;
+            // Update cursor to one past the last event we saw
+            cursor = last_event_id + 1;
 
             // Checkpoint periodically (every 10 batches)
             if events_processed % (batch_size as u64 * 10) == 0 {
@@ -244,6 +341,63 @@ impl BackfillManager {
             "metrics" => self.config.metrics.backfill_batch_size,
             "search" => self.config.search.backfill_batch_size,
             _ => 1000, // Default batch size
+        }
+    }
+}
+
+/// Run backfill for all enabled indexers across all shards.
+///
+/// For each indexer, iterates over every shard, loads the per-shard checkpoint,
+/// runs the backfill from that point, and saves the updated checkpoint.
+pub async fn run_all_backfills(
+    config: &ApiConfig,
+    db: &RocksDB,
+    shard_stores: &HashMap<u32, Stores>,
+    indexers: Vec<Arc<dyn Indexer>>,
+) {
+    for indexer in &indexers {
+        let indexer_name = indexer.name();
+        info!("Starting backfill for indexer: {}", indexer_name);
+
+        for (&shard_id, stores) in shard_stores {
+            let checkpoint = load_shard_checkpoint(db, indexer_name, shard_id);
+            let event_source = Arc::new(ShardEventSource::new(stores.clone()));
+            let manager = BackfillManager::new(config.clone(), event_source);
+
+            info!(
+                "Backfill shard {} for indexer {} from checkpoint {}",
+                shard_id, indexer_name, checkpoint
+            );
+
+            match manager
+                .run_backfill_from(indexer.as_ref(), checkpoint)
+                .await
+            {
+                Ok(stats) => {
+                    if let Err(e) =
+                        save_shard_checkpoint(db, indexer_name, shard_id, stats.final_event_id)
+                    {
+                        warn!(
+                            "Failed to save shard checkpoint for {} shard {}: {}",
+                            indexer_name, shard_id, e
+                        );
+                    }
+                    info!(
+                        "Backfill complete for {} shard {}: {} events",
+                        indexer_name, shard_id, stats.events_processed
+                    );
+                }
+                Err(IndexerError::FeatureDisabled(_)) => {
+                    debug!("Skipping disabled indexer: {}", indexer_name);
+                    break; // Skip remaining shards for this indexer
+                }
+                Err(e) => {
+                    warn!(
+                        "Backfill failed for {} shard {}: {}",
+                        indexer_name, shard_id, e
+                    );
+                }
+            }
         }
     }
 }

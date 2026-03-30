@@ -568,6 +568,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 &app_config.api,
                 node.block_stores.db.clone(),
                 hub_event_senders,
+                node.shard_stores.clone(),
             )
         };
 
@@ -852,6 +853,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 &app_config.api,
                 node.block_stores.db.clone(),
                 hub_event_senders,
+                node.shard_stores.clone(),
             )
         };
 

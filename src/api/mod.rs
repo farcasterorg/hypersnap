@@ -52,8 +52,10 @@ pub use social_graph::SocialGraphIndexer;
 pub use worker::IndexWorkerPool;
 
 use crate::proto::HubEvent;
+use crate::storage::store::stores::Stores;
+use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 
 /// Default channel capacity for index events.
 /// If indexers can't keep up, events are dropped and caught up via backfill.
@@ -102,10 +104,12 @@ impl ApiSystem {
 /// * `config` - Farcaster configuration
 /// * `db` - RocksDB instance for indexer storage
 /// * `hub_event_senders` - HubEvent broadcast senders from each shard engine
+/// * `shard_stores` - Stores for each shard, used for backfill event sourcing
 pub fn initialize(
     config: &ApiConfig,
     db: Arc<crate::storage::db::RocksDB>,
     hub_event_senders: Vec<(u32, broadcast::Sender<HubEvent>)>,
+    shard_stores: HashMap<u32, Stores>,
 ) -> Option<ApiSystem> {
     if !config.enabled {
         tracing::info!("Farcaster indexing disabled");
@@ -150,8 +154,28 @@ pub fn initialize(
         None
     };
 
+    // Collect indexers that need backfill
+    let mut backfill_indexers: Vec<Arc<dyn Indexer>> = Vec::new();
+    if config.social_graph.backfill_on_startup {
+        if let Some(ref idx) = social_graph_indexer {
+            backfill_indexers.push(idx.clone());
+        }
+    }
+    if config.channels.backfill_on_startup {
+        if let Some(ref idx) = channels_indexer {
+            backfill_indexers.push(idx.clone());
+        }
+    }
+    if config.metrics.backfill_on_startup {
+        if let Some(ref idx) = metrics_indexer {
+            backfill_indexers.push(idx.clone());
+        }
+    }
+
+    let needs_backfill = !backfill_indexers.is_empty();
+
     // Create worker pool and register indexers
-    let mut worker_pool = IndexWorkerPool::new(config.clone(), index_rx, db);
+    let mut worker_pool = IndexWorkerPool::new(config.clone(), index_rx, db.clone());
 
     if let Some(ref indexer) = social_graph_indexer {
         worker_pool.register_arc(indexer.clone());
@@ -172,11 +196,41 @@ pub fn initialize(
         worker_pool.run().await;
     });
 
-    // Create bridges for each shard
+    // Create a watch channel to gate bridges on backfill completion.
+    // Bridges subscribe to broadcast channels immediately (buffering live events),
+    // but wait for the backfill signal before starting to consume.
+    let (backfill_done_tx, _) = watch::channel(false);
+
+    // Spawn backfill if needed
+    if needs_backfill {
+        let backfill_config = config.clone();
+        let backfill_db = db.clone();
+        let backfill_tx = backfill_done_tx.clone();
+        tokio::spawn(async move {
+            backfill::run_all_backfills(
+                &backfill_config,
+                &backfill_db,
+                &shard_stores,
+                backfill_indexers,
+            )
+            .await;
+            let _ = backfill_tx.send(true);
+            tracing::info!("All backfills complete, unblocking bridges");
+        });
+    } else {
+        // No backfill needed — unblock bridges immediately
+        let _ = backfill_done_tx.send(true);
+    }
+
+    // Create bridges for each shard, gated on backfill completion
     let mut bridge_handles = Vec::new();
     for (shard_id, hub_event_tx) in hub_event_senders {
         let bridge = HubEventBridge::from_sender(&hub_event_tx, index_tx.clone(), shard_id);
+        let mut rx = backfill_done_tx.subscribe();
         let handle = tokio::spawn(async move {
+            // Wait until backfill is done (checks current value first, no race)
+            let _ = rx.wait_for(|&done| done).await;
+            tracing::info!(shard_id, "Backfill complete, starting bridge");
             bridge.run().await;
         });
         bridge_handles.push(handle);
