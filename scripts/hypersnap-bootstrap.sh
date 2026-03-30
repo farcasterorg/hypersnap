@@ -1,13 +1,13 @@
 #!/bin/bash
 
-# This is the bootstrap script for snapchain. It is used to install the latest version of snapchain.
-# Simply run the following command to install the latest version of snapchain:
+# This is the bootstrap script for hypersnap. It is used to install the latest version of hypersnap.
+# Simply run the following command to install the latest version of hypersnap:
 # curl <file location> | bash
 
-REPO="farcasterxyz/snapchain"
+REPO="farcasterorg/hypersnap"
 RAWFILE_BASE="https://raw.githubusercontent.com/$REPO"
 LATEST_TAG="@latest"
-SCRIPT_FILE_PATH="scripts/snapchain.sh"
+SCRIPT_FILE_PATH="scripts/hypersnap.sh"
 
 install_jq() {
     if command -v jq >/dev/null 2>&1; then
@@ -68,19 +68,19 @@ fetch_file_from_repo() {
 }
 
 do_bootstrap() {
-    # Make the ~/snapchain directory if it doesn't exist
-    mkdir -p ~/snapchain
+    # Make the ~/hypersnap directory if it doesn't exist
+    mkdir -p ~/hypersnap
 
     local tmp_file
     tmp_file=$(mktemp)
     fetch_file_from_repo "$SCRIPT_FILE_PATH" "$tmp_file"
 
-    mv "$tmp_file" ~/snapchain/snapchain.sh
-    chmod +x ~/snapchain/snapchain.sh
+    mv "$tmp_file" ~/hypersnap/hypersnap.sh
+    chmod +x ~/hypersnap/hypersnap.sh
 
-    # Run the snapchain.sh script
-    cd ~/snapchain
-    exec ./snapchain.sh "upgrade" < /dev/tty
+    # Run the hypersnap.sh script
+    cd ~/hypersnap
+    exec ./hypersnap.sh "upgrade" < /dev/tty
 }
 
 # Install jq

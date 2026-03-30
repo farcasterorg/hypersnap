@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Builds and publishes image to Docker Hub for a single architecture.
-# This is intended to be run by our GitHub Actions workflow.
+# For full multi-arch deploy, use scripts/deploy.sh instead.
 #
 # MUST be run from the root of the repository so the Docker build context is correct.
 #
@@ -25,10 +25,10 @@ echo "Publishing $SNAPCHAIN_VERSION for linux/$ARCH"
 # Build for single architecture using vanilla docker CLI
 docker build -f Dockerfile \
   --platform "linux/${ARCH}" \
-  -t farcasterxyz/snapchain:${SNAPCHAIN_VERSION}-${ARCH} \
+  -t farcasterorg/hypersnap:${SNAPCHAIN_VERSION}-${ARCH} \
   .
 
 # Push the architecture-specific tag
-docker push farcasterxyz/snapchain:${SNAPCHAIN_VERSION}-${ARCH}
+docker push farcasterorg/hypersnap:${SNAPCHAIN_VERSION}-${ARCH}
 
-echo "Successfully published farcasterxyz/snapchain:${SNAPCHAIN_VERSION}-${ARCH}"
+echo "Successfully published farcasterorg/hypersnap:${SNAPCHAIN_VERSION}-${ARCH}"

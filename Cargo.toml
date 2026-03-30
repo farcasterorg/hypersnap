@@ -6,11 +6,15 @@ resolver = "2"
 name = "snapchain"
 version = "0.11.5"
 edition = "2021"
-default-run = "snapchain"
+default-run = "hypersnap"
 
 [lib]
 name = "snapchain"
 path = "src/lib.rs"
+
+[[bin]]
+name = "hypersnap"
+path = "src/main.rs"
 
 [dependencies]
 snapchain-proto = { path = "proto" }

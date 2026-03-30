@@ -1,6 +1,6 @@
 services:
-  snapchain:
-    image: farcasterxyz/snapchain:latest
+  hypersnap:
+    image: farcasterorg/hypersnap:latest
     pull_policy: always
     #    build: # For testing
     #      context: .
@@ -114,12 +114,33 @@ services:
           "80d7800b45db3ec6d6e4be4d278db1aea1c7a77206941ec976a8680ecbe56860"
         ]
 
+        [hyper]
+        enabled = true
+
+        [api]
+        enabled = true
+
+        [api.social_graph]
+        enabled = true
+
+        [api.channels]
+        enabled = true
+
+        [api.metrics]
+        enabled = true
+
+        [api.feeds]
+        enabled = true
+
+        [api.conversations]
+        enabled = true
+
         [snapshot]
         endpoint_url = "https://e1f9f185c6e63471dd39f96abd3413c4.r2.cloudflarestorage.com"
         load_db_from_snapshot=true
         EOF
         exec $0 $@ # Now run the original command
-    command: [ "./snapchain", "--config-path", "config.toml" ]
+    command: [ "./hypersnap", "--config-path", "config.toml" ]
     restart: always
     ports:
       - "3381:3381/tcp"
@@ -129,7 +150,7 @@ services:
       - .rocks:/app/.rocks
       - .rocks.snapshot:/app/.rocks.snapshot
     networks:
-      - snapchain
+      - hypersnap
     ulimits:
       nofile:
         soft: 65535
@@ -153,7 +174,7 @@ services:
       - '${STATSD_PUBLISH:-8125}:8125/udp' # StatsD
       - '${STATSD_ADMIN_PUBLISH:-8126}:8126' # StatsD admin
     networks:
-      - snapchain
+      - hypersnap
 
   # Start this if you want to see perf metrics for your hubble node. Remember to start `statsd` as well.
   grafana:
@@ -172,8 +193,8 @@ services:
     ports:
       - '3000:3000' # Grafana web
     networks:
-      - snapchain
+      - hypersnap
 
 networks:
-  snapchain:
+  hypersnap:
     driver: bridge

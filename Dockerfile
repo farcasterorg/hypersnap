@@ -63,7 +63,7 @@ WORKDIR /app
 COPY --from=builder /usr/src/app/proto/definitions /app/proto
 COPY --from=builder /usr/src/app/nodes /app/nodes
 COPY --from=builder \
-  /usr/src/app/target/release/snapchain \
+  /usr/src/app/target/release/hypersnap \
   /usr/src/app/target/release/follow_blocks \
   /usr/src/app/target/release/setup_local_testnet \
   /usr/src/app/target/release/submit_message \
@@ -71,4 +71,5 @@ COPY --from=builder \
   /app/
 
 ENV RUSTFLAGS="-Awarnings"
-CMD ["./snapchain", "--id", "1"]
+ENTRYPOINT ["./hypersnap"]
+CMD ["--config-path", "config.toml"]
