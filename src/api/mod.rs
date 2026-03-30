@@ -35,6 +35,7 @@ pub mod metrics;
 pub mod search;
 pub mod social_graph;
 pub mod types;
+pub mod user_hydrator;
 pub mod worker;
 
 pub use backfill::BackfillManager;
@@ -49,6 +50,7 @@ pub use indexer::{Indexer, IndexerError};
 pub use metrics::MetricsIndexer;
 pub use search::SearchIndexer;
 pub use social_graph::SocialGraphIndexer;
+pub use user_hydrator::HubUserHydrator;
 pub use worker::IndexWorkerPool;
 
 use crate::proto::HubEvent;
