@@ -266,22 +266,6 @@ impl SnapchainNode {
             network,
         );
         let block_stores = engine.stores();
-        let hyper_block_engine = if let Some(ref hyper_dir) = hyper_db_dir {
-            let hyper_trie = MerkleTrie::new().unwrap();
-            let hyper_block_db =
-                RocksDB::open_shard_db_with_cache(hyper_dir.as_str(), 0, block_cache.clone());
-            let hyper_engine = BlockEngine::new(
-                hyper_trie,
-                statsd_client.clone(),
-                hyper_block_db,
-                config.max_messages_per_block,
-                None,
-                network,
-            );
-            Some(Arc::new(Mutex::new(hyper_engine)))
-        } else {
-            None
-        };
         let block_proposer = BlockProposer::new(
             validator_address.clone(),
             block_shard.clone(),
