@@ -1,18 +1,18 @@
 #!/bin/bash
 
-# The snapchain installation script. This script is used to install the latest version of snapchain.
-# It can also be used to upgrade an existing installation of snapchain, also upgrading
+# The hypersnap installation script. This script is used to install the latest version of hypersnap.
+# It can also be used to upgrade an existing installation of hypersnap, also upgrading
 # itself in the process.
 
 # Define the version of this script
 CURRENT_VERSION="1"
 
-REPO="farcasterxyz/snapchain"
+REPO="farcasterorg/hypersnap"
 RAWFILE_BASE="https://raw.githubusercontent.com/$REPO"
 LATEST_TAG="@latest"
 
 DOCKER_COMPOSE_FILE_PATH="docker-compose.mainnet.yml"
-SCRIPT_FILE_PATH="scripts/snapchain.sh"
+SCRIPT_FILE_PATH="scripts/hypersnap.sh"
 GRAFANA_DASHBOARD_JSON_PATH="grafana/grafana-dashboard.json"
 GRAFANA_INI_PATH="grafana/grafana.ini"
 
@@ -156,7 +156,7 @@ prompt_for_hub_operator_agreement() {
     prompt_agreement() {
         tried=0
         while true; do
-            printf "⚠️  IMPORTANT: You will NOT get any rewards for running this node\n"
+            printf "⚠️  IMPORTANT: The network has not yet released a token. Running a node at this time will not earn tokens. Do you understand?\n"
             printf "> Please type \"Yes\" to continue: "
             read -r response
             case $(printf "%s" "$response" | tr '[:upper:]' '[:lower:]') in
@@ -398,25 +398,41 @@ setup_crontab() {
         local user=$(pwd | cut -d/ -f3)
         USER_CRONTAB_CMD="crontab -u ${user}"
 
+        # Clean up old snapchain.sh crontab entries from before the rename
         if $USER_CRONTAB_CMD -l 2>/dev/null | grep -q "snapchain.sh"; then
             $USER_CRONTAB_CMD -l > /tmp/temp_cron.txt
             sed -i '/snapchain\.sh/d' /tmp/temp_cron.txt
             $USER_CRONTAB_CMD /tmp/temp_cron.txt
             rm /tmp/temp_cron.txt
         fi
+
+        if $USER_CRONTAB_CMD -l 2>/dev/null | grep -q "hypersnap.sh"; then
+            $USER_CRONTAB_CMD -l > /tmp/temp_cron.txt
+            sed -i '/hypersnap\.sh/d' /tmp/temp_cron.txt
+            $USER_CRONTAB_CMD /tmp/temp_cron.txt
+            rm /tmp/temp_cron.txt
+        fi
+    fi
+
+    # Clean up old snapchain.sh crontab entries from before the rename
+    if $CRONTAB_CMD -l 2>/dev/null | grep -q "snapchain.sh"; then
+        $CRONTAB_CMD -l > /tmp/temp_cron.txt
+        sed -i '/snapchain\.sh/d' /tmp/temp_cron.txt
+        $CRONTAB_CMD /tmp/temp_cron.txt
+        rm /tmp/temp_cron.txt
     fi
 
     # Check if the crontab file is already installed
-    if $CRONTAB_CMD -l 2>/dev/null | grep -q "snapchain.sh"; then
+    if $CRONTAB_CMD -l 2>/dev/null | grep -q "hypersnap.sh"; then
       # Fix buggy crontab entry which would run every minute
-      if $CRONTAB_CMD -l 2>/dev/null | grep "snapchain.sh" | grep -q "^\*"; then
+      if $CRONTAB_CMD -l 2>/dev/null | grep "hypersnap.sh" | grep -q "^\*"; then
         echo "Removing crontab for upgrade"
 
         # Export the existing crontab entries to a temporary file in /tmp/
         crontab -l > /tmp/temp_cron.txt
 
-        # Remove the line containing "snapchain.sh" from the temporary file
-        sed -i '/snapchain\.sh/d' /tmp/temp_cron.txt
+        # Remove the line containing "hypersnap.sh" from the temporary file
+        sed -i '/hypersnap\.sh/d' /tmp/temp_cron.txt
         crontab /tmp/temp_cron.txt
         rm /tmp/temp_cron.txt
       else
@@ -445,7 +461,7 @@ setup_crontab() {
     local day_of_week=$(( ( 0x${sha:0:8} % 5 ) + 1 ))
     # Pick a random hour between midnight and 6am
     local hour=$((RANDOM % 7))
-    local crontab_entry="0 $hour * * $day_of_week $(pwd)/snapchain.sh autoupgrade >> $(pwd)/snapchain-autoupgrade.log 2>&1"
+    local crontab_entry="0 $hour * * $day_of_week $(pwd)/hypersnap.sh autoupgrade >> $(pwd)/hypersnap-autoupgrade.log 2>&1"
     if ($CRONTAB_CMD -l 2>/dev/null; echo "${crontab_entry}") | $CRONTAB_CMD -; then
         echo "✅ added auto-upgrade to crontab (0 $hour * * $day_of_week)"
     else
@@ -453,13 +469,13 @@ setup_crontab() {
     fi
 }
 
-start_snapchain() {
+start_hypersnap() {
 
-    # Stop the "snapchain" service if it is already running
-    $COMPOSE_CMD stop snapchain
+    # Stop the "hypersnap" service if it is already running
+    $COMPOSE_CMD stop hypersnap
 
-    # Start the "snapchain" service
-    $COMPOSE_CMD up -d snapchain
+    # Start the "hypersnap" service
+    $COMPOSE_CMD up -d hypersnap
 }
 
 cleanup() {
@@ -501,19 +517,19 @@ reexec_as_root_if_needed() {
     if [[ "$(uname)" == "Linux" ]]; then
         # Check if not running as root, then re-exec as root
         if [[ "$(id -u)" -ne 0 ]]; then
-            # Ensure the script runs in the ~/snapchain directory
-            cd ~/snapchain || { echo "Failed to switch to ~/snapchain directory."; exit 1; }
+            # Ensure the script runs in the ~/hypersnap directory
+            cd ~/hypersnap || { echo "Failed to switch to ~/hypersnap directory."; exit 1; }
             exec sudo "$0" "$@"
         else
-            # If the current directory is not named "snapchain", change to "~/snapchain"
-            if [[ "$(basename "$PWD")" != "snapchain" ]]; then
-                cd "$(dirname "$0")" || { echo "Failed to switch to ~/snapchain directory."; exit 1; }
+            # If the current directory is not named "hypersnap", change to "~/hypersnap"
+            if [[ "$(basename "$PWD")" != "hypersnap" ]]; then
+                cd "$(dirname "$0")" || { echo "Failed to switch to ~/hypersnap directory."; exit 1; }
             fi
             echo "✅ Running on Linux ($(pwd))."
         fi
     # Check if on macOS
     elif [[ "$(uname)" == "Darwin" ]]; then
-        cd ~/snapchain || { echo "Failed to switch to ~/snapchain directory."; exit 1; }
+        cd ~/hypersnap || { echo "Failed to switch to ~/hypersnap directory."; exit 1; }
         echo "✅ Running on macOS $(pwd)."
     fi
 }
@@ -530,13 +546,13 @@ if [ "$1" == "up" ]; then
    # Setup the docker-compose command
     set_compose_command
 
-    # Run docker compose up -d snapchain
-    $COMPOSE_CMD up -d snapchain statsd # grafana
+    # Run docker compose up -d hypersnap
+    $COMPOSE_CMD up -d hypersnap statsd # grafana
 
-    echo "✅ snapchain is running."
+    echo "✅ hypersnap is running."
 
     # Finally, start showing the logs
-    $COMPOSE_CMD logs --tail 100 -f snapchain
+    $COMPOSE_CMD logs --tail 100 -f hypersnap
 
     exit 0
 fi
@@ -549,16 +565,16 @@ if [ "$1" == "down" ]; then
     # Run docker compose down
     $COMPOSE_CMD down
 
-    echo "✅ snapchain is stopped."
+    echo "✅ hypersnap is stopped."
 
     exit 0
 fi
 
 # Check the command-line argument for 'upgrade'
 if [ "$1" == "upgrade" ]; then
-    # Ensure the ~/snapchain directory exists
-    if [ ! -d ~/snapchain ]; then
-        mkdir -p ~/snapchain || { echo "Failed to create ~/snapchain directory."; exit 1; }
+    # Ensure the ~/hypersnap directory exists
+    if [ ! -d ~/hypersnap ]; then
+        mkdir -p ~/hypersnap || { echo "Failed to create ~/hypersnap directory."; exit 1; }
     fi
 
     # Install dependencies
@@ -586,8 +602,8 @@ if [ "$1" == "upgrade" ]; then
 
     setup_crontab
 
-    # Start the snapchain service
-    start_snapchain
+    # Start the hypersnap service
+    start_hypersnap
 
     echo "✅ Upgrade complete."
     echo ""
@@ -597,15 +613,15 @@ if [ "$1" == "upgrade" ]; then
     sleep 5
 
     # Finally, start showing the logs
-    $COMPOSE_CMD logs --tail 100 -f snapchain
+    $COMPOSE_CMD logs --tail 100 -f hypersnap
 
     exit 0
 fi
 
-# Show logs of the snapchain service
+# Show logs of the hypersnap service
 if [ "$1" == "logs" ]; then
     set_compose_command
-    $COMPOSE_CMD logs --tail 100 -f snapchain
+    $COMPOSE_CMD logs --tail 100 -f hypersnap
     exit 0
 fi
 
@@ -615,7 +631,7 @@ if [ "$1" == "autoupgrade" ]; then
       source ~/.bashrc
     fi
 
-    echo "$(date) Attempting snapchain autoupgrade..."
+    echo "$(date) Attempting hypersnap autoupgrade..."
 
     # Since cronjob is running under root, make sure the dependencies are installed
     install_jq
@@ -628,23 +644,23 @@ if [ "$1" == "autoupgrade" ]; then
     self_upgrade "$@"
     fetch_latest_docker_compose_and_dashboard
     ensure_grafana
-    start_snapchain
+    start_hypersnap
     sleep 5
     cleanup
 
-    echo "$(date) Completed snapchain autoupgrade"
+    echo "$(date) Completed hypersnap autoupgrade"
 
     exit 0
 fi
 
 # If run without args OR with "help", show a help
 if [ $# -eq 0 ] || [ "$1" == "help" ]; then
-    echo "snapchain.sh - Install or upgrade snapchain"
-    echo "Usage:     snapchain.sh [command]"
-    echo "  upgrade  Upgrade an existing installation of snapchain"
-    echo "  logs     Show the logs of the snapchain service"
-    echo "  up       Start snapchain and Grafana dashboard"
-    echo "  down     Stop snapchain and Grafana dashboard"
+    echo "hypersnap.sh - Install or upgrade hypersnap"
+    echo "Usage:     hypersnap.sh [command]"
+    echo "  upgrade  Upgrade an existing installation of hypersnap"
+    echo "  logs     Show the logs of the hypersnap service"
+    echo "  up       Start hypersnap and Grafana dashboard"
+    echo "  down     Stop hypersnap and Grafana dashboard"
     echo "  help     Show this help"
     echo ""
     echo "add SKIP_CRONTAB=true to your .env to skip installing the autoupgrade crontab"

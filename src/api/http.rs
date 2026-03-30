@@ -53,15 +53,19 @@ pub trait UserHydrator: Send + Sync {
 }
 
 /// Farcaster HTTP handler for v2 API endpoints.
+///
+/// Late-bound fields (conversations, feeds, search, user_hydrator) use
+/// interior mutability so they can be set after construction once the
+/// hub service is available. All clones share the same underlying state.
 #[derive(Clone)]
 pub struct ApiHttpHandler {
     social_graph: Option<Arc<SocialGraphIndexer>>,
     channels: Option<Arc<ChannelsIndexer>>,
     metrics: Option<Arc<MetricsIndexer>>,
-    conversations: Option<Arc<dyn ConversationHandler>>,
-    feeds: Option<Arc<dyn FeedHandler>>,
-    search: Option<Arc<SearchIndexer>>,
-    user_hydrator: Option<Arc<dyn UserHydrator>>,
+    conversations: Arc<std::sync::RwLock<Option<Arc<dyn ConversationHandler>>>>,
+    feeds: Arc<std::sync::RwLock<Option<Arc<dyn FeedHandler>>>>,
+    search: Arc<std::sync::RwLock<Option<Arc<SearchIndexer>>>>,
+    user_hydrator: Arc<std::sync::RwLock<Option<Arc<dyn UserHydrator>>>>,
 }
 
 impl ApiHttpHandler {
@@ -75,35 +79,31 @@ impl ApiHttpHandler {
             social_graph,
             channels,
             metrics,
-            conversations: None,
-            feeds: None,
-            search: None,
-            user_hydrator: None,
+            conversations: Arc::new(std::sync::RwLock::new(None)),
+            feeds: Arc::new(std::sync::RwLock::new(None)),
+            search: Arc::new(std::sync::RwLock::new(None)),
+            user_hydrator: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
-    /// Set the conversation handler.
-    pub fn with_conversations(mut self, handler: Arc<dyn ConversationHandler>) -> Self {
-        self.conversations = Some(handler);
-        self
+    /// Set the conversation handler (callable after construction).
+    pub fn set_conversations(&self, handler: Arc<dyn ConversationHandler>) {
+        *self.conversations.write().unwrap() = Some(handler);
     }
 
-    /// Set the feed handler.
-    pub fn with_feeds(mut self, handler: Arc<dyn FeedHandler>) -> Self {
-        self.feeds = Some(handler);
-        self
+    /// Set the feed handler (callable after construction).
+    pub fn set_feeds(&self, handler: Arc<dyn FeedHandler>) {
+        *self.feeds.write().unwrap() = Some(handler);
     }
 
-    /// Set the search indexer.
-    pub fn with_search(mut self, indexer: Arc<SearchIndexer>) -> Self {
-        self.search = Some(indexer);
-        self
+    /// Set the search indexer (callable after construction).
+    pub fn set_search(&self, indexer: Arc<SearchIndexer>) {
+        *self.search.write().unwrap() = Some(indexer);
     }
 
-    /// Set the user hydrator.
-    pub fn with_user_hydrator(mut self, hydrator: Arc<dyn UserHydrator>) -> Self {
-        self.user_hydrator = Some(hydrator);
-        self
+    /// Set the user hydrator (callable after construction).
+    pub fn set_user_hydrator(&self, hydrator: Arc<dyn UserHydrator>) {
+        *self.user_hydrator.write().unwrap() = Some(hydrator);
     }
 
     /// Check if this handler can handle the given request.
@@ -342,7 +342,8 @@ impl ApiHttpHandler {
 
     /// Hydrate a user or return stub.
     async fn get_user(&self, fid: u64) -> User {
-        if let Some(hydrator) = &self.user_hydrator {
+        let hydrator = self.user_hydrator.read().unwrap().clone();
+        if let Some(hydrator) = hydrator {
             if let Some(user) = hydrator.hydrate_user(fid).await {
                 return user;
             }
@@ -352,7 +353,8 @@ impl ApiHttpHandler {
 
     /// Hydrate multiple users or return stubs.
     async fn get_users(&self, fids: &[u64]) -> Vec<User> {
-        if let Some(hydrator) = &self.user_hydrator {
+        let hydrator = self.user_hydrator.read().unwrap().clone();
+        if let Some(hydrator) = hydrator {
             let users = hydrator.hydrate_users(fids).await;
             if !users.is_empty() {
                 return users;
@@ -543,7 +545,8 @@ impl ApiHttpHandler {
         _cursor: Option<&str>,
         limit: usize,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
-        let Some(indexer) = &self.search else {
+        let indexer = self.search.read().unwrap().clone();
+        let Some(indexer) = indexer else {
             return Ok(Self::error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Search indexing not available",
@@ -602,7 +605,8 @@ impl ApiHttpHandler {
         id_type: &str,
         reply_depth: u32,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
-        let Some(handler) = &self.conversations else {
+        let handler = self.conversations.read().unwrap().clone();
+        let Some(handler) = handler else {
             return Ok(Self::error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Conversation service not available",
@@ -744,7 +748,8 @@ impl ApiHttpHandler {
         cursor: Option<&str>,
         limit: usize,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
-        let Some(handler) = &self.feeds else {
+        let handler = self.feeds.read().unwrap().clone();
+        let Some(handler) = handler else {
             return Ok(Self::error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Feed service not available",
@@ -791,7 +796,8 @@ impl ApiHttpHandler {
         cursor: Option<&str>,
         limit: usize,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
-        let Some(handler) = &self.feeds else {
+        let handler = self.feeds.read().unwrap().clone();
+        let Some(handler) = handler else {
             return Ok(Self::error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Feed service not available",

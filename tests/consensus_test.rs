@@ -267,6 +267,7 @@ impl ReadNodeForTest {
             fc_network,
             registry,
             None,
+            None,
         )
         .await;
 
@@ -371,6 +372,7 @@ impl NodeForTest {
             statsd_client.clone(),
             fc_network,
             registry,
+            None,
             None,
         )
         .await;

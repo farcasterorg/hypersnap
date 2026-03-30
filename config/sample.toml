@@ -1,67 +1,50 @@
-log_format = "json"
+# Hypersnap sample configuration
+# This reflects the defaults used in the Docker image.
+# Override any values via this file, environment variables (SNAPCHAIN_ prefix),
+# or CLI flags.
 
-[hyper]
-enabled = false
-# Example: set to help operators alert on disk growth.
-# retention_soft_cap = 500000
-metrics_interval = "60s"
+rpc_address = "0.0.0.0:3383"
+http_address = "0.0.0.0:3381"
+rocksdb_dir = ".rocks"
+fc_network = "Mainnet"
+read_node = true
 
 [statsd]
-prefix = "snaptest"
+prefix = "snapchain"
+addr = "127.0.0.1:8125"
+use_tags = true
 
-[fnames]
-disable = false
-stop_at = 200
-start_from = 0
-url = "https://fnames.farcaster.xyz/transfers"
+[gossip]
+address = "/ip4/0.0.0.0/udp/3382/quic-v1"
+# bootstrap_peers = "/ip4/..., /ip4/..."
 
 [consensus]
-num_shards = 1
-shard_ids = [1]
+shard_ids = [1, 2]
+num_shards = 2
 
-[mempool]
-queue_size = 500
+[hyper]
+enabled = true
+# retention_soft_cap = 500000  # Optional: alert on disk growth
+# metrics_interval = "60s"
 
-# Farcaster API v2 compatibility layer (optional)
-# Enables additional indexing for Farcaster v2 API endpoints
 [api]
-enabled = false  # Set to true to enable API indexing
+enabled = true
 
-# Social graph indexing for follower/following counts
 [api.social_graph]
 enabled = true
-backfill_on_startup = false
-backfill_batch_size = 1000
 
-# Channel indexing
 [api.channels]
 enabled = true
-backfill_on_startup = false
-backfill_batch_size = 1000
 
-# Engagement metrics (likes, recasts, replies)
 [api.metrics]
 enabled = true
-backfill_on_startup = false
-backfill_batch_size = 1000
-trending_window_hours = 24
 
-# Feed generation (following, trending)
 [api.feeds]
 enabled = true
-max_following_fetch = 1000
-default_page_size = 25
 
-# Conversation/thread aggregation
 [api.conversations]
 enabled = true
-max_depth = 10
-max_replies = 500
 
-# Full-text search using Tantivy
-[api.search]
-enabled = false
-backfill_on_startup = false
-backfill_batch_size = 1000
-memory_budget_mb = 50
-# index_path = "/var/lib/snapchain/search_index"  # Optional: custom index path
+[snapshot]
+endpoint_url = "https://e1f9f185c6e63471dd39f96abd3413c4.r2.cloudflarestorage.com"
+load_db_from_snapshot = true

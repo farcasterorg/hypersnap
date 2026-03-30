@@ -204,7 +204,7 @@ aws_secret_access_key = "{aws_secret_access_key}"
         let config_file_content = config_file_content.trim().to_string() + "\n";
 
         std::fs::write(
-            format!("nodes/{id}/snapchain.toml", id = id),
+            format!("nodes/{id}/hypersnap.toml", id = id),
             config_file_content,
         )
         .expect("Failed to write config file");

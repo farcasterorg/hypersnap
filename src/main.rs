@@ -92,6 +92,67 @@ async fn start_servers(
         gossip.swarm.local_peer_id().to_string(),
     ));
 
+    // Wire late-bound API handlers that depend on the hub service
+    if let Some(ref handler) = api_handler {
+        if app_config.api.conversations.enabled {
+            let conv = Arc::new(snapchain::api::ConversationService::new(
+                app_config.api.conversations.clone(),
+                service.clone(),
+            ));
+            handler.set_conversations(conv);
+        }
+        if app_config.api.feeds.enabled {
+            let social_graph = if app_config.api.social_graph.enabled {
+                Some(Arc::new(snapchain::api::SocialGraphIndexer::new(
+                    app_config.api.social_graph.clone(),
+                    block_stores.db.clone(),
+                )))
+            } else {
+                None
+            };
+            let metrics = if app_config.api.metrics.enabled {
+                Some(Arc::new(snapchain::api::MetricsIndexer::new(
+                    app_config.api.metrics.clone(),
+                    block_stores.db.clone(),
+                )))
+            } else {
+                None
+            };
+            let feeds = Arc::new(snapchain::api::FeedService::new(
+                app_config.api.feeds.clone(),
+                social_graph,
+                metrics,
+                service.clone(),
+            ));
+            handler.set_feeds(feeds);
+        }
+        if app_config.api.search.enabled {
+            match snapchain::api::SearchIndexer::new(
+                app_config.api.search.clone(),
+                &app_config.api.search.index_path,
+            ) {
+                Ok(search) => handler.set_search(Arc::new(search)),
+                Err(e) => {
+                    warn!("Failed to initialize search indexer: {:?}", e);
+                }
+            }
+        }
+        // Wire user hydrator for populating User objects in API responses
+        let social_graph_for_hydrator = if app_config.api.social_graph.enabled {
+            Some(Arc::new(snapchain::api::SocialGraphIndexer::new(
+                app_config.api.social_graph.clone(),
+                block_stores.db.clone(),
+            )))
+        } else {
+            None
+        };
+        let hydrator = Arc::new(snapchain::api::HubUserHydrator::new(
+            service.clone(),
+            social_graph_for_hydrator,
+        ));
+        handler.set_user_hydrator(hydrator);
+    }
+
     let replication_service = if let Some(replicator) = replicator {
         let service = ReplicationServiceServer::new(ReplicationServer::new(
             replicator,
@@ -479,7 +540,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let (onchain_events_request_tx, onchain_events_request_rx) = broadcast::channel(100);
     let (fname_request_tx, fname_request_rx) = broadcast::channel(100);
 
-    let global_db = RocksDB::open_global_db(&app_config.rocksdb_dir);
+    let shared_block_cache = rocksdb::Cache::new_lru_cache(512 * 1024 * 1024);
+    let global_db = RocksDB::open_global_db_with_cache(
+        &app_config.rocksdb_dir,
+        Some(shared_block_cache.clone()),
+    );
     let local_state_store = LocalStateStore::new(global_db);
 
     if app_config.read_node {
@@ -503,6 +568,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             app_config.fc_network,
             registry,
             engine_post_commit_tx,
+            Some(shared_block_cache.clone()),
         )
         .await;
 
@@ -566,6 +632,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 &app_config.api,
                 node.block_stores.db.clone(),
                 hub_event_senders,
+                node.shard_stores.clone(),
             )
         };
 
@@ -681,6 +748,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             app_config.fc_network,
             registry,
             engine_post_commit_tx,
+            Some(shared_block_cache.clone()),
         )
         .await;
 
@@ -851,6 +919,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 &app_config.api,
                 node.block_stores.db.clone(),
                 hub_event_senders,
+                node.shard_stores.clone(),
             )
         };
 

@@ -6,11 +6,15 @@ resolver = "2"
 name = "snapchain"
 version = "0.11.5"
 edition = "2021"
-default-run = "snapchain"
+default-run = "hypersnap"
 
 [lib]
 name = "snapchain"
 path = "src/lib.rs"
+
+[[bin]]
+name = "hypersnap"
+path = "src/main.rs"
 
 [dependencies]
 snapchain-proto = { path = "proto" }
@@ -106,6 +110,7 @@ solar-macros = "=0.1.1"
 solar-config = "=0.1.1"
 nix = { version = "0.29", features = ["resource"] }
 svm-rs-builds = "0.5.22"
+tikv-jemallocator = "0.6"
 
 
 [dev-dependencies]

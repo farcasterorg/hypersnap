@@ -57,6 +57,7 @@ impl SnapchainNode {
         network: FarcasterNetwork,
         registry: &SharedRegistry,
         engine_post_commit_tx: Option<mpsc::Sender<PostCommitMessage>>,
+        block_cache: Option<rocksdb::Cache>,
     ) -> Self {
         let validator_address = Address(keypair.public().to_bytes());
 
@@ -66,7 +67,8 @@ impl SnapchainNode {
         // Create block engine first (needed for block_stores reference)
         let block_shard = SnapchainShard::new(0);
         let trie = MerkleTrie::new().unwrap();
-        let block_db = RocksDB::open_shard_db(rocksdb_dir.as_str(), 0);
+        let block_db =
+            RocksDB::open_shard_db_with_cache(rocksdb_dir.as_str(), 0, block_cache.clone());
         let engine = BlockEngine::new(
             trie,
             statsd_client.clone(),
@@ -93,7 +95,11 @@ impl SnapchainNode {
             let shard = SnapchainShard::new(shard_id);
             let ctx = SnapchainValidatorContext::new(keypair.clone());
 
-            let db = RocksDB::open_shard_db(rocksdb_dir.clone().as_str(), shard_id);
+            let db = RocksDB::open_shard_db_with_cache(
+                rocksdb_dir.clone().as_str(),
+                shard_id,
+                block_cache.clone(),
+            );
             let trie = merkle_trie::MerkleTrie::new().unwrap(); //TODO: don't unwrap()
             let engine = match ShardEngine::new(
                 db.clone(),
@@ -249,7 +255,8 @@ impl SnapchainNode {
         let block_shard = SnapchainShard::new(0);
 
         let trie = MerkleTrie::new().unwrap();
-        let block_db = RocksDB::open_shard_db(rocksdb_dir.as_str(), 0);
+        let block_db =
+            RocksDB::open_shard_db_with_cache(rocksdb_dir.as_str(), 0, block_cache.clone());
         let engine = BlockEngine::new(
             trie,
             statsd_client.clone(),
@@ -259,6 +266,22 @@ impl SnapchainNode {
             network,
         );
         let block_stores = engine.stores();
+        let hyper_block_engine = if let Some(ref hyper_dir) = hyper_db_dir {
+            let hyper_trie = MerkleTrie::new().unwrap();
+            let hyper_block_db =
+                RocksDB::open_shard_db_with_cache(hyper_dir.as_str(), 0, block_cache.clone());
+            let hyper_engine = BlockEngine::new(
+                hyper_trie,
+                statsd_client.clone(),
+                hyper_block_db,
+                config.max_messages_per_block,
+                None,
+                network,
+            );
+            Some(Arc::new(Mutex::new(hyper_engine)))
+        } else {
+            None
+        };
         let block_proposer = BlockProposer::new(
             validator_address.clone(),
             block_shard.clone(),

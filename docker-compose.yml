@@ -9,7 +9,7 @@ x-common: &common
 services:
   node1:
     <<: *common
-    command: ["./snapchain", "--config-path", "./nodes/1/snapchain.toml"]
+    command: ["./hypersnap", "--config-path", "./nodes/1/hypersnap.toml"]
     ports:
       - "50051:50051/udp"
       - "3381:3381/tcp"
@@ -21,7 +21,7 @@ services:
       - node1-data:/app/.rocks
   node2:
     <<: *common
-    command: ["./snapchain", "--config-path", "./nodes/2/snapchain.toml"]
+    command: ["./hypersnap", "--config-path", "./nodes/2/hypersnap.toml"]
     ports:
       - "50052:50052/udp"
       - "3384:3384/tcp"
@@ -32,7 +32,7 @@ services:
       - node2-data:/app/.rocks
   node3:
     <<: *common
-    command: ["./snapchain", "--config-path", "./nodes/3/snapchain.toml"]
+    command: ["./hypersnap", "--config-path", "./nodes/3/hypersnap.toml"]
     ports:
       - "50053:50053/udp"
       - "3385:3385/tcp"
@@ -43,7 +43,7 @@ services:
       - node3-data:/app/.rocks
   node4:
     <<: *common
-    command: ["./snapchain", "--config-path", "./nodes/4/snapchain.toml"]
+    command: ["./hypersnap", "--config-path", "./nodes/4/hypersnap.toml"]
     ports:
       - "50054:50054/udp"
       - "3386:3386/tcp"
