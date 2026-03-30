@@ -3243,6 +3243,7 @@ where
 pub struct Router<Service: HubService> {
     service: Arc<HubHttpServiceImpl<Service>>,
     api_handler: Option<ApiHttpHandler>,
+    mempool_tx: Option<tokio::sync::mpsc::Sender<crate::mempool::mempool::MempoolRequest>>,
 }
 
 impl<Service> Router<Service>
@@ -3253,7 +3254,17 @@ where
         Self {
             service: Arc::new(service),
             api_handler: None,
+            mempool_tx: None,
         }
+    }
+
+    /// Set the mempool sender for hyper-specific message submission.
+    pub fn with_mempool_tx(
+        mut self,
+        tx: tokio::sync::mpsc::Sender<crate::mempool::mempool::MempoolRequest>,
+    ) -> Self {
+        self.mempool_tx = Some(tx);
+        self
     }
 
     /// Set the API handler for v2 API endpoints.
@@ -3504,6 +3515,9 @@ where
                 )
                 .await
             }
+            (&Method::POST, "/v1/submitHyperMessage") => {
+                self.handle_submit_hyper_message(req).await
+            }
             _ => Ok(Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .body(Full::new(Bytes::from("Not Found")).boxed())
@@ -3587,6 +3601,213 @@ where
                 .status(StatusCode::BAD_REQUEST)
                 .header("content-type", "application/json")
                 .body(Full::new(Bytes::from(serde_json::to_vec(&err).unwrap())).boxed())
+                .unwrap()),
+        }
+    }
+
+    async fn handle_submit_hyper_message(
+        &self,
+        req: Request<hyper::body::Incoming>,
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        use crate::core::validations;
+        use crate::mempool::mempool::{MempoolRequest, MempoolSource};
+        use crate::storage::store::mempool_poller::MempoolMessage;
+        use prost::Message as ProstMessage;
+
+        let content_type = req.headers().get("content-type");
+        match content_type.and_then(|v| v.to_str().ok()) {
+            Some("application/octet-stream") => {}
+            _ => {
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header("content-type", "application/json")
+                    .body(
+                        Full::new(Bytes::from(
+                            serde_json::to_vec(&ErrorResponse {
+                                error: "Content-Type must be application/octet-stream".to_string(),
+                                error_detail: None,
+                            })
+                            .unwrap(),
+                        ))
+                        .boxed(),
+                    )
+                    .unwrap());
+            }
+        }
+
+        let body_bytes = match req.collect().await {
+            Ok(b) => b.to_bytes(),
+            Err(e) => {
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header("content-type", "application/json")
+                    .body(
+                        Full::new(Bytes::from(
+                            serde_json::to_vec(&ErrorResponse {
+                                error: "Failed to read request body".to_string(),
+                                error_detail: Some(e.to_string()),
+                            })
+                            .unwrap(),
+                        ))
+                        .boxed(),
+                    )
+                    .unwrap());
+            }
+        };
+
+        let hyper_message = match proto::HyperMessage::decode(body_bytes.as_ref()) {
+            Ok(msg) => msg,
+            Err(e) => {
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header("content-type", "application/json")
+                    .body(
+                        Full::new(Bytes::from(
+                            serde_json::to_vec(&ErrorResponse {
+                                error: "Invalid protobuf data".to_string(),
+                                error_detail: Some(e.to_string()),
+                            })
+                            .unwrap(),
+                        ))
+                        .boxed(),
+                    )
+                    .unwrap());
+            }
+        };
+
+        // Structural validation
+        if let Err(e) = validations::hyper_message::validate_hyper_message(&hyper_message) {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header("content-type", "application/json")
+                .body(
+                    Full::new(Bytes::from(
+                        serde_json::to_vec(&ErrorResponse {
+                            error: "Invalid hyper message".to_string(),
+                            error_detail: Some(e.to_string()),
+                        })
+                        .unwrap(),
+                    ))
+                    .boxed(),
+                )
+                .unwrap());
+        }
+
+        let mempool_tx = match &self.mempool_tx {
+            Some(tx) => tx,
+            None => {
+                return Ok(Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .header("content-type", "application/json")
+                    .body(
+                        Full::new(Bytes::from(
+                            serde_json::to_vec(&ErrorResponse {
+                                error: "Hyper message submission not available".to_string(),
+                                error_detail: None,
+                            })
+                            .unwrap(),
+                        ))
+                        .boxed(),
+                    )
+                    .unwrap());
+            }
+        };
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        match mempool_tx.try_send(MempoolRequest::AddMessage(
+            MempoolMessage::HyperSignerMessage(hyper_message),
+            MempoolSource::RPC,
+            Some(tx),
+        )) {
+            Ok(_) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                return Ok(Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .header("content-type", "application/json")
+                    .body(
+                        Full::new(Bytes::from(
+                            serde_json::to_vec(&ErrorResponse {
+                                error: "Mempool channel is full".to_string(),
+                                error_detail: None,
+                            })
+                            .unwrap(),
+                        ))
+                        .boxed(),
+                    )
+                    .unwrap());
+            }
+            Err(e) => {
+                return Ok(Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .header("content-type", "application/json")
+                    .body(
+                        Full::new(Bytes::from(
+                            serde_json::to_vec(&ErrorResponse {
+                                error: "Failed to submit to mempool".to_string(),
+                                error_detail: Some(e.to_string()),
+                            })
+                            .unwrap(),
+                        ))
+                        .boxed(),
+                    )
+                    .unwrap());
+            }
+        }
+
+        let timeout_duration = std::time::Duration::from_millis(500);
+        match tokio::time::timeout(timeout_duration, rx).await {
+            Ok(Ok(Ok(()))) => Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(
+                    Full::new(Bytes::from(
+                        serde_json::to_vec(&serde_json::json!({"ok": true})).unwrap(),
+                    ))
+                    .boxed(),
+                )
+                .unwrap()),
+            Ok(Ok(Err(hub_error))) => Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header("content-type", "application/json")
+                .body(
+                    Full::new(Bytes::from(
+                        serde_json::to_vec(&ErrorResponse {
+                            error: "Message rejected".to_string(),
+                            error_detail: Some(hub_error.to_string()),
+                        })
+                        .unwrap(),
+                    ))
+                    .boxed(),
+                )
+                .unwrap()),
+            Ok(Err(_)) => Ok(Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header("content-type", "application/json")
+                .body(
+                    Full::new(Bytes::from(
+                        serde_json::to_vec(&ErrorResponse {
+                            error: "Mempool channel closed".to_string(),
+                            error_detail: None,
+                        })
+                        .unwrap(),
+                    ))
+                    .boxed(),
+                )
+                .unwrap()),
+            Err(_) => Ok(Response::builder()
+                .status(StatusCode::GATEWAY_TIMEOUT)
+                .header("content-type", "application/json")
+                .body(
+                    Full::new(Bytes::from(
+                        serde_json::to_vec(&ErrorResponse {
+                            error: "Timeout waiting for mempool".to_string(),
+                            error_detail: None,
+                        })
+                        .unwrap(),
+                    ))
+                    .boxed(),
+                )
                 .unwrap()),
         }
     }

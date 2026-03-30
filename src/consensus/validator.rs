@@ -1,4 +1,5 @@
 use super::consensus::ValidatorSetConfig;
+use crate::consensus::hyper_proposer::HyperProposer;
 use crate::consensus::proposer::{BlockProposer, Proposer, ShardProposer};
 use crate::core::types::{
     Address, FullProposalExt, Height, ShardId, SnapchainShard, SnapchainValidator,
@@ -87,6 +88,7 @@ pub struct ShardValidator {
     // TODO: Fix once we remove the actor system
     block_proposer: Option<BlockProposer>,
     shard_proposer: Option<ShardProposer>,
+    hyper_proposer: Option<HyperProposer>,
     pub started: bool,
     local_state_store: LocalStateStore,
     pub statsd: StatsdClientWrapper,
@@ -99,6 +101,7 @@ impl ShardValidator {
         validator_set: Vec<ValidatorSetConfig>,
         block_proposer: Option<BlockProposer>,
         shard_proposer: Option<ShardProposer>,
+        hyper_proposer: Option<HyperProposer>,
         local_state_store: LocalStateStore,
         statsd: StatsdClientWrapper,
     ) -> ShardValidator {
@@ -120,6 +123,7 @@ impl ShardValidator {
             current_proposer: None,
             block_proposer,
             shard_proposer,
+            hyper_proposer,
             started: false,
             local_state_store,
             statsd,
@@ -143,6 +147,8 @@ impl ShardValidator {
             return p.get_confirmed_height();
         } else if let Some(p) = &self.shard_proposer {
             return p.get_confirmed_height();
+        } else if let Some(p) = &self.hyper_proposer {
+            return p.get_confirmed_height();
         }
         panic!("No proposer set on validator");
     }
@@ -151,6 +157,8 @@ impl ShardValidator {
         if let Some(p) = &self.block_proposer {
             return p.get_min_height();
         } else if let Some(p) = &self.shard_proposer {
+            return p.get_min_height();
+        } else if let Some(p) = &self.hyper_proposer {
             return p.get_min_height();
         }
         panic!("No proposer set on validator");
@@ -218,6 +226,8 @@ impl ShardValidator {
             block_proposer.decide(commits.clone()).await;
         } else if let Some(shard_proposer) = &mut self.shard_proposer {
             shard_proposer.decide(commits.clone()).await;
+        } else if let Some(hyper_proposer) = &mut self.hyper_proposer {
+            hyper_proposer.decide(commits.clone()).await;
         } else {
             panic!("No proposer set");
         }
@@ -253,6 +263,8 @@ impl ShardValidator {
             return block_proposer.get_decided_value(height).await;
         } else if let Some(shard_proposer) = &self.shard_proposer {
             return shard_proposer.get_decided_value(height).await;
+        } else if let Some(hyper_proposer) = &self.hyper_proposer {
+            return hyper_proposer.get_decided_value(height).await;
         }
         panic!("No proposer set");
     }
@@ -276,6 +288,8 @@ impl ShardValidator {
             block_proposer.add_proposed_value(full_proposal)
         } else if let Some(shard_proposer) = &mut self.shard_proposer {
             shard_proposer.add_proposed_value(full_proposal)
+        } else if let Some(hyper_proposer) = &mut self.hyper_proposer {
+            hyper_proposer.add_proposed_value(full_proposal)
         } else {
             panic!("No proposer set");
         };
@@ -311,6 +325,8 @@ impl ShardValidator {
             block_proposer.propose_value(height, round, timeout).await
         } else if let Some(shard_proposer) = &mut self.shard_proposer {
             shard_proposer.propose_value(height, round, timeout).await
+        } else if let Some(hyper_proposer) = &mut self.hyper_proposer {
+            hyper_proposer.propose_value(height, round, timeout).await
         } else {
             panic!("No proposer set");
         };
@@ -329,6 +345,8 @@ impl ShardValidator {
             block_proposer.get_proposed_value(shard_hash)
         } else if let Some(shard_proposer) = &mut self.shard_proposer {
             shard_proposer.get_proposed_value(shard_hash)
+        } else if let Some(hyper_proposer) = &mut self.hyper_proposer {
+            hyper_proposer.get_proposed_value(shard_hash)
         } else {
             panic!("No proposer set");
         }

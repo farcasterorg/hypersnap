@@ -26,6 +26,13 @@ const UNIT_TYPE_2024_CUTOFF_TIMESTAMP_TESTNET: u32 = 1752426000; // 2025-07-13 5
 const ONE_YEAR_IN_SECONDS: u32 = 365 * 24 * 60 * 60;
 const SUPPORTED_SIGNER_KEY_TYPE: u32 = 1;
 
+/// Sentinel block number for off-chain signer events. Distinguishes them from
+/// real on-chain events whose block number is always < u32::MAX.
+pub const OFFCHAIN_SIGNER_SENTINEL_BLOCK: u32 = u32::MAX - 1;
+
+/// Chain ID for off-chain signer events (not associated with any real chain).
+pub const OFFCHAIN_SIGNER_CHAIN_ID: u32 = 0;
+
 #[derive(Error, Debug)]
 pub enum OnchainEventStorageError {
     #[error(transparent)]
@@ -45,6 +52,12 @@ pub enum OnchainEventStorageError {
 
     #[error("Duplicate onchain event")]
     DuplicateOnchainEvent,
+
+    #[error("Nonce too low: got {got}, expected > {expected}")]
+    NonceTooLow { got: u64, expected: u64 },
+
+    #[error("Missing signer body in hyper message")]
+    MissingSignerBody,
 }
 
 /** A page of messages returned from various APIs */
@@ -110,6 +123,15 @@ fn make_id_register_by_fid_key(fid: u64) -> Vec<u8> {
     ];
     id_register_by_fid_key.extend(make_fid_key(fid));
     id_register_by_fid_key
+}
+
+fn make_offchain_signer_nonce_key(fid: u64) -> Vec<u8> {
+    let mut key = vec![
+        RootPrefix::OnChainEvent as u8,
+        OnChainEventPostfix::OffchainSignerNonceByFid as u8,
+    ];
+    key.extend(make_fid_key(fid));
+    key
 }
 
 fn make_signer_onchain_event_by_signer_key(fid: u64, key: Vec<u8>) -> Vec<u8> {
@@ -773,6 +795,109 @@ impl OnchainEventStore {
             None => Ok(false),
             Some(_) => Ok(true),
         }
+    }
+
+    // --- Off-chain signer nonce tracking ---
+
+    /// Read the last-used nonce for off-chain signers of a given FID.
+    pub fn get_offchain_signer_nonce(
+        &self,
+        fid: u64,
+        txn_batch: &RocksDbTransactionBatch,
+    ) -> Result<u64, OnchainEventStorageError> {
+        let key = make_offchain_signer_nonce_key(fid);
+        match get_from_db_or_txn(&self.db, txn_batch, &key)? {
+            Some(bytes) => {
+                let arr: [u8; 8] = bytes.try_into().map_err(|_| {
+                    OnchainEventStorageError::HubError(HubError::internal_db_error(
+                        "invalid nonce bytes",
+                    ))
+                })?;
+                Ok(u64::from_be_bytes(arr))
+            }
+            None => Ok(0),
+        }
+    }
+
+    /// Write the nonce for off-chain signers of a given FID.
+    fn set_offchain_signer_nonce(txn_batch: &mut RocksDbTransactionBatch, fid: u64, nonce: u64) {
+        let key = make_offchain_signer_nonce_key(fid);
+        txn_batch.put(key, nonce.to_be_bytes().to_vec());
+    }
+
+    /// Merge an off-chain signer event from a `HyperMessage`.
+    ///
+    /// Constructs a synthetic `OnChainEvent` and delegates to
+    /// `merge_onchain_event()` which populates the `SignerByFid`
+    /// secondary index — so `get_active_signer()` works unchanged.
+    pub fn merge_offchain_signer_event(
+        &self,
+        hyper_message: &proto::HyperMessage,
+        txn_batch: &mut RocksDbTransactionBatch,
+    ) -> Result<HubEvent, OnchainEventStorageError> {
+        let data = hyper_message
+            .data
+            .as_ref()
+            .ok_or(OnchainEventStorageError::MissingSignerBody)?;
+        let fid = data.fid;
+
+        let (key, key_type, nonce, event_type, metadata, metadata_type) = match &data.body {
+            Some(proto::hyper_message_data::Body::SignerAddBody(body)) => (
+                body.key.clone(),
+                body.key_type,
+                body.nonce,
+                SignerEventType::Add,
+                body.metadata.clone().unwrap_or_default(),
+                body.metadata_type.unwrap_or(0),
+            ),
+            Some(proto::hyper_message_data::Body::SignerRemoveBody(body)) => (
+                body.key.clone(),
+                SUPPORTED_SIGNER_KEY_TYPE,
+                body.nonce,
+                SignerEventType::Remove,
+                vec![],
+                0,
+            ),
+            _ => return Err(OnchainEventStorageError::MissingSignerBody),
+        };
+
+        // Validate nonce
+        let stored_nonce = self.get_offchain_signer_nonce(fid, txn_batch)?;
+        if nonce <= stored_nonce {
+            return Err(OnchainEventStorageError::NonceTooLow {
+                got: nonce,
+                expected: stored_nonce,
+            });
+        }
+
+        // Construct synthetic OnChainEvent
+        let synthetic_event = OnChainEvent {
+            r#type: OnChainEventType::EventTypeSigner as i32,
+            chain_id: OFFCHAIN_SIGNER_CHAIN_ID,
+            block_number: OFFCHAIN_SIGNER_SENTINEL_BLOCK,
+            block_hash: vec![],
+            block_timestamp: data.timestamp as u64,
+            transaction_hash: hyper_message.hash.clone(),
+            log_index: nonce as u32,
+            fid,
+            tx_index: 0,
+            version: 1,
+            body: Some(on_chain_event::Body::SignerEventBody(SignerEventBody {
+                key,
+                key_type,
+                event_type: event_type as i32,
+                metadata,
+                metadata_type,
+            })),
+        };
+
+        // Merge via existing path — populates SignerByFid secondary index
+        let hub_event = self.merge_onchain_event(synthetic_event, txn_batch)?;
+
+        // Update nonce
+        Self::set_offchain_signer_nonce(txn_batch, fid, nonce);
+
+        Ok(hub_event)
     }
 }
 

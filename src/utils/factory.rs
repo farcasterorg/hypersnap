@@ -836,6 +836,178 @@ pub mod shard_chunk_factory {
     }
 }
 
+pub mod hyper_signer_factory {
+    use super::*;
+    use alloy_dyn_abi::TypedData;
+    use alloy_signer_local::PrivateKeySigner;
+    use prost::Message;
+    use serde_json::json;
+
+    fn signer_authorization_types() -> serde_json::Value {
+        json!({
+            "EIP712Domain": [
+                { "name": "name", "type": "string" },
+                { "name": "version", "type": "string" },
+                { "name": "chainId", "type": "uint256" },
+                { "name": "verifyingContract", "type": "address" }
+            ],
+            "SignerAuthorization": [
+                { "name": "fid", "type": "uint256" },
+                { "name": "key", "type": "bytes" },
+                { "name": "deadline", "type": "uint256" },
+                { "name": "nonce", "type": "uint256" }
+            ]
+        })
+    }
+
+    fn signer_revocation_types() -> serde_json::Value {
+        json!({
+            "EIP712Domain": [
+                { "name": "name", "type": "string" },
+                { "name": "version", "type": "string" },
+                { "name": "chainId", "type": "uint256" },
+                { "name": "verifyingContract", "type": "address" }
+            ],
+            "SignerRevocation": [
+                { "name": "fid", "type": "uint256" },
+                { "name": "key", "type": "bytes" },
+                { "name": "deadline", "type": "uint256" },
+                { "name": "nonce", "type": "uint256" }
+            ]
+        })
+    }
+
+    fn signer_authorization_domain() -> serde_json::Value {
+        json!({
+            "name": "Farcaster SignerAuthorization",
+            "version": "1",
+            "chainId": 10,
+            "verifyingContract": "0x0000000000000000000000000000000000000000"
+        })
+    }
+
+    /// Create a valid HyperMessage for signer add with EIP-712 custody signature.
+    pub fn create_hyper_signer_add(
+        fid: u64,
+        signer_key: &SigningKey,
+        custody_signer: PrivateKeySigner,
+        nonce: u64,
+        deadline: u64,
+    ) -> crate::proto::HyperMessage {
+        let key = signer_key.verifying_key().as_bytes().to_vec();
+
+        let body = crate::proto::SignerAddBody {
+            key: key.clone(),
+            key_type: 1,
+            deadline,
+            nonce,
+            metadata: None,
+            metadata_type: None,
+        };
+
+        let data = crate::proto::HyperMessageData {
+            r#type: crate::proto::HyperMessageType::SignerAdd as i32,
+            fid,
+            timestamp: time::farcaster_time(),
+            network: FarcasterNetwork::Mainnet as i32,
+            body: Some(crate::proto::hyper_message_data::Body::SignerAddBody(body)),
+        };
+
+        let data_bytes = data.encode_to_vec();
+        let hash = blake3::hash(&data_bytes).as_bytes()[..20].to_vec();
+
+        // EIP-712 signature
+        let typed_data_json = json!({
+            "types": signer_authorization_types(),
+            "primaryType": "SignerAuthorization",
+            "domain": signer_authorization_domain(),
+            "message": {
+                "fid": fid,
+                "key": hex::encode(&key),
+                "deadline": deadline,
+                "nonce": nonce,
+            },
+        });
+
+        let typed_data = serde_json::from_value::<TypedData>(typed_data_json).unwrap();
+        let prehash = typed_data.eip712_signing_hash().unwrap();
+        let sig = custody_signer.sign_hash_sync(&prehash).unwrap();
+        let signature: Vec<u8> = sig.into();
+
+        let custody_address = custody_signer.address().to_vec();
+
+        crate::proto::HyperMessage {
+            data: Some(data),
+            hash: hash.clone(),
+            hash_scheme: crate::proto::HashScheme::Blake3 as i32,
+            signature,
+            signature_scheme: crate::proto::SignatureScheme::Eip712 as i32,
+            signer: custody_address,
+            data_bytes: Some(data_bytes),
+        }
+    }
+
+    /// Create a valid HyperMessage for signer remove with EIP-712 custody signature.
+    pub fn create_hyper_signer_remove(
+        fid: u64,
+        signer_key: &SigningKey,
+        custody_signer: PrivateKeySigner,
+        nonce: u64,
+        deadline: u64,
+    ) -> crate::proto::HyperMessage {
+        let key = signer_key.verifying_key().as_bytes().to_vec();
+
+        let body = crate::proto::SignerRemoveBody {
+            key: key.clone(),
+            deadline,
+            nonce,
+        };
+
+        let data = crate::proto::HyperMessageData {
+            r#type: crate::proto::HyperMessageType::SignerRemove as i32,
+            fid,
+            timestamp: time::farcaster_time(),
+            network: FarcasterNetwork::Mainnet as i32,
+            body: Some(crate::proto::hyper_message_data::Body::SignerRemoveBody(
+                body,
+            )),
+        };
+
+        let data_bytes = data.encode_to_vec();
+        let hash = blake3::hash(&data_bytes).as_bytes()[..20].to_vec();
+
+        // EIP-712 signature
+        let typed_data_json = json!({
+            "types": signer_revocation_types(),
+            "primaryType": "SignerRevocation",
+            "domain": signer_authorization_domain(),
+            "message": {
+                "fid": fid,
+                "key": hex::encode(&key),
+                "deadline": deadline,
+                "nonce": nonce,
+            },
+        });
+
+        let typed_data = serde_json::from_value::<TypedData>(typed_data_json).unwrap();
+        let prehash = typed_data.eip712_signing_hash().unwrap();
+        let sig = custody_signer.sign_hash_sync(&prehash).unwrap();
+        let signature: Vec<u8> = sig.into();
+
+        let custody_address = custody_signer.address().to_vec();
+
+        crate::proto::HyperMessage {
+            data: Some(data),
+            hash: hash.clone(),
+            hash_scheme: crate::proto::HashScheme::Blake3 as i32,
+            signature,
+            signature_scheme: crate::proto::SignatureScheme::Eip712 as i32,
+            signer: custody_address,
+            data_bytes: Some(data_bytes),
+        }
+    }
+}
+
 pub mod hub_events_factory {
     use crate::proto;
 

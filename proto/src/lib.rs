@@ -132,6 +132,44 @@ impl proto::Message {
     }
 }
 
+impl proto::HyperMessage {
+    pub fn fid(&self) -> u64 {
+        self.data.as_ref().map(|d| d.fid).unwrap_or(0)
+    }
+
+    pub fn hyper_msg_type(&self) -> proto::HyperMessageType {
+        self.data
+            .as_ref()
+            .and_then(|d| proto::HyperMessageType::try_from(d.r#type).ok())
+            .unwrap_or(proto::HyperMessageType::None)
+    }
+
+    pub fn hex_hash(&self) -> String {
+        hex::encode(&self.hash)
+    }
+
+    pub fn is_signer_message(&self) -> bool {
+        matches!(
+            self.hyper_msg_type(),
+            proto::HyperMessageType::SignerAdd | proto::HyperMessageType::SignerRemove
+        )
+    }
+
+    pub fn signer_add_body(&self) -> Option<&proto::SignerAddBody> {
+        self.data.as_ref().and_then(|d| match &d.body {
+            Some(proto::hyper_message_data::Body::SignerAddBody(b)) => Some(b),
+            _ => None,
+        })
+    }
+
+    pub fn signer_remove_body(&self) -> Option<&proto::SignerRemoveBody> {
+        self.data.as_ref().and_then(|d| match &d.body {
+            Some(proto::hyper_message_data::Body::SignerRemoveBody(b)) => Some(b),
+            _ => None,
+        })
+    }
+}
+
 // Make malachite happy. Prost already implements PartialEq, should be safe to mark as Eq.
 impl Eq for proto::FullProposal {}
 
@@ -154,6 +192,10 @@ impl proto::FullProposal {
                 shard_index: self.height().shard_index as u32,
                 hash: shard_chunk.hash.clone(),
             },
+            Some(proto::full_proposal::ProposedValue::Hyper(hyper_chunk)) => proto::ShardHash {
+                shard_index: self.height().shard_index as u32,
+                hash: hyper_chunk.hash.clone(),
+            },
             _ => {
                 panic!("Invalid proposal type");
             }
@@ -174,6 +216,17 @@ impl proto::FullProposal {
     pub fn shard_chunk(&self, commits: proto::Commits) -> Option<proto::ShardChunk> {
         match &self.proposed_value {
             Some(proto::full_proposal::ProposedValue::Shard(chunk)) => {
+                let mut chunk = chunk.clone();
+                chunk.commits = Some(commits);
+                Some(chunk)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn hyper_chunk(&self, commits: proto::Commits) -> Option<proto::HyperChunk> {
+        match &self.proposed_value {
+            Some(proto::full_proposal::ProposedValue::Hyper(chunk)) => {
                 let mut chunk = chunk.clone();
                 chunk.commits = Some(commits);
                 Some(chunk)
@@ -213,5 +266,31 @@ impl proto::ConsensusMessage {
             }
         }
         Err("Could not determine shard id for ConsensusMessage".to_string())
+    }
+}
+
+impl proto::HyperChunk {
+    pub fn height(&self) -> Option<proto::Height> {
+        self.header.as_ref().and_then(|h| h.height)
+    }
+
+    pub fn hex_hash(&self) -> String {
+        hex::encode(&self.hash)
+    }
+
+    pub fn shard_id(&self) -> Option<u32> {
+        self.height().map(|h| h.shard_index)
+    }
+}
+
+impl proto::HyperChunkHeader {
+    pub fn height(&self) -> Option<proto::Height> {
+        self.height
+    }
+}
+
+impl proto::HyperTransaction {
+    pub fn fid(&self) -> u64 {
+        self.fid
     }
 }

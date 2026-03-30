@@ -213,11 +213,27 @@ pub struct NodeMetadata {
 #[derive(Clone)]
 pub struct MerkleTrie {
     root: Option<TrieNode>,
+    root_prefix: u8,
 }
 
 impl MerkleTrie {
     pub fn new() -> Result<Self, TrieError> {
-        Ok(MerkleTrie { root: None })
+        use crate::storage::constants::RootPrefix;
+        Ok(MerkleTrie {
+            root: None,
+            root_prefix: RootPrefix::MerkleTrieNode as u8,
+        })
+    }
+
+    pub fn new_with_prefix(root_prefix: u8) -> Result<Self, TrieError> {
+        Ok(MerkleTrie {
+            root: None,
+            root_prefix,
+        })
+    }
+
+    fn apply_root_prefix(&self, ctx: &Context) {
+        ctx.set_root_prefix(self.root_prefix);
     }
 
     pub fn update_for_event(
@@ -227,6 +243,7 @@ impl MerkleTrie {
         event: &proto::HubEvent,
         txn_batch: &mut RocksDbTransactionBatch,
     ) -> Result<(), TrieError> {
+        self.apply_root_prefix(ctx);
         let (inserts, deletes) = TrieKey::for_hub_event(event);
 
         for key in inserts {
@@ -240,7 +257,7 @@ impl MerkleTrie {
     }
 
     fn create_empty_root(&mut self, txn_batch: &mut RocksDbTransactionBatch) {
-        let root_key = TrieNode::make_primary_key(&[], None);
+        let root_key = TrieNode::make_primary_key(self.root_prefix, &[], None);
         let empty = TrieNode::new();
         let serialized = TrieNode::serialize(&empty);
 
@@ -266,7 +283,7 @@ impl MerkleTrie {
     }
 
     fn load_root(&self, db: &RocksDB) -> Result<Option<TrieNode>, TrieError> {
-        let root_key = TrieNode::make_primary_key(&[], None);
+        let root_key = TrieNode::make_primary_key(self.root_prefix, &[], None);
 
         if let Some(root_bytes) = db.get(&root_key).map_err(TrieError::wrap_database)? {
             let root_node = TrieNode::deserialize(&root_bytes.as_slice())?;
@@ -297,6 +314,7 @@ impl MerkleTrie {
         txn_batch: &mut RocksDbTransactionBatch,
         keys: Vec<&[u8]>,
     ) -> Result<Vec<bool>, TrieError> {
+        self.apply_root_prefix(ctx);
         let keys: Vec<Vec<u8>> = keys.into_iter().map(expand_nibbles).collect();
 
         if keys.is_empty() {
@@ -331,6 +349,7 @@ impl MerkleTrie {
         txn_batch: &mut RocksDbTransactionBatch,
         keys: Vec<&[u8]>,
     ) -> Result<Vec<bool>, TrieError> {
+        self.apply_root_prefix(ctx);
         let keys: Vec<Vec<u8>> = keys.into_iter().map(expand_nibbles).collect();
 
         if keys.is_empty() {
@@ -357,6 +376,7 @@ impl MerkleTrie {
     }
 
     pub fn exists(&mut self, ctx: &Context, db: &RocksDB, key: &[u8]) -> Result<bool, TrieError> {
+        self.apply_root_prefix(ctx);
         let key: Vec<u8> = expand_nibbles(key);
 
         if let Some(root) = self.root.as_mut() {
@@ -403,7 +423,7 @@ impl MerkleTrie {
         prefix: &[u8],
     ) -> Option<TrieNode> {
         let prefix = expand_nibbles(prefix);
-        let node_key = TrieNode::make_primary_key(&prefix, None);
+        let node_key = TrieNode::make_primary_key(self.root_prefix, &prefix, None);
 
         return Self::get_node_from_txn_or_db(db, txn_batch, &node_key);
     }
@@ -446,6 +466,7 @@ impl MerkleTrie {
         db: &RocksDB,
         prefix: &[u8],
     ) -> Result<Vec<Vec<u8>>, TrieError> {
+        self.apply_root_prefix(ctx);
         let prefix = expand_nibbles(prefix);
 
         if let Some(root) = self.root.as_mut() {
@@ -478,6 +499,7 @@ impl MerkleTrie {
         max_items: usize,
         page_token: Option<String>,
     ) -> Result<Option<String>, TrieError> {
+        self.apply_root_prefix(ctx);
         if self.root.is_none() {
             return Err(TrieError::TrieNotInitialized);
         }
@@ -680,7 +702,7 @@ impl MerkleTrie {
             for char in node.children().keys() {
                 let mut child_prefix = expand_nibbles(prefix);
                 child_prefix.push(*char);
-                let node_key = TrieNode::make_primary_key(&child_prefix, None);
+                let node_key = TrieNode::make_primary_key(self.root_prefix, &child_prefix, None);
 
                 let child_node = Self::get_node_from_txn_or_db(db, txn_batch, &node_key).ok_or(
                     TrieError::ChildNotFound {

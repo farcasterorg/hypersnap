@@ -4,6 +4,7 @@ use crate::proto::CastId;
 
 pub mod cast;
 pub mod error;
+pub mod hyper_message;
 pub mod link;
 pub mod message;
 pub mod reaction;

@@ -1,4 +1,5 @@
 use crate::consensus::consensus::{Config, MalachiteEventShard};
+use crate::consensus::hyper_proposer::HyperProposer;
 use crate::consensus::malachite::network_connector::MalachiteNetworkEvent;
 use crate::consensus::malachite::spawn::MalachiteConsensusActors;
 use crate::consensus::proposer::{BlockProposer, ShardProposer};
@@ -6,10 +7,13 @@ use crate::consensus::validator::ShardValidator;
 use crate::core::types::{Address, ShardId, SnapchainShard, SnapchainValidatorContext};
 use crate::mempool::mempool::MempoolMessagesRequest;
 use crate::network::gossip::GossipEvent;
-use crate::proto::{Block, FarcasterNetwork, ShardChunk};
+use crate::proto::{Block, FarcasterNetwork, HyperChunk, ShardChunk};
+use crate::storage::constants::HYPER_SHARD_ID;
 use crate::storage::db::RocksDB;
+use crate::storage::store::backfill;
 use crate::storage::store::block_engine::{BlockEngine, BlockStores};
 use crate::storage::store::engine::{PostCommitMessage, Senders, ShardEngine};
+use crate::storage::store::hyper_engine::{HyperEngine, SnapchainAnchor};
 use crate::storage::store::node_local_state::LocalStateStore;
 use crate::storage::store::stores::StoreLimits;
 use crate::storage::store::stores::Stores;
@@ -21,8 +25,7 @@ use libp2p::identity::ed25519::Keypair;
 use libp2p::PeerId;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use tokio::sync::Mutex;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tracing::warn;
 
 const MAX_SHARDS: u32 = 64;
@@ -33,7 +36,8 @@ pub struct SnapchainNode {
     pub shard_stores: HashMap<u32, Stores>,
     pub shard_senders: HashMap<u32, Senders>,
     pub block_stores: BlockStores,
-    pub hyper_block_engine: Option<Arc<Mutex<BlockEngine>>>,
+    /// Send snapchain anchor updates when blocks are committed.
+    pub anchor_tx: watch::Sender<SnapchainAnchor>,
     pub address: Address,
 }
 
@@ -44,6 +48,7 @@ impl SnapchainNode {
         local_peer_id: PeerId,
         gossip_tx: mpsc::Sender<GossipEvent<SnapchainValidatorContext>>,
         shard_decision_tx: broadcast::Sender<ShardChunk>,
+        hyper_decision_tx: broadcast::Sender<HyperChunk>,
         block_tx: Option<broadcast::Sender<Block>>,
         messages_request_tx: mpsc::Sender<MempoolMessagesRequest>,
         local_state_store: LocalStateStore,
@@ -56,10 +61,11 @@ impl SnapchainNode {
     ) -> Self {
         let validator_address = Address(keypair.public().to_bytes());
 
-        // Now create the block validator
-        let block_shard = SnapchainShard::new(0);
+        // Create anchor channel for snapchain → hyper anchoring
+        let (anchor_tx, anchor_rx) = watch::channel(SnapchainAnchor::default());
 
-        // We might want to use different keys for the block shard so signatures are different and cannot be accidentally used in the wrong shard
+        // Create block engine first (needed for block_stores reference)
+        let block_shard = SnapchainShard::new(0);
         let trie = MerkleTrie::new().unwrap();
         let block_db =
             RocksDB::open_shard_db_with_cache(rocksdb_dir.as_str(), 0, block_cache.clone());
@@ -77,7 +83,6 @@ impl SnapchainNode {
 
         let mut shard_senders: HashMap<u32, Senders> = HashMap::new();
         let mut shard_stores: HashMap<u32, Stores> = HashMap::new();
-        let hyper_db_dir: Option<String> = None;
 
         // Create the shard validators
         for shard_id in config.shard_ids.clone() {
@@ -152,6 +157,7 @@ impl SnapchainNode {
                 validator_sets,
                 None,
                 Some(shard_proposer),
+                None,
                 local_state_store.clone(),
                 statsd_client.clone(),
             );
@@ -174,10 +180,80 @@ impl SnapchainNode {
             consensus_actors.insert(shard_id, consensus_actor.unwrap());
         }
 
+        // Run backfill for each shard (populates hyper trie before HyperEngine init)
+        if let Some(shard_1_stores) = shard_stores.get(&1) {
+            let hyper_db = shard_1_stores.db.clone();
+            for shard_id in config.shard_ids.clone() {
+                if let Some(stores) = shard_stores.get(&shard_id) {
+                    backfill::run_backfill(stores, &hyper_db);
+                }
+            }
+        }
+
+        // Create the hyper engine and consensus actor
+        // Share RocksDB with shard 1 (same DB, different key prefixes)
+        if let Some(shard_1_stores) = shard_stores.get(&1) {
+            let hyper_db = shard_1_stores.db.clone();
+            let hyper_shard = SnapchainShard::new(HYPER_SHARD_ID);
+
+            let hyper_engine = match HyperEngine::new(
+                hyper_db,
+                network,
+                HYPER_SHARD_ID,
+                shard_1_stores.clone(),
+                anchor_rx,
+                Some(messages_request_tx.clone()),
+                config.max_messages_per_block,
+                statsd_client.clone(),
+            ) {
+                Ok(engine) => engine,
+                Err(err) => {
+                    panic!("Failed to create hyper engine: {}", err);
+                }
+            };
+
+            let hyper_proposer = HyperProposer::new(
+                validator_address.clone(),
+                hyper_shard.clone(),
+                hyper_engine,
+                statsd_client.clone(),
+                hyper_decision_tx,
+            );
+
+            let hyper_validator_sets = config.get_validator_set_config(HYPER_SHARD_ID);
+            let hyper_validator = ShardValidator::new(
+                validator_address.clone(),
+                hyper_shard.clone(),
+                hyper_validator_sets,
+                None,
+                None,
+                Some(hyper_proposer),
+                local_state_store.clone(),
+                statsd_client.clone(),
+            );
+
+            let ctx = SnapchainValidatorContext::new(keypair.clone());
+            let hyper_consensus_actor = MalachiteConsensusActors::create_and_start(
+                ctx,
+                hyper_validator,
+                local_peer_id,
+                rocksdb_dir.clone(),
+                gossip_tx.clone(),
+                registry,
+                config.clone(),
+                statsd_client.clone(),
+            )
+            .await;
+
+            if hyper_consensus_actor.is_err() {
+                panic!("Failed to create consensus actor for hyper shard");
+            }
+            consensus_actors.insert(HYPER_SHARD_ID, hyper_consensus_actor.unwrap());
+        }
+
         // Now create the block validator
         let block_shard = SnapchainShard::new(0);
 
-        // We might want to use different keys for the block shard so signatures are different and cannot be accidentally used in the wrong shard
         let trie = MerkleTrie::new().unwrap();
         let block_db =
             RocksDB::open_shard_db_with_cache(rocksdb_dir.as_str(), 0, block_cache.clone());
@@ -190,22 +266,6 @@ impl SnapchainNode {
             network,
         );
         let block_stores = engine.stores();
-        let hyper_block_engine = if let Some(ref hyper_dir) = hyper_db_dir {
-            let hyper_trie = MerkleTrie::new().unwrap();
-            let hyper_block_db =
-                RocksDB::open_shard_db_with_cache(hyper_dir.as_str(), 0, block_cache.clone());
-            let hyper_engine = BlockEngine::new(
-                hyper_trie,
-                statsd_client.clone(),
-                hyper_block_db,
-                config.max_messages_per_block,
-                None,
-                network,
-            );
-            Some(Arc::new(Mutex::new(hyper_engine)))
-        } else {
-            None
-        };
         let block_proposer = BlockProposer::new(
             validator_address.clone(),
             block_shard.clone(),
@@ -222,6 +282,7 @@ impl SnapchainNode {
             block_shard.clone(),
             validator_sets,
             Some(block_proposer),
+            None,
             None,
             local_state_store,
             statsd_client.clone(),
@@ -249,7 +310,7 @@ impl SnapchainNode {
             shard_senders,
             shard_stores,
             block_stores,
-            hyper_block_engine,
+            anchor_tx,
         }
     }
 

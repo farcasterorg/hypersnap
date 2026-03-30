@@ -103,6 +103,10 @@ impl ReadValidator {
             proto::decided_value::Value::Block(block) => {
                 block.header.as_ref().unwrap().height.unwrap()
             }
+
+            proto::decided_value::Value::Hyper(hyper_chunk) => {
+                hyper_chunk.header.as_ref().unwrap().height.unwrap()
+            }
         }
     }
 
@@ -113,6 +117,10 @@ impl ReadValidator {
             }
 
             proto::decided_value::Value::Block(block) => block.commits.as_ref().unwrap(),
+
+            proto::decided_value::Value::Hyper(hyper_chunk) => {
+                hyper_chunk.commits.as_ref().unwrap()
+            }
         };
 
         verify_signatures(&commits, &self.validator_sets)

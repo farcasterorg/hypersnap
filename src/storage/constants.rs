@@ -1,5 +1,8 @@
 pub const PAGE_SIZE_MAX: usize = 1_000;
 
+/// Shard ID for the hyper consensus engine. Must not conflict with snapchain shard IDs (1..MAX_SHARDS).
+pub const HYPER_SHARD_ID: u32 = 100;
+
 #[allow(dead_code)]
 pub enum RootPrefix {
     Block = 1,
@@ -56,6 +59,12 @@ pub enum RootPrefix {
     ReplicationBootstrapStatus = 21,
 
     LendStorageByRecipient = 22,
+
+    /* Hyper Merkle Trie Node (separate from snapchain MerkleTrieNode) */
+    HyperMerkleTrieNode = 23,
+
+    /* Hyper Chunk storage */
+    HyperChunk = 24,
 }
 
 /** Copied from the JS code */
@@ -128,4 +137,6 @@ pub enum OnChainEventPostfix {
 
     #[allow(dead_code)] // TODO
     IdRegisterByCustodyAddress = 53,
+
+    OffchainSignerNonceByFid = 54,
 }

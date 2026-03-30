@@ -22,6 +22,7 @@ pub struct Context<'a> {
     db_read_count: atomic::AtomicU64,
     mem_read_count: atomic::AtomicU64,
     on_drop: Option<Box<dyn FnOnce((u64, u64)) + Send + 'a>>,
+    root_prefix: atomic::AtomicU8,
 }
 
 impl<'a> Context<'a> {
@@ -30,6 +31,7 @@ impl<'a> Context<'a> {
             db_read_count: atomic::AtomicU64::new(0),
             mem_read_count: atomic::AtomicU64::new(0),
             on_drop: None,
+            root_prefix: atomic::AtomicU8::new(RootPrefix::MerkleTrieNode as u8),
         }
     }
 
@@ -41,7 +43,16 @@ impl<'a> Context<'a> {
             db_read_count: atomic::AtomicU64::new(0),
             mem_read_count: atomic::AtomicU64::new(0),
             on_drop: Some(Box::new(callback)),
+            root_prefix: atomic::AtomicU8::new(RootPrefix::MerkleTrieNode as u8),
         }
+    }
+
+    pub fn root_prefix(&self) -> u8 {
+        self.root_prefix.load(atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_root_prefix(&self, prefix: u8) {
+        self.root_prefix.store(prefix, atomic::Ordering::Relaxed);
     }
 }
 
@@ -108,9 +119,13 @@ impl TrieNode {
     }
 
     #[inline]
-    pub(crate) fn make_primary_key(prefix: &[u8], child_char: Option<u8>) -> Vec<u8> {
+    pub(crate) fn make_primary_key(
+        root_prefix: u8,
+        prefix: &[u8],
+        child_char: Option<u8>,
+    ) -> Vec<u8> {
         let mut key = Vec::with_capacity(1 + prefix.len() + 1);
-        key.push(RootPrefix::MerkleTrieNode as u8);
+        key.push(root_prefix);
         key.extend_from_slice(prefix);
         if let Some(char) = child_char {
             key.push(char);
@@ -299,7 +314,7 @@ impl TrieNode {
                 self.items += 1;
 
                 self.update_hash(child_hashes, &prefix)?;
-                self.put_to_txn(txn, &prefix);
+                self.put_to_txn(txn, ctx.root_prefix(), &prefix);
 
                 inserted = true;
 
@@ -385,7 +400,7 @@ impl TrieNode {
             self.items += successes;
 
             self.update_hash(child_hashes, &prefix)?;
-            self.put_to_txn(txn, &prefix);
+            self.put_to_txn(txn, ctx.root_prefix(), &prefix);
         }
 
         Ok(results)
@@ -410,7 +425,7 @@ impl TrieNode {
                     self.key = None;
                     self.items -= 1;
 
-                    self.delete_to_txn(txn, &prefix);
+                    self.delete_to_txn(txn, ctx.root_prefix(), &prefix);
                     self.update_hash(child_hashes, &prefix)?;
 
                     results[i] = true;
@@ -486,7 +501,7 @@ impl TrieNode {
 
             if self.items == 0 {
                 // Delete this node
-                self.delete_to_txn(txn, &prefix);
+                self.delete_to_txn(txn, ctx.root_prefix(), &prefix);
                 self.update_hash(child_hashes, &prefix)?;
                 return Ok(results);
             }
@@ -505,13 +520,14 @@ impl TrieNode {
                     self.children.remove(&char);
 
                     // Delete child
-                    let child_prefix = Self::make_primary_key(&prefix, Some(char));
-                    self.delete_to_txn(txn, &child_prefix);
+                    let child_prefix =
+                        Self::make_primary_key(ctx.root_prefix(), &prefix, Some(char));
+                    self.delete_to_txn(txn, ctx.root_prefix(), &child_prefix);
                 }
             }
 
             self.update_hash(child_hashes, &prefix)?;
-            self.put_to_txn(txn, &prefix);
+            self.put_to_txn(txn, ctx.root_prefix(), &prefix);
         }
 
         Ok(results)
@@ -583,7 +599,7 @@ impl TrieNode {
             self.child_hashes.insert(new_child_char, new_child.hash());
         }
 
-        self.put_to_txn(txn, &prefix);
+        self.put_to_txn(txn, ctx.root_prefix(), &prefix);
 
         Ok(())
     }
@@ -601,7 +617,8 @@ impl TrieNode {
             Entry::Occupied(mut entry) => {
                 match entry.get_mut() {
                     TrieNodeType::Serialized(_) => {
-                        let child_prefix = Self::make_primary_key(prefix, Some(char));
+                        let child_prefix =
+                            Self::make_primary_key(ctx.root_prefix(), prefix, Some(char));
                         let child_node = db
                             .get(&child_prefix)
                             .map_err(TrieError::wrap_database)?
@@ -650,14 +667,14 @@ impl TrieNode {
         Ok(())
     }
 
-    fn put_to_txn(&self, txn: &mut RocksDbTransactionBatch, prefix: &[u8]) {
-        let key = Self::make_primary_key(prefix, None);
+    fn put_to_txn(&self, txn: &mut RocksDbTransactionBatch, root_prefix: u8, prefix: &[u8]) {
+        let key = Self::make_primary_key(root_prefix, prefix, None);
         let serialized = Self::serialize(self);
         txn.put(key, serialized);
     }
 
-    fn delete_to_txn(&self, txn: &mut RocksDbTransactionBatch, prefix: &[u8]) {
-        let key = Self::make_primary_key(prefix, None);
+    fn delete_to_txn(&self, txn: &mut RocksDbTransactionBatch, root_prefix: u8, prefix: &[u8]) {
+        let key = Self::make_primary_key(root_prefix, prefix, None);
         txn.delete(key);
     }
 

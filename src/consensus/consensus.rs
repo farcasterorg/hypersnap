@@ -64,6 +64,10 @@ pub struct Config {
     validator_sets: Option<Vec<ValidatorSetConfig>>,
     validator_addresses: Option<Vec<String>>, // Deprecated
 
+    // Hyper validator configuration (separate from snapchain)
+    hyper_validator_sets: Option<Vec<ValidatorSetConfig>>,
+    hyper_validator_addresses: Option<Vec<String>>,
+
     // Number of seconds to wait before kicking off start height
     pub consensus_start_delay: u32,
     pub sync_request_timeout: Duration,
@@ -91,6 +95,8 @@ impl Config {
             max_messages_per_block: self.max_messages_per_block,
             validator_addresses: None,
             validator_sets: Some(validator_sets.clone()),
+            hyper_validator_sets: self.hyper_validator_sets.clone(),
+            hyper_validator_addresses: self.hyper_validator_addresses.clone(),
             consensus_start_delay: self.consensus_start_delay,
             sync_request_timeout: self.sync_request_timeout,
             sync_status_update_interval: self.sync_status_update_interval,
@@ -99,13 +105,31 @@ impl Config {
     }
 
     pub fn get_validator_set_config(&self, shard_id: u32) -> Vec<ValidatorSetConfig> {
+        // For hyper shard, use hyper-specific config if available
+        if shard_id == crate::storage::constants::HYPER_SHARD_ID {
+            if let Some(sets) = &self.hyper_validator_sets {
+                assert!(!sets.is_empty());
+                return sets.to_vec();
+            }
+            if let Some(addresses) = &self.hyper_validator_addresses {
+                assert!(!addresses.is_empty());
+                return vec![ValidatorSetConfig {
+                    effective_at: 0,
+                    validator_public_keys: addresses.clone(),
+                    shard_ids: vec![shard_id],
+                }];
+            }
+            // Fall through to snapchain validators if no hyper-specific config
+        }
+
+        // Existing snapchain logic
         if let Some(sets) = &self.validator_sets {
-            assert!(sets.len() > 0);
+            assert!(!sets.is_empty());
             return sets.to_vec();
         }
 
         if let Some(addresses) = &self.validator_addresses {
-            assert!(addresses.len() > 0);
+            assert!(!addresses.is_empty());
             return vec![ValidatorSetConfig {
                 effective_at: 0,
                 validator_public_keys: addresses.clone(),
@@ -141,6 +165,8 @@ impl Default for Config {
             max_messages_per_block: 1000,
             validator_addresses: None,
             validator_sets: None,
+            hyper_validator_sets: None,
+            hyper_validator_addresses: None,
             consensus_start_delay: 2,
             sync_request_timeout: Duration::from_secs(2),
             sync_status_update_interval: Duration::from_secs(10),

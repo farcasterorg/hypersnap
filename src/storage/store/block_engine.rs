@@ -971,4 +971,76 @@ impl BlockEngine {
             Ok(())
         }
     }
+
+    // --- Off-chain signer (hyper) message support ---
+
+    /// Validate a HyperMessage for signer add/remove on shard 0.
+    pub fn validate_hyper_signer_message(
+        &self,
+        hyper_message: &proto::HyperMessage,
+        timestamp: &FarcasterTime,
+    ) -> Result<(), MessageValidationError> {
+        validations::hyper_message::validate_hyper_message(hyper_message)?;
+
+        let data = hyper_message
+            .data
+            .as_ref()
+            .ok_or(MessageValidationError::NoMessageData)?;
+        let fid = data.fid;
+
+        // Check FID is registered
+        let id_register_event = self
+            .stores
+            .onchain_event_store
+            .get_id_register_event_by_fid(fid, None)
+            .map_err(|_| MessageValidationError::MissingFid)?
+            .ok_or(MessageValidationError::MissingFid)?;
+
+        let custody_address = match &id_register_event.body {
+            Some(proto::on_chain_event::Body::IdRegisterEventBody(body)) => body.to.clone(),
+            _ => return Err(MessageValidationError::MissingFid),
+        };
+
+        // Signer must match custody address
+        if hyper_message.signer != custody_address {
+            return Err(MessageValidationError::MissingSigner);
+        }
+
+        // Deadline check
+        let deadline = match &data.body {
+            Some(proto::hyper_message_data::Body::SignerAddBody(b)) => b.deadline,
+            Some(proto::hyper_message_data::Body::SignerRemoveBody(b)) => b.deadline,
+            _ => return Err(MessageValidationError::NoMessageData),
+        };
+        if deadline < timestamp.to_u64() {
+            return Err(MessageValidationError::HubError(
+                HubError::validation_failure("signer authorization deadline has passed"),
+            ));
+        }
+
+        // Nonce check
+        let txn_batch = RocksDbTransactionBatch::new();
+        let nonce = match &data.body {
+            Some(proto::hyper_message_data::Body::SignerAddBody(b)) => b.nonce,
+            Some(proto::hyper_message_data::Body::SignerRemoveBody(b)) => b.nonce,
+            _ => return Err(MessageValidationError::NoMessageData),
+        };
+        let stored_nonce = self
+            .stores
+            .onchain_event_store
+            .get_offchain_signer_nonce(fid, &txn_batch)
+            .map_err(|e| {
+                MessageValidationError::HubError(HubError::internal_db_error(&e.to_string()))
+            })?;
+        if nonce <= stored_nonce {
+            return Err(MessageValidationError::HubError(
+                HubError::validation_failure(&format!(
+                    "nonce too low: got {}, expected > {}",
+                    nonce, stored_nonce
+                )),
+            ));
+        }
+
+        Ok(())
+    }
 }

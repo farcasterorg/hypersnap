@@ -306,7 +306,12 @@ impl ShardEngine {
         );
 
         let version = self.version_for(timestamp);
-        let mut snapchain_txns = MempoolPoller::create_transactions_from_mempool(messages)?
+        // Filter out any hyper messages that may have been routed here
+        let regular_messages: Vec<_> = messages
+            .into_iter()
+            .filter(|m| !matches!(m, MempoolMessage::HyperSignerMessage(_)))
+            .collect();
+        let mut snapchain_txns = MempoolPoller::create_transactions_from_mempool(regular_messages)?
             .into_iter()
             .filter_map(|mut transaction| {
                 // TODO(aditi): In the future, this seems like it should just be a part of the validation logic in replay_snapchain_txn.
@@ -2215,4 +2220,6 @@ impl ShardEngine {
         }
         signer_event.event_type == proto::SignerEventType::Remove as i32
     }
+
+    // --- Off-chain signer (hyper) message support ---
 }

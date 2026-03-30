@@ -196,6 +196,7 @@ async fn start_servers(
 
     let http_shutdown_tx = shutdown_tx.clone();
     let http_server_config = app_config.http_server.clone();
+    let http_mempool_tx = mempool_tx.clone();
     tokio::spawn(async move {
         let listener = TcpListener::bind(http_socket_addr).await.unwrap();
         info!(http_addr = http_addr, "HttpService listening",);
@@ -210,9 +211,11 @@ async fn start_servers(
                     let http_server_config = http_server_config.clone();
                     let service_clone = http_service.clone();
                     let api = api_handler.clone();
+                    let mempool_tx_clone = http_mempool_tx.clone();
                     tokio::spawn(async move {
                         let mut router =
-                            snapchain::network::http_server::Router::new(service_clone);
+                            snapchain::network::http_server::Router::new(service_clone)
+                                .with_mempool_tx(mempool_tx_clone);
                         if let Some(handler) = api {
                             router = router.with_api_handler(handler);
                         }
@@ -716,6 +719,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     } else {
         let (shard_decision_tx, shard_decision_rx) = broadcast::channel(100);
+        let (hyper_decision_tx, _hyper_decision_rx) =
+            broadcast::channel::<snapchain::proto::HyperChunk>(100);
 
         let (block_tx, block_rx) = broadcast::channel(1000);
 
@@ -734,6 +739,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             local_peer_id,
             gossip_tx.clone(),
             shard_decision_tx,
+            hyper_decision_tx,
             Some(block_tx.clone()),
             messages_request_tx,
             local_state_store.clone(),
@@ -872,30 +878,29 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         }
 
-        if let Some(hyper_engine) = node.hyper_block_engine.clone() {
-            let mut hyper_block_rx = block_tx.subscribe();
-            let hyper_gossip_tx = gossip_tx.clone();
+        // Wire anchor updates: when a block is committed, send anchor to hyper engine
+        {
+            let anchor_tx = node.anchor_tx.clone();
+            let mut anchor_block_rx = block_tx.subscribe();
             tokio::spawn(async move {
                 loop {
-                    match hyper_block_rx.recv().await {
+                    match anchor_block_rx.recv().await {
                         Ok(block) => {
-                            let state_root = {
-                                let mut engine = hyper_engine.lock().await;
-                                engine.commit_block(&block);
-                                engine.current_state_root()
-                            };
-                            let envelope =
-                                snapchain_hyper::build_envelope_for_block(&block, state_root)
-                                    .into();
-                            if let Err(err) = hyper_gossip_tx
-                                .send(GossipEvent::BroadcastHyperEnvelope(envelope))
-                                .await
-                            {
-                                warn!(reason = ?err, "Failed to broadcast hyper envelope");
+                            if let Some(header) = &block.header {
+                                let anchor =
+                                    snapchain::storage::store::hyper_engine::SnapchainAnchor {
+                                        block_number: header
+                                            .height
+                                            .as_ref()
+                                            .map(|h| h.block_number)
+                                            .unwrap_or(0),
+                                        state_root: header.state_root.clone(),
+                                    };
+                                let _ = anchor_tx.send(anchor);
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                            warn!(skipped, "Hyper block subscriber lagged behind");
+                            warn!(skipped, "Anchor block subscriber lagged behind");
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
                     }

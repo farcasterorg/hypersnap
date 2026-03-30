@@ -132,6 +132,74 @@ impl MyHubService {
         service
     }
 
+    #[allow(dead_code)]
+    async fn submit_hyper_message_internal(
+        &self,
+        hyper_message: proto::HyperMessage,
+    ) -> Result<proto::HyperMessage, HubError> {
+        let fid = hyper_message.fid();
+        if fid == 0 {
+            return Err(HubError::invalid_parameter("fid cannot be 0"));
+        }
+
+        // Structural validation
+        validations::hyper_message::validate_hyper_message(&hyper_message)
+            .map_err(|e| HubError::validation_failure(&format!("invalid hyper message: {}", e)))?;
+
+        // TODO: For EIP-1271 contract custody signatures, validate at submit time
+        // via chain_clients (similar to validate_contract_signature for verifications).
+
+        let (tx, rx) = oneshot::channel();
+
+        match self.mempool_tx.try_send(MempoolRequest::AddMessage(
+            MempoolMessage::HyperSignerMessage(hyper_message.clone()),
+            MempoolSource::RPC,
+            Some(tx),
+        )) {
+            Ok(_) => {
+                self.statsd_client
+                    .count("rpc.submit_hyper_message.success", 1, vec![]);
+                debug!("successfully submitted hyper message");
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.statsd_client
+                    .count("rpc.submit_hyper_message.channel_full", 1, vec![]);
+                return Err(HubError::unavailable("mempool channel is full"));
+            }
+            Err(e) => {
+                error!(
+                    "Error sending hyper message to mempool channel: {:?}",
+                    e.to_string()
+                );
+                return Err(HubError::unavailable("mempool channel send error"));
+            }
+        }
+
+        let result = match timeout(MEMPOOL_ADD_REQUEST_TIMEOUT, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(err)) => {
+                self.statsd_client
+                    .count("rpc.mempool_submit_error", 1, vec![]);
+                error!(
+                    "Error receiving hyper message from mempool channel: {:?}",
+                    err.to_string()
+                );
+                return Err(HubError::unavailable("Error adding to mempool"));
+            }
+            Err(_) => {
+                self.statsd_client
+                    .count("rpc.mempool_submit_timeout", 1, vec![]);
+                error!("Timeout receiving hyper message from mempool channel");
+                return Err(HubError::unavailable("Error adding to mempool"));
+            }
+        };
+
+        match result {
+            Ok(_) => Ok(hyper_message),
+            Err(hub_error) => Err(hub_error),
+        }
+    }
+
     async fn submit_message_internal(
         &self,
         message: proto::Message,

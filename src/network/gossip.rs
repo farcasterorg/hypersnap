@@ -833,12 +833,34 @@ impl SnapchainGossip {
                     );
                     Some(SystemMessage::MalachiteNetwork(shard, event))
                 }
-                Some(proto::gossip_message::GossipMessage::HyperEnvelope(_)) => {
-                    warn!(
-                        "Received hyper envelope from peer {}, ignoring (not yet supported)",
-                        peer_id
-                    );
-                    None
+                Some(proto::gossip_message::GossipMessage::HyperEnvelope(envelope)) => {
+                    // Decode HyperMempoolMessage from the envelope payload
+                    use prost::Message as _;
+                    match proto::HyperMempoolMessage::decode(envelope.payload.as_slice()) {
+                        Ok(hyper_mempool) => match hyper_mempool.hyper_message {
+                            Some(proto::hyper_mempool_message::HyperMessage::SignerMessage(
+                                hyper_msg,
+                            )) => {
+                                let mempool_message = MempoolMessage::HyperSignerMessage(hyper_msg);
+                                Some(SystemMessage::Mempool(MempoolRequest::AddMessage(
+                                    mempool_message,
+                                    MempoolSource::Gossip,
+                                    None,
+                                )))
+                            }
+                            None => {
+                                warn!("Empty hyper mempool message from peer: {}", peer_id);
+                                None
+                            }
+                        },
+                        Err(e) => {
+                            warn!(
+                                "Failed to decode hyper envelope payload from peer {}: {}",
+                                peer_id, e
+                            );
+                            None
+                        }
+                    }
                 }
                 Some(proto::gossip_message::GossipMessage::MempoolMessage(message)) => {
                     if let Some(mempool_message_proto) = message.mempool_message {

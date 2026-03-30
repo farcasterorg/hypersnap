@@ -359,12 +359,14 @@ impl NodeForTest {
         let node_local_store = LocalStateStore::new(global_db);
         let (messages_request_tx, messages_request_rx) = mpsc::channel(100);
         let (shard_decision_tx, shard_decision_rx) = broadcast::channel(100);
+        let (hyper_decision_tx, _hyper_decision_rx) = broadcast::channel::<proto::HyperChunk>(100);
         let node = SnapchainNode::create(
             keypair.clone(),
             consensus_config.clone(),
             peer_id,
             gossip_tx.clone(),
             shard_decision_tx,
+            hyper_decision_tx,
             Some(block_tx.clone()),
             messages_request_tx,
             node_local_store,

@@ -37,6 +37,8 @@ pub enum MempoolMessage {
         for_shard: u32,
         message: proto::BlockEvent,
     },
+    /// Off-chain signer add/remove (hyper-only, never in snapchain blocks).
+    HyperSignerMessage(proto::HyperMessage),
 }
 
 impl MempoolMessage {
@@ -59,6 +61,7 @@ impl MempoolMessage {
                 },
                 None => 0,
             },
+            MempoolMessage::HyperSignerMessage(msg) => msg.fid(),
         }
     }
 
@@ -66,6 +69,9 @@ impl MempoolMessage {
         let msg = match self {
             MempoolMessage::UserMessage(msg) => {
                 proto::mempool_message::MempoolMessage::UserMessage(msg.clone())
+            }
+            MempoolMessage::HyperSignerMessage(_) => {
+                panic!("HyperSignerMessage must not be converted to snapchain MempoolMessage")
             }
             _ => todo!(),
         };
@@ -171,6 +177,10 @@ impl MempoolPoller {
                             fname_transfer: None,
                             block_event: None,
                         })
+                    }
+                    MempoolMessage::HyperSignerMessage(_) => {
+                        // Hyper signer messages are NOT included in snapchain blocks/transactions.
+                        // They are processed separately via the hyper pipeline.
                     }
                 }
             }

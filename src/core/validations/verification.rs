@@ -549,3 +549,215 @@ pub fn validate_remove_address(
         _ => Err(ValidationError::InvalidData),
     }
 }
+
+// --- EIP-712 Signer Authorization ---
+
+fn signer_authorization_types() -> Value {
+    json!({
+        "EIP712Domain": [
+            { "name": "name", "type": "string" },
+            { "name": "version", "type": "string" },
+            { "name": "chainId", "type": "uint256" },
+            { "name": "verifyingContract", "type": "address" }
+        ],
+        "SignerAuthorization": [
+            { "name": "fid", "type": "uint256" },
+            { "name": "key", "type": "bytes" },
+            { "name": "deadline", "type": "uint256" },
+            { "name": "nonce", "type": "uint256" }
+        ]
+    })
+}
+
+fn signer_authorization_domain() -> Value {
+    json!({
+        "name": "Farcaster SignerAuthorization",
+        "version": "1",
+        "chainId": 10,
+        "verifyingContract": "0x0000000000000000000000000000000000000000"
+    })
+}
+
+fn signer_revocation_types() -> Value {
+    json!({
+        "EIP712Domain": [
+            { "name": "name", "type": "string" },
+            { "name": "version", "type": "string" },
+            { "name": "chainId", "type": "uint256" },
+            { "name": "verifyingContract", "type": "address" }
+        ],
+        "SignerRevocation": [
+            { "name": "fid", "type": "uint256" },
+            { "name": "key", "type": "bytes" },
+            { "name": "deadline", "type": "uint256" },
+            { "name": "nonce", "type": "uint256" }
+        ]
+    })
+}
+
+/// Validate an EOA custody signature for a signer add authorization.
+pub fn validate_signer_add_custody_signature(
+    fid: u64,
+    body: &proto::SignerAddBody,
+    signature: &[u8],
+    expected_custody_address: &[u8],
+) -> Result<(), ValidationError> {
+    let json = json!({
+        "types": signer_authorization_types(),
+        "primaryType": "SignerAuthorization",
+        "domain": signer_authorization_domain(),
+        "message": {
+            "fid": fid,
+            "key": hex::encode(&body.key),
+            "deadline": body.deadline,
+            "nonce": body.nonce,
+        },
+    });
+
+    validate_eip712_custody_signature(&json, signature, expected_custody_address)
+}
+
+/// Validate an EOA custody signature for a signer remove authorization.
+pub fn validate_signer_remove_custody_signature(
+    fid: u64,
+    body: &proto::SignerRemoveBody,
+    signature: &[u8],
+    expected_custody_address: &[u8],
+) -> Result<(), ValidationError> {
+    let json = json!({
+        "types": signer_revocation_types(),
+        "primaryType": "SignerRevocation",
+        "domain": signer_authorization_domain(),
+        "message": {
+            "fid": fid,
+            "key": hex::encode(&body.key),
+            "deadline": body.deadline,
+            "nonce": body.nonce,
+        },
+    });
+
+    validate_eip712_custody_signature(&json, signature, expected_custody_address)
+}
+
+/// Common EIP-712 signature recovery against an expected custody address.
+fn validate_eip712_custody_signature(
+    typed_data_json: &Value,
+    signature: &[u8],
+    expected_custody_address: &[u8],
+) -> Result<(), ValidationError> {
+    let typed_data = serde_json::from_value::<TypedData>(typed_data_json.clone())
+        .map_err(|_| ValidationError::InvalidData)?;
+
+    let prehash = typed_data
+        .eip712_signing_hash()
+        .map_err(|_| ValidationError::InvalidHash)?;
+
+    if signature.len() != 65 {
+        return Err(ValidationError::InvalidSignature);
+    }
+
+    let sig = alloy_primitives::PrimitiveSignature::from_bytes_and_parity(
+        &signature[0..64],
+        signature[64] != 0x1b && signature[64] != 0x00,
+    );
+
+    let recovered_address = sig
+        .recover_address_from_prehash(&prehash)
+        .map_err(|_| ValidationError::InvalidSignature)?;
+
+    if recovered_address.as_slice() != expected_custody_address {
+        return Err(ValidationError::InvalidSignature);
+    }
+
+    Ok(())
+}
+
+/// Validate an EIP-1271 contract custody signature for a signer add.
+pub async fn validate_signer_add_contract_signature<P, T>(
+    provider: P,
+    fid: u64,
+    body: &proto::SignerAddBody,
+    signature: &[u8],
+    custody_address: &[u8],
+) -> Result<(), ValidationError>
+where
+    P: Provider<T>,
+    T: Transport + Clone,
+{
+    let json = json!({
+        "types": signer_authorization_types(),
+        "primaryType": "SignerAuthorization",
+        "domain": signer_authorization_domain(),
+        "message": {
+            "fid": fid,
+            "key": hex::encode(&body.key),
+            "deadline": body.deadline,
+            "nonce": body.nonce,
+        },
+    });
+
+    validate_eip1271_custody_signature(&json, signature, custody_address, provider).await
+}
+
+/// Validate an EIP-1271 contract custody signature for a signer remove.
+pub async fn validate_signer_remove_contract_signature<P, T>(
+    provider: P,
+    fid: u64,
+    body: &proto::SignerRemoveBody,
+    signature: &[u8],
+    custody_address: &[u8],
+) -> Result<(), ValidationError>
+where
+    P: Provider<T>,
+    T: Transport + Clone,
+{
+    let json = json!({
+        "types": signer_revocation_types(),
+        "primaryType": "SignerRevocation",
+        "domain": signer_authorization_domain(),
+        "message": {
+            "fid": fid,
+            "key": hex::encode(&body.key),
+            "deadline": body.deadline,
+            "nonce": body.nonce,
+        },
+    });
+
+    validate_eip1271_custody_signature(&json, signature, custody_address, provider).await
+}
+
+/// Common EIP-1271 contract signature validation.
+async fn validate_eip1271_custody_signature<P, T>(
+    typed_data_json: &Value,
+    signature: &[u8],
+    custody_address: &[u8],
+    provider: P,
+) -> Result<(), ValidationError>
+where
+    P: Provider<T>,
+    T: Transport + Clone,
+{
+    let typed_data = serde_json::from_value::<TypedData>(typed_data_json.clone())
+        .map_err(|_| ValidationError::InvalidData)?;
+
+    let hash = typed_data
+        .eip712_signing_hash()
+        .map_err(|_| ValidationError::InvalidHash)?;
+
+    let address_arr: [u8; 20] = custody_address
+        .try_into()
+        .map_err(|_| ValidationError::InvalidData)?;
+
+    match eth_signature_verifier::verify_signature(
+        alloy_primitives::Bytes::from(signature.to_vec()),
+        alloy_primitives::Address::from(address_arr),
+        hash,
+        &provider,
+    )
+    .await
+    {
+        Ok(Verification::Valid) => Ok(()),
+        Ok(Verification::Invalid) => Err(ValidationError::InvalidSignature),
+        Err(_) => Err(ValidationError::InvalidSignature),
+    }
+}

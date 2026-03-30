@@ -3,6 +3,7 @@ syntax = "proto3";
 import "message.proto";
 import "username_proof.proto";
 import "onchain_event.proto";
+import "hyper.proto";
 
 // Common types
 
@@ -76,6 +77,7 @@ message FullProposal {
   oneof proposed_value {
     Block block = 4;
     ShardChunk shard = 5;
+    HyperChunk hyper = 6;
   }
 }
 
@@ -83,6 +85,7 @@ message DecidedValue {
   oneof value {
     Block block = 2;
     ShardChunk shard = 3;
+    HyperChunk hyper = 4;
   }
 }
 
@@ -195,6 +198,30 @@ message ValidatorMessage {
   BlockEvent block_event = 3;
 }
 
+
+// Hyper block types
+message HyperChunkHeader {
+  Height height = 1;
+  uint64 timestamp = 2;
+  bytes parent_hash = 3;
+  bytes hyper_state_root = 4;
+  // Snapchain anchor
+  uint64 snapchain_block_number = 5;
+  bytes snapchain_state_root = 6;
+}
+
+message HyperChunk {
+  HyperChunkHeader header = 1;
+  bytes hash = 2;
+  repeated HyperTransaction transactions = 3;
+  Commits commits = 4;
+}
+
+message HyperTransaction {
+  uint64 fid = 1;
+  bytes account_root = 2;
+  repeated HyperMessage hyper_messages = 3;
+}
 
 // Gossip related messages
 message MempoolMessage {

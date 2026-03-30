@@ -259,6 +259,8 @@ impl Host {
                     Some(decided_value::Value::Block(block))
                 } else if let Some(shard_chunk) = proposed_value.shard_chunk(commits.clone()) {
                     Some(decided_value::Value::Shard(shard_chunk))
+                } else if let Some(hyper_chunk) = proposed_value.hyper_chunk(commits.clone()) {
+                    Some(decided_value::Value::Hyper(hyper_chunk))
                 } else {
                     None
                 };
@@ -336,6 +338,10 @@ impl Host {
                             certificate: commits.to_commit_certificate(),
                             value_bytes: Bytes::from(shard_chunk.encode_to_vec()),
                         }),
+                        full_proposal::ProposedValue::Hyper(hyper_chunk) => Some(RawDecidedValue {
+                            certificate: commits.to_commit_certificate(),
+                            value_bytes: Bytes::from(hyper_chunk.encode_to_vec()),
+                        }),
                     },
                     None => None,
                 };
@@ -359,6 +365,14 @@ impl Host {
                         round: round.as_i64(),
                         proposer: validator_address.to_vec(),
                         proposed_value: Some(full_proposal::ProposedValue::Block(decoded_block)),
+                    }
+                } else if height.shard_index == crate::storage::constants::HYPER_SHARD_ID {
+                    let hyper_chunk = proto::HyperChunk::decode(value_bytes.as_ref()).unwrap();
+                    FullProposal {
+                        height: Some(height),
+                        round: round.as_i64(),
+                        proposer: validator_address.to_vec(),
+                        proposed_value: Some(full_proposal::ProposedValue::Hyper(hyper_chunk)),
                     }
                 } else {
                     let chunk = ShardChunk::decode(value_bytes.as_ref()).unwrap();

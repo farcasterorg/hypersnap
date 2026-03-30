@@ -1,5 +1,93 @@
 syntax = "proto3";
 
+import "message.proto";
+import "username_proof.proto";
+
+// Superset of snapchain MessageType — mirrors all standard values,
+// adds hyper-specific types at 100+ to never conflict with upstream.
+enum HyperMessageType {
+  HYPER_MESSAGE_TYPE_NONE = 0;
+  HYPER_MESSAGE_TYPE_CAST_ADD = 1;
+  HYPER_MESSAGE_TYPE_CAST_REMOVE = 2;
+  HYPER_MESSAGE_TYPE_REACTION_ADD = 3;
+  HYPER_MESSAGE_TYPE_REACTION_REMOVE = 4;
+  HYPER_MESSAGE_TYPE_LINK_ADD = 5;
+  HYPER_MESSAGE_TYPE_LINK_REMOVE = 6;
+  HYPER_MESSAGE_TYPE_VERIFICATION_ADD_ETH_ADDRESS = 7;
+  HYPER_MESSAGE_TYPE_VERIFICATION_REMOVE = 8;
+  HYPER_MESSAGE_TYPE_USER_DATA_ADD = 11;
+  HYPER_MESSAGE_TYPE_USERNAME_PROOF = 12;
+  HYPER_MESSAGE_TYPE_FRAME_ACTION = 13;
+  HYPER_MESSAGE_TYPE_LINK_COMPACT_STATE = 14;
+  HYPER_MESSAGE_TYPE_LEND_STORAGE = 15;
+
+  // Hyper-specific types
+  HYPER_MESSAGE_TYPE_SIGNER_ADD = 100;
+  HYPER_MESSAGE_TYPE_SIGNER_REMOVE = 101;
+}
+
+message SignerAddBody {
+  bytes key = 1;              // Ed25519 public key (32 bytes)
+  uint32 key_type = 2;        // 1 = Ed25519
+  uint64 deadline = 3;        // Farcaster epoch seconds
+  uint64 nonce = 4;           // Monotonic per-FID nonce
+  optional bytes metadata = 5;
+  optional uint32 metadata_type = 6;
+}
+
+message SignerRemoveBody {
+  bytes key = 1;
+  uint64 deadline = 2;
+  uint64 nonce = 3;
+}
+
+// Message data for hyper-specific messages.
+// Uses HyperMessageType and carries hyper-specific bodies alongside
+// all standard body types for completeness.
+message HyperMessageData {
+  HyperMessageType type = 1;
+  uint64 fid = 2;
+  uint32 timestamp = 3;
+  FarcasterNetwork network = 4;
+  oneof body {
+    // Standard bodies (same field numbers as MessageData for clarity)
+    CastAddBody cast_add_body = 5;
+    CastRemoveBody cast_remove_body = 6;
+    ReactionBody reaction_body = 7;
+    VerificationAddAddressBody verification_add_address_body = 9;
+    VerificationRemoveBody verification_remove_body = 10;
+    UserDataBody user_data_body = 12;
+    LinkBody link_body = 14;
+    UserNameProof username_proof_body = 15;
+    FrameActionBody frame_action_body = 16;
+    LinkCompactStateBody link_compact_state_body = 17;
+    LendStorageBody lend_storage_body = 18;
+
+    // Hyper-specific bodies
+    SignerAddBody signer_add_body = 19;
+    SignerRemoveBody signer_remove_body = 20;
+  }
+}
+
+// Hyper message envelope — same structure as Message but uses
+// HyperMessageData. Carries hyper-specific messages.
+message HyperMessage {
+  HyperMessageData data = 1;
+  bytes hash = 2;
+  HashScheme hash_scheme = 3;
+  bytes signature = 4;
+  SignatureScheme signature_scheme = 5;
+  bytes signer = 6;
+  optional bytes data_bytes = 7;
+}
+
+message HyperMempoolMessage {
+  oneof hyper_message {
+    HyperMessage signer_message = 1;
+  }
+}
+
+// Existing types unchanged:
 message HyperBlockMetadata {
   uint64 canonical_block_id = 1;
   bytes parent_hash = 2;

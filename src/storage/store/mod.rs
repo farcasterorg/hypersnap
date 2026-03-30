@@ -1,10 +1,13 @@
 pub use self::block::*;
 
 pub mod account;
+pub mod backfill;
 pub mod block;
 pub mod block_engine;
 pub mod engine;
 pub mod engine_metrics;
+pub mod hyper_chunk_store;
+pub mod hyper_engine;
 pub mod mempool_poller;
 pub mod node_local_state;
 pub mod shard;
@@ -19,6 +22,8 @@ pub mod test_helper;
 mod block_engine_test;
 #[cfg(test)]
 mod engine_tests;
+#[cfg(test)]
+mod hyper_engine_tests;
 #[cfg(test)]
 mod node_local_state_tests;
 #[cfg(test)]

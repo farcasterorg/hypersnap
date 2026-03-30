@@ -1,4 +1,5 @@
 pub mod consensus;
+pub mod hyper_proposer;
 pub mod malachite;
 pub mod proposer;
 pub mod read_validator;

@@ -273,6 +273,11 @@ impl MempoolMessage {
                 };
                 validator_message.mempool_key()
             }
+            MempoolMessage::HyperSignerMessage(msg) => MempoolKey::new(
+                MempoolMessageKind::ValidatorMessage,
+                msg.data.as_ref().map(|d| d.timestamp as u64).unwrap_or(0),
+                msg.hex_hash(),
+            ),
         }
     }
 }
@@ -317,6 +322,11 @@ impl ReadNodeMempool {
     }
 
     fn message_already_exists(&self, shard: u32, message: &MempoolMessage) -> bool {
+        // Hyper shard messages are not stored in snapchain shard stores
+        if shard == crate::storage::constants::HYPER_SHARD_ID {
+            return false;
+        }
+
         let fid = message.fid();
 
         let db = if shard == 0 {
@@ -363,8 +373,9 @@ impl ReadNodeMempool {
                 MempoolMessage::OnchainEvent(_)
                 | MempoolMessage::OnchainEventForMigration(_)
                 | MempoolMessage::FnameTransfer(_)
-                | MempoolMessage::BlockEvent { .. } => {
-                    // Don't do duplicate checks for validator messages. They are infrequent, and engine can handle duplicates.
+                | MempoolMessage::BlockEvent { .. }
+                | MempoolMessage::HyperSignerMessage(_) => {
+                    // Don't do duplicate checks for validator/hyper messages. They are infrequent, and engine can handle duplicates.
                     false
                 }
             },
@@ -372,7 +383,7 @@ impl ReadNodeMempool {
     }
 
     async fn gossip_message(&self, message: MempoolMessage, source: MempoolSource) {
-        match message {
+        match &message {
             MempoolMessage::UserMessage(_) => {
                 // Don't re-broadcast messages that were received from gossip, other nodes will already have them.
                 if source != MempoolSource::Gossip {
@@ -383,6 +394,36 @@ impl ReadNodeMempool {
 
                     if let Err(e) = result {
                         warn!("Failed to gossip message {:?}", e);
+                    }
+                }
+            }
+            MempoolMessage::HyperSignerMessage(hyper_msg) => {
+                // Hyper signer messages are gossiped via the hyper envelope topic only.
+                if source != MempoolSource::Gossip {
+                    use prost::Message as _;
+                    let hyper_mempool = proto::HyperMempoolMessage {
+                        hyper_message: Some(
+                            proto::hyper_mempool_message::HyperMessage::SignerMessage(
+                                hyper_msg.clone(),
+                            ),
+                        ),
+                    };
+                    let envelope = proto::HyperEnvelope {
+                        metadata: Some(proto::HyperBlockMetadata {
+                            canonical_block_id: 0,
+                            parent_hash: vec![],
+                            hyper_state_root: vec![],
+                            extra_rules_version: 0,
+                            retained_message_count: 0,
+                        }),
+                        payload: hyper_mempool.encode_to_vec(),
+                    };
+                    let result = self
+                        .gossip_tx
+                        .send(GossipEvent::BroadcastHyperEnvelope(envelope))
+                        .await;
+                    if let Err(e) = result {
+                        warn!("Failed to gossip hyper signer message {:?}", e);
                     }
                 }
             }
@@ -429,6 +470,10 @@ impl ReadNodeMempool {
                     message,
                     self.num_shards,
                 )]
+            }
+            MempoolMessage::HyperSignerMessage(_) => {
+                // Route to hyper shard only
+                vec![crate::storage::constants::HYPER_SHARD_ID]
             }
         }
     }
@@ -546,7 +591,8 @@ impl Mempool {
             MempoolMessage::OnchainEvent(_)
             | MempoolMessage::OnchainEventForMigration(_)
             | MempoolMessage::FnameTransfer(_)
-            | MempoolMessage::BlockEvent { .. } => false,
+            | MempoolMessage::BlockEvent { .. }
+            | MempoolMessage::HyperSignerMessage(_) => false,
         }
     }
 

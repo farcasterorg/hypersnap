@@ -200,6 +200,15 @@ impl SnapchainReadNode {
             proto::decided_value::Value::Block(block) => {
                 block.header.as_ref().unwrap().height.unwrap().shard_index
             }
+            proto::decided_value::Value::Hyper(hyper_chunk) => {
+                hyper_chunk
+                    .header
+                    .as_ref()
+                    .unwrap()
+                    .height
+                    .unwrap()
+                    .shard_index
+            }
         };
         let actors = self.consensus_actors.get(&shard_id).unwrap();
         actors.cast_decided_value(decided_value).unwrap();
