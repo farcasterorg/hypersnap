@@ -99,7 +99,7 @@ check "channel/user-active"         "/v2/farcaster/channel/user-active?fid=${TES
 echo ""
 
 echo "=== Reaction ==="
-check "reaction/cast"               "/v2/farcaster/reaction/cast?hash=0x0db20e2ccb3bbb7684f592c0e9e35fb6c006cb0c&types=likes&limit=5"
+check "reaction/cast"               "/v2/farcaster/reaction/cast?hash=${CAST_HASH}&types=likes&limit=5"
 check "reaction/user"               "/v2/farcaster/reaction/user?fid=${TEST_FID}&type=likes&limit=5"
 echo ""
 
