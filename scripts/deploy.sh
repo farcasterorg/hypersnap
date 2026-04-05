@@ -8,10 +8,11 @@
 #   docker buildx  (for multi-arch builds; included with Docker Desktop)
 #
 # Usage:
-#   ./scripts/deploy.sh                # Build + push both arches, create manifest, tag latest
-#   ./scripts/deploy.sh --no-latest    # Build + push but don't update :latest tag
-#   ./scripts/deploy.sh --arch amd64   # Build + push only one architecture (no manifest)
-#   ./scripts/deploy.sh --dry-run      # Build locally without pushing (verify only)
+#   ./scripts/deploy.sh                    # Build + push both arches, tag version + latest
+#   ./scripts/deploy.sh --no-latest        # Build + push but don't update :latest tag
+#   ./scripts/deploy.sh --arch amd64       # Build + push only one architecture
+#   ./scripts/deploy.sh --dry-run          # Build locally without pushing (verify only)
+#   ./scripts/deploy.sh --channel nightly  # Publish as nightly-{version}-{commit} / nightly-latest
 #
 # MUST be run from the root of the repository.
 
@@ -28,6 +29,7 @@ fi
 TAG_LATEST=true
 SINGLE_ARCH=""
 DRY_RUN=false
+CHANNEL=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -43,18 +45,33 @@ while [[ $# -gt 0 ]]; do
       DRY_RUN=true
       shift
       ;;
+    --channel)
+      CHANNEL="$2"
+      shift 2
+      ;;
     *)
       echo "Unknown option: $1"
-      echo "Usage: $0 [--no-latest] [--arch amd64|arm64] [--dry-run]"
+      echo "Usage: $0 [--no-latest] [--arch amd64|arm64] [--dry-run] [--channel NAME]"
       exit 1
       ;;
   esac
 done
 
-if [ "$DRY_RUN" = true ]; then
-  echo "==> DRY RUN: building $IMAGE version $SNAPCHAIN_VERSION (no push)"
+# When a channel is set, prefix all version tags with it and append the short git commit.
+# e.g. --channel nightly → nightly-0.11.6-dc8d8df, nightly-latest
+if [ -n "$CHANNEL" ]; then
+  GIT_SHORT=$(git rev-parse --short HEAD)
+  VERSION_TAG="${CHANNEL}-${SNAPCHAIN_VERSION}-${GIT_SHORT}"
+  LATEST_TAG="${CHANNEL}-latest"
 else
-  echo "==> Deploying $IMAGE version $SNAPCHAIN_VERSION"
+  VERSION_TAG="${SNAPCHAIN_VERSION}"
+  LATEST_TAG="latest"
+fi
+
+if [ "$DRY_RUN" = true ]; then
+  echo "==> DRY RUN: building $IMAGE version $VERSION_TAG (no push)"
+else
+  echo "==> Deploying $IMAGE version $VERSION_TAG"
 fi
 
 # Ensure buildx builder exists
@@ -65,47 +82,6 @@ if ! docker buildx inspect "$BUILDER_NAME" &>/dev/null; then
 else
   docker buildx use "$BUILDER_NAME"
 fi
-
-build_and_push() {
-  local arch="$1"
-  local tag="${IMAGE}:${SNAPCHAIN_VERSION}-${arch}"
-  echo "==> Building $tag"
-  if [ "$DRY_RUN" = true ]; then
-    docker buildx build \
-      --platform "linux/${arch}" \
-      --tag "$tag" \
-      --load \
-      -f Dockerfile \
-      .
-    echo "==> Built $tag (local only, not pushed)"
-    echo "==> Verify with: docker run --rm $tag --help"
-    echo "==> Or run interactively: docker run --rm -it $tag /bin/bash"
-  else
-    docker buildx build \
-      --platform "linux/${arch}" \
-      --tag "$tag" \
-      --push \
-      -f Dockerfile \
-      .
-    echo "==> Pushed $tag"
-  fi
-}
-
-create_manifest() {
-  local tag="$1"
-  if [ "$DRY_RUN" = true ]; then
-    echo "==> [skip] Would create multi-arch manifest: ${IMAGE}:${tag}"
-    return
-  fi
-  echo "==> Creating multi-arch manifest: ${IMAGE}:${tag}"
-  # Remove existing manifest if present (docker manifest has no --force on create)
-  docker manifest rm "${IMAGE}:${tag}" 2>/dev/null || true
-  docker manifest create "${IMAGE}:${tag}" \
-    "${IMAGE}:${SNAPCHAIN_VERSION}-amd64" \
-    "${IMAGE}:${SNAPCHAIN_VERSION}-arm64"
-  docker manifest push "${IMAGE}:${tag}"
-  echo "==> Pushed manifest ${IMAGE}:${tag}"
-}
 
 # Default to host arch in dry-run mode if no arch specified
 if [ "$DRY_RUN" = true ] && [ -z "$SINGLE_ARCH" ]; then
@@ -118,26 +94,44 @@ if [ "$DRY_RUN" = true ] && [ -z "$SINGLE_ARCH" ]; then
   echo "==> Dry run: defaulting to host architecture ($SINGLE_ARCH)"
 fi
 
+# Determine platforms
 if [ -n "$SINGLE_ARCH" ]; then
-  # Single-arch mode
-  build_and_push "$SINGLE_ARCH"
-  if [ "$DRY_RUN" = true ]; then
-    echo "==> Dry run complete. Image available locally."
-  else
-    echo "==> Done (single arch: $SINGLE_ARCH)"
-  fi
+  PLATFORMS="linux/${SINGLE_ARCH}"
 else
-  # Full multi-arch deploy
-  build_and_push "amd64"
-  build_and_push "arm64"
-
-  # Create versioned manifest
-  create_manifest "$SNAPCHAIN_VERSION"
-
-  # Optionally tag as latest
-  if [ "$TAG_LATEST" = true ]; then
-    create_manifest "latest"
-  fi
-
-  echo "==> Deploy complete: $IMAGE:$SNAPCHAIN_VERSION"
+  PLATFORMS="linux/amd64,linux/arm64"
 fi
+
+# Collect tags
+TAGS="--tag ${IMAGE}:${VERSION_TAG}"
+if [ "$TAG_LATEST" = true ] && [ -z "$SINGLE_ARCH" ]; then
+  TAGS="$TAGS --tag ${IMAGE}:${LATEST_TAG}"
+fi
+
+# Build (and optionally push) with buildx.
+# buildx --platform with multiple arches produces a proper multi-arch
+# manifest in a single step, avoiding the "manifest list from manifest
+# list" error that happens when composing separately-pushed arch tags.
+echo "==> Building ${IMAGE}:${VERSION_TAG} for ${PLATFORMS}"
+if [ "$DRY_RUN" = true ]; then
+  docker buildx build \
+    --platform "$PLATFORMS" \
+    $TAGS \
+    --load \
+    -f Dockerfile \
+    .
+  echo "==> Built locally (not pushed)"
+  echo "==> Verify with: docker run --rm ${IMAGE}:${VERSION_TAG} --help"
+else
+  docker buildx build \
+    --platform "$PLATFORMS" \
+    $TAGS \
+    --push \
+    -f Dockerfile \
+    .
+  echo "==> Pushed ${IMAGE}:${VERSION_TAG}"
+  if [ "$TAG_LATEST" = true ] && [ -z "$SINGLE_ARCH" ]; then
+    echo "==> Pushed ${IMAGE}:${LATEST_TAG}"
+  fi
+fi
+
+echo "==> Deploy complete: $IMAGE:$VERSION_TAG"

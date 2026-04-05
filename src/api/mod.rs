@@ -45,7 +45,7 @@ pub use config::ApiConfig;
 pub use conversations::ConversationService;
 pub use events::{IndexEvent, IndexEventReceiver, IndexEventSender};
 pub use feeds::{FeedHandler, FeedService};
-pub use http::{ApiHttpHandler, ConversationHandler};
+pub use http::{ApiHttpHandler, ChannelFeedHandler, ConversationHandler, HubQueryHandler};
 pub use indexer::{Indexer, IndexerError};
 pub use metrics::MetricsIndexer;
 pub use search::SearchIndexer;
@@ -112,6 +112,7 @@ pub fn initialize(
     db: Arc<crate::storage::db::RocksDB>,
     hub_event_senders: Vec<(u32, broadcast::Sender<HubEvent>)>,
     shard_stores: HashMap<u32, Stores>,
+    chain_client: Option<Arc<dyn crate::connectors::onchain_events::ChainAPI>>,
 ) -> Option<ApiSystem> {
     if !config.enabled {
         tracing::info!("Farcaster indexing disabled");
@@ -138,9 +139,10 @@ pub fn initialize(
 
     let channels_indexer = if config.channels.enabled {
         tracing::info!("Channels indexer enabled");
-        Some(Arc::new(ChannelsIndexer::new(
+        Some(Arc::new(ChannelsIndexer::new_with_chain_client(
             config.channels.clone(),
             db.clone(),
+            chain_client,
         )))
     } else {
         None

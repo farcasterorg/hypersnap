@@ -111,7 +111,7 @@ impl HubEventBridge {
                 None
             }
             HubEventType::PruneMessage => {
-                // Prune events may be relevant for some indexers
+                // Forward pruned messages so indexers can handle per-context
                 if let Some(hub_event::Body::PruneMessageBody(body)) = &hub_event.body {
                     if let Some(message) = &body.message {
                         return Some(IndexEvent::message(
@@ -124,7 +124,7 @@ impl HubEventBridge {
                 None
             }
             HubEventType::RevokeMessage => {
-                // Revoke events are important for maintaining consistency
+                // Revoked signer messages must be removed from all contexts
                 if let Some(hub_event::Body::RevokeMessageBody(body)) = &hub_event.body {
                     if let Some(message) = &body.message {
                         return Some(IndexEvent::message(

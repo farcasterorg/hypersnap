@@ -308,7 +308,8 @@ impl BackfillManager {
                 .as_ref()
                 .map(|e| IndexEvent::onchain(e.clone(), shard_id, 0)),
             hub_event::Body::PruneMessageBody(body) => {
-                // We might want to handle pruning differently
+                // Prune events contain the original message. Forward it so
+                // indexers can decide per-context whether to retain or drop.
                 body.message
                     .as_ref()
                     .map(|m| IndexEvent::message(m.clone(), shard_id, 0))
@@ -318,13 +319,9 @@ impl BackfillManager {
                 .as_ref()
                 .map(|m| IndexEvent::message(m.clone(), shard_id, 0)),
             hub_event::Body::MergeUsernameProofBody(_) => {
-                // Username proofs handled via hub event directly
                 Some(IndexEvent::hub_event(event.clone(), shard_id))
             }
-            hub_event::Body::MergeFailure(_) => {
-                // Merge failures are not indexed
-                None
-            }
+            hub_event::Body::MergeFailure(_) => None,
             hub_event::Body::BlockConfirmedBody(body) => Some(IndexEvent::block_committed(
                 body.shard_index,
                 body.block_number,
@@ -359,7 +356,10 @@ pub async fn run_all_backfills(
         let indexer_name = indexer.name();
         info!("Starting backfill for indexer: {}", indexer_name);
 
-        for (&shard_id, stores) in shard_stores {
+        let mut sorted_shards: Vec<_> = shard_stores.iter().collect();
+        sorted_shards.sort_by_key(|(&id, _)| id);
+
+        for (&shard_id, stores) in sorted_shards {
             let checkpoint = load_shard_checkpoint(db, indexer_name, shard_id);
             let event_source = Arc::new(ShardEventSource::new(stores.clone()));
             let manager = BackfillManager::new(config.clone(), event_source);

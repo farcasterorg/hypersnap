@@ -1,9 +1,10 @@
 use super::{
-    get_many_messages, make_cast_id_key, make_fid_key, make_message_primary_key, make_user_key,
-    read_fid_key, read_ts_hash,
+    get_many_messages, make_cast_id_key, make_fid_key, make_message_primary_key,
+    make_user_key_with_prefix, read_fid_key, read_ts_hash,
     store::{Store, StoreDef},
     MessagesPage, StoreEventHandler, HASH_LENGTH, PAGE_SIZE_MAX, TRUE_VALUE, TS_HASH_LENGTH,
 };
+use crate::hyper::StateContext;
 use crate::storage::constants::{RootPrefix, UserPostfix};
 use crate::storage::db::PageOptions;
 use crate::storage::util::{bytes_compare, increment_vec_u8};
@@ -133,11 +134,15 @@ impl StoreDef for CastStoreDef {
         txn: &mut RocksDbTransactionBatch,
         ts_hash: &[u8; TS_HASH_LENGTH],
         message: &Message,
+        ctx: StateContext,
     ) -> Result<(), HubError> {
-        if let Ok(Some(by_parent_key)) = self.by_parent_secondary_index_key(ts_hash, message) {
+        if let Ok(Some(by_parent_key)) = self.by_parent_secondary_index_key(ts_hash, message, &ctx)
+        {
             txn.put(by_parent_key, vec![TRUE_VALUE]);
         }
-        if let Ok(Some(by_mention_keys)) = self.by_mention_secondary_index_key(ts_hash, message) {
+        if let Ok(Some(by_mention_keys)) =
+            self.by_mention_secondary_index_key(ts_hash, message, &ctx)
+        {
             for by_mention_key in by_mention_keys {
                 txn.put(by_mention_key, vec![TRUE_VALUE]);
             }
@@ -150,14 +155,17 @@ impl StoreDef for CastStoreDef {
         txn: &mut RocksDbTransactionBatch,
         ts_hash: &[u8; TS_HASH_LENGTH],
         message: &Message,
+        ctx: StateContext,
     ) -> Result<(), HubError> {
-        let by_parent_key = self.by_parent_secondary_index_key(ts_hash, message);
+        let by_parent_key = self.by_parent_secondary_index_key(ts_hash, message, &ctx);
 
         if let Ok(Some(by_parent_key)) = by_parent_key {
             txn.delete(by_parent_key);
         }
 
-        if let Ok(Some(by_mention_keys)) = self.by_mention_secondary_index_key(ts_hash, message) {
+        if let Ok(Some(by_mention_keys)) =
+            self.by_mention_secondary_index_key(ts_hash, message, &ctx)
+        {
             for by_mention_key in by_mention_keys {
                 txn.delete(by_mention_key);
             }
@@ -166,7 +174,7 @@ impl StoreDef for CastStoreDef {
         Ok(())
     }
 
-    fn make_add_key(&self, message: &Message) -> Result<Vec<u8>, HubError> {
+    fn make_add_key(&self, message: &Message, ctx: StateContext) -> Result<Vec<u8>, HubError> {
         let hash = match message.data.as_ref().unwrap().body.as_ref() {
             Some(message::message_data::Body::CastAddBody(_)) => message.hash.as_ref(),
             Some(message::message_data::Body::CastRemoveBody(cast_remove_body)) => {
@@ -179,13 +187,14 @@ impl StoreDef for CastStoreDef {
                 })
             }
         };
-        Ok(Self::make_cast_adds_key(
+        Ok(Self::make_cast_adds_key_with_prefix(
+            ctx.root_prefix(RootPrefix::User),
             message.data.as_ref().unwrap().fid,
             hash,
         ))
     }
 
-    fn make_remove_key(&self, message: &Message) -> Result<Vec<u8>, HubError> {
+    fn make_remove_key(&self, message: &Message, ctx: StateContext) -> Result<Vec<u8>, HubError> {
         let hash = match message.data.as_ref().unwrap().body.as_ref() {
             Some(message::message_data::Body::CastAddBody(_)) => message.hash.as_ref(),
             Some(message::message_data::Body::CastRemoveBody(cast_remove_body)) => {
@@ -199,14 +208,19 @@ impl StoreDef for CastStoreDef {
             }
         };
 
-        Ok(Self::make_cast_removes_key(
+        Ok(Self::make_cast_removes_key_with_prefix(
+            ctx.root_prefix(RootPrefix::User),
             message.data.as_ref().unwrap().fid,
             hash,
         ))
     }
 
     #[inline]
-    fn make_compact_state_add_key(&self, _message: &Message) -> Result<Vec<u8>, HubError> {
+    fn make_compact_state_add_key(
+        &self,
+        _message: &Message,
+        _ctx: StateContext,
+    ) -> Result<Vec<u8>, HubError> {
         Err(HubError {
             code: "bad_request.invalid_param".to_string(),
             message: "Cast Store doesn't support compact state".to_string(),
@@ -214,7 +228,11 @@ impl StoreDef for CastStoreDef {
     }
 
     #[inline]
-    fn make_compact_state_prefix(&self, _fid: u64) -> Result<Vec<u8>, HubError> {
+    fn make_compact_state_prefix(
+        &self,
+        _fid: u64,
+        _ctx: StateContext,
+    ) -> Result<Vec<u8>, HubError> {
         Err(HubError {
             code: "bad_request.invalid_param".to_string(),
             message: "Cast Store doesn't support compact state".to_string(),
@@ -232,6 +250,7 @@ impl CastStoreDef {
         &self,
         ts_hash: &[u8; TS_HASH_LENGTH],
         message: &Message,
+        ctx: &StateContext,
     ) -> Result<Option<Vec<u8>>, HubError> {
         // For cast add, make sure at least one of parentCastId or parentUrl is set
         let cast_body = match message.data.as_ref().unwrap().body.as_ref().unwrap() {
@@ -247,7 +266,8 @@ impl CastStoreDef {
             message: "Invalid cast body".to_string(),
         })?;
 
-        let by_parent_key = Self::make_cast_by_parent_key(
+        let by_parent_key = Self::make_cast_by_parent_key_with_prefix(
+            ctx.root_prefix(RootPrefix::CastsByParent),
             parent,
             message.data.as_ref().unwrap().fid,
             Some(ts_hash),
@@ -263,9 +283,24 @@ impl CastStoreDef {
         fid: u64,
         ts_hash: Option<&[u8; TS_HASH_LENGTH]>,
     ) -> Vec<u8> {
+        Self::make_cast_by_parent_key_with_prefix(
+            RootPrefix::CastsByParent as u8,
+            parent,
+            fid,
+            ts_hash,
+        )
+    }
+
+    #[inline]
+    pub fn make_cast_by_parent_key_with_prefix(
+        root_prefix: u8,
+        parent: &Parent,
+        fid: u64,
+        ts_hash: Option<&[u8; TS_HASH_LENGTH]>,
+    ) -> Vec<u8> {
         let mut key = Vec::with_capacity(1 + 28 + 24 + 4);
 
-        key.push(RootPrefix::CastsByParent as u8); // CastsByParent prefix, 1 byte
+        key.push(root_prefix); // CastsByParent prefix, 1 byte
         key.extend_from_slice(&Self::make_parent_key(parent));
         if let Some(ts_hash_val) = ts_hash {
             if ts_hash_val.len() == TS_HASH_LENGTH {
@@ -291,6 +326,7 @@ impl CastStoreDef {
         &self,
         ts_hash: &[u8; TS_HASH_LENGTH],
         message: &Message,
+        ctx: &StateContext,
     ) -> Result<Option<Vec<Vec<u8>>>, HubError> {
         // For cast add, make sure at least one of parentCastId or parentUrl is set
         let cast_body = match message.data.as_ref().unwrap().body.as_ref().unwrap() {
@@ -307,7 +343,8 @@ impl CastStoreDef {
         }
         let mut result = Vec::with_capacity(cast_body.mentions.len());
         for &mention in cast_body.mentions.iter() {
-            let mention_key = Self::make_cast_by_mention_key(
+            let mention_key = Self::make_cast_by_mention_key_with_prefix(
+                ctx.root_prefix(RootPrefix::CastsByMention),
                 mention,
                 message.data.as_ref().unwrap().fid,
                 Some(ts_hash),
@@ -320,9 +357,14 @@ impl CastStoreDef {
     // Generates unique keys used to store or fetch CastAdd messages in the adds set index
     #[inline]
     pub fn make_cast_adds_key(fid: u64, hash: &Vec<u8>) -> Vec<u8> {
+        Self::make_cast_adds_key_with_prefix(RootPrefix::User as u8, fid, hash)
+    }
+
+    #[inline]
+    pub fn make_cast_adds_key_with_prefix(root_prefix: u8, fid: u64, hash: &Vec<u8>) -> Vec<u8> {
         let mut key = Vec::with_capacity(5 + 1 + 20);
 
-        key.extend_from_slice(&make_user_key(fid));
+        key.extend_from_slice(&make_user_key_with_prefix(root_prefix, fid));
         key.push(UserPostfix::CastAdds as u8); // CastAdds postfix, 1 byte
         if hash.len() == HASH_LENGTH {
             // hash, 20 bytes
@@ -338,8 +380,23 @@ impl CastStoreDef {
         fid: u64,
         ts_hash: Option<&[u8; TS_HASH_LENGTH]>,
     ) -> Vec<u8> {
+        Self::make_cast_by_mention_key_with_prefix(
+            RootPrefix::CastsByMention as u8,
+            mention,
+            fid,
+            ts_hash,
+        )
+    }
+
+    #[inline]
+    pub fn make_cast_by_mention_key_with_prefix(
+        root_prefix: u8,
+        mention: u64,
+        fid: u64,
+        ts_hash: Option<&[u8; TS_HASH_LENGTH]>,
+    ) -> Vec<u8> {
         let mut key = Vec::with_capacity(1 + 4 + 24 + 4);
-        key.push(RootPrefix::CastsByMention as u8); // CastsByMention prefix, 1 byte
+        key.push(root_prefix); // CastsByMention prefix, 1 byte
         key.extend_from_slice(&make_fid_key(mention));
         if ts_hash.is_some() && ts_hash.unwrap().len() == TS_HASH_LENGTH {
             key.extend_from_slice(ts_hash.unwrap());
@@ -353,10 +410,15 @@ impl CastStoreDef {
     // Generates unique keys used to store or fetch CastRemove messages in the removes set index
     #[inline]
     pub fn make_cast_removes_key(fid: u64, hash: &Vec<u8>) -> Vec<u8> {
+        Self::make_cast_removes_key_with_prefix(RootPrefix::User as u8, fid, hash)
+    }
+
+    #[inline]
+    pub fn make_cast_removes_key_with_prefix(root_prefix: u8, fid: u64, hash: &Vec<u8>) -> Vec<u8> {
         let mut key = Vec::with_capacity(5 + 1 + 20);
 
-        key.extend_from_slice(&make_user_key(fid));
-        key.push(UserPostfix::CastRemoves as u8); // CastAdds postfix, 1 byte
+        key.extend_from_slice(&make_user_key_with_prefix(root_prefix, fid));
+        key.push(UserPostfix::CastRemoves as u8); // CastRemoves postfix, 1 byte
         if hash.len() == HASH_LENGTH {
             // hash, 20 bytes
             key.extend_from_slice(hash.as_slice());

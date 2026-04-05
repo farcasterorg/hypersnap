@@ -56,6 +56,18 @@ pub enum RootPrefix {
     ReplicationBootstrapStatus = 21,
 
     LendStorageByRecipient = 22,
+
+    // Hyper-mode prefixes: shadow key space that retains messages pruned
+    // from the snapchain-compatible stores. These MUST NOT collide with
+    // any snapchain prefix so the legacy key space stays 1:1 compatible.
+    HyperUser = 30,
+    HyperCastsByParent = 31,
+    HyperCastsByMention = 32,
+    HyperLinksByTarget = 33,
+    HyperReactionsByTarget = 34,
+    HyperVerificationByAddress = 35,
+    HyperUserNameProofByName = 36,
+    HyperLendStorageByRecipient = 37,
 }
 
 /** Copied from the JS code */

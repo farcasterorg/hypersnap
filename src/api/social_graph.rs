@@ -258,7 +258,7 @@ impl SocialGraphIndexer {
         result
     }
 
-    /// Process a link message (add or remove).
+    /// Process a link message (add, remove, or compact state).
     fn process_link_message(
         &self,
         message: &Message,
@@ -268,6 +268,14 @@ impl SocialGraphIndexer {
             .data
             .as_ref()
             .ok_or_else(|| IndexerError::InvalidData("message has no data".into()))?;
+
+        // Handle LinkCompactState — a full snapshot of all links for this FID
+        if let Some(Body::LinkCompactStateBody(compact)) = &data.body {
+            if compact.r#type == "follow" {
+                self.process_compact_follow_state(data.fid, &compact.target_fids, txn)?;
+            }
+            return Ok(());
+        }
 
         let link_body = match &data.body {
             Some(Body::LinkBody(body)) => body,
@@ -369,6 +377,80 @@ impl SocialGraphIndexer {
         if current > 0 {
             txn.put(key, (current - 1).to_be_bytes().to_vec());
         }
+        Ok(())
+    }
+
+    /// Process a LinkCompactState message — replaces the full follow set for a source FID.
+    ///
+    /// This clears any existing following entries for the source FID and replaces
+    /// them with the target_fids from the compact state. Follower entries and counts
+    /// are updated accordingly.
+    fn process_compact_follow_state(
+        &self,
+        source_fid: u64,
+        target_fids: &[u64],
+        txn: &mut RocksDbTransactionBatch,
+    ) -> Result<(), IndexerError> {
+        // First, remove all existing following entries for this FID
+        let following_prefix = Self::make_following_prefix(source_fid);
+        let stop_prefix = Self::increment_prefix(&following_prefix);
+        let page_options = crate::storage::db::PageOptions {
+            page_size: Some(100_000),
+            page_token: None,
+            reverse: false,
+        };
+
+        let mut old_targets = Vec::new();
+        self.db
+            .for_each_iterator_by_prefix_paged(
+                Some(following_prefix),
+                Some(stop_prefix),
+                &page_options,
+                |key, _value| {
+                    if key.len() == 18 {
+                        let target_fid = u64::from_be_bytes(key[10..18].try_into().unwrap());
+                        old_targets.push(target_fid);
+                    }
+                    Ok(false)
+                },
+            )
+            .map_err(|e| IndexerError::Storage(e.to_string()))?;
+
+        // Remove old relationships
+        for &old_target in &old_targets {
+            let follower_key = Self::make_follower_key(old_target, source_fid);
+            txn.delete(follower_key);
+            let following_key = Self::make_following_key(source_fid, old_target);
+            txn.delete(following_key);
+            self.decrement_follower_count(old_target, txn)?;
+        }
+
+        // Reset following count for source
+        let following_count_key = Self::make_following_count_key(source_fid);
+        txn.put(following_count_key, 0u64.to_be_bytes().to_vec());
+
+        // Add new relationships
+        let timestamp = 0u32.to_be_bytes().to_vec();
+        for &target_fid in target_fids {
+            let follower_key = Self::make_follower_key(target_fid, source_fid);
+            txn.put(follower_key, timestamp.clone());
+
+            let following_key = Self::make_following_key(source_fid, target_fid);
+            txn.put(following_key, timestamp.clone());
+
+            self.increment_follower_count(target_fid, txn)?;
+        }
+
+        // Set correct following count
+        let following_count_key = Self::make_following_count_key(source_fid);
+        txn.put(
+            following_count_key,
+            (target_fids.len() as u64).to_be_bytes().to_vec(),
+        );
+
+        self.items_indexed
+            .fetch_add(target_fids.len() as u64, Ordering::Relaxed);
+
         Ok(())
     }
 

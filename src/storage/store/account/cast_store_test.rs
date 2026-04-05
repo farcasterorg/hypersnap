@@ -1672,6 +1672,296 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_dual_write_shared_db_legacy_keys_unaffected_by_hyper() {
+        // Verify that Legacy and Hyper stores in the same RocksDB use separate
+        // key spaces: Legacy keys are byte-for-byte snapchain-compatible, and
+        // Hyper data does not contaminate the Legacy key space.
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let db = RocksDB::new(db_path.to_str().unwrap());
+        db.open().unwrap();
+        let db = Arc::new(db);
+        let event_handler = StoreEventHandler::new();
+
+        // Both stores share the SAME RocksDB, different key prefixes
+        let legacy_store = Store::new_with_store_def_ctx(
+            db.clone(),
+            event_handler.clone(),
+            CastStoreDef::new(2), // prune limit of 2
+            StoreOptions::default(),
+            StateContext::Legacy,
+        );
+        let hyper_store = Store::new_with_store_def_ctx(
+            db.clone(),
+            event_handler.clone(),
+            CastStoreDef::new(2),
+            StoreOptions::default(),
+            StateContext::Hyper,
+        );
+
+        let timestamp = time::farcaster_time();
+        let mut messages = vec![];
+        for i in 0..4 {
+            messages.push(messages_factory::casts::create_cast_add(
+                FID_FOR_TEST,
+                &format!("cast {}", i),
+                Some(timestamp + i as u32),
+                None,
+            ));
+        }
+
+        // Dual-write: merge all messages into both stores (same txn batch)
+        let mut txn = RocksDbTransactionBatch::new();
+        for msg in &messages {
+            legacy_store.merge(msg, &mut txn).unwrap();
+            hyper_store.merge(msg, &mut txn).unwrap();
+        }
+        db.commit(txn).unwrap();
+
+        // Prune Legacy (limit 2 → keeps 2 newest, prunes 2 oldest)
+        let mut prune_txn = RocksDbTransactionBatch::new();
+        let pruned = legacy_store
+            .prune_messages(FID_FOR_TEST, 4, 2, &mut prune_txn)
+            .unwrap();
+        assert_eq!(pruned.len(), 2, "Legacy should prune 2 messages");
+        db.commit(prune_txn).unwrap();
+
+        // Legacy: only 2 messages remain (the newest)
+        let legacy_casts =
+            CastStore::get_cast_adds_by_fid(&legacy_store, FID_FOR_TEST, &PageOptions::default())
+                .unwrap();
+        assert_eq!(
+            legacy_casts.messages.len(),
+            2,
+            "Legacy should have 2 messages after pruning"
+        );
+
+        // Hyper: all 4 messages still present
+        let hyper_casts =
+            CastStore::get_cast_adds_by_fid(&hyper_store, FID_FOR_TEST, &PageOptions::default())
+                .unwrap();
+        assert_eq!(
+            hyper_casts.messages.len(),
+            4,
+            "Hyper should retain all 4 messages"
+        );
+
+        // Verify the pruned messages are retrievable from Hyper
+        for msg in &messages {
+            let hyper_result =
+                CastStore::get_cast_add(&hyper_store, FID_FOR_TEST, msg.hash.clone()).unwrap();
+            assert!(
+                hyper_result.is_some(),
+                "Hyper should have message {}",
+                hex::encode(&msg.hash)
+            );
+        }
+
+        // Verify the oldest messages are NOT in Legacy
+        let legacy_oldest =
+            CastStore::get_cast_add(&legacy_store, FID_FOR_TEST, messages[0].hash.clone()).unwrap();
+        assert!(
+            legacy_oldest.is_none(),
+            "Legacy should not have the pruned oldest message"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_legacy_produces_same_state_as_snapchain_only_node() {
+        // Simulate a snapchain-only node (Legacy only) and a Hypersnap node
+        // (Legacy + Hyper dual-write). After identical operations including
+        // pruning, the Legacy store state should be identical in both cases.
+        let temp_dir_snapchain = tempfile::TempDir::new().unwrap();
+        let db_snapchain = {
+            let db = RocksDB::new(temp_dir_snapchain.path().join("sc.db").to_str().unwrap());
+            db.open().unwrap();
+            Arc::new(db)
+        };
+        let temp_dir_hyper = tempfile::TempDir::new().unwrap();
+        let db_hyper = {
+            let db = RocksDB::new(temp_dir_hyper.path().join("hy.db").to_str().unwrap());
+            db.open().unwrap();
+            Arc::new(db)
+        };
+        let event_handler = StoreEventHandler::new();
+
+        // Snapchain-only: just Legacy
+        let sc_store = Store::new_with_store_def_ctx(
+            db_snapchain.clone(),
+            event_handler.clone(),
+            CastStoreDef::new(2),
+            StoreOptions::default(),
+            StateContext::Legacy,
+        );
+
+        // Hypersnap: Legacy + Hyper sharing same DB
+        let hy_legacy = Store::new_with_store_def_ctx(
+            db_hyper.clone(),
+            event_handler.clone(),
+            CastStoreDef::new(2),
+            StoreOptions::default(),
+            StateContext::Legacy,
+        );
+        let hy_hyper = Store::new_with_store_def_ctx(
+            db_hyper.clone(),
+            event_handler.clone(),
+            CastStoreDef::new(2),
+            StoreOptions::default(),
+            StateContext::Hyper,
+        );
+
+        let timestamp = time::farcaster_time();
+        let mut messages = vec![];
+        for i in 0..5 {
+            messages.push(messages_factory::casts::create_cast_add(
+                FID_FOR_TEST,
+                &format!("msg {}", i),
+                Some(timestamp + i as u32),
+                None,
+            ));
+        }
+
+        // Process on snapchain-only node
+        let mut sc_txn = RocksDbTransactionBatch::new();
+        for msg in &messages {
+            sc_store.merge(msg, &mut sc_txn).unwrap();
+        }
+        let sc_pruned = sc_store
+            .prune_messages(FID_FOR_TEST, 5, 2, &mut sc_txn)
+            .unwrap();
+        db_snapchain.commit(sc_txn).unwrap();
+
+        // Process on hypersnap node (dual-write)
+        let mut hy_txn = RocksDbTransactionBatch::new();
+        for msg in &messages {
+            hy_legacy.merge(msg, &mut hy_txn).unwrap();
+            hy_hyper.merge(msg, &mut hy_txn).unwrap();
+        }
+        // Only prune Legacy, not Hyper
+        let hy_pruned = hy_legacy
+            .prune_messages(FID_FOR_TEST, 5, 2, &mut hy_txn)
+            .unwrap();
+        db_hyper.commit(hy_txn).unwrap();
+
+        // Same messages should be pruned
+        assert_eq!(sc_pruned.len(), hy_pruned.len());
+
+        // Legacy stores should have identical content
+        let sc_casts =
+            CastStore::get_cast_adds_by_fid(&sc_store, FID_FOR_TEST, &PageOptions::default())
+                .unwrap();
+        let hy_legacy_casts =
+            CastStore::get_cast_adds_by_fid(&hy_legacy, FID_FOR_TEST, &PageOptions::default())
+                .unwrap();
+        assert_eq!(sc_casts.messages.len(), hy_legacy_casts.messages.len());
+
+        // Compare actual messages — same hashes should remain
+        let sc_hashes: Vec<_> = sc_casts
+            .messages
+            .iter()
+            .map(|m| hex::encode(&m.hash))
+            .collect();
+        let hy_hashes: Vec<_> = hy_legacy_casts
+            .messages
+            .iter()
+            .map(|m| hex::encode(&m.hash))
+            .collect();
+        assert_eq!(sc_hashes, hy_hashes, "Legacy state must match snapchain");
+
+        // Meanwhile, Hyper has everything
+        let hy_hyper_casts =
+            CastStore::get_cast_adds_by_fid(&hy_hyper, FID_FOR_TEST, &PageOptions::default())
+                .unwrap();
+        assert_eq!(
+            hy_hyper_casts.messages.len(),
+            5,
+            "Hyper retains all messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hyper_keys_do_not_appear_under_legacy_prefix() {
+        // Verify that scanning the Legacy prefix range does not return
+        // any Hyper-prefixed keys, ensuring merkle root compatibility.
+        use crate::storage::constants::RootPrefix;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let db = RocksDB::new(db_path.to_str().unwrap());
+        db.open().unwrap();
+        let db = Arc::new(db);
+        let event_handler = StoreEventHandler::new();
+
+        let hyper_store = Store::new_with_store_def_ctx(
+            db.clone(),
+            event_handler.clone(),
+            CastStoreDef::new(100),
+            StoreOptions::default(),
+            StateContext::Hyper,
+        );
+
+        let timestamp = time::farcaster_time();
+        let msg = messages_factory::casts::create_cast_add(
+            FID_FOR_TEST,
+            "hyper-only cast",
+            Some(timestamp),
+            None,
+        );
+
+        let mut txn = RocksDbTransactionBatch::new();
+        hyper_store.merge(&msg, &mut txn).unwrap();
+        db.commit(txn).unwrap();
+
+        // Scan the Legacy User prefix — should find nothing
+        let legacy_prefix = vec![RootPrefix::User as u8];
+        let legacy_stop = vec![RootPrefix::User as u8 + 1];
+        let mut legacy_count = 0;
+        db.for_each_iterator_by_prefix_paged(
+            Some(legacy_prefix),
+            Some(legacy_stop),
+            &PageOptions {
+                page_size: Some(1000),
+                page_token: None,
+                reverse: false,
+            },
+            |_key, _value| {
+                legacy_count += 1;
+                Ok(false) // continue
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            legacy_count, 0,
+            "No keys should exist under Legacy prefix when only Hyper writes occurred"
+        );
+
+        // Scan the Hyper User prefix — should find the message
+        let hyper_prefix = vec![RootPrefix::HyperUser as u8];
+        let hyper_stop = vec![RootPrefix::HyperUser as u8 + 1];
+        let mut hyper_count = 0;
+        db.for_each_iterator_by_prefix_paged(
+            Some(hyper_prefix),
+            Some(hyper_stop),
+            &PageOptions {
+                page_size: Some(1000),
+                page_token: None,
+                reverse: false,
+            },
+            |_key, _value| {
+                hyper_count += 1;
+                Ok(false) // continue
+            },
+        )
+        .unwrap();
+
+        assert!(
+            hyper_count > 0,
+            "Keys should exist under Hyper prefix after Hyper write"
+        );
+    }
+
+    #[tokio::test]
     async fn test_prune_messages_no_op_when_no_messages() {
         let (store, db, _temp_dir) = create_test_store();
 

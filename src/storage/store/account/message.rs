@@ -139,11 +139,18 @@ pub fn read_ts_hash(key: &[u8], offset: usize) -> [u8; TS_HASH_LENGTH] {
 
 #[inline]
 pub fn make_user_key(fid: u64) -> Vec<u8> {
+    make_user_key_with_prefix(RootPrefix::User as u8, fid)
+}
+
+/// Create a user key with an explicit root prefix byte.
+///
+/// Use `StateContext::root_prefix(RootPrefix::User)` to obtain the
+/// correct prefix for the current context.
+#[inline]
+pub fn make_user_key_with_prefix(root_prefix: u8, fid: u64) -> Vec<u8> {
     let mut key = Vec::with_capacity(1 + 4);
-    key.push(RootPrefix::User as u8);
-
+    key.push(root_prefix);
     key.extend_from_slice(&make_fid_key(fid));
-
     key
 }
 
@@ -153,8 +160,23 @@ pub fn make_message_primary_key(
     set: u8,
     ts_hash: Option<&[u8; TS_HASH_LENGTH]>,
 ) -> Vec<u8> {
+    make_message_primary_key_with_prefix(
+        crate::storage::constants::RootPrefix::User as u8,
+        fid,
+        set,
+        ts_hash,
+    )
+}
+
+#[inline]
+pub fn make_message_primary_key_with_prefix(
+    root_prefix: u8,
+    fid: u64,
+    set: u8,
+    ts_hash: Option<&[u8; TS_HASH_LENGTH]>,
+) -> Vec<u8> {
     let mut key = Vec::with_capacity(1 + 4 + 1 + TS_HASH_LENGTH);
-    key.extend_from_slice(&make_user_key(fid));
+    key.extend_from_slice(&make_user_key_with_prefix(root_prefix, fid));
     key.push(set);
     if ts_hash.is_some() {
         key.extend_from_slice(ts_hash.unwrap());
@@ -180,7 +202,25 @@ pub fn get_message(
     set: u8,
     ts_hash: &[u8; TS_HASH_LENGTH],
 ) -> Result<Option<MessageProto>, HubError> {
-    let key = make_message_primary_key(fid, set, Some(ts_hash));
+    get_message_with_prefix(
+        db,
+        txn,
+        crate::storage::constants::RootPrefix::User as u8,
+        fid,
+        set,
+        ts_hash,
+    )
+}
+
+pub fn get_message_with_prefix(
+    db: &RocksDB,
+    txn: &RocksDbTransactionBatch,
+    root_prefix: u8,
+    fid: u64,
+    set: u8,
+    ts_hash: &[u8; TS_HASH_LENGTH],
+) -> Result<Option<MessageProto>, HubError> {
+    let key = make_message_primary_key_with_prefix(root_prefix, fid, set, Some(ts_hash));
     get_message_by_key(db, txn, &key)
 }
 
@@ -323,10 +363,23 @@ pub fn put_message_transaction(
     txn: &mut RocksDbTransactionBatch,
     message: &MessageProto,
 ) -> Result<(), HubError> {
+    put_message_transaction_with_prefix(
+        txn,
+        message,
+        crate::storage::constants::RootPrefix::User as u8,
+    )
+}
+
+pub fn put_message_transaction_with_prefix(
+    txn: &mut RocksDbTransactionBatch,
+    message: &MessageProto,
+    root_prefix: u8,
+) -> Result<(), HubError> {
     let data = message.data.as_ref().unwrap();
     let ts_hash = make_ts_hash(data.timestamp, &message.hash)?;
 
-    let primary_key = make_message_primary_key(
+    let primary_key = make_message_primary_key_with_prefix(
+        root_prefix,
         data.fid,
         type_to_set_postfix(MessageType::try_from(data.r#type).unwrap())? as u8,
         Some(&ts_hash),
@@ -340,10 +393,23 @@ pub fn delete_message_transaction(
     txn: &mut RocksDbTransactionBatch,
     message: &MessageProto,
 ) -> Result<(), HubError> {
+    delete_message_transaction_with_prefix(
+        txn,
+        message,
+        crate::storage::constants::RootPrefix::User as u8,
+    )
+}
+
+pub fn delete_message_transaction_with_prefix(
+    txn: &mut RocksDbTransactionBatch,
+    message: &MessageProto,
+    root_prefix: u8,
+) -> Result<(), HubError> {
     let data = message.data.as_ref().unwrap();
     let ts_hash = make_ts_hash(data.timestamp, &message.hash)?;
 
-    let primary_key = make_message_primary_key(
+    let primary_key = make_message_primary_key_with_prefix(
+        root_prefix,
         data.fid,
         type_to_set_postfix(MessageType::try_from(data.r#type).unwrap())? as u8,
         Some(&ts_hash),

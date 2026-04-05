@@ -288,6 +288,7 @@ mod tests {
                 auth,
                 block_stores,
                 stores,
+                HashMap::new(),
                 senders,
                 statsd_client,
                 num_shards,

@@ -368,6 +368,61 @@ where
         }
         (0, 0, 0, 0.0)
     }
+
+    /// Fetch casts from a channel by parent URL.
+    pub async fn get_channel_feed(
+        &self,
+        channel_url: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<FeedResponse, FeedError> {
+        let page_token: Option<Vec<u8>> = cursor.and_then(|c| hex::decode(c).ok());
+
+        let request = proto::CastsByParentRequest {
+            parent: Some(proto::casts_by_parent_request::Parent::ParentUrl(
+                channel_url.to_string(),
+            )),
+            page_size: Some(limit as u32),
+            page_token,
+            reverse: Some(true), // Newest first
+        };
+
+        let response = self
+            .hub_service
+            .get_casts_by_parent(Request::new(request))
+            .await
+            .map_err(|e| FeedError::ServiceError(e.message().to_string()))?;
+
+        let inner = response.into_inner();
+        let messages = inner.messages;
+        let next_cursor = inner
+            .next_page_token
+            .filter(|t| !t.is_empty())
+            .map(|t| hex::encode(&t));
+
+        let mut items = Vec::with_capacity(messages.len());
+        for cast in messages {
+            let (likes, recasts, replies, score) = if let Some(data) = &cast.data {
+                self.get_cast_metrics(data.fid, &cast.hash)
+            } else {
+                (0, 0, 0, 0.0)
+            };
+
+            items.push(FeedItem {
+                cast,
+                likes,
+                recasts,
+                replies,
+                score,
+            });
+        }
+
+        Ok(FeedResponse {
+            items,
+            next_cursor,
+            total: None,
+        })
+    }
 }
 
 /// Implement FeedHandler trait for type-erased access in HTTP handler.
@@ -395,6 +450,22 @@ where
         limit: usize,
     ) -> Result<FeedResponse, FeedError> {
         FeedService::get_trending_feed(self, cursor, limit).await
+    }
+}
+
+/// Implement ChannelFeedHandler trait for type-erased access in HTTP handler.
+#[async_trait]
+impl<S> crate::api::http::ChannelFeedHandler for FeedService<S>
+where
+    S: proto::hub_service_server::HubService + Send + Sync + 'static,
+{
+    async fn get_channel_feed(
+        &self,
+        channel_url: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<FeedResponse, FeedError> {
+        FeedService::get_channel_feed(self, channel_url, cursor, limit).await
     }
 }
 

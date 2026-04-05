@@ -5,7 +5,7 @@
 
 use crate::api::http::UserHydrator;
 use crate::api::social_graph::SocialGraphIndexer;
-use crate::api::types::{Bio, User, UserProfile, VerifiedAddresses};
+use crate::api::types::{Bio, PrimaryAddress, User, UserProfile, VerifiedAddresses};
 use crate::proto::{self, message_data::Body, Protocol, UserDataType};
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -39,16 +39,22 @@ where
             display_name: None,
             custody_address: String::new(),
             pfp_url: None,
+            registered_at: String::new(),
             profile: UserProfile {
                 bio: Bio {
                     text: String::new(),
                 },
+                location: None,
+                banner: None,
             },
             follower_count: 0,
             following_count: 0,
             verifications: Vec::new(),
+            auth_addresses: Vec::new(),
             verified_addresses: VerifiedAddresses::default(),
+            verified_accounts: Vec::new(),
             viewer_context: None,
+            score: None,
         };
 
         // Fetch user data (username, display name, pfp, bio)
@@ -79,10 +85,7 @@ where
             match self.hydrate_user(fid).await {
                 Some(user) => users.push(user),
                 None => {
-                    // Shouldn't happen since hydrate_user always returns Some,
-                    // but fall back to stub if it ever does
                     users.push(User {
-                        object: "user".to_string(),
                         fid,
                         username: format!("fid:{}", fid),
                         ..Default::default()
@@ -161,12 +164,18 @@ where
 
             match Protocol::try_from(body.protocol) {
                 Ok(Protocol::Ethereum) => {
-                    user.verified_addresses.eth_addresses.push(addr);
+                    user.verified_addresses.eth_addresses.push(addr.clone());
+                    if user.verified_addresses.primary.eth_address.is_none() {
+                        user.verified_addresses.primary.eth_address = Some(addr);
+                    }
                 }
                 Ok(Protocol::Solana) => {
                     // Solana addresses are base58, not hex
                     let sol_addr = bs58::encode(&body.address).into_string();
-                    user.verified_addresses.sol_addresses.push(sol_addr);
+                    user.verified_addresses.sol_addresses.push(sol_addr.clone());
+                    if user.verified_addresses.primary.sol_address.is_none() {
+                        user.verified_addresses.primary.sol_address = Some(sol_addr);
+                    }
                 }
                 _ => {}
             }
@@ -192,6 +201,13 @@ where
         let event = response.get_ref();
         if let Some(proto::on_chain_event::Body::IdRegisterEventBody(body)) = &event.body {
             user.custody_address = format!("0x{}", hex::encode(&body.to));
+        }
+
+        // Populate registered_at from the on-chain event block timestamp
+        if event.block_timestamp > 0 {
+            user.registered_at = chrono::DateTime::from_timestamp(event.block_timestamp as i64, 0)
+                .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+                .unwrap_or_default();
         }
     }
 }

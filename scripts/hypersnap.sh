@@ -11,7 +11,19 @@ REPO="farcasterorg/hypersnap"
 RAWFILE_BASE="https://raw.githubusercontent.com/$REPO"
 LATEST_TAG="@latest"
 
-DOCKER_COMPOSE_FILE_PATH="docker-compose.mainnet.yml"
+# Release channel: "stable" (default) or "nightly".
+# Set HYPERSNAP_CHANNEL=nightly in .env (or export it) to track the nightly builds.
+if [ -f .env ] && grep -q "^HYPERSNAP_CHANNEL=" .env 2>/dev/null; then
+    HYPERSNAP_CHANNEL=$(grep "^HYPERSNAP_CHANNEL=" .env | cut -d= -f2)
+fi
+HYPERSNAP_CHANNEL="${HYPERSNAP_CHANNEL:-stable}"
+
+if [ "$HYPERSNAP_CHANNEL" = "nightly" ]; then
+    DOCKER_COMPOSE_FILE_PATH="docker-compose.nightly.yml"
+else
+    DOCKER_COMPOSE_FILE_PATH="docker-compose.mainnet.yml"
+fi
+
 SCRIPT_FILE_PATH="scripts/hypersnap.sh"
 GRAFANA_DASHBOARD_JSON_PATH="grafana/grafana-dashboard.json"
 GRAFANA_INI_PATH="grafana/grafana.ini"
@@ -663,6 +675,7 @@ if [ $# -eq 0 ] || [ "$1" == "help" ]; then
     echo "  down     Stop hypersnap and Grafana dashboard"
     echo "  help     Show this help"
     echo ""
+    echo "Channel: $HYPERSNAP_CHANNEL (set HYPERSNAP_CHANNEL=nightly in .env to track nightly builds)"
     echo "add SKIP_CRONTAB=true to your .env to skip installing the autoupgrade crontab"
     exit 0
 fi

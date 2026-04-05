@@ -201,6 +201,11 @@ pub trait ChainAPI: Send + Sync {
         claim: VerificationAddressClaim,
         body: &VerificationAddAddressBody,
     ) -> Result<(), validations::error::ValidationError>;
+    /// Resolve the on-chain `name()` of an ERC-721 or ERC-20 contract.
+    async fn token_name(&self, contract: Address) -> Result<String, String> {
+        let _ = contract;
+        Err("not implemented".into())
+    }
 }
 
 #[derive(Eq, Hash, PartialEq, Debug)]
@@ -324,6 +329,37 @@ impl ChainAPI for RealL1Client {
         body: &VerificationAddAddressBody,
     ) -> Result<(), validations::error::ValidationError> {
         validate_verification_contract_signature(&self.provider, claim, body).await
+    }
+
+    async fn token_name(&self, contract: Address) -> Result<String, String> {
+        use alloy_rpc_types::TransactionRequest;
+
+        // name() selector = keccak256("name()")[:4] = 0x06fdde03
+        let calldata = hex::decode("06fdde03").unwrap();
+
+        let tx = TransactionRequest::default()
+            .to(contract)
+            .input(calldata.into());
+
+        let result = self
+            .provider
+            .call(&tx)
+            .await
+            .map_err(|e| format!("eth_call failed: {}", e))?;
+
+        // ABI-decode the string return value.
+        // Layout: 32-byte offset, 32-byte length, then UTF-8 data.
+        let bytes = result.as_ref();
+        if bytes.len() < 64 {
+            return Err("response too short for ABI-encoded string".into());
+        }
+        let len_u256 = U256::from_be_slice(&bytes[32..64]);
+        let len: usize = len_u256.to::<u64>() as usize;
+        if bytes.len() < 64 + len {
+            return Err("response truncated".into());
+        }
+        String::from_utf8(bytes[64..64 + len].to_vec())
+            .map_err(|e| format!("invalid UTF-8 in name: {}", e))
     }
 }
 
