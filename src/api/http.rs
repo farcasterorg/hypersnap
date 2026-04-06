@@ -14,7 +14,7 @@ use crate::api::types::{
     self, Bio, BulkCastsResponse, BulkUsersResponse, Cast, CastReactions, CastReplies,
     CastResponse, CastWithReplies, CastsSearchResponse, CastsSearchResult, Channel, ChannelMember,
     ChannelMemberListResponse, ChannelResponse, ChannelsResponse, Conversation,
-    ConversationResponse, ErrorResponse, FeedResponse, FnameAvailabilityResponse,
+    ConversationResponse, Embed, ErrorResponse, FeedResponse, FnameAvailabilityResponse,
     FollowersResponse, NextCursor, Notification, NotificationsResponse, ParentAuthor, Reaction,
     ReactionCastRef, ReactionsResponse, StorageAllocation, StorageAllocationsResponse,
     StorageUsage, StorageUsageResponse, User, UserProfile, UserResponse, UsernameProofResponse,
@@ -838,11 +838,9 @@ impl ApiHttpHandler {
             .await
         {
             Ok(conversation) => {
-                let root_cast = self.conversation_cast_to_cast(&conversation.root).await;
-                let cast_with_replies = CastWithReplies {
-                    cast: root_cast,
-                    direct_replies: Vec::new(), // Would need recursive conversion
-                };
+                let cast_with_replies = self
+                    .conversation_cast_to_cast_with_replies(&conversation.root)
+                    .await;
 
                 let response = ConversationResponse {
                     conversation: Conversation {
@@ -873,6 +871,24 @@ impl ApiHttpHandler {
         let mut cast = self.message_to_cast(&conv_cast.cast).await;
         cast.replies.count = conv_cast.replies.len() as u64;
         cast
+    }
+
+    /// Recursively convert a ConversationCast into CastWithReplies.
+    fn conversation_cast_to_cast_with_replies<'a>(
+        &'a self,
+        conv_cast: &'a crate::api::conversations::ConversationCast,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CastWithReplies> + Send + 'a>> {
+        Box::pin(async move {
+            let cast = self.conversation_cast_to_cast(conv_cast).await;
+            let mut direct_replies = Vec::with_capacity(conv_cast.replies.len());
+            for reply in &conv_cast.replies {
+                direct_replies.push(self.conversation_cast_to_cast_with_replies(reply).await);
+            }
+            CastWithReplies {
+                cast,
+                direct_replies,
+            }
+        })
     }
 
     /// Handle GET /v2/farcaster/feed/following/?fid=X
@@ -1101,6 +1117,33 @@ impl ApiHttpHandler {
             mentioned_profiles_ranges.push(types::TextRange { start, end: start });
         }
 
+        // Extract embeds
+        let embeds: Vec<Embed> = cast_body
+            .map(|b| {
+                let mut result: Vec<Embed> = b
+                    .embeds
+                    .iter()
+                    .filter_map(|e| match &e.embed {
+                        Some(crate::proto::embed::Embed::Url(url)) => {
+                            Some(Embed::Url { url: url.clone() })
+                        }
+                        Some(crate::proto::embed::Embed::CastId(id)) => Some(Embed::Cast {
+                            cast_id: types::CastId {
+                                fid: id.fid,
+                                hash: hex::encode(&id.hash),
+                            },
+                        }),
+                        None => None,
+                    })
+                    .collect();
+                // Also include deprecated string-only embeds
+                for url in &b.embeds_deprecated {
+                    result.push(Embed::Url { url: url.clone() });
+                }
+                result
+            })
+            .unwrap_or_default();
+
         let author = self.get_user(fid).await;
         Cast {
             object: "cast".to_string(),
@@ -1112,7 +1155,7 @@ impl ApiHttpHandler {
             author,
             text,
             timestamp: format_timestamp(timestamp),
-            embeds: Vec::new(),
+            embeds,
             r#type: cast_type.to_string(),
             reactions: CastReactions::default(),
             replies: CastReplies::default(),
