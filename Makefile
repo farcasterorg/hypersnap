@@ -31,6 +31,14 @@ publish-no-latest:
 publish-dry-run:
 	./scripts/deploy.sh --dry-run
 
+.PHONY: publish-nightly
+publish-nightly:
+	./scripts/deploy.sh --channel nightly
+
+.PHONY: publish-nightly-dry-run
+publish-nightly-dry-run:
+	./scripts/deploy.sh --channel nightly --dry-run
+
 .PHONY: changelog
 changelog:
 	#SNAPCHAIN_VERSION=$(awk -F '"' '/^version =/ {print $2}' ./Cargo.toml)

@@ -36,9 +36,19 @@ mod keys {
     /// Allows iteration over all FIDs that this user follows
     pub const FOLLOWING_BY_FID: u8 = 0x04;
 
+    /// Schema version: <prefix><0xFE> -> version:4
+    pub const SCHEMA_VERSION: u8 = 0xFE;
+
     /// Checkpoint: <prefix><0xFF> -> event_id:8
     pub const CHECKPOINT: u8 = 0xFF;
 }
+
+/// Current schema version. Bump when the indexer logic changes to force re-backfill.
+/// v1: initial follower/following tracking
+/// v2: fix batch processing of LinkCompactState (flush txn before compact state)
+/// v3: fix incomplete data clearing (was limited to 100K entries, now loops to completion)
+/// v4: switch to block-based backfill (reads shard chunks, not HubEvents)
+const SOCIAL_GRAPH_SCHEMA_VERSION: u32 = 4;
 
 /// Social graph indexer that tracks follow relationships.
 pub struct SocialGraphIndexer {
@@ -51,6 +61,26 @@ pub struct SocialGraphIndexer {
 impl SocialGraphIndexer {
     pub fn new(config: FeatureConfig, db: Arc<RocksDB>) -> Self {
         // Load checkpoint from DB
+        let checkpoint = Self::load_checkpoint(&db).unwrap_or(0);
+
+        // Check schema version — if outdated, clear backfill checkpoints
+        // and all index data so backfill re-runs from scratch.
+        let version_key = vec![keys::SOCIAL_GRAPH_PREFIX, keys::SCHEMA_VERSION];
+        let stored_version = match db.get(&version_key) {
+            Ok(Some(v)) if v.len() == 4 => u32::from_be_bytes(v[..4].try_into().unwrap()),
+            _ => 0,
+        };
+        if stored_version < SOCIAL_GRAPH_SCHEMA_VERSION {
+            tracing::info!(
+                "Social graph schema upgraded (v{} → v{}), clearing index for re-backfill",
+                stored_version,
+                SOCIAL_GRAPH_SCHEMA_VERSION,
+            );
+            Self::clear_all_data(&db);
+            let _ = db.put(&version_key, &SOCIAL_GRAPH_SCHEMA_VERSION.to_be_bytes());
+        }
+
+        // Re-read checkpoint after potential clear (clear_all_data deletes it)
         let checkpoint = Self::load_checkpoint(&db).unwrap_or(0);
 
         Self {
@@ -258,7 +288,7 @@ impl SocialGraphIndexer {
         result
     }
 
-    /// Process a link message (add or remove).
+    /// Process a link message (add, remove, or compact state).
     fn process_link_message(
         &self,
         message: &Message,
@@ -268,6 +298,14 @@ impl SocialGraphIndexer {
             .data
             .as_ref()
             .ok_or_else(|| IndexerError::InvalidData("message has no data".into()))?;
+
+        // Handle LinkCompactState — a full snapshot of all links for this FID
+        if let Some(Body::LinkCompactStateBody(compact)) = &data.body {
+            if compact.r#type == "follow" {
+                self.process_compact_follow_state(data.fid, &compact.target_fids, txn)?;
+            }
+            return Ok(());
+        }
 
         let link_body = match &data.body {
             Some(Body::LinkBody(body)) => body,
@@ -372,6 +410,80 @@ impl SocialGraphIndexer {
         Ok(())
     }
 
+    /// Process a LinkCompactState message — replaces the full follow set for a source FID.
+    ///
+    /// This clears any existing following entries for the source FID and replaces
+    /// them with the target_fids from the compact state. Follower entries and counts
+    /// are updated accordingly.
+    fn process_compact_follow_state(
+        &self,
+        source_fid: u64,
+        target_fids: &[u64],
+        txn: &mut RocksDbTransactionBatch,
+    ) -> Result<(), IndexerError> {
+        // First, remove all existing following entries for this FID
+        let following_prefix = Self::make_following_prefix(source_fid);
+        let stop_prefix = Self::increment_prefix(&following_prefix);
+        let page_options = crate::storage::db::PageOptions {
+            page_size: Some(100_000),
+            page_token: None,
+            reverse: false,
+        };
+
+        let mut old_targets = Vec::new();
+        self.db
+            .for_each_iterator_by_prefix_paged(
+                Some(following_prefix),
+                Some(stop_prefix),
+                &page_options,
+                |key, _value| {
+                    if key.len() == 18 {
+                        let target_fid = u64::from_be_bytes(key[10..18].try_into().unwrap());
+                        old_targets.push(target_fid);
+                    }
+                    Ok(false)
+                },
+            )
+            .map_err(|e| IndexerError::Storage(e.to_string()))?;
+
+        // Remove old relationships
+        for &old_target in &old_targets {
+            let follower_key = Self::make_follower_key(old_target, source_fid);
+            txn.delete(follower_key);
+            let following_key = Self::make_following_key(source_fid, old_target);
+            txn.delete(following_key);
+            self.decrement_follower_count(old_target, txn)?;
+        }
+
+        // Reset following count for source
+        let following_count_key = Self::make_following_count_key(source_fid);
+        txn.put(following_count_key, 0u64.to_be_bytes().to_vec());
+
+        // Add new relationships
+        let timestamp = 0u32.to_be_bytes().to_vec();
+        for &target_fid in target_fids {
+            let follower_key = Self::make_follower_key(target_fid, source_fid);
+            txn.put(follower_key, timestamp.clone());
+
+            let following_key = Self::make_following_key(source_fid, target_fid);
+            txn.put(following_key, timestamp.clone());
+
+            self.increment_follower_count(target_fid, txn)?;
+        }
+
+        // Set correct following count
+        let following_count_key = Self::make_following_count_key(source_fid);
+        txn.put(
+            following_count_key,
+            (target_fids.len() as u64).to_be_bytes().to_vec(),
+        );
+
+        self.items_indexed
+            .fetch_add(target_fids.len() as u64, Ordering::Relaxed);
+
+        Ok(())
+    }
+
     fn get_count_from_txn_or_db(
         &self,
         key: &[u8],
@@ -464,6 +576,86 @@ impl SocialGraphIndexer {
             Err(e) => Err(IndexerError::Storage(e.to_string())),
         }
     }
+
+    /// Clear all social graph index data and backfill checkpoints.
+    fn clear_all_data(db: &RocksDB) {
+        let prefix = vec![keys::SOCIAL_GRAPH_PREFIX];
+        let stop = vec![keys::SOCIAL_GRAPH_PREFIX + 1];
+
+        // Loop until all keys are deleted — with ~1M FIDs and multiple
+        // entries per FID there can be millions of keys. A single page
+        // scan of 100K won't cover them all.
+        let mut total_deleted = 0u64;
+        loop {
+            let page_options = crate::storage::db::PageOptions {
+                page_size: Some(100_000),
+                page_token: None,
+                reverse: false,
+            };
+            let mut keys = Vec::new();
+            let _ = db.for_each_iterator_by_prefix_paged(
+                Some(prefix.clone()),
+                Some(stop.clone()),
+                &page_options,
+                |key, _| {
+                    keys.push(key.to_vec());
+                    Ok(false)
+                },
+            );
+            if keys.is_empty() {
+                break;
+            }
+            let batch_len = keys.len() as u64;
+            let mut txn = RocksDbTransactionBatch::new();
+            for key in keys {
+                txn.delete(key);
+            }
+            let _ = db.commit(txn);
+            total_deleted += batch_len;
+        }
+        if total_deleted > 0 {
+            tracing::info!("Cleared {} social graph index entries", total_deleted);
+        }
+
+        // Clear per-shard backfill checkpoints for both the old event-based
+        // backfill ("social_graph") and the new block-based backfill
+        // ("api_block_backfill") which is shared across all indexers.
+        for name in ["social_graph", "api_block_backfill"] {
+            let mut cp_prefix = Vec::with_capacity(2 + name.len());
+            cp_prefix.push(0xE3);
+            cp_prefix.push(name.len() as u8);
+            cp_prefix.extend_from_slice(name.as_bytes());
+            let cp_stop = {
+                let mut s = cp_prefix.clone();
+                if let Some(last) = s.last_mut() {
+                    *last += 1;
+                }
+                s
+            };
+            let mut cp_keys = Vec::new();
+            let page_options = crate::storage::db::PageOptions {
+                page_size: Some(100),
+                page_token: None,
+                reverse: false,
+            };
+            let _ = db.for_each_iterator_by_prefix_paged(
+                Some(cp_prefix),
+                Some(cp_stop),
+                &page_options,
+                |key, _| {
+                    cp_keys.push(key.to_vec());
+                    Ok(false)
+                },
+            );
+            if !cp_keys.is_empty() {
+                let mut txn = RocksDbTransactionBatch::new();
+                for key in cp_keys {
+                    txn.delete(key);
+                }
+                let _ = db.commit(txn);
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -490,6 +682,17 @@ impl Indexer for SocialGraphIndexer {
             IndexEvent::MessagesCommitted { messages, .. } => {
                 let mut txn = RocksDbTransactionBatch::new();
                 for message in messages {
+                    let is_compact = message
+                        .data
+                        .as_ref()
+                        .map(|d| matches!(&d.body, Some(Body::LinkCompactStateBody(_))))
+                        .unwrap_or(false);
+                    if is_compact && txn.len() > 0 {
+                        self.db
+                            .commit(txn)
+                            .map_err(|e| IndexerError::Storage(e.to_string()))?;
+                        txn = RocksDbTransactionBatch::new();
+                    }
                     self.process_link_message(message, &mut txn)?;
                 }
                 if txn.len() > 0 {
@@ -498,9 +701,7 @@ impl Indexer for SocialGraphIndexer {
                         .map_err(|e| IndexerError::Storage(e.to_string()))?;
                 }
             }
-            _ => {
-                // Other event types not relevant for social graph
-            }
+            _ => {}
         }
         Ok(())
     }
@@ -509,16 +710,33 @@ impl Indexer for SocialGraphIndexer {
         let mut txn = RocksDbTransactionBatch::new();
 
         for event in events {
-            match event {
-                IndexEvent::MessageCommitted { message, .. } => {
-                    self.process_link_message(message, &mut txn)?;
+            let messages: Vec<&Message> = match event {
+                IndexEvent::MessageCommitted { message, .. } => vec![message],
+                IndexEvent::MessagesCommitted { messages, .. } => messages.iter().collect(),
+                _ => continue,
+            };
+
+            for message in messages {
+                // LinkCompactState reads existing entries from RocksDB to
+                // determine what to delete/replace. If prior LinkAdds in this
+                // batch wrote entries to the txn but haven't been committed,
+                // the compact state won't see them and counts will be wrong.
+                // Flush the txn before processing any compact state so the DB
+                // is up-to-date.
+                let is_compact = message
+                    .data
+                    .as_ref()
+                    .map(|d| matches!(&d.body, Some(Body::LinkCompactStateBody(_))))
+                    .unwrap_or(false);
+
+                if is_compact && txn.len() > 0 {
+                    self.db
+                        .commit(txn)
+                        .map_err(|e| IndexerError::Storage(e.to_string()))?;
+                    txn = RocksDbTransactionBatch::new();
                 }
-                IndexEvent::MessagesCommitted { messages, .. } => {
-                    for message in messages {
-                        self.process_link_message(message, &mut txn)?;
-                    }
-                }
-                _ => {}
+
+                self.process_link_message(message, &mut txn)?;
             }
         }
 
@@ -856,5 +1074,193 @@ mod tests {
 
         let (followers, _) = indexer.get_followers(1, None, 10).unwrap();
         assert_eq!(followers, vec![20]);
+    }
+
+    fn make_compact_state_message(from_fid: u64, target_fids: Vec<u64>) -> Message {
+        use crate::proto::LinkCompactStateBody;
+        Message {
+            data: Some(MessageData {
+                fid: from_fid,
+                r#type: MessageType::LinkCompactState as i32,
+                body: Some(Body::LinkCompactStateBody(LinkCompactStateBody {
+                    r#type: "follow".to_string(),
+                    target_fids,
+                })),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// LinkCompactState in a batch with prior LinkAdds must produce correct
+    /// counts. This is a regression test for the bug where compact state
+    /// read old_targets from DB (missing uncommitted txn entries), causing
+    /// double-counted followers and zero following counts.
+    #[tokio::test]
+    async fn test_compact_state_in_batch_produces_correct_counts() {
+        let db = make_test_db();
+        let config = FeatureConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let indexer = SocialGraphIndexer::new(config, db);
+
+        // Batch: LinkAdd(1→10), LinkAdd(1→20), CompactState(1, [10, 20, 30])
+        let events = vec![
+            IndexEvent::message(make_follow_message(1, 10, true), 0, 1),
+            IndexEvent::message(make_follow_message(1, 20, true), 0, 2),
+            IndexEvent::message(make_compact_state_message(1, vec![10, 20, 30]), 0, 3),
+        ];
+        indexer.process_batch(&events).await.unwrap();
+
+        // Following count must be 3 (from compact state), not 0 or 5
+        assert_eq!(indexer.get_following_count(1).unwrap(), 3);
+
+        // Follower counts must each be 1, not 2 (no double-counting)
+        assert_eq!(indexer.get_follower_count(10).unwrap(), 1);
+        assert_eq!(indexer.get_follower_count(20).unwrap(), 1);
+        assert_eq!(indexer.get_follower_count(30).unwrap(), 1);
+
+        // Following list must have exactly [10, 20, 30]
+        let (following, _) = indexer.get_following(1, None, 100).unwrap();
+        assert_eq!(following.len(), 3);
+        assert!(following.contains(&10));
+        assert!(following.contains(&20));
+        assert!(following.contains(&30));
+    }
+
+    /// A compact state replacing a previous compact state must correctly
+    /// clean up old entries and counts.
+    #[tokio::test]
+    async fn test_compact_state_replaces_previous_compact_state() {
+        let db = make_test_db();
+        let config = FeatureConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let indexer = SocialGraphIndexer::new(config, db);
+
+        // First compact state: user 1 follows 10, 20
+        let event = IndexEvent::message(make_compact_state_message(1, vec![10, 20]), 0, 1);
+        indexer.process_event(&event).await.unwrap();
+
+        assert_eq!(indexer.get_following_count(1).unwrap(), 2);
+        assert_eq!(indexer.get_follower_count(10).unwrap(), 1);
+        assert_eq!(indexer.get_follower_count(20).unwrap(), 1);
+
+        // Second compact state: user 1 now follows 20, 30 (dropped 10, added 30)
+        let event = IndexEvent::message(make_compact_state_message(1, vec![20, 30]), 0, 2);
+        indexer.process_event(&event).await.unwrap();
+
+        assert_eq!(indexer.get_following_count(1).unwrap(), 2);
+        assert_eq!(indexer.get_follower_count(10).unwrap(), 0); // unfollowed
+        assert_eq!(indexer.get_follower_count(20).unwrap(), 1); // still followed
+        assert_eq!(indexer.get_follower_count(30).unwrap(), 1); // newly followed
+    }
+
+    /// Simulate a realistic backfill scenario: many users with LinkAdds
+    /// followed by compact state, processed in large batches.
+    /// Verifies that the final follower/following counts and lists match
+    /// the compact state truth, not the intermediate add accumulation.
+    #[tokio::test]
+    async fn test_backfill_with_compact_state_produces_correct_results() {
+        let db = make_test_db();
+        let config = FeatureConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let indexer = SocialGraphIndexer::new(config, db);
+
+        // Simulate backfill: user 100 follows 1,2,3,4,5 via individual adds,
+        // then a compact state says user 100 follows [3,4,5,6,7] (dropped 1,2; added 6,7).
+        // Also: user 200 follows 100 via individual add,
+        //       user 300 follows 100 via individual add.
+        let mut events = Vec::new();
+
+        // Individual adds for user 100
+        for target in [1, 2, 3, 4, 5] {
+            events.push(IndexEvent::message(
+                make_follow_message(100, target, true),
+                0,
+                target,
+            ));
+        }
+
+        // Followers of user 100
+        events.push(IndexEvent::message(
+            make_follow_message(200, 100, true),
+            0,
+            6,
+        ));
+        events.push(IndexEvent::message(
+            make_follow_message(300, 100, true),
+            0,
+            7,
+        ));
+
+        // Compact state for user 100 — the authoritative follow list
+        events.push(IndexEvent::message(
+            make_compact_state_message(100, vec![3, 4, 5, 6, 7]),
+            0,
+            8,
+        ));
+
+        // Compact state for user 200 — follows user 100 and user 50
+        events.push(IndexEvent::message(
+            make_compact_state_message(200, vec![100, 50]),
+            0,
+            9,
+        ));
+
+        // Process everything in one batch (simulating backfill batch_size)
+        indexer.process_batch(&events).await.unwrap();
+
+        // User 100: following = [3,4,5,6,7] (5 users, from compact state)
+        assert_eq!(indexer.get_following_count(100).unwrap(), 5);
+        let (following, _) = indexer.get_following(100, None, 100).unwrap();
+        assert_eq!(following.len(), 5);
+        assert!(following.contains(&3));
+        assert!(following.contains(&4));
+        assert!(following.contains(&5));
+        assert!(following.contains(&6));
+        assert!(following.contains(&7));
+        // 1 and 2 should NOT be in the following list
+        assert!(!following.contains(&1));
+        assert!(!following.contains(&2));
+
+        // User 200: following = [100, 50] (from compact state)
+        assert_eq!(indexer.get_following_count(200).unwrap(), 2);
+        let (following, _) = indexer.get_following(200, None, 100).unwrap();
+        assert!(following.contains(&100));
+        assert!(following.contains(&50));
+
+        // Follower counts:
+        // User 100 is followed by: 200 (from compact state) and 300 (from individual add)
+        assert_eq!(indexer.get_follower_count(100).unwrap(), 2);
+        let (followers, _) = indexer.get_followers(100, None, 100).unwrap();
+        assert_eq!(followers.len(), 2);
+        assert!(followers.contains(&200));
+        assert!(followers.contains(&300));
+
+        // Users 1 and 2: follower_count should be 0 (user 100 unfollowed via compact state)
+        assert_eq!(indexer.get_follower_count(1).unwrap(), 0);
+        assert_eq!(indexer.get_follower_count(2).unwrap(), 0);
+
+        // Users 3,4,5: each has exactly 1 follower (user 100, from compact state)
+        for fid in [3, 4, 5] {
+            assert_eq!(
+                indexer.get_follower_count(fid).unwrap(),
+                1,
+                "follower_count for fid {} should be 1",
+                fid
+            );
+        }
+
+        // Users 6,7: each has exactly 1 follower (user 100, from compact state)
+        assert_eq!(indexer.get_follower_count(6).unwrap(), 1);
+        assert_eq!(indexer.get_follower_count(7).unwrap(), 1);
+
+        // User 50: 1 follower (user 200, from compact state)
+        assert_eq!(indexer.get_follower_count(50).unwrap(), 1);
     }
 }

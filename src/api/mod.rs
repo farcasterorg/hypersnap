@@ -24,6 +24,7 @@
 
 pub mod backfill;
 pub mod bridge;
+pub mod cast_hash_index;
 pub mod channels;
 pub mod config;
 pub mod conversations;
@@ -40,12 +41,14 @@ pub mod worker;
 
 pub use backfill::BackfillManager;
 pub use bridge::HubEventBridge;
+pub use cast_hash_index::CastHashIndexer;
 pub use channels::ChannelsIndexer;
 pub use config::ApiConfig;
+pub use config::FeatureConfig;
 pub use conversations::ConversationService;
 pub use events::{IndexEvent, IndexEventReceiver, IndexEventSender};
 pub use feeds::{FeedHandler, FeedService};
-pub use http::{ApiHttpHandler, ConversationHandler};
+pub use http::{ApiHttpHandler, ChannelFeedHandler, ConversationHandler, HubQueryHandler};
 pub use indexer::{Indexer, IndexerError};
 pub use metrics::MetricsIndexer;
 pub use search::SearchIndexer;
@@ -112,6 +115,7 @@ pub fn initialize(
     db: Arc<crate::storage::db::RocksDB>,
     hub_event_senders: Vec<(u32, broadcast::Sender<HubEvent>)>,
     shard_stores: HashMap<u32, Stores>,
+    chain_client: Option<Arc<dyn crate::connectors::onchain_events::ChainAPI>>,
 ) -> Option<ApiSystem> {
     if !config.enabled {
         tracing::info!("Farcaster indexing disabled");
@@ -138,9 +142,10 @@ pub fn initialize(
 
     let channels_indexer = if config.channels.enabled {
         tracing::info!("Channels indexer enabled");
-        Some(Arc::new(ChannelsIndexer::new(
+        Some(Arc::new(ChannelsIndexer::new_with_chain_client(
             config.channels.clone(),
             db.clone(),
+            chain_client,
         )))
     } else {
         None
@@ -156,8 +161,18 @@ pub fn initialize(
         None
     };
 
+    // Cast hash index is always enabled when API is enabled — it's needed
+    // for O(1) cast-by-hash lookups across all endpoints.
+    let cast_hash_config = FeatureConfig {
+        enabled: true,
+        backfill_on_startup: true,
+        ..Default::default()
+    };
+    let cast_hash_indexer = Arc::new(CastHashIndexer::new(cast_hash_config, db.clone()));
+
     // Collect indexers that need backfill
     let mut backfill_indexers: Vec<Arc<dyn Indexer>> = Vec::new();
+    backfill_indexers.push(cast_hash_indexer.clone());
     if config.social_graph.backfill_on_startup {
         if let Some(ref idx) = social_graph_indexer {
             backfill_indexers.push(idx.clone());
@@ -178,6 +193,8 @@ pub fn initialize(
 
     // Create worker pool and register indexers
     let mut worker_pool = IndexWorkerPool::new(config.clone(), index_rx, db.clone());
+
+    worker_pool.register_arc(cast_hash_indexer.clone());
 
     if let Some(ref indexer) = social_graph_indexer {
         worker_pool.register_arc(indexer.clone());
@@ -203,19 +220,13 @@ pub fn initialize(
     // but wait for the backfill signal before starting to consume.
     let (backfill_done_tx, _) = watch::channel(false);
 
-    // Spawn backfill if needed
+    // Spawn backfill if needed — replays shard chunks (blocks) from genesis
+    // so that snapshot-loaded nodes get full historical data indexed.
     if needs_backfill {
-        let backfill_config = config.clone();
         let backfill_db = db.clone();
         let backfill_tx = backfill_done_tx.clone();
         tokio::spawn(async move {
-            backfill::run_all_backfills(
-                &backfill_config,
-                &backfill_db,
-                &shard_stores,
-                backfill_indexers,
-            )
-            .await;
+            run_block_backfill(&backfill_db, &shard_stores, backfill_indexers).await;
             let _ = backfill_tx.send(true);
             tracing::info!("All backfills complete, unblocking bridges");
         });
@@ -239,7 +250,12 @@ pub fn initialize(
     }
 
     // Create HTTP handler
-    let http_handler = ApiHttpHandler::new(social_graph_indexer, channels_indexer, metrics_indexer);
+    let http_handler = ApiHttpHandler::new(
+        social_graph_indexer,
+        channels_indexer,
+        metrics_indexer,
+        Some(cast_hash_indexer),
+    );
 
     Some(ApiSystem {
         worker_handle,
@@ -247,4 +263,149 @@ pub fn initialize(
         shutdown_tx,
         http_handler,
     })
+}
+
+const BLOCK_BACKFILL_CHECKPOINT: &str = "api_block_backfill";
+const BLOCK_BACKFILL_BATCH: u64 = 100;
+
+/// Backfill all indexers by replaying shard chunks (blocks) from genesis.
+///
+/// Unlike the event-based backfill, this reads directly from the block store
+/// which contains the full history even on snapshot-loaded nodes.
+async fn run_block_backfill(
+    db: &crate::storage::db::RocksDB,
+    shard_stores: &HashMap<u32, Stores>,
+    indexers: Vec<Arc<dyn Indexer>>,
+) {
+    let mut sorted_shards: Vec<_> = shard_stores.keys().cloned().collect();
+    sorted_shards.sort();
+
+    for shard_id in sorted_shards {
+        let stores = match shard_stores.get(&shard_id) {
+            Some(s) => s,
+            None => continue,
+        };
+
+        let checkpoint = backfill::load_shard_checkpoint(db, BLOCK_BACKFILL_CHECKPOINT, shard_id);
+        let max_height = match stores.shard_store.max_block_number() {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(shard_id, error = %e, "Failed to get max block number, skipping shard");
+                continue;
+            }
+        };
+
+        if checkpoint > max_height {
+            tracing::info!(
+                shard_id,
+                checkpoint,
+                max_height,
+                "API backfill already complete for shard"
+            );
+            continue;
+        }
+
+        tracing::info!(
+            shard_id,
+            from = checkpoint,
+            to = max_height,
+            "Starting API block backfill"
+        );
+
+        let start = std::time::Instant::now();
+        let mut messages_processed: u64 = 0;
+        let mut height = checkpoint;
+
+        while height <= max_height {
+            let end = (height + BLOCK_BACKFILL_BATCH).min(max_height);
+            let chunks = match stores.shard_store.get_shard_chunks(height, Some(end)) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(shard_id, height, error = %e, "Failed to get shard chunks");
+                    break;
+                }
+            };
+
+            if chunks.is_empty() {
+                height = end + 1;
+                continue;
+            }
+
+            // Collect all user messages from this batch of chunks
+            let mut batch_messages: Vec<crate::proto::Message> = Vec::new();
+            for chunk in &chunks {
+                for txn in &chunk.transactions {
+                    for msg in &txn.user_messages {
+                        batch_messages.push(msg.clone());
+                    }
+                }
+            }
+
+            if !batch_messages.is_empty() {
+                let event = IndexEvent::messages(batch_messages.clone(), shard_id, 0);
+                let events = [event];
+
+                for indexer in &indexers {
+                    if indexer.is_enabled() {
+                        if let Err(e) = indexer.process_batch(&events).await {
+                            tracing::warn!(
+                                shard_id,
+                                indexer = indexer.name(),
+                                error = %e,
+                                "Indexer batch error during block backfill"
+                            );
+                        }
+                    }
+                }
+
+                messages_processed += batch_messages.len() as u64;
+            }
+
+            height = end + 1;
+
+            // Checkpoint periodically
+            if height % (BLOCK_BACKFILL_BATCH * 10) == 0 || height > max_height {
+                let _ = backfill::save_shard_checkpoint(
+                    db,
+                    BLOCK_BACKFILL_CHECKPOINT,
+                    shard_id,
+                    height,
+                );
+            }
+
+            // Progress logging
+            if height % (BLOCK_BACKFILL_BATCH * 100) == 0 {
+                let pct = (height as f64 / max_height as f64) * 100.0;
+                tracing::info!(
+                    shard_id,
+                    height,
+                    max_height,
+                    messages_processed,
+                    elapsed_secs = start.elapsed().as_secs(),
+                    "{:.1}% complete",
+                    pct,
+                );
+            }
+
+            // Yield to other tasks
+            if height % (BLOCK_BACKFILL_BATCH * 10) == 0 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        // Final checkpoint
+        let _ = backfill::save_shard_checkpoint(
+            db,
+            BLOCK_BACKFILL_CHECKPOINT,
+            shard_id,
+            max_height + 1,
+        );
+
+        tracing::info!(
+            shard_id,
+            messages_processed,
+            elapsed_secs = start.elapsed().as_secs(),
+            "API block backfill complete for shard"
+        );
+    }
 }

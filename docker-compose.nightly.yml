@@ -1,6 +1,6 @@
 services:
   hypersnap:
-    image: farcasterorg/hypersnap:latest
+    image: farcasterorg/hypersnap:nightly-latest
     pull_policy: always
     #    build: # For testing
     #      context: .

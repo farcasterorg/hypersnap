@@ -166,6 +166,10 @@ pub struct ShardEngine {
     pub db: Arc<RocksDB>,
     senders: Senders,
     stores: Stores,
+    /// Shadow stores using Hyper key prefixes. When present, every merge
+    /// is dual-written here (same RocksDB, different key space). Pruning
+    /// is skipped so the hyper stores retain all historical data.
+    hyper_stores: Option<Stores>,
     metrics: Metrics,
     pending_txn: Option<CachedTransaction>,
     fname_signer_address: Option<alloy_primitives::Address>,
@@ -242,9 +246,12 @@ impl ShardEngine {
             }
         }
 
+        let hyper_stores = Some(stores.with_state_context(StateContext::Hyper));
+
         Ok(ShardEngine {
             shard_id,
             network,
+            hyper_stores,
             stores,
             mempool_poller: MempoolPoller {
                 shard_id,
@@ -275,6 +282,11 @@ impl ShardEngine {
 
     pub fn stores_with_state_context(&self, ctx: StateContext) -> Stores {
         self.stores.with_state_context(ctx)
+    }
+
+    /// Get the hyper shadow stores, if enabled.
+    pub fn get_hyper_stores(&self) -> Option<Stores> {
+        self.hyper_stores.clone()
     }
 
     pub fn get_senders(&self) -> Senders {
@@ -592,6 +604,7 @@ impl ShardEngine {
         let (hub_event, fid) = match &trie_message.trie_message {
             Some(TrieMessage::UserMessage(m)) => {
                 let events = self.merge_message(m, txn_batch)?;
+                self.merge_message_hyper(m, txn_batch);
                 // This is only expected for deleted
                 if events.len() != 1 {
                     return Err(EngineError::ReplicatorError(format!(
@@ -675,6 +688,7 @@ impl ShardEngine {
                     .as_ref()
                     .ok_or(MessageValidationError::BlockEventMissingBody)?;
                 let hub_events = self.merge_message(&message, txn_batch)?;
+                self.merge_message_hyper(&message, txn_batch);
                 for event in &hub_events {
                     self.update_trie(trie_ctx, event, txn_batch)?;
                 }
@@ -899,6 +913,12 @@ impl ShardEngine {
         }
 
         for key in revoked_signers {
+            // Revoke from hyper stores too — signer revocation is semantic,
+            // not a storage limit, so revoked messages should be gone from both.
+            if let Some(ref hyper) = self.hyper_stores {
+                let _ = hyper.revoke_messages(snapchain_txn.fid, &key, txn_batch);
+            }
+
             let result = self
                 .stores
                 .revoke_messages(snapchain_txn.fid, &key, txn_batch);
@@ -967,6 +987,9 @@ impl ShardEngine {
                     let result = self.merge_message(msg, txn_batch);
                     match result {
                         Ok(merge_events) => {
+                            // Dual-write to hyper shadow stores (same txn, different key space)
+                            self.merge_message_hyper(msg, txn_batch);
+
                             for event in &merge_events {
                                 merged_messages_count += 1;
                                 self.update_trie(trie_ctx, &event, txn_batch)?;
@@ -1239,6 +1262,48 @@ impl ShardEngine {
         self.metrics
             .time_with_shard("merge_message_time_us", elapsed.as_micros() as u64);
         Ok(event)
+    }
+
+    /// Dual-write a message to the hyper shadow stores.
+    ///
+    /// Writes to the same RocksDB transaction batch but using Hyper-prefixed
+    /// keys. Errors are logged but do not fail the block — hyper is best-effort.
+    fn merge_message_hyper(&self, msg: &proto::Message, txn_batch: &mut RocksDbTransactionBatch) {
+        if let Some(ref hyper) = self.hyper_stores {
+            let data = match msg.data.as_ref() {
+                Some(d) => d,
+                None => return,
+            };
+            let mt = match MessageType::try_from(data.r#type) {
+                Ok(mt) => mt,
+                Err(_) => return,
+            };
+            let result = match mt {
+                MessageType::CastAdd | MessageType::CastRemove => {
+                    hyper.cast_store.merge(msg, txn_batch).map(|_| ())
+                }
+                MessageType::LinkAdd | MessageType::LinkRemove | MessageType::LinkCompactState => {
+                    hyper.link_store.merge(msg, txn_batch).map(|_| ())
+                }
+                MessageType::ReactionAdd | MessageType::ReactionRemove => {
+                    hyper.reaction_store.merge(msg, txn_batch).map(|_| ())
+                }
+                MessageType::UserDataAdd => hyper.user_data_store.merge(msg, txn_batch).map(|_| ()),
+                MessageType::VerificationAddEthAddress | MessageType::VerificationRemove => {
+                    hyper.verification_store.merge(msg, txn_batch).map(|_| ())
+                }
+                MessageType::UsernameProof => {
+                    hyper.username_proof_store.merge(msg, txn_batch).map(|_| ())
+                }
+                MessageType::LendStorage => {
+                    StorageLendStore::merge(&hyper.storage_lend_store, msg, txn_batch).map(|_| ())
+                }
+                _ => Ok(()),
+            };
+            if let Err(e) = result {
+                warn!(shard_id = self.shard_id, error = %e, "hyper merge failed");
+            }
+        }
     }
 
     fn prune_messages(

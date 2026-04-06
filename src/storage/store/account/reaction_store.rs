@@ -1,9 +1,10 @@
 use super::{
-    get_many_messages, make_cast_id_key, make_fid_key, make_message_primary_key, make_user_key,
-    read_fid_key, read_ts_hash,
+    get_many_messages, make_cast_id_key, make_fid_key, make_message_primary_key,
+    make_user_key_with_prefix, read_fid_key, read_ts_hash,
     store::{Store, StoreDef},
     MessagesPage, StoreEventHandler, PAGE_SIZE_MAX, TS_HASH_LENGTH,
 };
+use crate::hyper::StateContext;
 use crate::{core::error::HubError, proto::SignatureScheme, storage::store::account::StoreOptions};
 use crate::{proto::message_data::Body, storage::db::PageOptions};
 use crate::{
@@ -79,8 +80,9 @@ impl StoreDef for ReactionStoreDef {
         txn: &mut RocksDbTransactionBatch,
         ts_hash: &[u8; TS_HASH_LENGTH],
         message: &Message,
+        ctx: StateContext,
     ) -> Result<(), HubError> {
-        let (by_target_key, rtype) = self.secondary_index_key(ts_hash, message)?;
+        let (by_target_key, rtype) = self.secondary_index_key(ts_hash, message, &ctx)?;
 
         txn.put(by_target_key, vec![rtype]);
 
@@ -93,8 +95,9 @@ impl StoreDef for ReactionStoreDef {
         txn: &mut RocksDbTransactionBatch,
         ts_hash: &[u8; TS_HASH_LENGTH],
         message: &Message,
+        ctx: StateContext,
     ) -> Result<(), HubError> {
-        let (by_target_key, _) = self.secondary_index_key(ts_hash, message)?;
+        let (by_target_key, _) = self.secondary_index_key(ts_hash, message, &ctx)?;
 
         txn.delete(by_target_key);
 
@@ -102,7 +105,7 @@ impl StoreDef for ReactionStoreDef {
     }
 
     #[inline]
-    fn make_add_key(&self, message: &Message) -> Result<Vec<u8>, HubError> {
+    fn make_add_key(&self, message: &Message, ctx: StateContext) -> Result<Vec<u8>, HubError> {
         let reaction_body = match message.data.as_ref().unwrap().body.as_ref().unwrap() {
             Body::ReactionBody(reaction_body) => reaction_body,
             _ => {
@@ -113,7 +116,8 @@ impl StoreDef for ReactionStoreDef {
             }
         };
 
-        Self::make_reaction_adds_key(
+        Self::make_reaction_adds_key_with_prefix(
+            ctx.root_prefix(RootPrefix::User),
             message.data.as_ref().unwrap().fid,
             reaction_body.r#type,
             reaction_body.target.as_ref(),
@@ -121,7 +125,7 @@ impl StoreDef for ReactionStoreDef {
     }
 
     #[inline]
-    fn make_remove_key(&self, message: &Message) -> Result<Vec<u8>, HubError> {
+    fn make_remove_key(&self, message: &Message, ctx: StateContext) -> Result<Vec<u8>, HubError> {
         let reaction_body = match message.data.as_ref().unwrap().body.as_ref().unwrap() {
             Body::ReactionBody(reaction_body) => reaction_body,
             _ => {
@@ -132,7 +136,8 @@ impl StoreDef for ReactionStoreDef {
             }
         };
 
-        Self::make_reaction_removes_key(
+        Self::make_reaction_removes_key_with_prefix(
+            ctx.root_prefix(RootPrefix::User),
             message.data.as_ref().unwrap().fid,
             reaction_body.r#type,
             reaction_body.target.as_ref(),
@@ -140,7 +145,11 @@ impl StoreDef for ReactionStoreDef {
     }
 
     #[inline]
-    fn make_compact_state_add_key(&self, _message: &Message) -> Result<Vec<u8>, HubError> {
+    fn make_compact_state_add_key(
+        &self,
+        _message: &Message,
+        _ctx: StateContext,
+    ) -> Result<Vec<u8>, HubError> {
         Err(HubError {
             code: "bad_request.invalid_param".to_string(),
             message: "Reaction Store doesn't support compact state".to_string(),
@@ -148,7 +157,11 @@ impl StoreDef for ReactionStoreDef {
     }
 
     #[inline]
-    fn make_compact_state_prefix(&self, _fid: u64) -> Result<Vec<u8>, HubError> {
+    fn make_compact_state_prefix(
+        &self,
+        _fid: u64,
+        _ctx: StateContext,
+    ) -> Result<Vec<u8>, HubError> {
         Err(HubError {
             code: "bad_request.invalid_param".to_string(),
             message: "Reaction Store doesn't support compact state".to_string(),
@@ -166,6 +179,7 @@ impl ReactionStoreDef {
         &self,
         ts_hash: &[u8; TS_HASH_LENGTH],
         message: &Message,
+        ctx: &StateContext,
     ) -> Result<(Vec<u8>, u8), HubError> {
         // Make sure at least one of targetCastId or targetUrl is set
         let reaction_body = match message.data.as_ref().unwrap().body.as_ref().unwrap() {
@@ -180,7 +194,8 @@ impl ReactionStoreDef {
             message: "Invalid reaction body".to_string(),
         })?;
 
-        let by_target_key = ReactionStoreDef::make_reactions_by_target_key(
+        let by_target_key = ReactionStoreDef::make_reactions_by_target_key_with_prefix(
+            ctx.root_prefix(RootPrefix::ReactionsByTarget),
             target,
             message.data.as_ref().unwrap().fid,
             Some(ts_hash),
@@ -194,9 +209,23 @@ impl ReactionStoreDef {
         fid: u64,
         ts_hash: Option<&[u8; TS_HASH_LENGTH]>,
     ) -> Vec<u8> {
+        Self::make_reactions_by_target_key_with_prefix(
+            RootPrefix::ReactionsByTarget as u8,
+            target,
+            fid,
+            ts_hash,
+        )
+    }
+
+    pub fn make_reactions_by_target_key_with_prefix(
+        root_prefix: u8,
+        target: &Target,
+        fid: u64,
+        ts_hash: Option<&[u8; TS_HASH_LENGTH]>,
+    ) -> Vec<u8> {
         let mut key = Vec::with_capacity(1 + 28 + 24 + 4);
 
-        key.push(RootPrefix::ReactionsByTarget as u8); // ReactionsByTarget prefix, 1 byte
+        key.push(root_prefix); // ReactionsByTarget prefix, 1 byte
         key.extend_from_slice(&Self::make_target_key(target));
         if ts_hash.is_some() && ts_hash.unwrap().len() == TS_HASH_LENGTH {
             key.extend_from_slice(ts_hash.unwrap());
@@ -220,6 +249,15 @@ impl ReactionStoreDef {
         r#type: i32,
         target: Option<&Target>,
     ) -> Result<Vec<u8>, HubError> {
+        Self::make_reaction_adds_key_with_prefix(RootPrefix::User as u8, fid, r#type, target)
+    }
+
+    pub fn make_reaction_adds_key_with_prefix(
+        root_prefix: u8,
+        fid: u64,
+        r#type: i32,
+        target: Option<&Target>,
+    ) -> Result<Vec<u8>, HubError> {
         if target.is_some() && r#type == 0 {
             return Err(HubError {
                 code: "bad_request.validation_failure".to_string(),
@@ -228,7 +266,7 @@ impl ReactionStoreDef {
         }
         let mut key = Vec::with_capacity(33 + 1 + 1 + 28);
 
-        key.extend_from_slice(&make_user_key(fid));
+        key.extend_from_slice(&make_user_key_with_prefix(root_prefix, fid));
         key.push(UserPostfix::ReactionAdds as u8); // ReactionAdds postfix, 1 byte
         if r#type > 0 {
             key.push(r#type as u8); // type, 1 byte
@@ -246,6 +284,15 @@ impl ReactionStoreDef {
         r#type: i32,
         target: Option<&Target>,
     ) -> Result<Vec<u8>, HubError> {
+        Self::make_reaction_removes_key_with_prefix(RootPrefix::User as u8, fid, r#type, target)
+    }
+
+    pub fn make_reaction_removes_key_with_prefix(
+        root_prefix: u8,
+        fid: u64,
+        r#type: i32,
+        target: Option<&Target>,
+    ) -> Result<Vec<u8>, HubError> {
         if target.is_some() && r#type == 0 {
             return Err(HubError {
                 code: "bad_request.validation_failure".to_string(),
@@ -254,7 +301,7 @@ impl ReactionStoreDef {
         }
         let mut key = Vec::with_capacity(33 + 1 + 1 + 28);
 
-        key.extend_from_slice(&make_user_key(fid));
+        key.extend_from_slice(&make_user_key_with_prefix(root_prefix, fid));
         key.push(UserPostfix::ReactionRemoves as u8); // ReactionRemoves postfix, 1 byte
         if r#type > 0 {
             key.push(r#type as u8); // type, 1 byte

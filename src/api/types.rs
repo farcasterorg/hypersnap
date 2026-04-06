@@ -5,7 +5,9 @@
 
 use serde::{Deserialize, Serialize};
 
-/// User object matching Farcaster API schema.
+// === Core Objects ===
+
+/// User object matching Farcaster v2 API schema.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
     pub object: String,
@@ -16,13 +18,18 @@ pub struct User {
     pub custody_address: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pfp_url: Option<String>,
+    pub registered_at: String,
     pub profile: UserProfile,
     pub follower_count: u64,
     pub following_count: u64,
     pub verifications: Vec<String>,
+    pub auth_addresses: Vec<AuthAddress>,
     pub verified_addresses: VerifiedAddresses,
+    pub verified_accounts: Vec<VerifiedAccount>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub viewer_context: Option<ViewerContext>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
 }
 
 impl Default for User {
@@ -34,20 +41,28 @@ impl Default for User {
             display_name: None,
             custody_address: String::new(),
             pfp_url: None,
+            registered_at: String::new(),
             profile: UserProfile::default(),
             follower_count: 0,
             following_count: 0,
             verifications: Vec::new(),
+            auth_addresses: Vec::new(),
             verified_addresses: VerifiedAddresses::default(),
+            verified_accounts: Vec::new(),
             viewer_context: None,
+            score: None,
         }
     }
 }
 
-/// User profile with bio.
+/// User profile with bio, location, and banner.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UserProfile {
     pub bio: Bio,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<Location>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub banner: Option<Banner>,
 }
 
 /// User bio.
@@ -56,11 +71,54 @@ pub struct Bio {
     pub text: String,
 }
 
+/// User location.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Location {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latitude: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub longitude: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// User banner image.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Banner {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+/// Authenticated address for a user.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthAddress {
+    pub address: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+}
+
 /// Verified addresses for a user.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VerifiedAddresses {
     pub eth_addresses: Vec<String>,
     pub sol_addresses: Vec<String>,
+    pub primary: PrimaryAddress,
+}
+
+/// Primary verified address.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PrimaryAddress {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eth_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sol_address: Option<String>,
+}
+
+/// Verified account on external platforms.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifiedAccount {
+    pub platform: String,
+    pub username: String,
 }
 
 /// Viewer context showing relationship to the viewer.
@@ -68,6 +126,10 @@ pub struct VerifiedAddresses {
 pub struct ViewerContext {
     pub following: bool,
     pub followed_by: bool,
+    #[serde(default)]
+    pub blocking: bool,
+    #[serde(default)]
+    pub blocked_by: bool,
 }
 
 /// Cast viewer context.
@@ -77,14 +139,7 @@ pub struct CastViewerContext {
     pub recasted: bool,
 }
 
-/// Follower object wrapping a user.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Follower {
-    pub object: String,
-    pub user: User,
-}
-
-/// Cast object matching Farcaster API schema.
+/// Cast object matching Farcaster v2 API schema.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Cast {
     pub object: String,
@@ -95,18 +150,29 @@ pub struct Cast {
     pub parent_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub root_parent_url: Option<String>,
+    pub parent_author: ParentAuthor,
     pub author: User,
     pub text: String,
     pub timestamp: String,
     pub embeds: Vec<Embed>,
+    pub r#type: String,
     pub reactions: CastReactions,
     pub replies: CastReplies,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_hash: Option<String>,
+    pub mentioned_profiles: Vec<User>,
+    #[serde(default)]
+    pub mentioned_profiles_ranges: Vec<TextRange>,
+    #[serde(default)]
+    pub mentioned_channels: Vec<ChannelDehydrated>,
+    #[serde(default)]
+    pub mentioned_channels_ranges: Vec<TextRange>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub channel: Option<Channel>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub viewer_context: Option<CastViewerContext>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author_channel_context: Option<ChannelUserContext>,
 }
 
 impl Default for Cast {
@@ -117,17 +183,54 @@ impl Default for Cast {
             parent_hash: None,
             parent_url: None,
             root_parent_url: None,
+            parent_author: ParentAuthor::default(),
             author: User::default(),
             text: String::new(),
             timestamp: String::new(),
             embeds: Vec::new(),
+            r#type: "cast".to_string(),
             reactions: CastReactions::default(),
             replies: CastReplies::default(),
             thread_hash: None,
+            mentioned_profiles: Vec::new(),
+            mentioned_profiles_ranges: Vec::new(),
+            mentioned_channels: Vec::new(),
+            mentioned_channels_ranges: Vec::new(),
             channel: None,
             viewer_context: None,
+            author_channel_context: None,
         }
     }
+}
+
+/// Parent author reference (just FID).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ParentAuthor {
+    pub fid: Option<u64>,
+}
+
+/// Text range for mention positions.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TextRange {
+    pub start: u32,
+    pub end: u32,
+}
+
+/// Dehydrated channel reference (used in mentioned_channels).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelDehydrated {
+    pub id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_url: Option<String>,
+}
+
+/// Channel user context.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ChannelUserContext {
+    pub following: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }
 
 /// Embed in a cast.
@@ -169,11 +272,12 @@ pub struct CastReplies {
     pub count: u64,
 }
 
-/// Channel information.
+/// Channel information matching Farcaster v2 API schema.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Channel {
     pub object: String,
     pub id: String,
+    pub url: String,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_url: Option<String>,
@@ -181,10 +285,19 @@ pub struct Channel {
     pub parent_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    pub created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub follower_count: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub member_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lead: Option<Box<User>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moderator_fids: Option<Vec<u64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pinned_cast_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub viewer_context: Option<ChannelUserContext>,
 }
 
 impl Default for Channel {
@@ -192,12 +305,18 @@ impl Default for Channel {
         Self {
             object: "channel".to_string(),
             id: String::new(),
+            url: String::new(),
             name: String::new(),
             image_url: None,
             parent_url: None,
             description: None,
+            created_at: String::new(),
             follower_count: None,
             member_count: None,
+            lead: None,
+            moderator_fids: None,
+            pinned_cast_hash: None,
+            viewer_context: None,
         }
     }
 }
@@ -214,7 +333,7 @@ pub struct NextCursor {
 /// Response for followers/following endpoints.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FollowersResponse {
-    pub users: Vec<Follower>,
+    pub users: Vec<User>,
     pub next: NextCursor,
 }
 
@@ -278,6 +397,128 @@ pub struct CastWithReplies {
     pub direct_replies: Vec<CastWithReplies>,
 }
 
+/// Response for single user lookup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserResponse {
+    pub user: User,
+}
+
+/// Response for bulk user lookup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BulkUsersResponse {
+    pub users: Vec<User>,
+}
+
+/// Response for single cast lookup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CastResponse {
+    pub cast: Cast,
+}
+
+/// Response for bulk cast lookup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BulkCastsResponse {
+    pub casts: Vec<Cast>,
+}
+
+/// Response for reactions on a cast.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReactionsResponse {
+    pub reactions: Vec<Reaction>,
+    pub next: NextCursor,
+}
+
+/// A reaction object matching Farcaster v2 API schema.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Reaction {
+    pub object: String,
+    pub reaction_type: String,
+    pub reaction_timestamp: String,
+    pub user: User,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cast: Option<ReactionCastRef>,
+}
+
+/// Minimal cast reference in a reaction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReactionCastRef {
+    pub hash: String,
+    pub fid: u64,
+}
+
+/// Response for channel listing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelsResponse {
+    pub channels: Vec<Channel>,
+    pub next: NextCursor,
+}
+
+/// Response for notifications.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationsResponse {
+    pub notifications: Vec<Notification>,
+    pub next: NextCursor,
+}
+
+/// A notification object.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Notification {
+    pub object: String,
+    pub r#type: String,
+    pub cast: Option<Cast>,
+    pub user: User,
+    pub timestamp: String,
+}
+
+/// Response for fname availability check.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FnameAvailabilityResponse {
+    pub available: bool,
+}
+
+/// Response for username proof.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsernameProofResponse {
+    pub r#type: String,
+    pub fid: u64,
+    pub username: String,
+    pub timestamp: u64,
+    pub owner: String,
+}
+
+/// Response for user storage allocation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageAllocationsResponse {
+    pub total_active_units: u64,
+    pub allocations: Vec<StorageAllocation>,
+}
+
+/// A single storage allocation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageAllocation {
+    pub object: String,
+    pub units: u64,
+    pub expiry: u64,
+}
+
+/// Response for user storage usage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageUsageResponse {
+    pub object: String,
+    pub casts: StorageUsage,
+    pub reactions: StorageUsage,
+    pub links: StorageUsage,
+    pub verifications: StorageUsage,
+    pub user_data: StorageUsage,
+}
+
+/// Storage usage for a message type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageUsage {
+    pub used: u64,
+    pub capacity: u64,
+}
+
 /// Error response matching Farcaster format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorResponse {
@@ -295,6 +536,9 @@ mod tests {
         let user = User::default();
         let json = serde_json::to_string(&user).unwrap();
         assert!(json.contains("\"object\":\"user\""));
+        assert!(json.contains("\"registered_at\":\"\""));
+        assert!(json.contains("\"auth_addresses\":[]"));
+        assert!(json.contains("\"verified_accounts\":[]"));
     }
 
     #[test]
@@ -302,6 +546,17 @@ mod tests {
         let cast = Cast::default();
         let json = serde_json::to_string(&cast).unwrap();
         assert!(json.contains("\"object\":\"cast\""));
+        assert!(json.contains("\"parent_author\""));
+        assert!(json.contains("\"mentioned_profiles\":[]"));
+        assert!(json.contains("\"type\":\"cast\""));
+    }
+
+    #[test]
+    fn test_channel_serialization() {
+        let channel = Channel::default();
+        let json = serde_json::to_string(&channel).unwrap();
+        assert!(json.contains("\"url\":\"\""));
+        assert!(json.contains("\"created_at\":\"\""));
     }
 
     #[test]
@@ -314,5 +569,26 @@ mod tests {
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"cursor\":\"abc\""));
+    }
+
+    #[test]
+    fn test_reaction_serialization() {
+        let reaction = Reaction {
+            object: "likes".to_string(),
+            reaction_type: "like".to_string(),
+            reaction_timestamp: "2024-01-01T00:00:00.000Z".to_string(),
+            user: User::default(),
+            cast: None,
+        };
+        let json = serde_json::to_string(&reaction).unwrap();
+        assert!(json.contains("\"reaction_timestamp\""));
+        assert!(json.contains("\"object\":\"likes\""));
+    }
+
+    #[test]
+    fn test_verified_addresses_has_primary() {
+        let va = VerifiedAddresses::default();
+        let json = serde_json::to_string(&va).unwrap();
+        assert!(json.contains("\"primary\""));
     }
 }

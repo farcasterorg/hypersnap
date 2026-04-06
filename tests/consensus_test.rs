@@ -436,6 +436,7 @@ impl NodeForTest {
             "".to_string(),
             node.block_stores.clone(),
             node.shard_stores.clone(),
+            HashMap::new(),
             node.shard_senders.clone(),
             statsd_client.clone(),
             num_shards,

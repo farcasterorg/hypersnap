@@ -1,9 +1,10 @@
 use super::{
-    get_many_messages, make_fid_key, make_message_primary_key, make_user_key, read_fid_key,
-    read_ts_hash,
+    get_many_messages, make_fid_key, make_message_primary_key, make_user_key_with_prefix,
+    read_fid_key, read_ts_hash,
     store::{Store, StoreDef},
     MessagesPage, StoreEventHandler, PAGE_SIZE_MAX, TS_HASH_LENGTH,
 };
+use crate::hyper::StateContext;
 use crate::{
     core::error::HubError,
     proto::{link_body::Target, SignatureScheme},
@@ -222,11 +223,19 @@ impl LinkStore {
 
     // Generates a unique key used to store a LinkCompactState message key in the store
     fn link_compact_state_add_key(fid: u64, link_type: &String) -> Result<Vec<u8>, HubError> {
+        Self::link_compact_state_add_key_with_prefix(RootPrefix::User as u8, fid, link_type)
+    }
+
+    fn link_compact_state_add_key_with_prefix(
+        root_prefix: u8,
+        fid: u64,
+        link_type: &String,
+    ) -> Result<Vec<u8>, HubError> {
         let mut key = Vec::with_capacity(
             Self::ROOT_PREFIXED_FID_BYTE_SIZE + Self::POSTFIX_BYTE_SIZE + Self::LINK_TYPE_BYTE_SIZE,
         );
 
-        key.extend_from_slice(&make_user_key(fid));
+        key.extend_from_slice(&make_user_key_with_prefix(root_prefix, fid));
         key.push(UserPostfix::LinkCompactStateMessage.as_u8());
         let type_bytes = &mut link_type.as_bytes().to_vec();
         // Pad with zero bytes
@@ -244,6 +253,14 @@ impl LinkStore {
     /// * `link_body` - body of link that contains type of link created and target ID of the object
     ///                 being reacted to
     fn link_add_key(fid: u64, link_body: &LinkBody) -> Result<Vec<u8>, HubError> {
+        Self::link_add_key_with_prefix(RootPrefix::User as u8, fid, link_body)
+    }
+
+    fn link_add_key_with_prefix(
+        root_prefix: u8,
+        fid: u64,
+        link_body: &LinkBody,
+    ) -> Result<Vec<u8>, HubError> {
         if link_body.target.is_some()
             && (link_body.r#type.is_empty() || link_body.r#type.len() == 0)
         {
@@ -267,7 +284,7 @@ impl LinkStore {
                 + Self::TARGET_ID_BYTE_SIZE,
         );
 
-        key.extend_from_slice(&make_user_key(fid));
+        key.extend_from_slice(&make_user_key_with_prefix(root_prefix, fid));
         key.push(UserPostfix::LinkAdds.as_u8());
         let type_bytes = &mut link_body.r#type.as_bytes().to_vec();
         // Pad with zero bytes
@@ -291,6 +308,14 @@ impl LinkStore {
     /// * `link_body` - body of link that contains type of link created and target ID of the object
     ///                 being reacted to
     fn link_remove_key(fid: u64, link_body: &LinkBody) -> Result<Vec<u8>, HubError> {
+        Self::link_remove_key_with_prefix(RootPrefix::User as u8, fid, link_body)
+    }
+
+    fn link_remove_key_with_prefix(
+        root_prefix: u8,
+        fid: u64,
+        link_body: &LinkBody,
+    ) -> Result<Vec<u8>, HubError> {
         if link_body.target.is_some()
             && (link_body.r#type.is_empty() || link_body.r#type.len() == 0)
         {
@@ -315,7 +340,7 @@ impl LinkStore {
         );
 
         // TODO: does the fid and rtype need to be padded? Is it okay not the check their lengths?
-        key.extend_from_slice(&make_user_key(fid));
+        key.extend_from_slice(&make_user_key_with_prefix(root_prefix, fid));
         key.push(UserPostfix::LinkRemoves.as_u8());
         let type_bytes = &mut link_body.r#type.as_bytes().to_vec();
         // Pad with zero bytes
@@ -375,6 +400,15 @@ impl LinkStore {
         fid: u64,
         ts_hash: Option<&[u8; TS_HASH_LENGTH]>,
     ) -> Result<Vec<u8>, HubError> {
+        Self::links_by_target_key_with_prefix(RootPrefix::LinksByTarget as u8, target, fid, ts_hash)
+    }
+
+    fn links_by_target_key_with_prefix(
+        root_prefix: u8,
+        target: &Target,
+        fid: u64,
+        ts_hash: Option<&[u8; TS_HASH_LENGTH]>,
+    ) -> Result<Vec<u8>, HubError> {
         if fid != 0 && (ts_hash.is_none() || ts_hash.is_some_and(|tsh| tsh.len() == 0)) {
             return Err(HubError::validation_failure(
                 "fid provided without timestamp hash",
@@ -394,7 +428,7 @@ impl LinkStore {
                 + Self::FID_BYTE_SIZE,
         );
 
-        key.push(RootPrefix::LinksByTarget as u8);
+        key.push(root_prefix);
         let Target::TargetFid(target_fid) = target;
         key.extend(make_fid_key(*target_fid));
 
@@ -416,6 +450,7 @@ impl LinkStore {
         &self,
         ts_hash: &[u8; TS_HASH_LENGTH],
         message: &Message,
+        ctx: &StateContext,
     ) -> Result<(Vec<u8>, Vec<u8>), HubError> {
         message
             .data
@@ -432,10 +467,15 @@ impl LinkStore {
                                 .as_ref()
                                 .ok_or(HubError::invalid_parameter("target ID not specified"))
                                 .and_then(|target| {
-                                    LinkStore::links_by_target_key(target, data.fid, Some(ts_hash))
-                                        .and_then(|target_key| {
-                                            Ok((target_key, link_body.r#type.as_bytes().to_vec()))
-                                        })
+                                    LinkStore::links_by_target_key_with_prefix(
+                                        ctx.root_prefix(RootPrefix::LinksByTarget),
+                                        target,
+                                        data.fid,
+                                        Some(ts_hash),
+                                    )
+                                    .and_then(|target_key| {
+                                        Ok((target_key, link_body.r#type.as_bytes().to_vec()))
+                                    })
                                 });
                         }
                         _ => Err(HubError::invalid_parameter("link body not specified")),
@@ -526,8 +566,9 @@ impl StoreDef for LinkStore {
         txn: &mut RocksDbTransactionBatch,
         ts_hash: &[u8; TS_HASH_LENGTH],
         message: &Message,
+        ctx: StateContext,
     ) -> Result<(), HubError> {
-        let (by_target_key, rtype) = self.secondary_index_key(ts_hash, message)?;
+        let (by_target_key, rtype) = self.secondary_index_key(ts_hash, message, &ctx)?;
 
         txn.put(by_target_key, rtype);
 
@@ -540,15 +581,21 @@ impl StoreDef for LinkStore {
         txn: &mut RocksDbTransactionBatch,
         ts_hash: &[u8; TS_HASH_LENGTH],
         message: &Message,
+        ctx: StateContext,
     ) -> Result<(), HubError> {
-        let (by_target_key, _) = self.secondary_index_key(ts_hash, message)?;
+        let (by_target_key, _) = self.secondary_index_key(ts_hash, message, &ctx)?;
 
         txn.delete(by_target_key);
 
         Ok(())
     }
 
-    fn make_compact_state_add_key(&self, message: &Message) -> Result<Vec<u8>, HubError> {
+    fn make_compact_state_add_key(
+        &self,
+        message: &Message,
+        ctx: StateContext,
+    ) -> Result<Vec<u8>, HubError> {
+        let root_prefix = ctx.root_prefix(RootPrefix::User);
         message
             .data
             .as_ref()
@@ -559,11 +606,17 @@ impl StoreDef for LinkStore {
                     .ok_or(HubError::invalid_parameter("invalid message data body"))
                     .and_then(|body_option| match body_option {
                         Body::LinkCompactStateBody(link_compact_body) => {
-                            Self::link_compact_state_add_key(data.fid, &link_compact_body.r#type)
+                            Self::link_compact_state_add_key_with_prefix(
+                                root_prefix,
+                                data.fid,
+                                &link_compact_body.r#type,
+                            )
                         }
-                        Body::LinkBody(link_body) => {
-                            Self::link_compact_state_add_key(data.fid, &link_body.r#type)
-                        }
+                        Body::LinkBody(link_body) => Self::link_compact_state_add_key_with_prefix(
+                            root_prefix,
+                            data.fid,
+                            &link_body.r#type,
+                        ),
                         _ => Err(HubError::invalid_parameter(
                             "link_compact_body not specified",
                         )),
@@ -572,26 +625,59 @@ impl StoreDef for LinkStore {
     }
 
     #[inline]
-    fn make_compact_state_prefix(&self, fid: u64) -> Result<Vec<u8>, HubError> {
+    fn make_compact_state_prefix(&self, fid: u64, ctx: StateContext) -> Result<Vec<u8>, HubError> {
         let mut prefix =
             Vec::with_capacity(Self::ROOT_PREFIXED_FID_BYTE_SIZE + Self::POSTFIX_BYTE_SIZE);
 
-        prefix.extend_from_slice(&make_user_key(fid));
+        prefix.extend_from_slice(&make_user_key_with_prefix(
+            ctx.root_prefix(RootPrefix::User),
+            fid,
+        ));
         prefix.push(UserPostfix::LinkCompactStateMessage.as_u8());
 
         Ok(prefix)
     }
 
     #[inline]
-    fn make_add_key(&self, message: &Message) -> Result<Vec<u8>, HubError> {
+    fn make_add_key(&self, message: &Message, ctx: StateContext) -> Result<Vec<u8>, HubError> {
         // Type bytes must be padded to 8 bytes, but we had a bug which allowed unpadded types,
         // so this function allows access to both types of keys
-        Self::make_add_key(message)
+        let root_prefix = ctx.root_prefix(RootPrefix::User);
+        message
+            .data
+            .as_ref()
+            .ok_or(HubError::invalid_parameter("invalid message data"))
+            .and_then(|data| {
+                data.body
+                    .as_ref()
+                    .ok_or(HubError::invalid_parameter("invalid message data body"))
+                    .and_then(|body_option| match body_option {
+                        Body::LinkBody(link_body) => {
+                            Self::link_add_key_with_prefix(root_prefix, data.fid, link_body)
+                        }
+                        _ => Err(HubError::invalid_parameter("link body not specified")),
+                    })
+            })
     }
 
     #[inline]
-    fn make_remove_key(&self, message: &Message) -> Result<Vec<u8>, HubError> {
-        Self::make_remove_key(message)
+    fn make_remove_key(&self, message: &Message, ctx: StateContext) -> Result<Vec<u8>, HubError> {
+        let root_prefix = ctx.root_prefix(RootPrefix::User);
+        message
+            .data
+            .as_ref()
+            .ok_or(HubError::invalid_parameter("invalid message data"))
+            .and_then(|data| {
+                data.body
+                    .as_ref()
+                    .ok_or(HubError::invalid_parameter("invalid message data body"))
+                    .and_then(|body_option| match body_option {
+                        Body::LinkBody(link_body) => {
+                            Self::link_remove_key_with_prefix(root_prefix, data.fid, link_body)
+                        }
+                        _ => Err(HubError::invalid_parameter("link body not specified")),
+                    })
+            })
     }
 
     #[inline]

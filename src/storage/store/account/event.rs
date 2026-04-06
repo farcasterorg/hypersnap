@@ -91,12 +91,25 @@ impl HubEventIdGenerator {
 
 pub struct StoreEventHandler {
     generator: Arc<Mutex<HubEventIdGenerator>>,
+    /// When true, commit_transaction is a no-op (no event persisted).
+    /// Used by hyper shadow stores to avoid duplicate events.
+    no_persist: bool,
 }
 
 impl StoreEventHandler {
     pub fn new() -> Arc<Self> {
         Arc::new(StoreEventHandler {
             generator: Arc::new(Mutex::new(HubEventIdGenerator::new(None, None))),
+            no_persist: false,
+        })
+    }
+
+    /// Create an event handler that generates event IDs but does not persist
+    /// them. Used for hyper shadow stores that share the same RocksDB.
+    pub fn new_no_persist() -> Arc<Self> {
+        Arc::new(StoreEventHandler {
+            generator: Arc::new(Mutex::new(HubEventIdGenerator::new(None, None))),
+            no_persist: true,
         })
     }
 
@@ -118,7 +131,9 @@ impl StoreEventHandler {
         let event_id = generator.generate_id(&raw_event)?;
         raw_event.id = event_id;
 
-        HubEvent::put_event_transaction(txn, &raw_event)?;
+        if !self.no_persist {
+            HubEvent::put_event_transaction(txn, &raw_event)?;
+        }
 
         Ok(event_id)
     }

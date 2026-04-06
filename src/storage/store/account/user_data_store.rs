@@ -1,5 +1,5 @@
 use super::{
-    is_message_in_time_range, make_user_key,
+    is_message_in_time_range, make_user_key_with_prefix,
     name_registry_events::{
         delete_username_proof_transaction, get_fname_proof_by_fid, get_username_proof,
         put_username_proof_transaction,
@@ -8,6 +8,7 @@ use super::{
     MessagesPage, StoreEventHandler,
 };
 use crate::core::message::HubEventExt;
+use crate::hyper::StateContext;
 use crate::{
     core::error::HubError,
     proto::{
@@ -17,7 +18,10 @@ use crate::{
     storage::util::bytes_compare,
 };
 use crate::{proto::message_data::Body, storage::db::PageOptions};
-use crate::{proto::MessageData, storage::constants::UserPostfix};
+use crate::{
+    proto::MessageData,
+    storage::constants::{RootPrefix, UserPostfix},
+};
 use crate::{
     proto::MessageType,
     storage::db::{RocksDB, RocksDbTransactionBatch},
@@ -76,7 +80,11 @@ impl StoreDef for UserDataStoreDef {
     }
 
     #[inline]
-    fn make_add_key(&self, message: &proto::Message) -> Result<Vec<u8>, HubError> {
+    fn make_add_key(
+        &self,
+        message: &proto::Message,
+        ctx: StateContext,
+    ) -> Result<Vec<u8>, HubError> {
         let user_data_body = match message.data.as_ref().unwrap().body.as_ref().unwrap() {
             Body::UserDataBody(body) => body,
             _ => {
@@ -87,7 +95,8 @@ impl StoreDef for UserDataStoreDef {
             }
         };
 
-        let key = Self::make_user_data_adds_key(
+        let key = Self::make_user_data_adds_key_with_prefix(
+            ctx.root_prefix(RootPrefix::User),
             message.data.as_ref().unwrap().fid,
             user_data_body.r#type,
         );
@@ -95,7 +104,11 @@ impl StoreDef for UserDataStoreDef {
     }
 
     #[inline]
-    fn make_remove_key(&self, _message: &proto::Message) -> Result<Vec<u8>, HubError> {
+    fn make_remove_key(
+        &self,
+        _message: &proto::Message,
+        _ctx: StateContext,
+    ) -> Result<Vec<u8>, HubError> {
         Err(HubError {
             code: "bad_request.invalid_param".to_string(),
             message: "removes not supported".to_string(),
@@ -103,7 +116,11 @@ impl StoreDef for UserDataStoreDef {
     }
 
     #[inline]
-    fn make_compact_state_add_key(&self, _message: &proto::Message) -> Result<Vec<u8>, HubError> {
+    fn make_compact_state_add_key(
+        &self,
+        _message: &proto::Message,
+        _ctx: StateContext,
+    ) -> Result<Vec<u8>, HubError> {
         Err(HubError {
             code: "bad_request.invalid_param".to_string(),
             message: "UserDataStore doesn't support compact state".to_string(),
@@ -111,7 +128,11 @@ impl StoreDef for UserDataStoreDef {
     }
 
     #[inline]
-    fn make_compact_state_prefix(&self, _fid: u64) -> Result<Vec<u8>, HubError> {
+    fn make_compact_state_prefix(
+        &self,
+        _fid: u64,
+        _ctx: StateContext,
+    ) -> Result<Vec<u8>, HubError> {
         Err(HubError {
             code: "bad_request.invalid_param".to_string(),
             message: "UserDataStore doesn't support compact state".to_string(),
@@ -134,9 +155,14 @@ impl UserDataStoreDef {
      */
     #[inline]
     fn make_user_data_adds_key(fid: u64, data_type: i32) -> Vec<u8> {
+        Self::make_user_data_adds_key_with_prefix(RootPrefix::User as u8, fid, data_type)
+    }
+
+    #[inline]
+    fn make_user_data_adds_key_with_prefix(root_prefix: u8, fid: u64, data_type: i32) -> Vec<u8> {
         let mut key = Vec::with_capacity(33 + 1 + 1);
 
-        key.extend_from_slice(&make_user_key(fid));
+        key.extend_from_slice(&make_user_key_with_prefix(root_prefix, fid));
         key.push(UserPostfix::UserDataAdds as u8);
         if data_type > 0 {
             key.push(data_type as u8);

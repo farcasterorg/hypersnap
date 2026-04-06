@@ -1,9 +1,10 @@
 use super::{
-    make_fid_key, make_user_key,
+    make_fid_key, make_user_key_with_prefix,
     message::{read_fid_key, FID_BYTES},
     store::{Store, StoreDef},
     MessagesPage, StoreEventHandler, TS_HASH_LENGTH,
 };
+use crate::hyper::StateContext;
 use crate::{
     core::error::HubError,
     proto::{Protocol, SignatureScheme, VerificationAddAddressBody, VerificationRemoveBody},
@@ -93,6 +94,7 @@ impl StoreDef for VerificationStoreDef {
         txn: &mut RocksDbTransactionBatch,
         _ts_hash: &[u8; TS_HASH_LENGTH],
         message: &Message,
+        ctx: StateContext,
     ) -> Result<(), HubError> {
         let address = match message.data.as_ref().unwrap().body.as_ref().unwrap() {
             Body::VerificationAddAddressBody(body) => &body.address,
@@ -112,7 +114,10 @@ impl StoreDef for VerificationStoreDef {
         }
 
         // Puts the fid into the byAddress index
-        let by_address_key = Self::make_verification_by_address_key(address);
+        let by_address_key = Self::make_verification_by_address_key_with_prefix(
+            ctx.root_prefix(RootPrefix::VerificationByAddress),
+            address,
+        );
         txn.put(
             by_address_key,
             make_fid_key(message.data.as_ref().unwrap().fid),
@@ -127,6 +132,7 @@ impl StoreDef for VerificationStoreDef {
         txn: &mut RocksDbTransactionBatch,
         _ts_hash: &[u8; TS_HASH_LENGTH],
         message: &Message,
+        ctx: StateContext,
     ) -> Result<(), HubError> {
         let address = match message.data.as_ref().unwrap().body.as_ref().unwrap() {
             Body::VerificationAddAddressBody(body) => &body.address,
@@ -146,14 +152,17 @@ impl StoreDef for VerificationStoreDef {
         }
 
         // Delete the message key from byAddress index
-        let by_address_key = Self::make_verification_by_address_key(address);
+        let by_address_key = Self::make_verification_by_address_key_with_prefix(
+            ctx.root_prefix(RootPrefix::VerificationByAddress),
+            address,
+        );
         txn.delete(by_address_key);
 
         Ok(())
     }
 
     #[inline]
-    fn make_add_key(&self, message: &Message) -> Result<Vec<u8>, HubError> {
+    fn make_add_key(&self, message: &Message, ctx: StateContext) -> Result<Vec<u8>, HubError> {
         let address = match message.data.as_ref().unwrap().body.as_ref().unwrap() {
             Body::VerificationAddAddressBody(body) => &body.address,
             Body::VerificationRemoveBody(body) => &body.address,
@@ -165,14 +174,15 @@ impl StoreDef for VerificationStoreDef {
             }
         };
 
-        Ok(Self::make_verification_adds_key(
+        Ok(Self::make_verification_adds_key_with_prefix(
+            ctx.root_prefix(RootPrefix::User),
             message.data.as_ref().unwrap().fid,
             address,
         ))
     }
 
     #[inline]
-    fn make_remove_key(&self, message: &Message) -> Result<Vec<u8>, HubError> {
+    fn make_remove_key(&self, message: &Message, ctx: StateContext) -> Result<Vec<u8>, HubError> {
         let address = match message.data.as_ref().unwrap().body.as_ref().unwrap() {
             Body::VerificationAddAddressBody(body) => &body.address,
             Body::VerificationRemoveBody(body) => &body.address,
@@ -184,14 +194,19 @@ impl StoreDef for VerificationStoreDef {
             }
         };
 
-        Ok(Self::make_verification_removes_key(
+        Ok(Self::make_verification_removes_key_with_prefix(
+            ctx.root_prefix(RootPrefix::User),
             message.data.as_ref().unwrap().fid,
             address,
         ))
     }
 
     #[inline]
-    fn make_compact_state_add_key(&self, _message: &Message) -> Result<Vec<u8>, HubError> {
+    fn make_compact_state_add_key(
+        &self,
+        _message: &Message,
+        _ctx: StateContext,
+    ) -> Result<Vec<u8>, HubError> {
         Err(HubError {
             code: "bad_request.invalid_param".to_string(),
             message: "Verification Store doesn't support compact state".to_string(),
@@ -199,7 +214,11 @@ impl StoreDef for VerificationStoreDef {
     }
 
     #[inline]
-    fn make_compact_state_prefix(&self, _fid: u64) -> Result<Vec<u8>, HubError> {
+    fn make_compact_state_prefix(
+        &self,
+        _fid: u64,
+        _ctx: StateContext,
+    ) -> Result<Vec<u8>, HubError> {
         Err(HubError {
             code: "bad_request.invalid_param".to_string(),
             message: "Verification Store doesn't support compact state".to_string(),
@@ -215,17 +234,37 @@ impl StoreDef for VerificationStoreDef {
 impl VerificationStoreDef {
     #[inline]
     pub fn make_verification_by_address_key(address: &[u8]) -> Vec<u8> {
+        Self::make_verification_by_address_key_with_prefix(
+            RootPrefix::VerificationByAddress as u8,
+            address,
+        )
+    }
+
+    #[inline]
+    pub fn make_verification_by_address_key_with_prefix(
+        root_prefix: u8,
+        address: &[u8],
+    ) -> Vec<u8> {
         let mut key = Vec::with_capacity(1 + address.len());
 
-        key.push(RootPrefix::VerificationByAddress as u8);
+        key.push(root_prefix);
         key.extend_from_slice(address);
         key
     }
 
     #[inline]
     pub fn make_verification_adds_key(fid: u64, address: &[u8]) -> Vec<u8> {
+        Self::make_verification_adds_key_with_prefix(RootPrefix::User as u8, fid, address)
+    }
+
+    #[inline]
+    pub fn make_verification_adds_key_with_prefix(
+        root_prefix: u8,
+        fid: u64,
+        address: &[u8],
+    ) -> Vec<u8> {
         let mut key = Vec::with_capacity(33 + 1 + address.len());
-        key.extend_from_slice(&make_user_key(fid));
+        key.extend_from_slice(&make_user_key_with_prefix(root_prefix, fid));
         key.push(UserPostfix::VerificationAdds as u8);
         key.extend_from_slice(address);
         key
@@ -233,8 +272,17 @@ impl VerificationStoreDef {
 
     #[inline]
     pub fn make_verification_removes_key(fid: u64, address: &[u8]) -> Vec<u8> {
+        Self::make_verification_removes_key_with_prefix(RootPrefix::User as u8, fid, address)
+    }
+
+    #[inline]
+    pub fn make_verification_removes_key_with_prefix(
+        root_prefix: u8,
+        fid: u64,
+        address: &[u8],
+    ) -> Vec<u8> {
         let mut key = Vec::with_capacity(33 + 1 + address.len());
-        key.extend_from_slice(&make_user_key(fid));
+        key.extend_from_slice(&make_user_key_with_prefix(root_prefix, fid));
         key.push(UserPostfix::VerificationRemoves as u8);
         key.extend_from_slice(address);
         key

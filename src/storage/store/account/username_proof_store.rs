@@ -1,9 +1,10 @@
 use super::{
-    get_from_db_or_txn, get_message, make_fid_key, make_user_key, read_fid_key,
+    get_from_db_or_txn, get_message, make_fid_key, make_user_key_with_prefix, read_fid_key,
     store::{Store, StoreDef},
     IntoU8, MessagesPage, StoreEventHandler, TS_HASH_LENGTH,
 };
 use crate::core::message::HubEventExt;
+use crate::hyper::StateContext;
 use crate::proto::message_data::Body;
 use crate::proto::{self, HubEvent, HubEventType, MergeUserNameProofBody, Message, MessageType};
 use crate::storage::constants::{RootPrefix, UserPostfix};
@@ -30,7 +31,7 @@ impl StoreDef for UsernameProofStoreDef {
     }
 
     #[inline]
-    fn make_add_key(&self, message: &Message) -> Result<Vec<u8>, HubError> {
+    fn make_add_key(&self, message: &Message, ctx: StateContext) -> Result<Vec<u8>, HubError> {
         if message.data.is_none() {
             return Err(HubError {
                 code: "bad_request.validation_failure".to_string(),
@@ -56,7 +57,8 @@ impl StoreDef for UsernameProofStoreDef {
             }
         };
 
-        Ok(Self::make_username_proof_by_fid_key(
+        Ok(Self::make_username_proof_by_fid_key_with_prefix(
+            ctx.root_prefix(RootPrefix::User),
             message.data.as_ref().unwrap().fid,
             name,
         ))
@@ -78,7 +80,7 @@ impl StoreDef for UsernameProofStoreDef {
     }
 
     #[inline]
-    fn make_remove_key(&self, _message: &Message) -> Result<Vec<u8>, HubError> {
+    fn make_remove_key(&self, _message: &Message, _ctx: StateContext) -> Result<Vec<u8>, HubError> {
         Err(HubError {
             code: "bad_request.validation_failure".to_string(),
             message: "Remove not supported".to_string(),
@@ -86,7 +88,11 @@ impl StoreDef for UsernameProofStoreDef {
     }
 
     #[inline]
-    fn make_compact_state_add_key(&self, _message: &Message) -> Result<Vec<u8>, HubError> {
+    fn make_compact_state_add_key(
+        &self,
+        _message: &Message,
+        _ctx: StateContext,
+    ) -> Result<Vec<u8>, HubError> {
         Err(HubError {
             code: "bad_request.invalid_param".to_string(),
             message: "Username Proof Store doesn't support compact state".to_string(),
@@ -94,7 +100,11 @@ impl StoreDef for UsernameProofStoreDef {
     }
 
     #[inline]
-    fn make_compact_state_prefix(&self, _fid: u64) -> Result<Vec<u8>, HubError> {
+    fn make_compact_state_prefix(
+        &self,
+        _fid: u64,
+        _ctx: StateContext,
+    ) -> Result<Vec<u8>, HubError> {
         Err(HubError {
             code: "bad_request.invalid_param".to_string(),
             message: "Username Proof Store doesn't support compact state".to_string(),
@@ -118,6 +128,7 @@ impl StoreDef for UsernameProofStoreDef {
         txn: &mut RocksDbTransactionBatch,
         _ts_hash: &[u8; TS_HASH_LENGTH],
         message: &Message,
+        ctx: StateContext,
     ) -> Result<(), HubError> {
         if message.data.is_none() {
             return Err(HubError {
@@ -135,7 +146,10 @@ impl StoreDef for UsernameProofStoreDef {
                 });
             }
 
-            let by_name_key = Self::make_username_proof_by_name_key(&body.name);
+            let by_name_key = Self::make_username_proof_by_name_key_with_prefix(
+                ctx.root_prefix(RootPrefix::UserNameProofByName),
+                &body.name,
+            );
             txn.put(
                 by_name_key,
                 make_fid_key(message.data.as_ref().unwrap().fid),
@@ -155,6 +169,7 @@ impl StoreDef for UsernameProofStoreDef {
         txn: &mut RocksDbTransactionBatch,
         _ts_hash: &[u8; TS_HASH_LENGTH],
         message: &Message,
+        ctx: StateContext,
     ) -> Result<(), HubError> {
         if message.data.is_none() {
             return Err(HubError {
@@ -172,7 +187,10 @@ impl StoreDef for UsernameProofStoreDef {
                 });
             }
 
-            let by_name_key = Self::make_username_proof_by_name_key(&body.name);
+            let by_name_key = Self::make_username_proof_by_name_key_with_prefix(
+                ctx.root_prefix(RootPrefix::UserNameProofByName),
+                &body.name,
+            );
             txn.delete(by_name_key);
             Ok(())
         } else {
@@ -189,6 +207,7 @@ impl StoreDef for UsernameProofStoreDef {
         txn: &RocksDbTransactionBatch,
         message: &Message,
         ts_hash: &[u8; TS_HASH_LENGTH],
+        ctx: StateContext,
     ) -> Result<Vec<Message>, HubError> {
         if message.data.is_none() {
             return Err(HubError {
@@ -338,9 +357,17 @@ impl StoreDef for UsernameProofStoreDef {
 impl UsernameProofStoreDef {
     #[inline]
     fn make_username_proof_by_name_key(name: &Vec<u8>) -> Vec<u8> {
+        Self::make_username_proof_by_name_key_with_prefix(
+            RootPrefix::UserNameProofByName as u8,
+            name,
+        )
+    }
+
+    #[inline]
+    fn make_username_proof_by_name_key_with_prefix(root_prefix: u8, name: &Vec<u8>) -> Vec<u8> {
         let mut key = Vec::with_capacity(1 + name.len());
 
-        key.push(RootPrefix::UserNameProofByName as u8);
+        key.push(root_prefix);
         key.extend(name);
 
         key
@@ -348,9 +375,18 @@ impl UsernameProofStoreDef {
 
     #[inline]
     fn make_username_proof_by_fid_key(fid: u64, name: &Vec<u8>) -> Vec<u8> {
+        Self::make_username_proof_by_fid_key_with_prefix(RootPrefix::User as u8, fid, name)
+    }
+
+    #[inline]
+    fn make_username_proof_by_fid_key_with_prefix(
+        root_prefix: u8,
+        fid: u64,
+        name: &Vec<u8>,
+    ) -> Vec<u8> {
         let mut key = Vec::with_capacity(1 + 4 + 1 + name.len());
 
-        key.extend_from_slice(&make_user_key(fid));
+        key.extend_from_slice(&make_user_key_with_prefix(root_prefix, fid));
         key.push(UserPostfix::UserNameProofAdds.as_u8());
         key.extend(name);
 

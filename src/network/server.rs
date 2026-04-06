@@ -65,6 +65,8 @@ pub struct MyHubService {
     allowed_users: HashMap<String, String>,
     block_stores: BlockStores,
     shard_stores: HashMap<u32, Stores>,
+    /// Hyper shadow stores for API queries (includes pruned messages).
+    pub hyper_shard_stores: HashMap<u32, Stores>,
     shard_senders: HashMap<u32, Senders>,
     num_shards: u32,
     message_router: Box<dyn routing::MessageRouter>,
@@ -83,6 +85,7 @@ impl MyHubService {
         rpc_auth: String,
         block_stores: BlockStores,
         shard_stores: HashMap<u32, Stores>,
+        hyper_shard_stores: HashMap<u32, Stores>,
         shard_senders: HashMap<u32, Senders>,
         statsd_client: StatsdClientWrapper,
         num_shards: u32,
@@ -119,6 +122,7 @@ impl MyHubService {
             block_stores,
             shard_senders,
             shard_stores,
+            hyper_shard_stores,
             statsd_client,
             message_router,
             num_shards,
@@ -2506,5 +2510,275 @@ impl HubService for MyHubService {
                 Err(Status::internal("Unable to retrieve connected peers."))
             }
         }
+    }
+}
+
+// === HubQueryHandler implementation for API layer ===
+
+#[tonic::async_trait]
+impl crate::api::HubQueryHandler for MyHubService {
+    async fn get_cast_by_hash(&self, hash: &[u8]) -> Option<Message> {
+        // Iterate all registered FIDs across all shards and do a direct
+        // RocksDB lookup for each. Each get_cast_add is a single RocksDB
+        // get (O(1)), so total cost is O(num_fids).
+        for stores in self.shard_stores.values() {
+            let mut page_token: Option<Vec<u8>> = None;
+            loop {
+                let page_options = PageOptions {
+                    page_size: Some(1000),
+                    page_token: page_token.clone(),
+                    reverse: false,
+                };
+                let (fids, next_token) = match stores.onchain_event_store.get_fids(&page_options) {
+                    Ok(result) => result,
+                    Err(_) => break,
+                };
+                if fids.is_empty() {
+                    break;
+                }
+                for fid in &fids {
+                    if let Ok(Some(msg)) =
+                        CastStore::get_cast_add(&stores.cast_store, *fid, hash.to_vec())
+                    {
+                        return Some(msg);
+                    }
+                }
+                match next_token {
+                    Some(token) if !token.is_empty() => page_token = Some(token),
+                    _ => break,
+                }
+            }
+        }
+        None
+    }
+
+    async fn get_casts_by_fid(
+        &self,
+        fid: u64,
+        limit: usize,
+        page_token: Option<Vec<u8>>,
+        reverse: bool,
+    ) -> Result<(Vec<Message>, Option<Vec<u8>>), String> {
+        let stores = self
+            .get_stores_for(fid)
+            .map_err(|e| e.message().to_string())?;
+        let options = PageOptions {
+            page_size: Some(limit),
+            page_token,
+            reverse,
+        };
+        let page = CastStore::get_cast_adds_by_fid(&stores.cast_store, fid, &options)
+            .map_err(|e| format!("{:?}", e))?;
+        Ok((page.messages, page.next_page_token))
+    }
+
+    async fn get_reactions_by_cast(
+        &self,
+        _fid: u64,
+        hash: &[u8],
+        reaction_type: i32,
+        limit: usize,
+    ) -> Result<Vec<Message>, String> {
+        // Scan all shards for reactions targeting this cast.
+        // First find the cast FID by scanning events.
+        let mut cast_fid = _fid;
+        if cast_fid == 0 {
+            if let Some(msg) = self.get_cast_by_hash(hash).await {
+                if let Some(data) = &msg.data {
+                    cast_fid = data.fid;
+                }
+            }
+        }
+
+        let target = reaction_body::Target::TargetCastId(CastId {
+            fid: cast_fid,
+            hash: hash.to_vec(),
+        });
+
+        let mut all_messages = Vec::new();
+        for stores in self.shard_stores.values() {
+            let options = PageOptions {
+                page_size: Some(limit),
+                page_token: None,
+                reverse: false,
+            };
+            if let Ok(page) = ReactionStore::get_reactions_by_target(
+                &stores.reaction_store,
+                &target,
+                reaction_type,
+                &options,
+            ) {
+                all_messages.extend(page.messages);
+            }
+            if all_messages.len() >= limit {
+                break;
+            }
+        }
+        all_messages.truncate(limit);
+        Ok(all_messages)
+    }
+
+    async fn get_reactions_by_fid(
+        &self,
+        fid: u64,
+        reaction_type: Option<i32>,
+        limit: usize,
+    ) -> Result<Vec<Message>, String> {
+        let stores = self
+            .get_stores_for(fid)
+            .map_err(|e| e.message().to_string())?;
+        let options = PageOptions {
+            page_size: Some(limit),
+            page_token: None,
+            reverse: false,
+        };
+        let page = ReactionStore::get_reaction_adds_by_fid(
+            &stores.reaction_store,
+            fid,
+            reaction_type.unwrap_or(0),
+            &options,
+        )
+        .map_err(|e| format!("{:?}", e))?;
+        Ok(page.messages)
+    }
+
+    async fn get_fid_by_username(&self, username: &str) -> Option<u64> {
+        // Try fname lookup first
+        let req = NameLookupRequest {
+            name: username.as_bytes().to_vec(),
+            r#type: UserNameType::UsernameTypeFname as i32,
+        };
+        if let Ok((fid, _)) = self.resolve_name(&req) {
+            return Some(fid);
+        }
+
+        // Try ENS lookup
+        if username.ends_with(".eth") {
+            let req = NameLookupRequest {
+                name: username.as_bytes().to_vec(),
+                r#type: UserNameType::UsernameTypeEnsL1 as i32,
+            };
+            if let Ok((fid, _)) = self.resolve_name(&req) {
+                return Some(fid);
+            }
+        }
+
+        None
+    }
+
+    async fn get_fids_by_address(&self, address: &[u8]) -> Vec<u64> {
+        let mut fids = Vec::new();
+
+        // Check verifications first (direct RocksDB lookup, O(1) per shard)
+        for stores in self.shard_stores.values() {
+            if let Ok(Some(fid)) =
+                VerificationStore::get_fid_by_address(&stores.verification_store, address)
+            {
+                if !fids.contains(&fid) {
+                    fids.push(fid);
+                }
+            }
+        }
+
+        // Check ID registry for custody address (uses a cache, but the
+        // initial population scans all id register events and can be slow).
+        // Skip if we already found matches via verifications.
+        if fids.is_empty() {
+            if let Ok(Some(event)) = self.find_id_registry_event_by_address(address) {
+                if let Some(Body::IdRegisterEventBody(body)) = &event.body {
+                    if body.to == address && !fids.contains(&event.fid) {
+                        fids.push(event.fid);
+                    }
+                }
+            }
+        }
+
+        fids
+    }
+
+    async fn get_username_proof(&self, name: &[u8]) -> Option<(u64, String, u64, Vec<u8>)> {
+        let name_str = std::str::from_utf8(name).ok()?;
+        let name_vec = name.to_vec();
+
+        if name_str.ends_with(".eth") {
+            for stores in self.shard_stores.values() {
+                if let Ok(Some(message)) = UsernameProofStore::get_username_proof(
+                    &stores.username_proof_store,
+                    &name_vec,
+                    &mut RocksDbTransactionBatch::new(),
+                ) {
+                    if let Some(data) = &message.data {
+                        if let Some(message_data::Body::UsernameProofBody(proof)) = &data.body {
+                            return Some((
+                                proof.fid,
+                                "ens".to_string(),
+                                proof.timestamp,
+                                proof.owner.clone(),
+                            ));
+                        }
+                    }
+                }
+            }
+        } else {
+            for stores in self.shard_stores.values() {
+                if let Ok(Some(proof)) = UserDataStore::get_username_proof(
+                    &stores.user_data_store,
+                    &mut RocksDbTransactionBatch::new(),
+                    name,
+                ) {
+                    return Some((
+                        proof.fid,
+                        "fname".to_string(),
+                        proof.timestamp,
+                        proof.owner.clone(),
+                    ));
+                }
+            }
+        }
+
+        None
+    }
+
+    async fn get_storage_limits(&self, fid: u64) -> Option<Vec<(String, u64, u64)>> {
+        let stores = self.get_stores_for(fid).ok()?;
+        let limits = stores.get_storage_limits(fid).ok()?;
+        Some(
+            limits
+                .limits
+                .iter()
+                .map(|l| (l.name.to_lowercase(), l.used, l.limit))
+                .collect(),
+        )
+    }
+
+    async fn get_notifications(
+        &self,
+        fid: u64,
+        limit: usize,
+        _cursor: Option<&str>,
+    ) -> Result<Vec<Message>, String> {
+        // Notifications = reactions on user's casts + mentions of user + new followers.
+        // For now, return reactions targeting user's casts and mentions.
+        let mut notifications = Vec::new();
+
+        // Get mentions of this user
+        for stores in self.shard_stores.values() {
+            let options = PageOptions {
+                page_size: Some(limit),
+                page_token: None,
+                reverse: true,
+            };
+            if let Ok(page) = CastStore::get_casts_by_mention(&stores.cast_store, fid, &options) {
+                notifications.extend(page.messages);
+            }
+        }
+
+        notifications.sort_by(|a, b| {
+            let ts_a = a.data.as_ref().map(|d| d.timestamp).unwrap_or(0);
+            let ts_b = b.data.as_ref().map(|d| d.timestamp).unwrap_or(0);
+            ts_b.cmp(&ts_a)
+        });
+        notifications.truncate(limit);
+        Ok(notifications)
     }
 }

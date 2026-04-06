@@ -76,10 +76,37 @@ async fn start_servers(
         local_state_store,
     );
 
+    // Build hyper shadow stores for API queries (includes pruned messages)
+    let hyper_shard_stores: HashMap<u32, _> = shard_stores
+        .iter()
+        .map(|(&id, s)| {
+            (
+                id,
+                s.with_state_context(snapchain::hyper::StateContext::Hyper),
+            )
+        })
+        .collect();
+
+    // Spawn hyper backfill to populate shadow stores from historical blocks
+    {
+        let backfill_db = block_stores.db.clone();
+        let backfill_shard_stores = shard_stores.clone();
+        let backfill_hyper_stores = hyper_shard_stores.clone();
+        tokio::spawn(async move {
+            snapchain::hyper::backfill::run_hyper_backfill(
+                &backfill_db,
+                &backfill_shard_stores,
+                &backfill_hyper_stores,
+            )
+            .await;
+        });
+    }
+
     let service = Arc::new(MyHubService::new(
         app_config.rpc_auth.clone(),
         block_stores.clone(),
         shard_stores.clone(),
+        hyper_shard_stores.clone(),
         shard_senders,
         statsd_client.clone(),
         app_config.consensus.num_shards,
@@ -92,12 +119,33 @@ async fn start_servers(
         gossip.swarm.local_peer_id().to_string(),
     ));
 
+    // Create a separate API service backed by hyper (un-pruned) stores.
+    // This ensures API consumers see full message history without pruning.
+    let api_service = Arc::new(MyHubService::new(
+        app_config.rpc_auth.clone(),
+        block_stores.clone(),
+        hyper_shard_stores,
+        HashMap::new(), // no shadow stores needed for the API service
+        HashMap::new(), // API service is read-only, no shard senders
+        statsd_client.clone(),
+        app_config.consensus.num_shards,
+        app_config.fc_network,
+        Box::new(routing::ShardRouter {}),
+        mempool_tx.clone(),
+        gossip.tx.clone(),
+        ChainClients {
+            chain_api_map: HashMap::new(),
+        },
+        VERSION.unwrap_or("unknown").to_string(),
+        gossip.swarm.local_peer_id().to_string(),
+    ));
+
     // Wire late-bound API handlers that depend on the hub service
     if let Some(ref handler) = api_handler {
         if app_config.api.conversations.enabled {
             let conv = Arc::new(snapchain::api::ConversationService::new(
                 app_config.api.conversations.clone(),
-                service.clone(),
+                api_service.clone(),
             ));
             handler.set_conversations(conv);
         }
@@ -122,9 +170,10 @@ async fn start_servers(
                 app_config.api.feeds.clone(),
                 social_graph,
                 metrics,
-                service.clone(),
+                api_service.clone(),
             ));
-            handler.set_feeds(feeds);
+            handler.set_feeds(feeds.clone());
+            handler.set_channel_feeds(feeds);
         }
         if app_config.api.search.enabled {
             match snapchain::api::SearchIndexer::new(
@@ -147,10 +196,13 @@ async fn start_servers(
             None
         };
         let hydrator = Arc::new(snapchain::api::HubUserHydrator::new(
-            service.clone(),
+            api_service.clone(),
             social_graph_for_hydrator,
         ));
         handler.set_user_hydrator(hydrator);
+
+        // Wire hub query handler for direct hub data access (cast lookup, reactions, etc.)
+        handler.set_hub_query(api_service.clone());
     }
 
     let replication_service = if let Some(replicator) = replicator {
@@ -625,15 +677,31 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .iter()
                 .map(|(shard_id, senders)| (*shard_id, senders.events_tx.clone()))
                 .collect();
+            let api_chain_client: Option<Arc<dyn snapchain::connectors::onchain_events::ChainAPI>> =
+                if !app_config.l1_rpc_url.is_empty() {
+                    snapchain::connectors::onchain_events::RealL1Client::new(
+                        app_config.l1_rpc_url.clone(),
+                        None,
+                    )
+                    .ok()
+                    .map(|c| Arc::new(c) as _)
+                } else {
+                    None
+                };
             snapchain::api::initialize(
                 &app_config.api,
                 node.block_stores.db.clone(),
                 hub_event_senders,
                 node.shard_stores.clone(),
+                api_chain_client,
             )
         };
 
-        let api_handler = api_system.as_ref().map(|s| s.http_handler.clone());
+        let api_handler = api_system.as_ref().map(|s| {
+            let mut h = s.http_handler.clone();
+            h.set_statsd(statsd_client.clone());
+            h
+        });
 
         start_servers(
             &app_config,
@@ -910,15 +978,31 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .iter()
                 .map(|(shard_id, senders)| (*shard_id, senders.events_tx.clone()))
                 .collect();
+            let api_chain_client: Option<Arc<dyn snapchain::connectors::onchain_events::ChainAPI>> =
+                if !app_config.l1_rpc_url.is_empty() {
+                    snapchain::connectors::onchain_events::RealL1Client::new(
+                        app_config.l1_rpc_url.clone(),
+                        None,
+                    )
+                    .ok()
+                    .map(|c| Arc::new(c) as _)
+                } else {
+                    None
+                };
             snapchain::api::initialize(
                 &app_config.api,
                 node.block_stores.db.clone(),
                 hub_event_senders,
                 node.shard_stores.clone(),
+                api_chain_client,
             )
         };
 
-        let api_handler = api_system.as_ref().map(|s| s.http_handler.clone());
+        let api_handler = api_system.as_ref().map(|s| {
+            let mut h = s.http_handler.clone();
+            h.set_statsd(statsd_client.clone());
+            h
+        });
 
         start_servers(
             &app_config,

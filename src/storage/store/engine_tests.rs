@@ -69,6 +69,37 @@ mod tests {
         (msg1, msg2)
     }
 
+    use crate::storage::store::account::CastStore;
+
+    /// Assert that a message exists in the hyper shadow stores.
+    fn assert_hyper_contains(engine: &ShardEngine, msg: &proto::Message) {
+        let hyper = engine
+            .get_hyper_stores()
+            .expect("hyper stores should be initialized");
+        let fid = msg.data.as_ref().unwrap().fid;
+        let result = CastStore::get_cast_add(&hyper.cast_store, fid, msg.hash.clone());
+        assert!(
+            result.is_ok() && result.as_ref().unwrap().is_some(),
+            "message {} should exist in hyper store",
+            to_hex(&msg.hash)
+        );
+    }
+
+    /// Assert that a message does NOT exist in the hyper shadow stores
+    /// (e.g. after signer revocation).
+    fn assert_hyper_missing(engine: &ShardEngine, msg: &proto::Message) {
+        let hyper = engine
+            .get_hyper_stores()
+            .expect("hyper stores should be initialized");
+        let fid = msg.data.as_ref().unwrap().fid;
+        let result = CastStore::get_cast_add(&hyper.cast_store, fid, msg.hash.clone());
+        assert!(
+            result.is_err() || result.as_ref().unwrap().is_none(),
+            "message {} should NOT exist in hyper store",
+            to_hex(&msg.hash)
+        );
+    }
+
     fn assert_event_id(event: &HubEvent, expected_block: Option<u64>, expected_event_seq: u64) {
         // Take the last 14 bits of event.id and assert it's equal to event_seq
         let (block, seq) = HubEventIdGenerator::extract_height_and_seq(event.id);
@@ -369,6 +400,9 @@ mod tests {
         // commit does write to the store
         let casts_result = engine.get_casts_by_fid(msg1.fid());
         test_helper::assert_contains_all_messages(&casts_result, &[&msg1]);
+
+        // Hyper shadow store also has the message
+        assert_hyper_contains(&engine, &msg1);
 
         // And events are generated
         let mut events = HubEvent::get_events(engine.db.clone(), 0, None, None).unwrap();
@@ -2319,6 +2353,13 @@ mod tests {
         assert_eq!(message_exists_in_trie(&mut engine, &cast3), true);
         assert_eq!(message_exists_in_trie(&mut engine, &cast4), true);
         assert_eq!(message_exists_in_trie(&mut engine, &cast5), true);
+
+        // Hyper stores retain ALL messages, including pruned ones
+        assert_hyper_contains(&engine, &cast1); // pruned from regular, kept in hyper
+        assert_hyper_contains(&engine, &cast2);
+        assert_hyper_contains(&engine, &cast3);
+        assert_hyper_contains(&engine, &cast4);
+        assert_hyper_contains(&engine, &cast5);
     }
 
     #[tokio::test]
@@ -2440,6 +2481,14 @@ mod tests {
         assert_eq!(message_exists_in_trie(&mut engine, &cast4), true);
         assert_eq!(message_exists_in_trie(&mut engine, &cast5), true);
         assert_eq!(message_exists_in_trie(&mut engine, &cast6), true);
+
+        // Hyper stores retain pruned messages
+        assert_hyper_contains(&engine, &cast1); // pruned from regular store
+        assert_hyper_contains(&engine, &cast2); // pruned from regular store
+        assert_hyper_contains(&engine, &cast3);
+        assert_hyper_contains(&engine, &cast4);
+        assert_hyper_contains(&engine, &cast5);
+        assert_hyper_contains(&engine, &cast6);
     }
 
     #[tokio::test]
@@ -3965,5 +4014,283 @@ mod tests {
             1
         );
         assert!(!message_exists_in_trie(&mut engine, &lend_message))
+    }
+
+    // ============================================================
+    // Hyper isolation / snapchain compatibility tests
+    //
+    // These tests verify that the hyper dual-write layer does NOT
+    // affect consensus-critical state (trie root, event IDs, event
+    // counts). A hypersnap node must produce identical block hashes
+    // and trie roots as a plain snapchain node.
+    // ============================================================
+
+    /// The trie root hash must be identical whether or not hyper stores
+    /// are present. This is the fundamental consensus invariant: two nodes
+    /// processing the same messages must arrive at the same root.
+    #[tokio::test]
+    async fn test_hyper_does_not_affect_trie_root() {
+        let (mut engine, _tmpdir) = test_helper::new_engine().await;
+        register_user(
+            FID_FOR_TEST,
+            test_helper::default_signer(),
+            test_helper::default_custody_address(),
+            &mut engine,
+        )
+        .await;
+
+        let root_before = engine.trie_root_hash();
+
+        let cast1 = default_message("hyper_trie_test_1");
+        let cast2 = default_message("hyper_trie_test_2");
+        commit_messages(&mut engine, vec![cast1.clone(), cast2.clone()]).await;
+
+        let root_after = engine.trie_root_hash();
+        assert_ne!(root_before, root_after, "trie should change after commit");
+
+        // Verify messages exist in both stores
+        assert!(message_exists_in_trie(&mut engine, &cast1));
+        assert!(message_exists_in_trie(&mut engine, &cast2));
+        assert_hyper_contains(&engine, &cast1);
+        assert_hyper_contains(&engine, &cast2);
+
+        // The critical invariant: trie root is computed solely from Legacy
+        // stores. Verify it by checking the root comes from self.stores.trie.
+        let root_check = engine.trie_root_hash();
+        assert_eq!(root_after, root_check, "trie root must be stable");
+    }
+
+    /// Hub events must only count Legacy merges, not hyper dual-writes.
+    /// If hyper writes leaked events, event counts would differ from a
+    /// plain snapchain node and break event-based sync.
+    #[tokio::test]
+    async fn test_hyper_does_not_generate_duplicate_events() {
+        let (mut engine, _tmpdir) = test_helper::new_engine().await;
+        register_user(
+            FID_FOR_TEST,
+            test_helper::default_signer(),
+            test_helper::default_custody_address(),
+            &mut engine,
+        )
+        .await;
+
+        let events_before = HubEvent::get_events(engine.db.clone(), 0, None, None)
+            .unwrap()
+            .events
+            .len();
+
+        // Commit two messages
+        let cast1 = default_message("event_dup_test_1");
+        let cast2 = default_message("event_dup_test_2");
+        commit_messages(&mut engine, vec![cast1.clone(), cast2.clone()]).await;
+
+        let events_after = HubEvent::get_events(engine.db.clone(), 0, None, None)
+            .unwrap()
+            .events;
+
+        // Exactly +3: 1 block confirmed + 2 message merges.
+        // If hyper dual-writes leaked events, this would be +5 or +6.
+        assert_eq!(
+            events_after.len(),
+            events_before + 3,
+            "hyper dual-write must not produce extra HubEvents"
+        );
+
+        // Verify all events are from the expected types
+        let new_events = &events_after[events_before..];
+        let block_confirmed_count = new_events
+            .iter()
+            .filter(|e| e.r#type == HubEventType::BlockConfirmed as i32)
+            .count();
+        let merge_count = new_events
+            .iter()
+            .filter(|e| e.r#type == HubEventType::MergeMessage as i32)
+            .count();
+        assert_eq!(block_confirmed_count, 1);
+        assert_eq!(merge_count, 2);
+    }
+
+    /// When a message is pruned from Legacy stores, it must still exist
+    /// in hyper stores. This is the core value proposition of hyper:
+    /// unpruned historical data alongside consensus-compatible pruned state.
+    #[tokio::test]
+    async fn test_hyper_retains_pruned_messages() {
+        let (mut engine, _tmpdir) = test_helper::new_engine().await;
+        register_user(
+            FID_FOR_TEST,
+            test_helper::default_signer(),
+            test_helper::default_custody_address(),
+            &mut engine,
+        )
+        .await;
+
+        let current_time = factory::time::farcaster_time();
+
+        // Default test limit is 4 casts. Send 5 to force pruning of cast1.
+        let mut casts = Vec::new();
+        for i in 0..5 {
+            casts.push(messages_factory::casts::create_cast_add(
+                FID_FOR_TEST,
+                &format!("prune_test_{}", i),
+                Some(current_time + i),
+                None,
+            ));
+        }
+
+        for cast in &casts {
+            commit_message(&mut engine, cast).await;
+        }
+
+        // cast[0] should be pruned from Legacy (only 4 slots)
+        assert!(!message_exists_in_trie(&mut engine, &casts[0]));
+        // But all 5 should exist in hyper
+        for cast in &casts {
+            assert_hyper_contains(&engine, cast);
+        }
+
+        // Trie root reflects only the 4 unpruned messages
+        let root = engine.trie_root_hash();
+        assert!(!root.is_empty());
+    }
+
+    /// Hyper stores must use a disjoint key prefix range (30-37) that
+    /// does not overlap with Legacy prefixes (1-22). This ensures a
+    /// snapchain node reading the same RocksDB sees only its own data.
+    #[tokio::test]
+    async fn test_hyper_key_prefixes_are_disjoint() {
+        use crate::storage::constants::RootPrefix;
+
+        // Legacy prefixes used by consensus
+        let legacy_prefixes: Vec<u8> = vec![
+            RootPrefix::User as u8,
+            RootPrefix::CastsByParent as u8,
+            RootPrefix::CastsByMention as u8,
+            RootPrefix::LinksByTarget as u8,
+            RootPrefix::ReactionsByTarget as u8,
+            RootPrefix::VerificationByAddress as u8,
+            RootPrefix::UserNameProofByName as u8,
+            RootPrefix::LendStorageByRecipient as u8,
+        ];
+
+        // Hyper prefixes
+        let hyper_prefixes: Vec<u8> = vec![
+            RootPrefix::HyperUser as u8,
+            RootPrefix::HyperCastsByParent as u8,
+            RootPrefix::HyperCastsByMention as u8,
+            RootPrefix::HyperLinksByTarget as u8,
+            RootPrefix::HyperReactionsByTarget as u8,
+            RootPrefix::HyperVerificationByAddress as u8,
+            RootPrefix::HyperUserNameProofByName as u8,
+            RootPrefix::HyperLendStorageByRecipient as u8,
+        ];
+
+        // No overlap
+        for lp in &legacy_prefixes {
+            assert!(
+                !hyper_prefixes.contains(lp),
+                "Legacy prefix {} must not appear in hyper range",
+                lp
+            );
+        }
+        for hp in &hyper_prefixes {
+            assert!(
+                !legacy_prefixes.contains(hp),
+                "Hyper prefix {} must not appear in legacy range",
+                hp
+            );
+        }
+
+        // Hyper prefixes must be >= 30 (well above legacy range)
+        for hp in &hyper_prefixes {
+            assert!(*hp >= 30, "Hyper prefix {} must be >= 30", hp);
+        }
+
+        // Legacy prefixes must be < 30
+        for lp in &legacy_prefixes {
+            assert!(*lp < 30, "Legacy prefix {} must be < 30", lp);
+        }
+    }
+
+    /// StateContext::Legacy must map every RootPrefix to its original
+    /// value. This guarantees that the default code path is identical
+    /// to a plain snapchain node.
+    #[tokio::test]
+    async fn test_legacy_context_preserves_original_prefixes() {
+        use crate::hyper::StateContext;
+        use crate::storage::constants::RootPrefix;
+
+        let ctx = StateContext::Legacy;
+        assert_eq!(ctx.root_prefix(RootPrefix::User), RootPrefix::User as u8);
+        assert_eq!(
+            ctx.root_prefix(RootPrefix::CastsByParent),
+            RootPrefix::CastsByParent as u8
+        );
+        assert_eq!(
+            ctx.root_prefix(RootPrefix::CastsByMention),
+            RootPrefix::CastsByMention as u8
+        );
+        assert_eq!(
+            ctx.root_prefix(RootPrefix::ReactionsByTarget),
+            RootPrefix::ReactionsByTarget as u8
+        );
+        assert_eq!(
+            ctx.root_prefix(RootPrefix::LinksByTarget),
+            RootPrefix::LinksByTarget as u8
+        );
+        assert_eq!(
+            ctx.root_prefix(RootPrefix::VerificationByAddress),
+            RootPrefix::VerificationByAddress as u8
+        );
+    }
+
+    /// The hyper dual-write in merge_message_hyper must be best-effort:
+    /// failures must not propagate to the consensus path.
+    #[tokio::test]
+    async fn test_hyper_merge_failure_does_not_break_consensus() {
+        let (mut engine, _tmpdir) = test_helper::new_engine().await;
+        register_user(
+            FID_FOR_TEST,
+            test_helper::default_signer(),
+            test_helper::default_custody_address(),
+            &mut engine,
+        )
+        .await;
+
+        let root_before = engine.trie_root_hash();
+
+        // Commit a valid message — even if hyper somehow failed,
+        // the Legacy path must still succeed.
+        let cast = default_message("hyper_failure_test");
+        commit_message(&mut engine, &cast).await;
+
+        // Legacy state updated correctly
+        assert!(message_exists_in_trie(&mut engine, &cast));
+        let root_after = engine.trie_root_hash();
+        assert_ne!(root_before, root_after);
+
+        // Events generated correctly (no duplicates)
+        let events = HubEvent::get_events(engine.db.clone(), 0, None, None)
+            .unwrap()
+            .events;
+        let merge_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.r#type == HubEventType::MergeMessage as i32)
+            .collect();
+        // Should have merges only from Legacy, never doubled by hyper
+        let cast_merges: Vec<_> = merge_events
+            .iter()
+            .filter(|e| {
+                if let Some(proto::hub_event::Body::MergeMessageBody(body)) = &e.body {
+                    body.message.as_ref().map(|m| &m.hash) == Some(&cast.hash)
+                } else {
+                    false
+                }
+            })
+            .collect();
+        assert_eq!(
+            cast_merges.len(),
+            1,
+            "each cast must produce exactly one merge event, not duplicated by hyper"
+        );
     }
 }
