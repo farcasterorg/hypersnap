@@ -46,7 +46,8 @@ mod keys {
 /// Current schema version. Bump when the indexer logic changes to force re-backfill.
 /// v1: initial follower/following tracking
 /// v2: fix batch processing of LinkCompactState (flush txn before compact state)
-const SOCIAL_GRAPH_SCHEMA_VERSION: u32 = 2;
+/// v3: fix incomplete data clearing (was limited to 100K entries, now loops to completion)
+const SOCIAL_GRAPH_SCHEMA_VERSION: u32 = 3;
 
 /// Social graph indexer that tracks follow relationships.
 pub struct SocialGraphIndexer {
@@ -77,6 +78,9 @@ impl SocialGraphIndexer {
             Self::clear_all_data(&db);
             let _ = db.put(&version_key, &SOCIAL_GRAPH_SCHEMA_VERSION.to_be_bytes());
         }
+
+        // Re-read checkpoint after potential clear (clear_all_data deletes it)
+        let checkpoint = Self::load_checkpoint(&db).unwrap_or(0);
 
         Self {
             config,
@@ -574,37 +578,42 @@ impl SocialGraphIndexer {
 
     /// Clear all social graph index data and backfill checkpoints.
     fn clear_all_data(db: &RocksDB) {
-        // Delete all keys under the social graph prefix
         let prefix = vec![keys::SOCIAL_GRAPH_PREFIX];
         let stop = vec![keys::SOCIAL_GRAPH_PREFIX + 1];
 
-        let page_options = crate::storage::db::PageOptions {
-            page_size: Some(100_000),
-            page_token: None,
-            reverse: false,
-        };
-
-        let mut keys_to_delete = Vec::new();
-        let _ = db.for_each_iterator_by_prefix_paged(
-            Some(prefix),
-            Some(stop),
-            &page_options,
-            |key, _| {
-                keys_to_delete.push(key.to_vec());
-                Ok(false)
-            },
-        );
-
-        if !keys_to_delete.is_empty() {
+        // Loop until all keys are deleted — with ~1M FIDs and multiple
+        // entries per FID there can be millions of keys. A single page
+        // scan of 100K won't cover them all.
+        let mut total_deleted = 0u64;
+        loop {
+            let page_options = crate::storage::db::PageOptions {
+                page_size: Some(100_000),
+                page_token: None,
+                reverse: false,
+            };
+            let mut keys = Vec::new();
+            let _ = db.for_each_iterator_by_prefix_paged(
+                Some(prefix.clone()),
+                Some(stop.clone()),
+                &page_options,
+                |key, _| {
+                    keys.push(key.to_vec());
+                    Ok(false)
+                },
+            );
+            if keys.is_empty() {
+                break;
+            }
+            let batch_len = keys.len() as u64;
             let mut txn = RocksDbTransactionBatch::new();
-            for key in &keys_to_delete {
-                txn.delete(key.clone());
+            for key in keys {
+                txn.delete(key);
             }
             let _ = db.commit(txn);
-            tracing::info!(
-                "Cleared {} social graph index entries",
-                keys_to_delete.len()
-            );
+            total_deleted += batch_len;
+        }
+        if total_deleted > 0 {
+            tracing::info!("Cleared {} social graph index entries", total_deleted);
         }
 
         // Clear per-shard backfill checkpoints (prefix 0xE3, name "social_graph")
@@ -620,8 +629,12 @@ impl SocialGraphIndexer {
             }
             s
         };
-
         let mut cp_keys = Vec::new();
+        let page_options = crate::storage::db::PageOptions {
+            page_size: Some(100),
+            page_token: None,
+            reverse: false,
+        };
         let _ = db.for_each_iterator_by_prefix_paged(
             Some(cp_prefix),
             Some(cp_stop),
@@ -1139,5 +1152,111 @@ mod tests {
         assert_eq!(indexer.get_follower_count(10).unwrap(), 0); // unfollowed
         assert_eq!(indexer.get_follower_count(20).unwrap(), 1); // still followed
         assert_eq!(indexer.get_follower_count(30).unwrap(), 1); // newly followed
+    }
+
+    /// Simulate a realistic backfill scenario: many users with LinkAdds
+    /// followed by compact state, processed in large batches.
+    /// Verifies that the final follower/following counts and lists match
+    /// the compact state truth, not the intermediate add accumulation.
+    #[tokio::test]
+    async fn test_backfill_with_compact_state_produces_correct_results() {
+        let db = make_test_db();
+        let config = FeatureConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let indexer = SocialGraphIndexer::new(config, db);
+
+        // Simulate backfill: user 100 follows 1,2,3,4,5 via individual adds,
+        // then a compact state says user 100 follows [3,4,5,6,7] (dropped 1,2; added 6,7).
+        // Also: user 200 follows 100 via individual add,
+        //       user 300 follows 100 via individual add.
+        let mut events = Vec::new();
+
+        // Individual adds for user 100
+        for target in [1, 2, 3, 4, 5] {
+            events.push(IndexEvent::message(
+                make_follow_message(100, target, true),
+                0,
+                target,
+            ));
+        }
+
+        // Followers of user 100
+        events.push(IndexEvent::message(
+            make_follow_message(200, 100, true),
+            0,
+            6,
+        ));
+        events.push(IndexEvent::message(
+            make_follow_message(300, 100, true),
+            0,
+            7,
+        ));
+
+        // Compact state for user 100 — the authoritative follow list
+        events.push(IndexEvent::message(
+            make_compact_state_message(100, vec![3, 4, 5, 6, 7]),
+            0,
+            8,
+        ));
+
+        // Compact state for user 200 — follows user 100 and user 50
+        events.push(IndexEvent::message(
+            make_compact_state_message(200, vec![100, 50]),
+            0,
+            9,
+        ));
+
+        // Process everything in one batch (simulating backfill batch_size)
+        indexer.process_batch(&events).await.unwrap();
+
+        // User 100: following = [3,4,5,6,7] (5 users, from compact state)
+        assert_eq!(indexer.get_following_count(100).unwrap(), 5);
+        let (following, _) = indexer.get_following(100, None, 100).unwrap();
+        assert_eq!(following.len(), 5);
+        assert!(following.contains(&3));
+        assert!(following.contains(&4));
+        assert!(following.contains(&5));
+        assert!(following.contains(&6));
+        assert!(following.contains(&7));
+        // 1 and 2 should NOT be in the following list
+        assert!(!following.contains(&1));
+        assert!(!following.contains(&2));
+
+        // User 200: following = [100, 50] (from compact state)
+        assert_eq!(indexer.get_following_count(200).unwrap(), 2);
+        let (following, _) = indexer.get_following(200, None, 100).unwrap();
+        assert!(following.contains(&100));
+        assert!(following.contains(&50));
+
+        // Follower counts:
+        // User 100 is followed by: 200 (from compact state) and 300 (from individual add)
+        assert_eq!(indexer.get_follower_count(100).unwrap(), 2);
+        let (followers, _) = indexer.get_followers(100, None, 100).unwrap();
+        assert_eq!(followers.len(), 2);
+        assert!(followers.contains(&200));
+        assert!(followers.contains(&300));
+
+        // Users 1 and 2: follower_count should be 0 (user 100 unfollowed via compact state)
+        assert_eq!(indexer.get_follower_count(1).unwrap(), 0);
+        assert_eq!(indexer.get_follower_count(2).unwrap(), 0);
+
+        // Users 3,4,5: each has exactly 1 follower (user 100, from compact state)
+        for fid in [3, 4, 5] {
+            assert_eq!(
+                indexer.get_follower_count(fid).unwrap(),
+                1,
+                "follower_count for fid {} should be 1",
+                fid
+            );
+        }
+
+        // Users 6,7: each has exactly 1 follower (user 100, from compact state)
+        assert_eq!(indexer.get_follower_count(6).unwrap(), 1);
+        assert_eq!(indexer.get_follower_count(7).unwrap(), 1);
+
+        // User 50: 1 follower (user 200, from compact state)
+        assert_eq!(indexer.get_follower_count(50).unwrap(), 1);
     }
 }

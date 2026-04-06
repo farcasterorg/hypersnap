@@ -139,6 +139,7 @@ pub struct ApiHttpHandler {
     search: Arc<std::sync::RwLock<Option<Arc<SearchIndexer>>>>,
     user_hydrator: Arc<std::sync::RwLock<Option<Arc<dyn UserHydrator>>>>,
     hub_query: Arc<std::sync::RwLock<Option<Arc<dyn HubQueryHandler>>>>,
+    statsd: Option<crate::utils::statsd_wrapper::StatsdClientWrapper>,
 }
 
 impl ApiHttpHandler {
@@ -160,6 +161,7 @@ impl ApiHttpHandler {
             search: Arc::new(std::sync::RwLock::new(None)),
             user_hydrator: Arc::new(std::sync::RwLock::new(None)),
             hub_query: Arc::new(std::sync::RwLock::new(None)),
+            statsd: None,
         }
     }
 
@@ -193,6 +195,11 @@ impl ApiHttpHandler {
         *self.hub_query.write().unwrap() = Some(handler);
     }
 
+    /// Set the statsd client for emitting API metrics.
+    pub fn set_statsd(&mut self, statsd: crate::utils::statsd_wrapper::StatsdClientWrapper) {
+        self.statsd = Some(statsd);
+    }
+
     /// Check if this handler can handle the given request.
     pub fn can_handle(&self, method: &Method, path: &str) -> bool {
         if method != Method::GET {
@@ -204,6 +211,11 @@ impl ApiHttpHandler {
         // All Farcaster v2 endpoints start with /v2/farcaster/
         if !path.starts_with("/v2/farcaster/") {
             return false;
+        }
+
+        // Admin/status endpoints (not v2 spec, internal)
+        if path == "/v2/farcaster/_status/backfill" {
+            return true;
         }
 
         matches!(
@@ -257,8 +269,15 @@ impl ApiHttpHandler {
         &self,
         req: Request<hyper::body::Incoming>,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        let start = std::time::Instant::now();
         let path = req.uri().path().trim_end_matches('/');
         let query = req.uri().query().unwrap_or("");
+
+        // Derive a short metric key from the path: /v2/farcaster/user/bulk → user.bulk
+        let metric_key = path
+            .strip_prefix("/v2/farcaster/")
+            .unwrap_or(path)
+            .replace('/', ".");
 
         // Parse query parameters
         let params = Self::parse_query_params(query);
@@ -301,7 +320,7 @@ impl ApiHttpHandler {
         }
 
         // Route to appropriate handler
-        match path {
+        let result = match path {
             // === User endpoints ===
             "/v2/farcaster/user" => {
                 let fid: u64 = require_fid!(params);
@@ -464,11 +483,33 @@ impl ApiHttpHandler {
                 self.handle_username_proof(&username).await
             }
 
+            // === Status endpoints ===
+            "/v2/farcaster/_status/backfill" => self.handle_backfill_status().await,
+
             _ => Ok(Self::error_response(
                 StatusCode::NOT_FOUND,
                 "Endpoint not found",
             )),
+        };
+
+        // Emit per-endpoint metrics
+        if let Some(ref statsd) = self.statsd {
+            let elapsed = start.elapsed();
+            statsd.count(&format!("api.request.{}", metric_key), 1, vec![]);
+            statsd.time(
+                &format!("api.latency.{}", metric_key),
+                elapsed.as_millis() as u64,
+            );
+            statsd.count("api.request.total", 1, vec![]);
+            if let Ok(ref resp) = result {
+                let status = resp.status().as_u16();
+                if status >= 400 {
+                    statsd.count("api.errors", 1, vec![]);
+                }
+            }
         }
+
+        result
     }
 
     /// Parse query string into key-value pairs.
@@ -1888,6 +1929,81 @@ impl ApiHttpHandler {
                 "Username proof not found",
             )),
         }
+    }
+
+    /// Emit indexer stats as statsd gauges (called from backfill status endpoint).
+    fn emit_indexer_gauges(&self) {
+        let Some(ref statsd) = self.statsd else {
+            return;
+        };
+        let emit = |name: &str, indexer: &dyn crate::api::indexer::Indexer| {
+            let stats = indexer.stats();
+            statsd.gauge(
+                &format!("api.indexer.{}.items", name),
+                stats.items_indexed,
+                vec![],
+            );
+            statsd.gauge(
+                &format!("api.indexer.{}.event_id", name),
+                stats.last_event_id,
+                vec![],
+            );
+        };
+        if let Some(ref sg) = self.social_graph {
+            emit("social_graph", sg.as_ref());
+        }
+        if let Some(ref ch) = self.channels {
+            emit("channels", ch.as_ref());
+        }
+        if let Some(ref m) = self.metrics {
+            emit("metrics", m.as_ref());
+        }
+        if let Some(ref chi) = self.cast_hash_index {
+            emit("cast_hash", chi.as_ref());
+        }
+    }
+
+    /// Handle GET /v2/farcaster/_status/backfill
+    async fn handle_backfill_status(
+        &self,
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        // Also push gauges to statsd when this endpoint is queried
+        self.emit_indexer_gauges();
+        let mut indexers = Vec::new();
+
+        let collect =
+            |name: &str, indexer: &dyn crate::api::indexer::Indexer| -> serde_json::Value {
+                let stats = indexer.stats();
+                serde_json::json!({
+                    "name": name,
+                    "enabled": indexer.is_enabled(),
+                    "items_indexed": stats.items_indexed,
+                    "last_event_id": stats.last_event_id,
+                    "backfill_complete": stats.backfill_complete,
+                })
+            };
+
+        if let Some(ref sg) = self.social_graph {
+            indexers.push(collect("social_graph", sg.as_ref()));
+        }
+        if let Some(ref ch) = self.channels {
+            indexers.push(collect("channels", ch.as_ref()));
+        }
+        if let Some(ref m) = self.metrics {
+            indexers.push(collect("metrics", m.as_ref()));
+        }
+        if let Some(ref chi) = self.cast_hash_index {
+            indexers.push(collect("cast_hash", chi.as_ref()));
+        }
+        {
+            let search = self.search.read().unwrap().clone();
+            if let Some(ref s) = search {
+                indexers.push(collect("search", s.as_ref()));
+            }
+        }
+
+        let body = serde_json::json!({ "indexers": indexers });
+        Ok(Self::json_response(StatusCode::OK, &body))
     }
 
     /// Convert internal feed items to Farcaster Cast format.

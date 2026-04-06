@@ -697,7 +697,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
             )
         };
 
-        let api_handler = api_system.as_ref().map(|s| s.http_handler.clone());
+        let api_handler = api_system.as_ref().map(|s| {
+            let mut h = s.http_handler.clone();
+            h.set_statsd(statsd_client.clone());
+            h
+        });
 
         start_servers(
             &app_config,
@@ -994,7 +998,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
             )
         };
 
-        let api_handler = api_system.as_ref().map(|s| s.http_handler.clone());
+        let api_handler = api_system.as_ref().map(|s| {
+            let mut h = s.http_handler.clone();
+            h.set_statsd(statsd_client.clone());
+            h
+        });
 
         start_servers(
             &app_config,
