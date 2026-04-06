@@ -2781,4 +2781,28 @@ impl crate::api::HubQueryHandler for MyHubService {
         notifications.truncate(limit);
         Ok(notifications)
     }
+
+    async fn get_onchain_events(
+        &self,
+        fid: u64,
+        event_type: i32,
+    ) -> Result<Vec<crate::proto::OnChainEvent>, String> {
+        let et = match crate::proto::OnChainEventType::try_from(event_type) {
+            Ok(et) => et,
+            Err(_) => return Err(format!("Invalid event type: {}", event_type)),
+        };
+        for stores in self.shard_stores.values() {
+            if let Ok(events) = stores.onchain_event_store.get_onchain_events(et, Some(fid)) {
+                if !events.is_empty() {
+                    return Ok(events);
+                }
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    async fn get_signer_events(&self, fid: u64) -> Result<Vec<crate::proto::OnChainEvent>, String> {
+        self.get_onchain_events(fid, crate::proto::OnChainEventType::EventTypeSigner as i32)
+            .await
+    }
 }

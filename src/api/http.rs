@@ -113,6 +113,16 @@ pub trait HubQueryHandler: Send + Sync {
     /// Get storage limits for a user.
     async fn get_storage_limits(&self, fid: u64) -> Option<Vec<(String, u64, u64)>>;
 
+    /// Get onchain events for a FID by type.
+    async fn get_onchain_events(
+        &self,
+        fid: u64,
+        event_type: i32,
+    ) -> Result<Vec<crate::proto::OnChainEvent>, String>;
+
+    /// Get signer events for a FID.
+    async fn get_signer_events(&self, fid: u64) -> Result<Vec<crate::proto::OnChainEvent>, String>;
+
     /// Get notifications for a user (reactions + mentions on their casts).
     async fn get_notifications(
         &self,
@@ -202,14 +212,26 @@ impl ApiHttpHandler {
 
     /// Check if this handler can handle the given request.
     pub fn can_handle(&self, method: &Method, path: &str) -> bool {
-        if method != Method::GET {
-            return false;
-        }
-
         let path = path.trim_end_matches('/');
 
         // All Farcaster v2 endpoints start with /v2/farcaster/
         if !path.starts_with("/v2/farcaster/") {
+            return false;
+        }
+
+        // POST batch endpoints
+        if method == &Method::POST {
+            return matches!(
+                path,
+                "/v2/farcaster/batch/following"
+                    | "/v2/farcaster/batch/reactions"
+                    | "/v2/farcaster/batch/cast-interactions"
+                    | "/v2/farcaster/batch/signers"
+                    | "/v2/farcaster/batch/id-registrations"
+            );
+        }
+
+        if method != &Method::GET {
             return false;
         }
 
@@ -270,17 +292,59 @@ impl ApiHttpHandler {
         req: Request<hyper::body::Incoming>,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
         let start = std::time::Instant::now();
-        let path = req.uri().path().trim_end_matches('/');
-        let query = req.uri().query().unwrap_or("");
+        let method = req.method().clone();
+        let path = req.uri().path().trim_end_matches('/').to_string();
+        let query = req.uri().query().unwrap_or("").to_string();
 
         // Derive a short metric key from the path: /v2/farcaster/user/bulk → user.bulk
         let metric_key = path
             .strip_prefix("/v2/farcaster/")
-            .unwrap_or(path)
+            .unwrap_or(&path)
             .replace('/', ".");
 
+        // Handle POST batch endpoints first (need to consume the body)
+        if method == Method::POST {
+            let body_bytes = match req.into_body().collect().await {
+                Ok(collected) => collected.to_bytes(),
+                Err(_) => {
+                    return Ok(Self::error_response(
+                        StatusCode::BAD_REQUEST,
+                        "Failed to read request body",
+                    ))
+                }
+            };
+            let result = match path.as_str() {
+                "/v2/farcaster/batch/following" => {
+                    self.handle_batch_following_batch(&body_bytes).await
+                }
+                "/v2/farcaster/batch/reactions" => {
+                    self.handle_batch_reactions_batch(&body_bytes).await
+                }
+                "/v2/farcaster/batch/cast-interactions" => {
+                    self.handle_batch_cast_interactions_batch(&body_bytes).await
+                }
+                "/v2/farcaster/batch/signers" => self.handle_batch_signers_batch(&body_bytes).await,
+                "/v2/farcaster/batch/id-registrations" => {
+                    self.handle_batch_id_registrations_batch(&body_bytes).await
+                }
+                _ => Ok(Self::error_response(
+                    StatusCode::NOT_FOUND,
+                    "Endpoint not found",
+                )),
+            };
+            if let Some(ref statsd) = self.statsd {
+                let elapsed = start.elapsed();
+                statsd.count(&format!("api.request.{}", metric_key), 1, vec![]);
+                statsd.time(
+                    &format!("api.latency.{}", metric_key),
+                    elapsed.as_millis() as u64,
+                );
+            }
+            return result;
+        }
+
         // Parse query parameters
-        let params = Self::parse_query_params(query);
+        let params = Self::parse_query_params(&query);
 
         // Common parameters
         let limit: usize = params
@@ -320,7 +384,7 @@ impl ApiHttpHandler {
         }
 
         // Route to appropriate handler
-        let result = match path {
+        let result = match path.as_str() {
             // === User endpoints ===
             "/v2/farcaster/user" => {
                 let fid: u64 = require_fid!(params);
@@ -2078,6 +2142,242 @@ impl ApiHttpHandler {
             casts.push(cast);
         }
         casts
+    }
+
+    // === Batch Endpoints ===
+
+    fn parse_batch_fids(body: &[u8]) -> Result<Vec<u64>, String> {
+        #[derive(serde::Deserialize)]
+        struct BatchRequest {
+            fids: Vec<u64>,
+        }
+        serde_json::from_slice::<BatchRequest>(body)
+            .map(|r| r.fids)
+            .map_err(|e| format!("Invalid JSON body: {}", e))
+    }
+
+    async fn handle_batch_following_batch(
+        &self,
+        body: &[u8],
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        let fids = match Self::parse_batch_fids(body) {
+            Ok(f) => f,
+            Err(e) => return Ok(Self::error_response(StatusCode::BAD_REQUEST, &e)),
+        };
+        let Some(indexer) = &self.social_graph else {
+            return Ok(Self::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Social graph not available",
+            ));
+        };
+
+        let mut results: HashMap<u64, Vec<serde_json::Value>> = HashMap::new();
+        for fid in fids {
+            let mut entries = Vec::new();
+            if let Ok((following, _)) = indexer.get_following_with_timestamps(fid, None, 10_000) {
+                for (target_fid, ts) in following {
+                    let followed_at = if ts > 0 {
+                        serde_json::Value::String(format_timestamp(ts))
+                    } else {
+                        serde_json::Value::Null
+                    };
+                    entries.push(serde_json::json!({
+                        "fid": target_fid,
+                        "followed_at": followed_at,
+                    }));
+                }
+            }
+            results.insert(fid, entries);
+        }
+        Ok(Self::json_response(StatusCode::OK, &results))
+    }
+
+    async fn handle_batch_reactions_batch(
+        &self,
+        body: &[u8],
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        let fids = match Self::parse_batch_fids(body) {
+            Ok(f) => f,
+            Err(e) => return Ok(Self::error_response(StatusCode::BAD_REQUEST, &e)),
+        };
+        let hub = self.hub_query.read().unwrap().clone();
+        let Some(hub) = hub else {
+            return Ok(Self::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Hub query not available",
+            ));
+        };
+
+        let mut results: HashMap<u64, Vec<serde_json::Value>> = HashMap::new();
+        for fid in fids {
+            let mut entries = Vec::new();
+            // Fetch all reaction types
+            if let Ok(messages) = hub.get_reactions_by_fid(fid, None, 10_000).await {
+                for msg in &messages {
+                    if let Some(data) = &msg.data {
+                        if let Some(crate::proto::message_data::Body::ReactionBody(body)) =
+                            &data.body
+                        {
+                            if let Some(crate::proto::reaction_body::Target::TargetCastId(id)) =
+                                &body.target
+                            {
+                                entries.push(serde_json::json!({
+                                    "target_fid": id.fid,
+                                    "timestamp": data.timestamp,
+                                }));
+                            }
+                        }
+                    }
+                }
+            }
+            results.insert(fid, entries);
+        }
+        Ok(Self::json_response(StatusCode::OK, &results))
+    }
+
+    async fn handle_batch_cast_interactions_batch(
+        &self,
+        body: &[u8],
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        let fids = match Self::parse_batch_fids(body) {
+            Ok(f) => f,
+            Err(e) => return Ok(Self::error_response(StatusCode::BAD_REQUEST, &e)),
+        };
+        let hub = self.hub_query.read().unwrap().clone();
+        let Some(hub) = hub else {
+            return Ok(Self::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Hub query not available",
+            ));
+        };
+
+        let mut results: HashMap<u64, Vec<serde_json::Value>> = HashMap::new();
+        for fid in fids {
+            let mut entries = Vec::new();
+            let mut page_token: Option<Vec<u8>> = None;
+            loop {
+                match hub
+                    .get_casts_by_fid(fid, 500, page_token.clone(), false)
+                    .await
+                {
+                    Ok((messages, next_token)) => {
+                        for msg in &messages {
+                            if let Some(data) = &msg.data {
+                                if data.r#type != crate::proto::MessageType::CastAdd as i32 {
+                                    continue;
+                                }
+                                if let Some(crate::proto::message_data::Body::CastAddBody(body)) =
+                                    &data.body
+                                {
+                                    let parent_fid = body.parent.as_ref().and_then(|p| match p {
+                                        crate::proto::cast_add_body::Parent::ParentCastId(id) => {
+                                            Some(id.fid)
+                                        }
+                                        _ => None,
+                                    });
+                                    let mentions: Vec<u64> = body.mentions.clone();
+                                    if parent_fid.is_some() || !mentions.is_empty() {
+                                        entries.push(serde_json::json!({
+                                            "parent_fid": parent_fid,
+                                            "mentions": mentions,
+                                            "timestamp": data.timestamp,
+                                        }));
+                                    }
+                                }
+                            }
+                        }
+                        match next_token {
+                            Some(t) if !t.is_empty() => page_token = Some(t),
+                            _ => break,
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            results.insert(fid, entries);
+        }
+        Ok(Self::json_response(StatusCode::OK, &results))
+    }
+
+    async fn handle_batch_signers_batch(
+        &self,
+        body: &[u8],
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        let fids = match Self::parse_batch_fids(body) {
+            Ok(f) => f,
+            Err(e) => return Ok(Self::error_response(StatusCode::BAD_REQUEST, &e)),
+        };
+        let hub = self.hub_query.read().unwrap().clone();
+        let Some(hub) = hub else {
+            return Ok(Self::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Hub query not available",
+            ));
+        };
+
+        let mut results: HashMap<u64, Vec<serde_json::Value>> = HashMap::new();
+        for fid in fids {
+            let mut entries = Vec::new();
+            if let Ok(events) = hub.get_signer_events(fid).await {
+                for event in &events {
+                    if let Some(crate::proto::on_chain_event::Body::SignerEventBody(body)) =
+                        &event.body
+                    {
+                        entries.push(serde_json::json!({
+                            "metadata": base64::Engine::encode(
+                                &base64::engine::general_purpose::STANDARD,
+                                &body.metadata,
+                            ),
+                            "metadata_type": body.metadata_type,
+                        }));
+                    }
+                }
+            }
+            results.insert(fid, entries);
+        }
+        Ok(Self::json_response(StatusCode::OK, &results))
+    }
+
+    async fn handle_batch_id_registrations_batch(
+        &self,
+        body: &[u8],
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        let fids = match Self::parse_batch_fids(body) {
+            Ok(f) => f,
+            Err(e) => return Ok(Self::error_response(StatusCode::BAD_REQUEST, &e)),
+        };
+        let hub = self.hub_query.read().unwrap().clone();
+        let Some(hub) = hub else {
+            return Ok(Self::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Hub query not available",
+            ));
+        };
+
+        let mut results: HashMap<u64, Vec<serde_json::Value>> = HashMap::new();
+        for fid in fids {
+            let mut entries = Vec::new();
+            if let Ok(events) = hub.get_onchain_events(fid, 3).await {
+                for event in &events {
+                    if let Some(crate::proto::on_chain_event::Body::IdRegisterEventBody(body)) =
+                        &event.body
+                    {
+                        let event_type = match body.event_type() {
+                            crate::proto::IdRegisterEventType::Register => "Register",
+                            crate::proto::IdRegisterEventType::Transfer => "Transfer",
+                            crate::proto::IdRegisterEventType::ChangeRecovery => "ChangeRecovery",
+                            _ => "None",
+                        };
+                        entries.push(serde_json::json!({
+                            "block_timestamp": event.block_timestamp,
+                            "event_type": event_type,
+                        }));
+                    }
+                }
+            }
+            results.insert(fid, entries);
+        }
+        Ok(Self::json_response(StatusCode::OK, &results))
     }
 
     /// Create a JSON response.
