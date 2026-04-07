@@ -312,11 +312,12 @@ impl Indexer for SearchIndexer {
     }
 
     fn stats(&self) -> IndexerStats {
+        let cp = self.checkpoint.load(Ordering::SeqCst);
         IndexerStats {
             items_indexed: self.docs_indexed.load(Ordering::Relaxed),
-            last_event_id: self.checkpoint.load(Ordering::SeqCst),
+            last_event_id: cp,
             last_block_height: 0,
-            backfill_complete: true,
+            backfill_complete: cp > 0,
             size_bytes: 0,
         }
     }

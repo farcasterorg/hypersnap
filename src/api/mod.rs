@@ -112,11 +112,13 @@ impl ApiSystem {
 /// * `db` - RocksDB instance for indexer storage
 /// * `hub_event_senders` - HubEvent broadcast senders from each shard engine
 /// * `shard_stores` - Stores for each shard, used for backfill event sourcing
+/// * `hyper_shard_stores` - Hyper stores (retain pruned data), used for search backfill
 pub fn initialize(
     config: &ApiConfig,
     db: Arc<crate::storage::db::RocksDB>,
     hub_event_senders: Vec<(u32, broadcast::Sender<HubEvent>)>,
     shard_stores: HashMap<u32, Stores>,
+    hyper_shard_stores: Option<HashMap<u32, Stores>>,
     chain_client: Option<Arc<dyn crate::connectors::onchain_events::ChainAPI>>,
 ) -> Option<ApiSystem> {
     if !config.enabled {
@@ -203,13 +205,10 @@ pub fn initialize(
             backfill_indexers.push(idx.clone());
         }
     }
-    if config.search.backfill_on_startup {
-        if let Some(ref idx) = search_indexer {
-            backfill_indexers.push(idx.clone());
-        }
-    }
+    // Search backfill is handled separately using hyper stores (includes pruned data)
+    let search_needs_backfill = config.search.backfill_on_startup && search_indexer.is_some();
 
-    let needs_backfill = !backfill_indexers.is_empty();
+    let needs_backfill = !backfill_indexers.is_empty() || search_needs_backfill;
 
     // Create worker pool and register indexers
     let mut worker_pool = IndexWorkerPool::new(config.clone(), index_rx, db.clone());
@@ -249,8 +248,26 @@ pub fn initialize(
     if needs_backfill {
         let backfill_db = db.clone();
         let backfill_tx = backfill_done_tx.clone();
+        let search_idx = if search_needs_backfill {
+            search_indexer.clone()
+        } else {
+            None
+        };
+        let hyper_stores_for_search = hyper_shard_stores.clone();
         tokio::spawn(async move {
-            run_block_backfill(&backfill_db, &shard_stores, backfill_indexers).await;
+            // Block-based backfill for non-search indexers
+            if !backfill_indexers.is_empty() {
+                run_block_backfill(&backfill_db, &shard_stores, backfill_indexers).await;
+            }
+            // Search backfill from hyper stores (includes pruned casts)
+            if let Some(search) = search_idx {
+                if let Some(ref stores) = hyper_stores_for_search {
+                    run_search_backfill(&backfill_db, stores, &search).await;
+                } else {
+                    // Fall back to block-based backfill if no hyper stores
+                    run_block_backfill(&backfill_db, &shard_stores, vec![search]).await;
+                }
+            }
             let _ = backfill_tx.send(true);
             tracing::info!("All backfills complete, unblocking bridges");
         });
@@ -288,6 +305,150 @@ pub fn initialize(
         http_handler,
         search_indexer,
     })
+}
+
+const SEARCH_BACKFILL_CHECKPOINT: &str = "search_hyper_backfill";
+
+/// Backfill search index from hyper stores by iterating all cast messages.
+///
+/// Hyper stores retain pruned messages, so this indexes the full cast history.
+/// Uses a per-shard checkpoint so restarts resume where they left off.
+async fn run_search_backfill(
+    db: &crate::storage::db::RocksDB,
+    hyper_stores: &HashMap<u32, Stores>,
+    search: &Arc<SearchIndexer>,
+) {
+    use crate::storage::db::PageOptions;
+    use crate::storage::store::account::CastStore;
+
+    tracing::info!("Starting search backfill from hyper stores");
+    let start = std::time::Instant::now();
+    let mut total_indexed: u64 = 0;
+
+    let mut sorted_shards: Vec<_> = hyper_stores.keys().cloned().collect();
+    sorted_shards.sort();
+
+    for shard_id in sorted_shards {
+        let stores = match hyper_stores.get(&shard_id) {
+            Some(s) => s,
+            None => continue,
+        };
+
+        // Check if this shard's search backfill is already done
+        let checkpoint_fid =
+            backfill::load_shard_checkpoint(db, SEARCH_BACKFILL_CHECKPOINT, shard_id);
+        if checkpoint_fid == u64::MAX {
+            tracing::info!(shard_id, "Search backfill already complete for shard");
+            continue;
+        }
+
+        tracing::info!(
+            shard_id,
+            resume_from_fid = checkpoint_fid,
+            "Starting search backfill for shard"
+        );
+
+        // Iterate all FIDs in this shard
+        let mut fid_page_token: Option<Vec<u8>> = None;
+        let mut fids_processed: u64 = 0;
+        loop {
+            let page_opts = PageOptions {
+                page_size: Some(1000),
+                page_token: fid_page_token.clone(),
+                reverse: false,
+            };
+            let (fids, next_token) = match stores.onchain_event_store.get_fids(&page_opts) {
+                Ok(r) => r,
+                Err(_) => break,
+            };
+            if fids.is_empty() {
+                break;
+            }
+
+            for fid in &fids {
+                // Skip FIDs we've already indexed
+                if *fid < checkpoint_fid {
+                    continue;
+                }
+
+                // Iterate all casts for this FID
+                let mut cast_page_token: Option<Vec<u8>> = None;
+                loop {
+                    let cast_opts = PageOptions {
+                        page_size: Some(500),
+                        page_token: cast_page_token.clone(),
+                        reverse: false,
+                    };
+                    let page =
+                        match CastStore::get_cast_adds_by_fid(&stores.cast_store, *fid, &cast_opts)
+                        {
+                            Ok(p) => p,
+                            Err(_) => break,
+                        };
+                    if page.messages.is_empty() {
+                        break;
+                    }
+
+                    let event = IndexEvent::messages(page.messages.clone(), shard_id, 0);
+                    if let Err(e) = search.process_batch(&[event]).await {
+                        tracing::warn!(error = %e, "Search backfill batch error");
+                    }
+                    total_indexed += page.messages.len() as u64;
+
+                    match page.next_page_token {
+                        Some(t) if !t.is_empty() => cast_page_token = Some(t),
+                        _ => break,
+                    }
+                }
+
+                fids_processed += 1;
+
+                // Checkpoint every 1000 FIDs
+                if fids_processed % 1000 == 0 {
+                    let _ = backfill::save_shard_checkpoint(
+                        db,
+                        SEARCH_BACKFILL_CHECKPOINT,
+                        shard_id,
+                        *fid,
+                    );
+                    if fids_processed % 10_000 == 0 {
+                        tracing::info!(
+                            shard_id,
+                            fids_processed,
+                            total_indexed,
+                            "Search backfill progress"
+                        );
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
+
+            match next_token {
+                Some(t) if !t.is_empty() => fid_page_token = Some(t),
+                _ => break,
+            }
+        }
+
+        // Mark shard as complete
+        let _ = backfill::save_shard_checkpoint(db, SEARCH_BACKFILL_CHECKPOINT, shard_id, u64::MAX);
+
+        // Update the search indexer's own checkpoint for stats()
+        if let Err(e) = search.save_checkpoint(u64::MAX).await {
+            tracing::warn!(error = %e, "Failed to save search checkpoint");
+        }
+
+        tracing::info!(
+            shard_id,
+            total_indexed,
+            "Search backfill complete for shard"
+        );
+    }
+
+    tracing::info!(
+        total_indexed,
+        elapsed = ?start.elapsed(),
+        "Search backfill from hyper stores complete"
+    );
 }
 
 const BLOCK_BACKFILL_CHECKPOINT: &str = "api_block_backfill";
@@ -425,6 +586,17 @@ async fn run_block_backfill(
             shard_id,
             max_height + 1,
         );
+
+        // Update each indexer's own checkpoint so stats() reflects progress
+        for indexer in &indexers {
+            if let Err(e) = indexer.save_checkpoint(max_height).await {
+                tracing::warn!(
+                    indexer = indexer.name(),
+                    error = %e,
+                    "Failed to save indexer checkpoint"
+                );
+            }
+        }
 
         tracing::info!(
             shard_id,

@@ -665,6 +665,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
             None
         };
 
+        // Build hyper stores for API search backfill (includes pruned messages)
+        let api_hyper_stores: HashMap<u32, _> = node
+            .shard_stores
+            .iter()
+            .map(|(&id, s)| {
+                (
+                    id,
+                    s.with_state_context(snapchain::hyper::StateContext::Hyper),
+                )
+            })
+            .collect();
+
         // Initialize API indexing system if enabled
         let api_system = {
             let hub_event_senders: Vec<(u32, broadcast::Sender<snapchain::proto::HubEvent>)> = node
@@ -688,6 +700,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 node.block_stores.db.clone(),
                 hub_event_senders,
                 node.shard_stores.clone(),
+                Some(api_hyper_stores),
                 api_chain_client,
             )
         };
@@ -968,6 +981,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
             });
         }
 
+        // Build hyper stores for API search backfill (includes pruned messages)
+        let api_hyper_stores: HashMap<u32, _> = node
+            .shard_stores
+            .iter()
+            .map(|(&id, s)| {
+                (
+                    id,
+                    s.with_state_context(snapchain::hyper::StateContext::Hyper),
+                )
+            })
+            .collect();
+
         // Initialize API indexing system if enabled
         let api_system = {
             let hub_event_senders: Vec<(u32, broadcast::Sender<snapchain::proto::HubEvent>)> = node
@@ -991,6 +1016,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 node.block_stores.db.clone(),
                 hub_event_senders,
                 node.shard_stores.clone(),
+                Some(api_hyper_stores),
                 api_chain_client,
             )
         };
