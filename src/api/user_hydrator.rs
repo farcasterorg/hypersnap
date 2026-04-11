@@ -6,7 +6,9 @@
 use crate::api::http::UserHydrator;
 use crate::api::social_graph::SocialGraphIndexer;
 use crate::api::types::{Bio, User, UserProfile, VerifiedAddresses};
+use crate::api::webhooks::CustodyAddressLookup;
 use crate::proto::{self, message_data::Body, Protocol, UserDataType};
+use alloy_primitives::Address;
 use async_trait::async_trait;
 use std::sync::Arc;
 use tonic::Request;
@@ -174,6 +176,12 @@ where
     }
 
     async fn populate_custody_address(&self, fid: u64, user: &mut User) {
+        if let Some(addr) = self.fetch_custody_address(fid).await {
+            user.custody_address = format!("0x{}", hex::encode(addr.as_slice()));
+        }
+    }
+
+    async fn fetch_custody_address(&self, fid: u64) -> Option<Address> {
         let request = Request::new(proto::FidRequest {
             fid,
             page_size: None,
@@ -181,17 +189,30 @@ where
             reverse: None,
         });
 
-        let Ok(response) = self
+        let response = self
             .hub_service
             .get_id_registry_on_chain_event(request)
             .await
-        else {
-            return;
-        };
-
+            .ok()?;
         let event = response.get_ref();
-        if let Some(proto::on_chain_event::Body::IdRegisterEventBody(body)) = &event.body {
-            user.custody_address = format!("0x{}", hex::encode(&body.to));
+        let proto::on_chain_event::Body::IdRegisterEventBody(body) = event.body.as_ref()? else {
+            return None;
+        };
+        if body.to.len() != 20 {
+            return None;
         }
+        let mut bytes = [0u8; 20];
+        bytes.copy_from_slice(&body.to);
+        Some(Address::from(bytes))
+    }
+}
+
+#[async_trait]
+impl<S> CustodyAddressLookup for HubUserHydrator<S>
+where
+    S: proto::hub_service_server::HubService + Send + Sync + 'static,
+{
+    async fn get_custody_address(&self, fid: u64) -> Option<Address> {
+        self.fetch_custody_address(fid).await
     }
 }

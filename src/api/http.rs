@@ -8,6 +8,7 @@ use crate::api::conversations::{Conversation as ConversationData, ConversationEr
 use crate::api::feeds::{FeedError, FeedHandler};
 use crate::api::indexer::Indexer;
 use crate::api::metrics::MetricsIndexer;
+use crate::api::notifications::{NotificationSendHandler, NotificationWebhookHandler};
 use crate::api::search::SearchIndexer;
 use crate::api::social_graph::SocialGraphIndexer;
 use crate::api::types::{
@@ -16,6 +17,7 @@ use crate::api::types::{
     ConversationResponse, ErrorResponse, FeedResponse, Follower, FollowersResponse, NextCursor,
     User, UserProfile, VerifiedAddresses,
 };
+use crate::api::webhooks::WebhookManagementHandler;
 use async_trait::async_trait;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
@@ -66,6 +68,15 @@ pub struct ApiHttpHandler {
     feeds: Arc<std::sync::RwLock<Option<Arc<dyn FeedHandler>>>>,
     search: Arc<std::sync::RwLock<Option<Arc<SearchIndexer>>>>,
     user_hydrator: Arc<std::sync::RwLock<Option<Arc<dyn UserHydrator>>>>,
+    /// Webhook management handler. Late-bound because it needs the user
+    /// hydrator (set after construction) for custody address lookups.
+    webhooks: Arc<std::sync::RwLock<Option<WebhookManagementHandler>>>,
+    /// Mini app notification webhook receiver. Set when notifications
+    /// are enabled and the JFS lookup is wired up.
+    notifications: Arc<std::sync::RwLock<Option<NotificationWebhookHandler>>>,
+    /// Mini app notification send endpoint. Set when notifications are
+    /// enabled and a send_api_key is configured.
+    notification_sender: Arc<std::sync::RwLock<Option<NotificationSendHandler>>>,
 }
 
 impl ApiHttpHandler {
@@ -83,7 +94,25 @@ impl ApiHttpHandler {
             feeds: Arc::new(std::sync::RwLock::new(None)),
             search: Arc::new(std::sync::RwLock::new(None)),
             user_hydrator: Arc::new(std::sync::RwLock::new(None)),
+            webhooks: Arc::new(std::sync::RwLock::new(None)),
+            notifications: Arc::new(std::sync::RwLock::new(None)),
+            notification_sender: Arc::new(std::sync::RwLock::new(None)),
         }
+    }
+
+    /// Install the webhook management handler (callable after construction).
+    pub fn set_webhooks(&self, handler: WebhookManagementHandler) {
+        *self.webhooks.write().unwrap() = Some(handler);
+    }
+
+    /// Install the mini app notification webhook handler.
+    pub fn set_notification_webhooks(&self, handler: NotificationWebhookHandler) {
+        *self.notifications.write().unwrap() = Some(handler);
+    }
+
+    /// Install the mini app notification send handler.
+    pub fn set_notification_sender(&self, handler: NotificationSendHandler) {
+        *self.notification_sender.write().unwrap() = Some(handler);
     }
 
     /// Set the conversation handler (callable after construction).
@@ -108,6 +137,29 @@ impl ApiHttpHandler {
 
     /// Check if this handler can handle the given request.
     pub fn can_handle(&self, method: &Method, path: &str) -> bool {
+        // Webhook management endpoints accept POST/PUT/DELETE/GET when the
+        // webhook system is configured.
+        if self.webhooks.read().unwrap().is_some()
+            && WebhookManagementHandler::can_handle(method, path)
+        {
+            return true;
+        }
+
+        // Mini app notification webhook receivers accept POST when
+        // notifications are configured.
+        if self.notifications.read().unwrap().is_some()
+            && NotificationWebhookHandler::can_handle(method, path)
+        {
+            return true;
+        }
+
+        // Mini app notification send endpoint.
+        if self.notification_sender.read().unwrap().is_some()
+            && NotificationSendHandler::can_handle(method, path)
+        {
+            return true;
+        }
+
         if method != Method::GET {
             return false;
         }
@@ -159,6 +211,46 @@ impl ApiHttpHandler {
         &self,
         req: Request<hyper::body::Incoming>,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        // Webhook management endpoints need to read the request body and
+        // headers, so route them before the GET-only path matching below.
+        if WebhookManagementHandler::can_handle(req.method(), req.uri().path()) {
+            let webhook_handler = self.webhooks.read().unwrap().clone();
+            if let Some(handler) = webhook_handler {
+                return Ok(handler.handle(req).await);
+            }
+            return Ok(Self::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Webhooks not enabled",
+            ));
+        }
+
+        // Mini app notification webhook receiver: POSTs from clients
+        // with JFS-signed events. Routed before the GET path matcher
+        // since it consumes the body.
+        if NotificationWebhookHandler::can_handle(req.method(), req.uri().path()) {
+            let handler = self.notifications.read().unwrap().clone();
+            if let Some(handler) = handler {
+                return Ok(handler.handle(req).await);
+            }
+            return Ok(Self::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Mini app notifications not enabled",
+            ));
+        }
+
+        // Mini app notification send endpoint: developer POSTs a
+        // notification payload + recipient filter, we fan out.
+        if NotificationSendHandler::can_handle(req.method(), req.uri().path()) {
+            let handler = self.notification_sender.read().unwrap().clone();
+            if let Some(handler) = handler {
+                return Ok(handler.handle(req).await);
+            }
+            return Ok(Self::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Mini app notification sending not enabled",
+            ));
+        }
+
         let path = req.uri().path().trim_end_matches('/');
         let query = req.uri().query().unwrap_or("");
 

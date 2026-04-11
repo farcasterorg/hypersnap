@@ -150,7 +150,29 @@ async fn start_servers(
             service.clone(),
             social_graph_for_hydrator,
         ));
+        // Hold a CustodyAddressLookup view of the hydrator before erasing
+        // it as `dyn UserHydrator`, so the webhook auth verifier can reuse
+        // the same hub-service-backed lookup path.
+        let custody_lookup: Arc<dyn snapchain::api::webhooks::CustodyAddressLookup> =
+            hydrator.clone();
         handler.set_user_hydrator(hydrator);
+
+        // Optional: webhook management API.
+        if app_config.api.webhooks.enabled {
+            let store = Arc::new(snapchain::api::webhooks::WebhookStore::new(
+                block_stores.db.clone(),
+            ));
+            let auth = snapchain::api::webhooks::WebhookAuthVerifier::new(
+                custody_lookup,
+                app_config.api.webhooks.signed_at_window_secs,
+            );
+            let webhook_handler = snapchain::api::webhooks::WebhookManagementHandler::new(
+                app_config.api.webhooks.clone(),
+                store,
+                auth,
+            );
+            handler.set_webhooks(webhook_handler);
+        }
     }
 
     let replication_service = if let Some(replicator) = replicator {
@@ -630,6 +652,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 node.block_stores.db.clone(),
                 hub_event_senders,
                 node.shard_stores.clone(),
+                Some(statsd_client.clone()),
             )
         };
 
@@ -915,6 +938,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 node.block_stores.db.clone(),
                 hub_event_senders,
                 node.shard_stores.clone(),
+                Some(statsd_client.clone()),
             )
         };
 

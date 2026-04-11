@@ -36,6 +36,14 @@ pub struct ApiConfig {
     /// AI-powered features (summaries).
     #[serde(default)]
     pub ai: AiConfig,
+
+    /// Outbound webhooks for real-time event delivery.
+    #[serde(default)]
+    pub webhooks: WebhooksConfig,
+
+    /// Mini app push notifications.
+    #[serde(default)]
+    pub notifications: NotificationsConfig,
 }
 
 impl Default for ApiConfig {
@@ -49,6 +57,8 @@ impl Default for ApiConfig {
             feeds: FeedConfig::default(),
             conversations: ConversationConfig::default(),
             ai: AiConfig::default(),
+            webhooks: WebhooksConfig::default(),
+            notifications: NotificationsConfig::default(),
         }
     }
 }
@@ -338,6 +348,229 @@ pub enum AiProvider {
     OpenAi,
     Anthropic,
     Local,
+}
+
+/// Configuration for outbound webhooks.
+///
+/// Webhooks let third parties subscribe to filtered Farcaster event streams
+/// (cast.created, follow.created, reaction.created, etc.) and receive HTTP
+/// POST deliveries with HMAC-SHA512 signatures.
+///
+/// Webhook ownership is per-FID, gated on an EIP-712 signature from the FID's
+/// custody address. See `src/api/webhooks/mod.rs` for the wire format.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WebhooksConfig {
+    /// Whether the webhook system is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Maximum webhooks any single FID may register.
+    #[serde(default = "default_max_webhooks_per_owner")]
+    pub max_webhooks_per_owner: usize,
+
+    /// Per-delivery HTTP timeout (seconds).
+    #[serde(default = "default_delivery_timeout_secs")]
+    pub delivery_timeout_secs: u64,
+
+    /// Number of concurrent in-flight deliveries across the worker pool.
+    #[serde(default = "default_delivery_concurrency")]
+    pub delivery_concurrency: usize,
+
+    /// Maximum retry attempts for transient delivery failures.
+    #[serde(default = "default_retry_max_attempts")]
+    pub retry_max_attempts: u32,
+
+    /// Initial backoff for retries (milliseconds, doubles each attempt).
+    #[serde(default = "default_retry_initial_backoff_ms")]
+    pub retry_initial_backoff_ms: u64,
+
+    /// HTTP header name for the HMAC-SHA512 signature.
+    #[serde(default = "default_signature_header")]
+    pub signature_header_name: String,
+
+    /// Default per-webhook rate limit (events per `default_rate_limit_duration_secs`).
+    #[serde(default = "default_rate_limit")]
+    pub default_rate_limit: u32,
+
+    /// Default rate limit window (seconds).
+    #[serde(default = "default_rate_limit_duration_secs")]
+    pub default_rate_limit_duration_secs: u64,
+
+    /// Maximum acceptable skew between client `signed_at` and server clock (seconds).
+    #[serde(default = "default_signed_at_window_secs")]
+    pub signed_at_window_secs: u64,
+
+    /// When `webhook.rotate_secret` is called, existing secrets are
+    /// marked with `expires_at = now + secret_grace_period_secs` so
+    /// receivers have time to switch over. Default 24 hours.
+    #[serde(default = "default_secret_grace_period_secs")]
+    pub secret_grace_period_secs: u64,
+
+    /// Permit webhook target URLs to resolve to loopback addresses
+    /// (`127.0.0.0/8`, `::1`). **Off by default** — only enable this
+    /// for local development against a webhook receiver running on
+    /// the same host as hypersnap. RFC 1918, link-local, and other
+    /// internal ranges are still blocked even with this set.
+    #[serde(default)]
+    pub allow_loopback_targets: bool,
+}
+
+impl Default for WebhooksConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_webhooks_per_owner: default_max_webhooks_per_owner(),
+            delivery_timeout_secs: default_delivery_timeout_secs(),
+            delivery_concurrency: default_delivery_concurrency(),
+            retry_max_attempts: default_retry_max_attempts(),
+            retry_initial_backoff_ms: default_retry_initial_backoff_ms(),
+            signature_header_name: default_signature_header(),
+            default_rate_limit: default_rate_limit(),
+            default_rate_limit_duration_secs: default_rate_limit_duration_secs(),
+            signed_at_window_secs: default_signed_at_window_secs(),
+            secret_grace_period_secs: default_secret_grace_period_secs(),
+            allow_loopback_targets: false,
+        }
+    }
+}
+
+impl WebhooksConfig {
+    /// Translate the `allow_loopback_targets` flag into the SSRF policy
+    /// the delivery worker passes to [`crate::api::ssrf::assert_safe_url`].
+    pub fn ssrf_policy(&self) -> crate::api::ssrf::SsrfPolicy {
+        if self.allow_loopback_targets {
+            crate::api::ssrf::SsrfPolicy::AllowLoopback
+        } else {
+            crate::api::ssrf::SsrfPolicy::Strict
+        }
+    }
+}
+
+fn default_max_webhooks_per_owner() -> usize {
+    25
+}
+fn default_delivery_timeout_secs() -> u64 {
+    10
+}
+fn default_delivery_concurrency() -> usize {
+    16
+}
+fn default_retry_max_attempts() -> u32 {
+    5
+}
+fn default_retry_initial_backoff_ms() -> u64 {
+    500
+}
+fn default_signature_header() -> String {
+    "X-Hypersnap-Signature".to_string()
+}
+fn default_rate_limit() -> u32 {
+    1000
+}
+fn default_rate_limit_duration_secs() -> u64 {
+    60
+}
+fn default_signed_at_window_secs() -> u64 {
+    300
+}
+fn default_secret_grace_period_secs() -> u64 {
+    86_400
+}
+
+/// Configuration for mini app push notifications.
+///
+/// Hypersnap acts as a multi-tenant notification proxy: each registered
+/// mini app gets a per-app webhook URL where Farcaster clients deliver
+/// `miniapp_added`/`notifications_enabled` events (JFS-signed). Hypersnap
+/// stores `(fid, notification_url, token)` and exposes a send endpoint
+/// that fans out to client notification URLs in batches.
+///
+/// See `src/api/notifications/mod.rs` for the wire format.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct NotificationsConfig {
+    /// Whether the notification system is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// API key required to call the send endpoint (header `x-api-key`).
+    /// If `None`, the send endpoint is disabled.
+    #[serde(default)]
+    pub send_api_key: Option<String>,
+
+    /// Mini apps registered for notification delivery.
+    #[serde(default)]
+    pub apps: Vec<MiniAppConfig>,
+
+    /// Maximum concurrent fan-out POSTs.
+    #[serde(default = "default_send_concurrency")]
+    pub send_concurrency: usize,
+
+    /// `(fid, notificationId)` dedupe TTL (seconds). Spec mandates 24h.
+    #[serde(default = "default_dedupe_ttl_secs")]
+    pub dedupe_ttl_secs: u64,
+
+    /// Per-fan-out HTTP timeout (seconds).
+    #[serde(default = "default_send_timeout_secs")]
+    pub send_timeout_secs: u64,
+
+    /// Permit notification URLs to resolve to loopback addresses
+    /// (`127.0.0.0/8`, `::1`). Off by default; only enable for local
+    /// development against a notification receiver running on the
+    /// same host.
+    #[serde(default)]
+    pub allow_loopback_targets: bool,
+}
+
+impl NotificationsConfig {
+    /// Translate the `allow_loopback_targets` flag into the SSRF
+    /// policy used by the receiver and sender.
+    pub fn ssrf_policy(&self) -> crate::api::ssrf::SsrfPolicy {
+        if self.allow_loopback_targets {
+            crate::api::ssrf::SsrfPolicy::AllowLoopback
+        } else {
+            crate::api::ssrf::SsrfPolicy::Strict
+        }
+    }
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            send_api_key: None,
+            apps: Vec::new(),
+            send_concurrency: default_send_concurrency(),
+            dedupe_ttl_secs: default_dedupe_ttl_secs(),
+            send_timeout_secs: default_send_timeout_secs(),
+            allow_loopback_targets: false,
+        }
+    }
+}
+
+/// A registered mini app for which Hypersnap proxies notifications.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MiniAppConfig {
+    /// Stable identifier used in the URL path: `/v2/farcaster/frame/webhook/<app_id>`
+    /// and `/v2/farcaster/frame/notifications/<app_id>`.
+    pub app_id: String,
+
+    /// Mini app's canonical URL (used for logging and validation only).
+    pub app_url: String,
+
+    /// Optional allowlist of signer FIDs whose JFS-signed events we accept.
+    /// If empty, any valid signer is accepted.
+    #[serde(default)]
+    pub signer_fid_allowlist: Vec<u64>,
+}
+
+fn default_send_concurrency() -> usize {
+    32
+}
+fn default_dedupe_ttl_secs() -> u64 {
+    86_400
+}
+fn default_send_timeout_secs() -> u64 {
+    10
 }
 
 #[cfg(test)]

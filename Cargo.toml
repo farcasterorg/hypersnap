@@ -111,6 +111,9 @@ solar-config = "=0.1.1"
 nix = { version = "0.29", features = ["resource"] }
 svm-rs-builds = "0.5.22"
 tikv-jemallocator = "0.6"
+uuid = { version = "1.10", features = ["v4", "serde"] }
+hmac = "0.12.1"
+regex = "1.11"
 
 
 [dev-dependencies]
