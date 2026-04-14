@@ -19,7 +19,7 @@ use crate::api::types::{
     ChannelMember, ChannelMemberListResponse, ChannelResponse, ChannelsResponse, Conversation,
     ConversationResponse, Embed, ErrorResponse, FeedResponse, FnameAvailabilityResponse,
     FollowersResponse, NextCursor, Notification, NotificationsResponse, OnChainEventEntry,
-    OnChainEventsResponse, ParentAuthor, Reaction, ReactionCastRef, ReactionsResponse,
+    OnChainEventsResponse, ParentAuthor, Reaction, ReactionsResponse,
     StorageAllocation, StorageAllocationsResponse, StorageUsage, StorageUsageResponse, User,
     UserProfile, UserResponse, UsernameProofResponse, VerifiedAddresses,
 };
@@ -993,9 +993,27 @@ impl ApiHttpHandler {
                     .get("feed_type")
                     .map(|s| s.as_str())
                     .unwrap_or("following");
-                let fid: Option<u64> = params.get("fid").and_then(|s| s.parse().ok());
-                self.handle_feed(feed_type, fid, cursor.as_deref(), limit)
-                    .await
+                match feed_type {
+                    "filter" => {
+                        let fids_str = match params.get("fids") {
+                            Some(f) => f.clone(),
+                            None => {
+                                return Ok(Self::error_response(
+                                    StatusCode::BAD_REQUEST,
+                                    "fids parameter required for filter feed",
+                                ))
+                            }
+                        };
+                        self.handle_filter_feed(&fids_str, cursor.as_deref(), limit)
+                            .await
+                    }
+                    _ => {
+                        let fid: Option<u64> =
+                            params.get("fid").and_then(|s| s.parse().ok());
+                        self.handle_feed(feed_type, fid, cursor.as_deref(), limit)
+                            .await
+                    }
+                }
             }
             "/v2/farcaster/feed/following" => {
                 let fid: u64 = require_fid!(params);
@@ -2241,6 +2259,126 @@ impl ApiHttpHandler {
         }
     }
 
+    /// Handle GET /v2/farcaster/feed?feed_type=filter&filter_type=fids&fids=1,2,3
+    ///
+    /// Multi-user feed: fetches casts from a list of FIDs, merge-sorts by
+    /// timestamp (newest first), and hydrates only the top `limit` results.
+    async fn handle_filter_feed(
+        &self,
+        fids_str: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        let hub = self.hub_query.read().unwrap().clone();
+        let Some(hub) = hub else {
+            return Ok(Self::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Hub query service not available",
+            ));
+        };
+
+        let fids: Vec<u64> = fids_str
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .take(100)
+            .collect();
+
+        if fids.is_empty() {
+            return Ok(Self::error_response(
+                StatusCode::BAD_REQUEST,
+                "fids parameter must contain valid FIDs",
+            ));
+        }
+
+        let cursor_ts: Option<u32> = cursor.and_then(|c| c.parse().ok());
+
+        // Phase 1: Collect raw messages into a max-heap (newest first).
+        // Only raw Messages go into the heap — hydration is deferred to phase 2
+        // so we don't waste work on casts that get discarded after merge-sort.
+        use std::collections::BinaryHeap;
+
+        struct TsCast {
+            ts: u32,
+            fid: u64,
+            msg: crate::proto::Message,
+        }
+        impl Eq for TsCast {}
+        impl PartialEq for TsCast {
+            fn eq(&self, other: &Self) -> bool {
+                self.ts == other.ts && self.fid == other.fid
+            }
+        }
+        impl Ord for TsCast {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                self.ts
+                    .cmp(&other.ts)
+                    .then_with(|| self.fid.cmp(&other.fid))
+            }
+        }
+        impl PartialOrd for TsCast {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+
+        let mut heap: BinaryHeap<TsCast> = BinaryHeap::new();
+
+        for &fid in &fids {
+            match hub.get_casts_by_fid(fid, limit, None, true).await {
+                Ok((messages, _)) => {
+                    for msg in messages {
+                        let ts = msg.data.as_ref().map(|d| d.timestamp).unwrap_or(0);
+                        if let Some(before) = cursor_ts {
+                            if ts >= before {
+                                continue;
+                            }
+                        }
+                        heap.push(TsCast { ts, fid, msg });
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+
+        // Phase 2: Pop only `limit` items from the heap, hydrate only those.
+        let mut casts = Vec::with_capacity(limit);
+        let mut last_ts = None;
+
+        while let Some(tc) = heap.pop() {
+            if casts.len() >= limit {
+                break;
+            }
+            let mut cast = self.message_to_cast(&tc.msg).await;
+            if let Some(ref metrics) = self.metrics {
+                if let Ok(m) = metrics.get_cast_metrics(tc.fid, &tc.msg.hash) {
+                    cast.reactions = CastReactions {
+                        likes_count: m.likes,
+                        recasts_count: m.recasts,
+                        likes: Vec::new(),
+                        recasts: Vec::new(),
+                    };
+                    cast.replies = CastReplies { count: m.replies };
+                }
+            }
+            last_ts = Some(tc.ts);
+            casts.push(cast);
+        }
+
+        let next_cursor = if !heap.is_empty() {
+            last_ts.map(|ts| ts.to_string())
+        } else {
+            None
+        };
+
+        let response = FeedResponse {
+            casts,
+            next: NextCursor {
+                cursor: next_cursor,
+            },
+        };
+        Ok(Self::json_response(StatusCode::OK, &response))
+    }
+
     /// Handle GET /v2/farcaster/channel/all?limit=N&cursor=X
     async fn handle_channel_all(
         &self,
@@ -2490,6 +2628,27 @@ impl ApiHttpHandler {
                     .and_then(|idx| idx.get_fid_by_hash(&hash))
             })
             .unwrap_or(0);
+        // Hydrate the target cast once — all reactions point to the same cast.
+        let target_cast: Option<Cast> = if let Some(msg) =
+            hub.get_cast_by_hash(&hash, Some(target_fid)).await
+        {
+            let mut cast = self.message_to_cast(&msg).await;
+            if let Some(ref metrics) = self.metrics {
+                if let Ok(m) = metrics.get_cast_metrics(target_fid, &hash) {
+                    cast.reactions = CastReactions {
+                        likes_count: m.likes,
+                        recasts_count: m.recasts,
+                        likes: Vec::new(),
+                        recasts: Vec::new(),
+                    };
+                    cast.replies = CastReplies { count: m.replies };
+                }
+            }
+            Some(cast)
+        } else {
+            None
+        };
+
         match hub
             .get_reactions_by_cast(target_fid, &hash, reaction_type, limit)
             .await
@@ -2512,10 +2671,7 @@ impl ApiHttpHandler {
                             reaction_type: reaction_type_str.to_string(),
                             reaction_timestamp: format_timestamp(data.timestamp),
                             user,
-                            cast: Some(ReactionCastRef {
-                                hash: hash_str.to_string(),
-                                fid: target_fid,
-                            }),
+                            cast: target_cast.clone(),
                         });
                     }
                 }
@@ -2561,14 +2717,28 @@ impl ApiHttpHandler {
                 for msg in &messages {
                     if let Some(data) = &msg.data {
                         let user = self.get_user(data.fid).await;
-                        let cast_ref = match &data.body {
+                        // Hydrate the full target cast per Neynar ReactionWithCastInfo schema.
+                        let hydrated_cast = match &data.body {
                             Some(crate::proto::message_data::Body::ReactionBody(body)) => {
                                 match &body.target {
                                     Some(crate::proto::reaction_body::Target::TargetCastId(id)) => {
-                                        Some(ReactionCastRef {
-                                            hash: hex::encode(&id.hash),
-                                            fid: id.fid,
-                                        })
+                                        if let Some(cast_msg) = hub.get_cast_by_hash(&id.hash, Some(id.fid)).await {
+                                            let mut cast = self.message_to_cast(&cast_msg).await;
+                                            if let Some(ref metrics) = self.metrics {
+                                                if let Ok(m) = metrics.get_cast_metrics(id.fid, &id.hash) {
+                                                    cast.reactions = CastReactions {
+                                                        likes_count: m.likes,
+                                                        recasts_count: m.recasts,
+                                                        likes: Vec::new(),
+                                                        recasts: Vec::new(),
+                                                    };
+                                                    cast.replies = CastReplies { count: m.replies };
+                                                }
+                                            }
+                                            Some(cast)
+                                        } else {
+                                            None // cast was deleted
+                                        }
                                     }
                                     _ => None,
                                 }
@@ -2588,7 +2758,7 @@ impl ApiHttpHandler {
                             reaction_type: rt_str.to_string(),
                             reaction_timestamp: format_timestamp(data.timestamp),
                             user,
-                            cast: cast_ref,
+                            cast: hydrated_cast,
                         });
                     }
                 }
