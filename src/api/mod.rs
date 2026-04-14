@@ -715,13 +715,27 @@ async fn run_search_backfill(
     );
 }
 
-const BLOCK_BACKFILL_CHECKPOINT: &str = "api_block_backfill";
 const BLOCK_BACKFILL_BATCH: u64 = 100;
+
+/// Per-indexer per-shard checkpoint name prefix. The backfill stores one
+/// checkpoint per (indexer, shard) so that adding a new indexer later
+/// triggers a fresh backfill only for that indexer instead of being
+/// silently skipped by a shared already-complete flag.
+fn backfill_checkpoint_name(indexer_name: &str) -> String {
+    format!("api_block_backfill:{}", indexer_name)
+}
 
 /// Backfill all indexers by replaying shard chunks (blocks) from genesis.
 ///
 /// Unlike the event-based backfill, this reads directly from the block store
 /// which contains the full history even on snapshot-loaded nodes.
+///
+/// Each indexer has its own per-shard checkpoint. The loop iterates blocks
+/// once per shard starting from the minimum checkpoint across all indexers,
+/// and only dispatches events to indexers whose individual checkpoint is at
+/// or below the current block height. That way, adding a new indexer later
+/// causes only that indexer to replay from genesis; already-caught-up
+/// indexers skip batches for heights they've already processed.
 async fn run_block_backfill(
     db: &crate::storage::db::RocksDB,
     shard_stores: &HashMap<u32, Stores>,
@@ -736,7 +750,15 @@ async fn run_block_backfill(
             None => continue,
         };
 
-        let checkpoint = backfill::load_shard_checkpoint(db, BLOCK_BACKFILL_CHECKPOINT, shard_id);
+        // Load each indexer's per-shard checkpoint. If it's missing (0),
+        // that indexer has never backfilled and will replay from height 0.
+        let mut per_indexer_checkpoint: Vec<u64> = indexers
+            .iter()
+            .map(|idx| {
+                backfill::load_shard_checkpoint(db, &backfill_checkpoint_name(idx.name()), shard_id)
+            })
+            .collect();
+
         let max_height = match stores.shard_store.max_block_number() {
             Ok(h) => h,
             Err(e) => {
@@ -745,26 +767,41 @@ async fn run_block_backfill(
             }
         };
 
-        if checkpoint > max_height {
+        // Determine the lowest checkpoint across all enabled indexers —
+        // this is where we start reading blocks.
+        let min_checkpoint = per_indexer_checkpoint
+            .iter()
+            .zip(indexers.iter())
+            .filter_map(|(cp, idx)| if idx.is_enabled() { Some(*cp) } else { None })
+            .min()
+            .unwrap_or(0);
+
+        if min_checkpoint > max_height {
             tracing::info!(
                 shard_id,
-                checkpoint,
+                min_checkpoint,
                 max_height,
                 "API backfill already complete for shard"
             );
             continue;
         }
 
-        tracing::info!(
-            shard_id,
-            from = checkpoint,
-            to = max_height,
-            "Starting API block backfill"
-        );
+        // Log which indexers actually need to catch up.
+        for (i, idx) in indexers.iter().enumerate() {
+            if idx.is_enabled() && per_indexer_checkpoint[i] <= max_height {
+                tracing::info!(
+                    shard_id,
+                    indexer = idx.name(),
+                    from = per_indexer_checkpoint[i],
+                    to = max_height,
+                    "Indexer starting block backfill"
+                );
+            }
+        }
 
         let start = std::time::Instant::now();
         let mut messages_processed: u64 = 0;
-        let mut height = checkpoint;
+        let mut height = min_checkpoint;
 
         while height <= max_height {
             let end = (height + BLOCK_BACKFILL_BATCH).min(max_height);
@@ -777,6 +814,12 @@ async fn run_block_backfill(
             };
 
             if chunks.is_empty() {
+                // Advance any indexer that's still behind this height.
+                for cp in per_indexer_checkpoint.iter_mut() {
+                    if *cp < end + 1 {
+                        *cp = end + 1;
+                    }
+                }
                 height = end + 1;
                 continue;
             }
@@ -795,32 +838,47 @@ async fn run_block_backfill(
                 let event = IndexEvent::messages(batch_messages.clone(), shard_id, 0);
                 let events = [event];
 
-                for indexer in &indexers {
-                    if indexer.is_enabled() {
-                        if let Err(e) = indexer.process_batch(&events).await {
-                            tracing::warn!(
-                                shard_id,
-                                indexer = indexer.name(),
-                                error = %e,
-                                "Indexer batch error during block backfill"
-                            );
-                        }
+                // Dispatch only to indexers whose per-shard checkpoint is
+                // at or below the current height — skip the ones already
+                // past this range.
+                for (i, indexer) in indexers.iter().enumerate() {
+                    if !indexer.is_enabled() {
+                        continue;
+                    }
+                    if per_indexer_checkpoint[i] > height {
+                        continue; // already past this block range
+                    }
+                    if let Err(e) = indexer.process_batch(&events).await {
+                        tracing::warn!(
+                            shard_id,
+                            indexer = indexer.name(),
+                            error = %e,
+                            "Indexer batch error during block backfill"
+                        );
                     }
                 }
 
                 messages_processed += batch_messages.len() as u64;
             }
 
+            // Advance indexer checkpoints that are still within this range.
+            for cp in per_indexer_checkpoint.iter_mut() {
+                if *cp < end + 1 {
+                    *cp = end + 1;
+                }
+            }
             height = end + 1;
 
-            // Checkpoint periodically
+            // Persist checkpoints periodically.
             if height % (BLOCK_BACKFILL_BATCH * 10) == 0 || height > max_height {
-                let _ = backfill::save_shard_checkpoint(
-                    db,
-                    BLOCK_BACKFILL_CHECKPOINT,
-                    shard_id,
-                    height,
-                );
+                for (i, idx) in indexers.iter().enumerate() {
+                    let _ = backfill::save_shard_checkpoint(
+                        db,
+                        &backfill_checkpoint_name(idx.name()),
+                        shard_id,
+                        per_indexer_checkpoint[i],
+                    );
+                }
             }
 
             // Progress logging
@@ -843,13 +901,17 @@ async fn run_block_backfill(
             }
         }
 
-        // Final checkpoint
-        let _ = backfill::save_shard_checkpoint(
-            db,
-            BLOCK_BACKFILL_CHECKPOINT,
-            shard_id,
-            max_height + 1,
-        );
+        // Final checkpoint persist for every indexer.
+        for (i, idx) in indexers.iter().enumerate() {
+            let final_cp = max_height + 1;
+            per_indexer_checkpoint[i] = final_cp;
+            let _ = backfill::save_shard_checkpoint(
+                db,
+                &backfill_checkpoint_name(idx.name()),
+                shard_id,
+                final_cp,
+            );
+        }
 
         // Update each indexer's own checkpoint so stats() reflects progress
         for indexer in &indexers {

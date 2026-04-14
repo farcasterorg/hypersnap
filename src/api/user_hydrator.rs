@@ -60,16 +60,56 @@ where
             followed_at: None,
         };
 
-        // Fetch user data (username, display name, pfp, bio)
-        self.populate_user_data(fid, &mut user).await;
+        // Fire the three independent hub reads in parallel — they each
+        // hit different stores, so there's no contention.
+        let (ud, verifications, custody) = tokio::join!(
+            self.fetch_user_data(fid),
+            self.fetch_verifications(fid),
+            self.fetch_custody_info(fid),
+        );
 
-        // Fetch verifications
-        self.populate_verifications(fid, &mut user).await;
+        if let Some(fields) = ud {
+            if let Some(v) = fields.username {
+                user.username = v;
+            }
+            user.display_name = fields.display_name;
+            user.pfp_url = fields.pfp_url;
+            if let Some(bio) = fields.bio {
+                user.profile.bio.text = bio;
+            }
+        }
 
-        // Fetch custody address
-        self.populate_custody_address(fid, &mut user).await;
+        for (addr, proto) in verifications {
+            user.verifications.push(addr.clone());
+            match proto {
+                Some(Protocol::Ethereum) => {
+                    user.verified_addresses.eth_addresses.push(addr.clone());
+                    if user.verified_addresses.primary.eth_address.is_none() {
+                        user.verified_addresses.primary.eth_address = Some(addr);
+                    }
+                }
+                Some(Protocol::Solana) => {
+                    user.verified_addresses.sol_addresses.push(addr.clone());
+                    if user.verified_addresses.primary.sol_address.is_none() {
+                        user.verified_addresses.primary.sol_address = Some(addr);
+                    }
+                }
+                _ => {}
+            }
+        }
 
-        // Fetch follower/following counts from social graph index
+        if let Some(info) = custody {
+            user.custody_address = format!("0x{}", hex::encode(info.address.as_slice()));
+            if info.block_timestamp > 0 {
+                user.registered_at =
+                    chrono::DateTime::from_timestamp(info.block_timestamp as i64, 0)
+                        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+                        .unwrap_or_default();
+            }
+        }
+
+        // Follower/following counts are direct RocksDB gets on the
+        // API-layer index — no gRPC round-trip.
         if let Some(ref sg) = self.social_graph {
             if let Ok(count) = sg.get_follower_count(fid) {
                 user.follower_count = count;
@@ -83,28 +123,34 @@ where
     }
 
     async fn hydrate_users(&self, fids: &[u64]) -> Vec<User> {
-        let mut users = Vec::with_capacity(fids.len());
-        for &fid in fids {
+        // Parallelize: N independent hydrations can run concurrently.
+        let futures = fids.iter().map(|&fid| async move {
             match self.hydrate_user(fid).await {
-                Some(user) => users.push(user),
-                None => {
-                    users.push(User {
-                        fid,
-                        username: format!("fid:{}", fid),
-                        ..Default::default()
-                    });
-                }
+                Some(user) => user,
+                None => User {
+                    fid,
+                    username: format!("fid:{}", fid),
+                    ..Default::default()
+                },
             }
-        }
-        users
+        });
+        futures::future::join_all(futures).await
     }
+}
+
+/// Extracted user-data fields from a single `get_user_data_by_fid` call.
+struct UserDataFields {
+    username: Option<String>,
+    display_name: Option<String>,
+    pfp_url: Option<String>,
+    bio: Option<String>,
 }
 
 impl<S> HubUserHydrator<S>
 where
     S: proto::hub_service_server::HubService + Send + Sync + 'static,
 {
-    async fn populate_user_data(&self, fid: u64, user: &mut User) {
+    async fn fetch_user_data(&self, fid: u64) -> Option<UserDataFields> {
         let request = Request::new(proto::FidRequest {
             fid,
             page_size: None,
@@ -112,8 +158,13 @@ where
             reverse: None,
         });
 
-        let Ok(response) = self.hub_service.get_user_data_by_fid(request).await else {
-            return;
+        let response = self.hub_service.get_user_data_by_fid(request).await.ok()?;
+
+        let mut fields = UserDataFields {
+            username: None,
+            display_name: None,
+            pfp_url: None,
+            bio: None,
         };
 
         for message in &response.get_ref().messages {
@@ -125,24 +176,20 @@ where
             };
 
             match UserDataType::try_from(body.r#type) {
-                Ok(UserDataType::Username) => {
-                    user.username = body.value.clone();
-                }
-                Ok(UserDataType::Display) => {
-                    user.display_name = Some(body.value.clone());
-                }
-                Ok(UserDataType::Pfp) => {
-                    user.pfp_url = Some(body.value.clone());
-                }
-                Ok(UserDataType::Bio) => {
-                    user.profile.bio.text = body.value.clone();
-                }
+                Ok(UserDataType::Username) => fields.username = Some(body.value.clone()),
+                Ok(UserDataType::Display) => fields.display_name = Some(body.value.clone()),
+                Ok(UserDataType::Pfp) => fields.pfp_url = Some(body.value.clone()),
+                Ok(UserDataType::Bio) => fields.bio = Some(body.value.clone()),
                 _ => {}
             }
         }
+
+        Some(fields)
     }
 
-    async fn populate_verifications(&self, fid: u64, user: &mut User) {
+    /// Returns `(formatted_address, protocol)` pairs. Solana addresses
+    /// are returned pre-encoded in base58.
+    async fn fetch_verifications(&self, fid: u64) -> Vec<(String, Option<Protocol>)> {
         let request = Request::new(proto::FidRequest {
             fid,
             page_size: None,
@@ -151,9 +198,10 @@ where
         });
 
         let Ok(response) = self.hub_service.get_verifications_by_fid(request).await else {
-            return;
+            return Vec::new();
         };
 
+        let mut out = Vec::new();
         for message in &response.get_ref().messages {
             let Some(data) = &message.data else {
                 continue;
@@ -162,40 +210,14 @@ where
                 continue;
             };
 
-            let addr = format!("0x{}", hex::encode(&body.address));
-            user.verifications.push(addr.clone());
-
-            match Protocol::try_from(body.protocol) {
-                Ok(Protocol::Ethereum) => {
-                    user.verified_addresses.eth_addresses.push(addr.clone());
-                    if user.verified_addresses.primary.eth_address.is_none() {
-                        user.verified_addresses.primary.eth_address = Some(addr);
-                    }
-                }
-                Ok(Protocol::Solana) => {
-                    // Solana addresses are base58, not hex
-                    let sol_addr = bs58::encode(&body.address).into_string();
-                    user.verified_addresses.sol_addresses.push(sol_addr.clone());
-                    if user.verified_addresses.primary.sol_address.is_none() {
-                        user.verified_addresses.primary.sol_address = Some(sol_addr);
-                    }
-                }
-                _ => {}
-            }
+            let proto_enum = Protocol::try_from(body.protocol).ok();
+            let addr = match proto_enum {
+                Some(Protocol::Solana) => bs58::encode(&body.address).into_string(),
+                _ => format!("0x{}", hex::encode(&body.address)),
+            };
+            out.push((addr, proto_enum));
         }
-    }
-
-    async fn populate_custody_address(&self, fid: u64, user: &mut User) {
-        if let Some(info) = self.fetch_custody_info(fid).await {
-            user.custody_address = format!("0x{}", hex::encode(info.address.as_slice()));
-            // Populate registered_at from the on-chain event block timestamp.
-            if info.block_timestamp > 0 {
-                user.registered_at =
-                    chrono::DateTime::from_timestamp(info.block_timestamp as i64, 0)
-                        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
-                        .unwrap_or_default();
-            }
-        }
+        out
     }
 
     /// Fetch the FID's current custody address along with the on-chain

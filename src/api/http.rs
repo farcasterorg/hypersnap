@@ -1558,12 +1558,25 @@ impl ApiHttpHandler {
                     ))
                 }
             };
-            // Resolve FID from hash via cast hash index (O(1) lookup)
-            let resolved_fid = self
+            // Resolve FID from hash. Try the O(1) index first; if the
+            // index hasn't indexed this cast yet (or doesn't have it for
+            // any other reason), fall back to the hub's cast-by-hash
+            // lookup, which scans shards but works.
+            let mut resolved_fid = self
                 .cast_hash_index
                 .as_ref()
                 .and_then(|idx| idx.get_fid_by_hash(&hash))
                 .unwrap_or(0);
+            if resolved_fid == 0 {
+                let hub = self.hub_query.read().unwrap().clone();
+                if let Some(hub) = hub {
+                    if let Some(msg) = hub.get_cast_by_hash(&hash, None).await {
+                        if let Some(data) = &msg.data {
+                            resolved_fid = data.fid;
+                        }
+                    }
+                }
+            }
             if resolved_fid == 0 {
                 return Ok(Self::error_response(
                     StatusCode::NOT_FOUND,
@@ -1854,10 +1867,16 @@ impl ApiHttpHandler {
             .map(|b| b.mentions_positions.clone())
             .unwrap_or_default();
 
-        let mut mentioned_profiles = Vec::new();
-        let mut mentioned_profiles_ranges = Vec::new();
-        for (i, &mention_fid) in mentions.iter().enumerate() {
-            mentioned_profiles.push(self.get_user(mention_fid).await);
+        // Hydrate author + all mentioned profiles in parallel. Each
+        // hydration is a set of gRPC calls that are independent across
+        // FIDs, so we fan them out concurrently rather than serially.
+        let author_fut = self.get_user(fid);
+        let mention_futs: Vec<_> = mentions.iter().map(|&mf| self.get_user(mf)).collect();
+        let (author, mentioned_profiles_vec) =
+            tokio::join!(author_fut, futures::future::join_all(mention_futs),);
+        let mentioned_profiles = mentioned_profiles_vec;
+        let mut mentioned_profiles_ranges = Vec::with_capacity(mentions.len());
+        for i in 0..mentions.len() {
             let start = mention_positions.get(i).copied().unwrap_or(0);
             mentioned_profiles_ranges.push(types::TextRange { start, end: start });
         }
@@ -1889,7 +1908,6 @@ impl ApiHttpHandler {
             })
             .unwrap_or_default();
 
-        let author = self.get_user(fid).await;
         Cast {
             object: "cast".to_string(),
             hash: hex::encode(&hash),
@@ -2910,6 +2928,12 @@ impl ApiHttpHandler {
         if let Some(ref chi) = self.cast_hash_index {
             emit("cast_hash", chi.as_ref());
         }
+        if let Some(ref cqi) = self.cast_quotes_index {
+            emit("cast_quotes", cqi.as_ref());
+        }
+        if let Some(ref udi) = self.user_data_index {
+            emit("user_data", udi.as_ref());
+        }
     }
 
     /// Handle GET /v2/farcaster/_status/backfill
@@ -2943,6 +2967,12 @@ impl ApiHttpHandler {
         }
         if let Some(ref chi) = self.cast_hash_index {
             indexers.push(collect("cast_hash", chi.as_ref()));
+        }
+        if let Some(ref cqi) = self.cast_quotes_index {
+            indexers.push(collect("cast_quotes", cqi.as_ref()));
+        }
+        if let Some(ref udi) = self.user_data_index {
+            indexers.push(collect("user_data", udi.as_ref()));
         }
         {
             let search = self.search.read().unwrap().clone();
