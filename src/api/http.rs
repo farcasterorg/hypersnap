@@ -19,7 +19,7 @@ use crate::api::types::{
     ChannelMember, ChannelMemberListResponse, ChannelResponse, ChannelsResponse, Conversation,
     ConversationResponse, Embed, ErrorResponse, FeedResponse, FnameAvailabilityResponse,
     FollowersResponse, NextCursor, Notification, NotificationsResponse, OnChainEventEntry,
-    OnChainEventsResponse, ParentAuthor, Reaction, ReactionsResponse,
+    OnChainEventsResponse, ParentAuthor, Reaction, ReactionCastRef, ReactionsResponse,
     StorageAllocation, StorageAllocationsResponse, StorageUsage, StorageUsageResponse, User,
     UserProfile, UserResponse, UsernameProofResponse, VerifiedAddresses,
 };
@@ -2628,27 +2628,6 @@ impl ApiHttpHandler {
                     .and_then(|idx| idx.get_fid_by_hash(&hash))
             })
             .unwrap_or(0);
-        // Hydrate the target cast once — all reactions point to the same cast.
-        let target_cast: Option<Cast> = if let Some(msg) =
-            hub.get_cast_by_hash(&hash, Some(target_fid)).await
-        {
-            let mut cast = self.message_to_cast(&msg).await;
-            if let Some(ref metrics) = self.metrics {
-                if let Ok(m) = metrics.get_cast_metrics(target_fid, &hash) {
-                    cast.reactions = CastReactions {
-                        likes_count: m.likes,
-                        recasts_count: m.recasts,
-                        likes: Vec::new(),
-                        recasts: Vec::new(),
-                    };
-                    cast.replies = CastReplies { count: m.replies };
-                }
-            }
-            Some(cast)
-        } else {
-            None
-        };
-
         match hub
             .get_reactions_by_cast(target_fid, &hash, reaction_type, limit)
             .await
@@ -2671,7 +2650,10 @@ impl ApiHttpHandler {
                             reaction_type: reaction_type_str.to_string(),
                             reaction_timestamp: format_timestamp(data.timestamp),
                             user,
-                            cast: target_cast.clone(),
+                            cast: Some(ReactionCastRef {
+                                hash: hash_str.to_string(),
+                                fid: target_fid,
+                            }),
                         });
                     }
                 }
@@ -2717,28 +2699,14 @@ impl ApiHttpHandler {
                 for msg in &messages {
                     if let Some(data) = &msg.data {
                         let user = self.get_user(data.fid).await;
-                        // Hydrate the full target cast per Neynar ReactionWithCastInfo schema.
-                        let hydrated_cast = match &data.body {
+                        let cast_ref = match &data.body {
                             Some(crate::proto::message_data::Body::ReactionBody(body)) => {
                                 match &body.target {
                                     Some(crate::proto::reaction_body::Target::TargetCastId(id)) => {
-                                        if let Some(cast_msg) = hub.get_cast_by_hash(&id.hash, Some(id.fid)).await {
-                                            let mut cast = self.message_to_cast(&cast_msg).await;
-                                            if let Some(ref metrics) = self.metrics {
-                                                if let Ok(m) = metrics.get_cast_metrics(id.fid, &id.hash) {
-                                                    cast.reactions = CastReactions {
-                                                        likes_count: m.likes,
-                                                        recasts_count: m.recasts,
-                                                        likes: Vec::new(),
-                                                        recasts: Vec::new(),
-                                                    };
-                                                    cast.replies = CastReplies { count: m.replies };
-                                                }
-                                            }
-                                            Some(cast)
-                                        } else {
-                                            None // cast was deleted
-                                        }
+                                        Some(ReactionCastRef {
+                                            hash: hex::encode(&id.hash),
+                                            fid: id.fid,
+                                        })
                                     }
                                     _ => None,
                                 }
@@ -2758,7 +2726,7 @@ impl ApiHttpHandler {
                             reaction_type: rt_str.to_string(),
                             reaction_timestamp: format_timestamp(data.timestamp),
                             user,
-                            cast: hydrated_cast,
+                            cast: cast_ref,
                         });
                     }
                 }

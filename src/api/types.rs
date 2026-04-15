@@ -433,9 +433,6 @@ pub struct ReactionsResponse {
 }
 
 /// A reaction object matching Farcaster v2 API schema.
-/// The `cast` field contains the full hydrated Cast object per the Neynar
-/// `ReactionWithCastInfo` schema. It is `None` when the target cast has
-/// been deleted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Reaction {
     pub object: String,
@@ -443,7 +440,14 @@ pub struct Reaction {
     pub reaction_timestamp: String,
     pub user: User,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cast: Option<Cast>,
+    pub cast: Option<ReactionCastRef>,
+}
+
+/// Minimal cast reference in a reaction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReactionCastRef {
+    pub hash: String,
+    pub fid: u64,
 }
 
 /// Response for channel listing.
