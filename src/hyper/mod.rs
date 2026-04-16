@@ -29,6 +29,11 @@ impl StateContext {
     pub const fn is_hyper(self) -> bool {
         matches!(self, StateContext::Hyper)
     }
+
+    /// Convenience inverse of [`is_hyper`].
+    pub const fn is_legacy(self) -> bool {
+        matches!(self, StateContext::Legacy)
+    }
 }
 
 /// Capability advertised during peer handshakes to signal that
@@ -64,6 +69,22 @@ impl HyperConfig {
 
     pub fn retention_soft_cap(&self) -> Option<u64> {
         self.retention_soft_cap
+    }
+
+    /// Builder-style setter for `retention_soft_cap`.
+    ///
+    /// Useful for constructing configs in tests and tooling without
+    /// having to spell out every field:
+    ///
+    /// ```
+    /// # use crate::hyper::HyperConfig;
+    /// let cfg = HyperConfig { enabled: true, ..HyperConfig::default() }
+    ///     .with_retention_cap(Some(1_000_000));
+    /// assert_eq!(cfg.retention_soft_cap(), Some(1_000_000));
+    /// ```
+    pub fn with_retention_cap(mut self, cap: Option<u64>) -> Self {
+        self.retention_soft_cap = cap;
+        self
     }
 }
 
@@ -106,6 +127,33 @@ impl HyperDiffReport {
             .unwrap_or(false)
             || self.retained_message_delta != 0
     }
+
+    /// Returns `true` when the report contains at least one human-readable note.
+    pub fn has_notes(&self) -> bool {
+        !self.notes.is_empty()
+    }
+
+    /// Returns `true` if any note contains the given substring.
+    ///
+    /// Useful for asserting specific conditions in tests and alerting
+    /// pipelines without iterating externally.
+    pub fn notes_contain(&self, substr: &str) -> bool {
+        self.notes.iter().any(|n| n.contains(substr))
+    }
+
+    /// Returns a single-line human-readable summary of the report,
+    /// suitable for logging and metrics labels.
+    ///
+    /// Format: `block=<id> diverged=<bool> delta=<delta> notes=<count>`
+    pub fn summary(&self) -> String {
+        format!(
+            "block={} diverged={} delta={} notes={}",
+            self.block_id,
+            self.diverged(),
+            self.retained_message_delta,
+            self.notes.len(),
+        )
+    }
 }
 
 impl From<HyperBlockMetadata> for proto::HyperBlockMetadata {
@@ -117,68 +165,6 @@ impl From<HyperBlockMetadata> for proto::HyperBlockMetadata {
             extra_rules_version: value.extra_rules_version,
             retained_message_count: value.retained_message_count,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn state_context_helpers() {
-        assert_eq!(StateContext::Legacy.namespace_prefix(), b"legacy");
-        assert!(StateContext::Legacy.allows_pruning());
-        assert!(!StateContext::Legacy.is_hyper());
-
-        assert_eq!(StateContext::Hyper.namespace_prefix(), b"hyper");
-        assert!(!StateContext::Hyper.allows_pruning());
-        assert!(StateContext::Hyper.is_hyper());
-    }
-
-    #[test]
-    fn hyper_config_defaults_and_accessors() {
-        let cfg = HyperConfig::default();
-        assert!(!cfg.can_start_pipeline());
-        assert_eq!(cfg.retention_soft_cap(), None);
-
-        let cfg = HyperConfig {
-            enabled: true,
-            retention_soft_cap: Some(42),
-            metrics_interval: Duration::from_secs(10),
-        };
-        assert!(cfg.can_start_pipeline());
-        assert_eq!(cfg.retention_soft_cap(), Some(42));
-        assert_eq!(cfg.metrics_interval, Duration::from_secs(10));
-    }
-
-    #[test]
-    fn hyper_envelope_round_trips_to_proto() {
-        let metadata = HyperBlockMetadata {
-            canonical_block_id: 99,
-            parent_hash: vec![0xaa, 0xbb],
-            hyper_state_root: vec![0x01, 0x02],
-            extra_rules_version: 3,
-            retained_message_count: 7,
-        };
-        let envelope = HyperEnvelope {
-            metadata: metadata.clone(),
-            payload: vec![0x10, 0x20, 0x30],
-        };
-
-        let proto_envelope: proto::HyperEnvelope = envelope.clone().into();
-        assert_eq!(proto_envelope.payload, envelope.payload);
-        assert_eq!(
-            proto_envelope.metadata.as_ref().unwrap().canonical_block_id,
-            metadata.canonical_block_id
-        );
-        assert_eq!(
-            proto_envelope
-                .metadata
-                .as_ref()
-                .unwrap()
-                .retained_message_count,
-            metadata.retained_message_count
-        );
     }
 }
 
@@ -203,7 +189,6 @@ pub fn build_envelope_for_block(block: &proto::Block, hyper_state_root: Vec<u8>)
         .as_ref()
         .map(|header| header.parent_hash.clone())
         .unwrap_or_default();
-
     HyperEnvelope {
         metadata: HyperBlockMetadata {
             canonical_block_id,
@@ -213,5 +198,117 @@ pub fn build_envelope_for_block(block: &proto::Block, hyper_state_root: Vec<u8>)
             retained_message_count: block.transactions.len() as u64,
         },
         payload: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_context_helpers() {
+        assert_eq!(StateContext::Legacy.namespace_prefix(), b"legacy");
+        assert!(StateContext::Legacy.allows_pruning());
+        assert!(!StateContext::Legacy.is_hyper());
+        assert!(StateContext::Legacy.is_legacy());
+
+        assert_eq!(StateContext::Hyper.namespace_prefix(), b"hyper");
+        assert!(!StateContext::Hyper.allows_pruning());
+        assert!(StateContext::Hyper.is_hyper());
+        assert!(!StateContext::Hyper.is_legacy());
+    }
+
+    #[test]
+    fn hyper_config_defaults_and_accessors() {
+        let cfg = HyperConfig::default();
+        assert!(!cfg.can_start_pipeline());
+        assert_eq!(cfg.retention_soft_cap(), None);
+
+        let cfg = HyperConfig {
+            enabled: true,
+            retention_soft_cap: Some(42),
+            metrics_interval: Duration::from_secs(10),
+        };
+        assert!(cfg.can_start_pipeline());
+        assert_eq!(cfg.retention_soft_cap(), Some(42));
+        assert_eq!(cfg.metrics_interval, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn hyper_config_with_retention_cap_builder() {
+        let cfg = HyperConfig {
+            enabled: true,
+            ..HyperConfig::default()
+        }
+        .with_retention_cap(Some(1_000_000));
+        assert!(cfg.can_start_pipeline());
+        assert_eq!(cfg.retention_soft_cap(), Some(1_000_000));
+
+        let cfg2 = HyperConfig::default().with_retention_cap(None);
+        assert_eq!(cfg2.retention_soft_cap(), None);
+    }
+
+    #[test]
+    fn hyper_envelope_round_trips_to_proto() {
+        let metadata = HyperBlockMetadata {
+            canonical_block_id: 99,
+            parent_hash: vec![0xaa, 0xbb],
+            hyper_state_root: vec![0x01, 0x02],
+            extra_rules_version: 3,
+            retained_message_count: 7,
+        };
+        let envelope = HyperEnvelope {
+            metadata: metadata.clone(),
+            payload: vec![0x10, 0x20, 0x30],
+        };
+        let proto_envelope: proto::HyperEnvelope = envelope.clone().into();
+        assert_eq!(proto_envelope.payload, envelope.payload);
+        assert_eq!(
+            proto_envelope.metadata.as_ref().unwrap().canonical_block_id,
+            metadata.canonical_block_id
+        );
+        assert_eq!(
+            proto_envelope
+                .metadata
+                .as_ref()
+                .unwrap()
+                .retained_message_count,
+            metadata.retained_message_count
+        );
+    }
+
+    #[test]
+    fn hyper_diff_report_helpers() {
+        let mut report = HyperDiffReport {
+            block_id: 42,
+            legacy_state_root: Some(vec![0x01]),
+            hyper_state_root: vec![0x01],
+            retained_message_delta: 0,
+            notes: vec![],
+        };
+
+        // No divergence, no notes.
+        assert!(!report.diverged());
+        assert!(!report.has_notes());
+        assert!(!report.notes_contain("pruned"));
+        assert_eq!(report.summary(), "block=42 diverged=false delta=0 notes=0");
+
+        // Add a note and verify helpers.
+        report.notes.push("pruned 5 messages in legacy store".to_string());
+        assert!(report.has_notes());
+        assert!(report.notes_contain("pruned"));
+        assert!(!report.notes_contain("missing"));
+        assert_eq!(report.summary(), "block=42 diverged=false delta=0 notes=1");
+
+        // Trigger divergence via state root mismatch.
+        report.hyper_state_root = vec![0x02];
+        assert!(report.diverged());
+        assert_eq!(report.summary(), "block=42 diverged=true delta=0 notes=1");
+
+        // Trigger divergence via delta.
+        report.hyper_state_root = vec![0x01];
+        report.retained_message_delta = -3;
+        assert!(report.diverged());
+        assert_eq!(report.summary(), "block=42 diverged=true delta=-3 notes=1");
     }
 }
