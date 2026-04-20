@@ -397,6 +397,7 @@ impl ApiHttpHandler {
                 "/v2/farcaster/batch/following"
                     | "/v2/farcaster/batch/reactions"
                     | "/v2/farcaster/batch/cast-interactions"
+                    | "/v2/farcaster/batch/cast-bodies"
                     | "/v2/farcaster/batch/signers"
                     | "/v2/farcaster/batch/id-registrations"
                     // Write action endpoints
@@ -704,6 +705,9 @@ impl ApiHttpHandler {
                 }
                 (Method::POST, "/v2/farcaster/batch/cast-interactions") => {
                     self.handle_batch_cast_interactions_batch(&body_bytes).await
+                }
+                (Method::POST, "/v2/farcaster/batch/cast-bodies") => {
+                    self.handle_batch_cast_bodies_batch(&body_bytes).await
                 }
                 (Method::POST, "/v2/farcaster/batch/signers") => {
                     self.handle_batch_signers_batch(&body_bytes).await
@@ -3882,6 +3886,94 @@ impl ApiHttpHandler {
                                     }
                                 }
                             }
+                        }
+                        match next_token {
+                            Some(t) if !t.is_empty() => page_token = Some(t),
+                            _ => break,
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            results.insert(fid, entries);
+        }
+        Ok(Self::json_response(StatusCode::OK, &results))
+    }
+
+    /// Full cast bodies per FID. Returns all CastAdd messages from each FID,
+    /// with text, embed URLs, mentions, parent-cast reference, timestamp, and
+    /// cast hash. Used by tools that need text-level analysis (e.g. SimHash
+    /// fingerprinting) that the metadata-only `/batch/cast-interactions`
+    /// endpoint does not expose.
+    async fn handle_batch_cast_bodies_batch(
+        &self,
+        body: &[u8],
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        let fids = match Self::parse_batch_fids(body) {
+            Ok(f) => f,
+            Err(e) => return Ok(Self::error_response(StatusCode::BAD_REQUEST, &e)),
+        };
+        let hub = self.hub_query.read().unwrap().clone();
+        let Some(hub) = hub else {
+            return Ok(Self::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Hub query not available",
+            ));
+        };
+
+        let mut results: HashMap<u64, Vec<serde_json::Value>> = HashMap::new();
+        for fid in fids {
+            let mut entries = Vec::new();
+            let mut page_token: Option<Vec<u8>> = None;
+            loop {
+                match hub
+                    .get_casts_by_fid(fid, 500, page_token.clone(), false)
+                    .await
+                {
+                    Ok((messages, next_token)) => {
+                        for msg in &messages {
+                            let Some(data) = &msg.data else { continue };
+                            if data.r#type != crate::proto::MessageType::CastAdd as i32 {
+                                continue;
+                            }
+                            let Some(crate::proto::message_data::Body::CastAddBody(cast_body)) =
+                                &data.body
+                            else {
+                                continue;
+                            };
+                            let (parent_fid, parent_hash) = match &cast_body.parent {
+                                Some(crate::proto::cast_add_body::Parent::ParentCastId(id)) => {
+                                    (Some(id.fid), Some(hex::encode(&id.hash)))
+                                }
+                                _ => (None, None),
+                            };
+                            let embeds: Vec<serde_json::Value> = cast_body
+                                .embeds
+                                .iter()
+                                .filter_map(|e| match &e.embed {
+                                    Some(crate::proto::embed::Embed::Url(u)) => {
+                                        Some(serde_json::json!({ "url": u }))
+                                    }
+                                    Some(crate::proto::embed::Embed::CastId(id)) => {
+                                        Some(serde_json::json!({
+                                            "cast_id": {
+                                                "fid": id.fid,
+                                                "hash": hex::encode(&id.hash),
+                                            }
+                                        }))
+                                    }
+                                    None => None,
+                                })
+                                .collect();
+                            entries.push(serde_json::json!({
+                                "hash": hex::encode(&msg.hash),
+                                "text": cast_body.text,
+                                "parent_fid": parent_fid,
+                                "parent_hash": parent_hash,
+                                "mentions": cast_body.mentions,
+                                "embeds": embeds,
+                                "timestamp": data.timestamp,
+                            }));
                         }
                         match next_token {
                             Some(t) if !t.is_empty() => page_token = Some(t),

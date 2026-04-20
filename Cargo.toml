@@ -116,6 +116,7 @@ tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 uuid = { version = "1.10", features = ["v4", "serde"] }
 hmac = "0.12.1"
 regex = "1.11"
+twox-hash = "1.6"
 
 
 [dev-dependencies]
