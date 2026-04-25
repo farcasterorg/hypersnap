@@ -1,4 +1,7 @@
+pub mod backfill;
+
 use crate::proto;
+use crate::storage::constants::RootPrefix;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -28,6 +31,29 @@ impl StateContext {
 
     pub const fn is_hyper(self) -> bool {
         matches!(self, StateContext::Hyper)
+    }
+
+    /// Map a RootPrefix to the appropriate value for this context.
+    ///
+    /// Legacy context returns the original prefix (snapchain-compatible).
+    /// Hyper context returns the shadow prefix for user-data key spaces,
+    /// keeping non-user infrastructure prefixes unchanged.
+    pub fn root_prefix(self, prefix: RootPrefix) -> u8 {
+        if self.is_hyper() {
+            match prefix {
+                RootPrefix::User => RootPrefix::HyperUser as u8,
+                RootPrefix::CastsByParent => RootPrefix::HyperCastsByParent as u8,
+                RootPrefix::CastsByMention => RootPrefix::HyperCastsByMention as u8,
+                RootPrefix::LinksByTarget => RootPrefix::HyperLinksByTarget as u8,
+                RootPrefix::ReactionsByTarget => RootPrefix::HyperReactionsByTarget as u8,
+                RootPrefix::VerificationByAddress => RootPrefix::HyperVerificationByAddress as u8,
+                RootPrefix::UserNameProofByName => RootPrefix::HyperUserNameProofByName as u8,
+                RootPrefix::LendStorageByRecipient => RootPrefix::HyperLendStorageByRecipient as u8,
+                other => other as u8,
+            }
+        } else {
+            prefix as u8
+        }
     }
 }
 

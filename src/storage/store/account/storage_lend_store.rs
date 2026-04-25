@@ -1,7 +1,8 @@
+use crate::hyper::StateContext;
 use tracing::warn;
 
 use super::{
-    make_user_key,
+    make_user_key_with_prefix,
     store::{Store, StoreDef},
     StoreEventHandler,
 };
@@ -76,7 +77,11 @@ impl StoreDef for StorageLendStoreDef {
     }
 
     #[inline]
-    fn make_add_key(&self, message: &proto::Message) -> Result<Vec<u8>, HubError> {
+    fn make_add_key(
+        &self,
+        message: &proto::Message,
+        ctx: StateContext,
+    ) -> Result<Vec<u8>, HubError> {
         let to_fid = match &message.data.as_ref().unwrap().body {
             Some(Body::LendStorageBody(lend_storage_body)) => lend_storage_body.to_fid,
             _ => {
@@ -86,7 +91,11 @@ impl StoreDef for StorageLendStoreDef {
                 })
             }
         };
-        let key = Self::make_storage_lend_primary_key(message.data.as_ref().unwrap().fid, to_fid);
+        let key = Self::make_storage_lend_primary_key_with_prefix(
+            ctx.root_prefix(RootPrefix::User),
+            message.data.as_ref().unwrap().fid,
+            to_fid,
+        );
         Ok(key)
     }
 
@@ -95,8 +104,12 @@ impl StoreDef for StorageLendStoreDef {
         txn: &mut RocksDbTransactionBatch,
         _ts_hash: &[u8; TS_HASH_LENGTH],
         message: &proto::Message,
+        ctx: StateContext,
     ) -> Result<(), HubError> {
-        if let Ok(secondary_key) = Self::by_borrower_secondary_index_key(message) {
+        if let Ok(secondary_key) = Self::by_borrower_secondary_index_key_with_prefix(
+            ctx.root_prefix(RootPrefix::LendStorageByRecipient),
+            message,
+        ) {
             txn.put(secondary_key, vec![TRUE_VALUE]);
         }
         Ok(())
@@ -107,8 +120,12 @@ impl StoreDef for StorageLendStoreDef {
         txn: &mut RocksDbTransactionBatch,
         _ts_hash: &[u8; TS_HASH_LENGTH],
         message: &proto::Message,
+        ctx: StateContext,
     ) -> Result<(), HubError> {
-        let to_fid_key = Self::by_borrower_secondary_index_key(message);
+        let to_fid_key = Self::by_borrower_secondary_index_key_with_prefix(
+            ctx.root_prefix(RootPrefix::LendStorageByRecipient),
+            message,
+        );
 
         if let Ok(to_fid_key) = to_fid_key {
             txn.delete(to_fid_key);
@@ -118,7 +135,11 @@ impl StoreDef for StorageLendStoreDef {
     }
 
     #[inline]
-    fn make_remove_key(&self, _message: &proto::Message) -> Result<Vec<u8>, HubError> {
+    fn make_remove_key(
+        &self,
+        _message: &proto::Message,
+        _ctx: StateContext,
+    ) -> Result<Vec<u8>, HubError> {
         Err(HubError {
             code: "bad_request.invalid_param".to_string(),
             message: "removes not supported".to_string(),
@@ -126,7 +147,11 @@ impl StoreDef for StorageLendStoreDef {
     }
 
     #[inline]
-    fn make_compact_state_add_key(&self, _message: &proto::Message) -> Result<Vec<u8>, HubError> {
+    fn make_compact_state_add_key(
+        &self,
+        _message: &proto::Message,
+        _ctx: StateContext,
+    ) -> Result<Vec<u8>, HubError> {
         Err(HubError {
             code: "bad_request.invalid_param".to_string(),
             message: "StorageLendStore doesn't support compact state".to_string(),
@@ -134,7 +159,11 @@ impl StoreDef for StorageLendStoreDef {
     }
 
     #[inline]
-    fn make_compact_state_prefix(&self, _fid: u64) -> Result<Vec<u8>, HubError> {
+    fn make_compact_state_prefix(
+        &self,
+        _fid: u64,
+        _ctx: StateContext,
+    ) -> Result<Vec<u8>, HubError> {
         Err(HubError {
             code: "bad_request.invalid_param".to_string(),
             message: "StorageLendStore doesn't support compact state".to_string(),
@@ -150,8 +179,17 @@ impl StoreDef for StorageLendStoreDef {
 impl StorageLendStoreDef {
     #[inline]
     fn make_storage_lend_primary_key(from_fid: u64, to_fid: u64) -> Vec<u8> {
+        Self::make_storage_lend_primary_key_with_prefix(RootPrefix::User as u8, from_fid, to_fid)
+    }
+
+    #[inline]
+    fn make_storage_lend_primary_key_with_prefix(
+        root_prefix: u8,
+        from_fid: u64,
+        to_fid: u64,
+    ) -> Vec<u8> {
         let mut key = vec![];
-        key.extend(make_user_key(from_fid));
+        key.extend(make_user_key_with_prefix(root_prefix, from_fid));
         key.push(UserPostfix::LendStorages as u8);
         key.extend(make_fid_key(to_fid));
 
@@ -159,6 +197,16 @@ impl StorageLendStoreDef {
     }
 
     fn by_borrower_secondary_index_key(message: &proto::Message) -> Result<Vec<u8>, HubError> {
+        Self::by_borrower_secondary_index_key_with_prefix(
+            RootPrefix::LendStorageByRecipient as u8,
+            message,
+        )
+    }
+
+    fn by_borrower_secondary_index_key_with_prefix(
+        root_prefix: u8,
+        message: &proto::Message,
+    ) -> Result<Vec<u8>, HubError> {
         let to_fid = match &message.data.as_ref().unwrap().body {
             Some(Body::LendStorageBody(lend_storage_body)) => lend_storage_body.to_fid,
             _ => {
@@ -170,7 +218,7 @@ impl StorageLendStoreDef {
         };
 
         let mut key = vec![];
-        key.push(RootPrefix::LendStorageByRecipient as u8);
+        key.push(root_prefix);
         key.extend(make_fid_key(to_fid));
         key.extend(make_fid_key(message.fid()));
         Ok(key)

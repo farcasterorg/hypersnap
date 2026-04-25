@@ -220,17 +220,46 @@ impl StoreLimits {
 
 impl Stores {
     pub fn with_state_context(&self, ctx: StateContext) -> Self {
+        // Hyper shadow stores must not persist HubEvents — they share the
+        // same RocksDB and would create duplicate event entries.
+        let hyper_handler = if ctx == StateContext::Hyper {
+            StoreEventHandler::new_no_persist()
+        } else {
+            self.event_handler.clone()
+        };
+
         Self {
             block_event_store: self.block_event_store.clone(),
             shard_store: self.shard_store.clone(),
-            cast_store: self.cast_store.with_state_context(ctx),
-            link_store: self.link_store.with_state_context(ctx),
-            reaction_store: self.reaction_store.with_state_context(ctx),
-            user_data_store: self.user_data_store.with_state_context(ctx),
-            verification_store: self.verification_store.with_state_context(ctx),
+            cast_store: self
+                .cast_store
+                .with_state_context(ctx)
+                .with_event_handler(hyper_handler.clone()),
+            link_store: self
+                .link_store
+                .with_state_context(ctx)
+                .with_event_handler(hyper_handler.clone()),
+            reaction_store: self
+                .reaction_store
+                .with_state_context(ctx)
+                .with_event_handler(hyper_handler.clone()),
+            user_data_store: self
+                .user_data_store
+                .with_state_context(ctx)
+                .with_event_handler(hyper_handler.clone()),
+            verification_store: self
+                .verification_store
+                .with_state_context(ctx)
+                .with_event_handler(hyper_handler.clone()),
             onchain_event_store: self.onchain_event_store.with_state_context(ctx),
-            username_proof_store: self.username_proof_store.with_state_context(ctx),
-            storage_lend_store: self.storage_lend_store.with_state_context(ctx),
+            username_proof_store: self
+                .username_proof_store
+                .with_state_context(ctx)
+                .with_event_handler(hyper_handler.clone()),
+            storage_lend_store: self
+                .storage_lend_store
+                .with_state_context(ctx)
+                .with_event_handler(hyper_handler),
             db: self.db.clone(),
             trie: self.trie.clone(),
             store_limits: self.store_limits.clone(),

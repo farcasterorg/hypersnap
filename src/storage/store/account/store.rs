@@ -1,8 +1,10 @@
 use super::{
     super::super::util::{bytes_compare, vec_to_u8_24},
-    delete_message_transaction, get_from_db_or_txn, get_message, get_messages_page_by_prefix,
-    is_message_in_time_range, make_message_primary_key, make_ts_hash, message_decode,
-    message_encode, put_message_transaction, MessagesPage, StoreEventHandler, TS_HASH_LENGTH,
+    delete_message_transaction, delete_message_transaction_with_prefix, get_from_db_or_txn,
+    get_message, get_message_with_prefix, get_messages_page_by_prefix, is_message_in_time_range,
+    make_message_primary_key, make_message_primary_key_with_prefix, make_ts_hash, message_decode,
+    message_encode, put_message_transaction, put_message_transaction_with_prefix, MessagesPage,
+    StoreEventHandler, TS_HASH_LENGTH,
 };
 use crate::core::error::HubError;
 use crate::core::message::HubEventExt;
@@ -66,6 +68,7 @@ pub trait StoreDef: Send + Sync {
         _txn: &mut RocksDbTransactionBatch,
         _ts_hash: &[u8; TS_HASH_LENGTH],
         _message: &Message,
+        _ctx: StateContext,
     ) -> Result<(), HubError> {
         Ok(())
     }
@@ -76,14 +79,19 @@ pub trait StoreDef: Send + Sync {
         _txn: &mut RocksDbTransactionBatch,
         _ts_hash: &[u8; TS_HASH_LENGTH],
         _message: &Message,
+        _ctx: StateContext,
     ) -> Result<(), HubError> {
         Ok(())
     }
 
-    fn make_add_key(&self, message: &Message) -> Result<Vec<u8>, HubError>;
-    fn make_remove_key(&self, message: &Message) -> Result<Vec<u8>, HubError>;
-    fn make_compact_state_add_key(&self, message: &Message) -> Result<Vec<u8>, HubError>;
-    fn make_compact_state_prefix(&self, fid: u64) -> Result<Vec<u8>, HubError>;
+    fn make_add_key(&self, message: &Message, ctx: StateContext) -> Result<Vec<u8>, HubError>;
+    fn make_remove_key(&self, message: &Message, ctx: StateContext) -> Result<Vec<u8>, HubError>;
+    fn make_compact_state_add_key(
+        &self,
+        message: &Message,
+        ctx: StateContext,
+    ) -> Result<Vec<u8>, HubError>;
+    fn make_compact_state_prefix(&self, fid: u64, ctx: StateContext) -> Result<Vec<u8>, HubError>;
 
     fn get_prune_size_limit(&self) -> u32;
 
@@ -93,11 +101,12 @@ pub trait StoreDef: Send + Sync {
         txn: &RocksDbTransactionBatch,
         message: &Message,
         ts_hash: &[u8; TS_HASH_LENGTH],
+        ctx: StateContext,
     ) -> Result<Vec<Message>, HubError> {
         let mut conflicts = vec![];
 
         if self.remove_type_supported() {
-            let remove_key = self.make_remove_key(message)?;
+            let remove_key = self.make_remove_key(message, ctx)?;
             let remove_ts_hash = get_from_db_or_txn(db, txn, &remove_key)?;
 
             if remove_ts_hash.is_some() {
@@ -120,9 +129,10 @@ pub trait StoreDef: Send + Sync {
 
                 // If the existing remove has a lower order than the new message, retrieve the full
                 // Remove message and delete it as part of the RocksDB transaction
-                let maybe_existing_remove = get_message(
+                let maybe_existing_remove = get_message_with_prefix(
                     &db,
                     txn,
+                    ctx.root_prefix(crate::storage::constants::RootPrefix::User),
                     message.data.as_ref().unwrap().fid,
                     self.postfix(),
                     &vec_to_u8_24(&remove_ts_hash)?,
@@ -140,7 +150,7 @@ pub trait StoreDef: Send + Sync {
         }
 
         // Check if there is an add timestamp hash for this
-        let add_key = self.make_add_key(message)?;
+        let add_key = self.make_add_key(message, ctx)?;
         let add_ts_hash = get_from_db_or_txn(db, txn, &add_key)?;
 
         if add_ts_hash.is_some() {
@@ -166,9 +176,10 @@ pub trait StoreDef: Send + Sync {
 
             // If the existing add has a lower order than the new message, retrieve the full
             // Add message and delete it as part of the RocksDB transaction
-            let maybe_existing_add = get_message(
+            let maybe_existing_add = get_message_with_prefix(
                 &db,
                 txn,
+                ctx.root_prefix(crate::storage::constants::RootPrefix::User),
                 message.data.as_ref().unwrap().fid,
                 self.postfix(),
                 &vec_to_u8_24(&add_ts_hash)?,
@@ -333,8 +344,24 @@ impl<T: StoreDef + Clone> Store<T> {
         }
     }
 
+    pub fn with_event_handler(&self, handler: Arc<StoreEventHandler>) -> Store<T> {
+        Store {
+            store_def: self.store_def.clone(),
+            store_event_handler: handler,
+            db: self.db.clone(),
+            store_opts: self.store_opts.clone(),
+            state_context: self.state_context,
+        }
+    }
+
     pub fn state_context(&self) -> StateContext {
         self.state_context
+    }
+
+    /// Root prefix byte for the User key space in this context.
+    fn user_prefix(&self) -> u8 {
+        self.state_context
+            .root_prefix(crate::storage::constants::RootPrefix::User)
     }
 
     pub fn store_def(&self) -> T {
@@ -372,16 +399,19 @@ impl<T: StoreDef + Clone> Store<T> {
             Some(txn) => txn,
             None => &RocksDbTransactionBatch::new(),
         };
-        let adds_key = self.store_def.make_add_key(partial_message)?;
+        let adds_key = self
+            .store_def
+            .make_add_key(partial_message, self.state_context)?;
         let message_ts_hash = get_from_db_or_txn(&self.db, txn, &adds_key)?;
 
         if message_ts_hash.is_none() {
             return Ok(None);
         }
 
-        get_message(
+        get_message_with_prefix(
             &self.db,
             txn,
+            self.user_prefix(),
             partial_message.data.as_ref().unwrap().fid,
             self.store_def.postfix(),
             &vec_to_u8_24(&message_ts_hash)?,
@@ -405,16 +435,19 @@ impl<T: StoreDef + Clone> Store<T> {
         }
 
         let txn = &RocksDbTransactionBatch::new();
-        let removes_key = self.store_def.make_remove_key(partial_message)?;
+        let removes_key = self
+            .store_def
+            .make_remove_key(partial_message, self.state_context)?;
         let message_ts_hash = get_from_db_or_txn(&self.db, txn, &removes_key)?;
 
         if message_ts_hash.is_none() {
             return Ok(None);
         }
 
-        get_message(
+        get_message_with_prefix(
             &self.db,
             txn,
+            self.user_prefix(),
             partial_message.data.as_ref().unwrap().fid,
             self.store_def.postfix(),
             &vec_to_u8_24(&message_ts_hash)?,
@@ -430,7 +463,12 @@ impl<T: StoreDef + Clone> Store<T> {
     where
         F: Fn(&Message) -> bool,
     {
-        let prefix = make_message_primary_key(fid, self.store_def.postfix(), None);
+        let prefix = make_message_primary_key_with_prefix(
+            self.user_prefix(),
+            fid,
+            self.store_def.postfix(),
+            None,
+        );
         let messages_page =
             get_messages_page_by_prefix(&self.db, &prefix, &page_options, |message| {
                 self.store_def.is_add_type(&message)
@@ -456,7 +494,12 @@ impl<T: StoreDef + Clone> Store<T> {
             });
         }
 
-        let prefix = make_message_primary_key(fid, self.store_def.postfix(), None);
+        let prefix = make_message_primary_key_with_prefix(
+            self.user_prefix(),
+            fid,
+            self.store_def.postfix(),
+            None,
+        );
         let messages = get_messages_page_by_prefix(&self.db, &prefix, &page_options, |message| {
             self.store_def.is_remove_type(&message)
                 && filter.as_ref().map(|f| f(&message)).unwrap_or(true)
@@ -477,7 +520,9 @@ impl<T: StoreDef + Clone> Store<T> {
             });
         }
 
-        let compact_state_key = self.store_def.make_compact_state_add_key(message)?;
+        let compact_state_key = self
+            .store_def
+            .make_compact_state_add_key(message, self.state_context)?;
         txn.put(compact_state_key, message_encode(&message));
 
         Ok(())
@@ -489,14 +534,19 @@ impl<T: StoreDef + Clone> Store<T> {
         ts_hash: &[u8; TS_HASH_LENGTH],
         message: &Message,
     ) -> Result<(), HubError> {
-        put_message_transaction(txn, &message)?;
+        put_message_transaction_with_prefix(
+            txn,
+            &message,
+            self.state_context
+                .root_prefix(crate::storage::constants::RootPrefix::User),
+        )?;
 
-        let adds_key = self.store_def.make_add_key(message)?;
+        let adds_key = self.store_def.make_add_key(message, self.state_context)?;
 
         txn.put(adds_key, ts_hash.to_vec());
 
         self.store_def
-            .build_secondary_indices(txn, ts_hash, message)?;
+            .build_secondary_indices(txn, ts_hash, message, self.state_context)?;
 
         Ok(())
     }
@@ -513,7 +563,9 @@ impl<T: StoreDef + Clone> Store<T> {
             });
         }
 
-        let compact_state_key = self.store_def.make_compact_state_add_key(message)?;
+        let compact_state_key = self
+            .store_def
+            .make_compact_state_add_key(message, self.state_context)?;
         txn.delete(compact_state_key);
 
         Ok(())
@@ -526,12 +578,17 @@ impl<T: StoreDef + Clone> Store<T> {
         message: &Message,
     ) -> Result<(), HubError> {
         self.store_def
-            .delete_secondary_indices(txn, ts_hash, message)?;
+            .delete_secondary_indices(txn, ts_hash, message, self.state_context)?;
 
-        let add_key = self.store_def.make_add_key(message)?;
+        let add_key = self.store_def.make_add_key(message, self.state_context)?;
         txn.delete(add_key);
 
-        delete_message_transaction(txn, message)
+        delete_message_transaction_with_prefix(
+            txn,
+            message,
+            self.state_context
+                .root_prefix(crate::storage::constants::RootPrefix::User),
+        )
     }
 
     fn put_remove_transaction(
@@ -547,9 +604,16 @@ impl<T: StoreDef + Clone> Store<T> {
             });
         }
 
-        put_message_transaction(txn, &message)?;
+        put_message_transaction_with_prefix(
+            txn,
+            &message,
+            self.state_context
+                .root_prefix(crate::storage::constants::RootPrefix::User),
+        )?;
 
-        let removes_key = self.store_def.make_remove_key(message)?;
+        let removes_key = self
+            .store_def
+            .make_remove_key(message, self.state_context)?;
         txn.put(removes_key, ts_hash.to_vec());
 
         Ok(())
@@ -567,10 +631,17 @@ impl<T: StoreDef + Clone> Store<T> {
             });
         }
 
-        let remove_key = self.store_def.make_remove_key(message)?;
+        let remove_key = self
+            .store_def
+            .make_remove_key(message, self.state_context)?;
         txn.delete(remove_key);
 
-        delete_message_transaction(txn, message)
+        delete_message_transaction_with_prefix(
+            txn,
+            message,
+            self.state_context
+                .root_prefix(crate::storage::constants::RootPrefix::User),
+        )
     }
 
     fn delete_many_transaction(
@@ -687,7 +758,9 @@ impl<T: StoreDef + Clone> Store<T> {
 
         // First, find if there's an existing compact state message, and if there is,
         // delete it if it is older
-        let compact_state_key = self.store_def.make_compact_state_add_key(message)?;
+        let compact_state_key = self
+            .store_def
+            .make_compact_state_add_key(message, self.state_context)?;
         let existing_compact_state = get_from_db_or_txn(&self.db, txn, &compact_state_key)?;
 
         if !self.store_opts.conflict_free && existing_compact_state.is_some() {
@@ -718,7 +791,12 @@ impl<T: StoreDef + Clone> Store<T> {
         // Go over all the messages for this Fid, that are older than the compact state message and
         // 1. Delete all remove messages
         // 2. Delete all add messages that are not in the target_fids list
-        let prefix = &make_message_primary_key(fid, self.store_def.postfix(), None);
+        let prefix = &make_message_primary_key_with_prefix(
+            self.user_prefix(),
+            fid,
+            self.store_def.postfix(),
+            None,
+        );
         self.db.for_each_iterator_by_prefix(
             Some(prefix.to_vec()),
             Some(increment_vec_u8(prefix)),
@@ -778,7 +856,9 @@ impl<T: StoreDef + Clone> Store<T> {
         // If the store supports compact state messages, we don't merge messages that don't exist in the compact state
         if self.store_def.compact_state_type_supported() && !self.store_opts.conflict_free {
             // Get the compact state message
-            let compact_state_key = self.store_def.make_compact_state_add_key(message)?;
+            let compact_state_key = self
+                .store_def
+                .make_compact_state_add_key(message, self.state_context)?;
             if let Some(compact_state_message_bytes) =
                 get_from_db_or_txn(&self.db, txn, &compact_state_key)?
             {
@@ -811,9 +891,13 @@ impl<T: StoreDef + Clone> Store<T> {
             // If the store is conflict-free, we don't need to check for merge conflicts
             vec![]
         } else {
-            let merge_conflicts = self
-                .store_def
-                .get_merge_conflicts(&self.db, txn, message, ts_hash)?;
+            let merge_conflicts = self.store_def.get_merge_conflicts(
+                &self.db,
+                txn,
+                message,
+                ts_hash,
+                self.state_context,
+            )?;
 
             // Delete all the merge conflicts
             self.delete_many_transaction(txn, &merge_conflicts)?;
@@ -846,7 +930,9 @@ impl<T: StoreDef + Clone> Store<T> {
         // If the store supports compact state messages, we don't merge messages that don't exist in the compact state
         if self.store_def.compact_state_type_supported() && !self.store_opts.conflict_free {
             // Get the compact state message
-            let compact_state_key = self.store_def.make_compact_state_add_key(message)?;
+            let compact_state_key = self
+                .store_def
+                .make_compact_state_add_key(message, self.state_context)?;
             if let Some(compact_state_message_bytes) =
                 get_from_db_or_txn(&self.db, txn, &compact_state_key)?
             {
@@ -872,9 +958,13 @@ impl<T: StoreDef + Clone> Store<T> {
             // If the store is conflict-free, we don't need to check for merge conflicts
             vec![]
         } else {
-            let merge_conflicts = self
-                .store_def
-                .get_merge_conflicts(&self.db, txn, message, ts_hash)?;
+            let merge_conflicts = self.store_def.get_merge_conflicts(
+                &self.db,
+                txn,
+                message,
+                ts_hash,
+                self.state_context,
+            )?;
 
             // Delete all the merge conflicts
             self.delete_many_transaction(txn, &merge_conflicts)?;
@@ -945,7 +1035,12 @@ impl<T: StoreDef + Clone> Store<T> {
             return Ok(pruned_events); // Nothing to prune
         }
 
-        let prefix = &make_message_primary_key(fid, self.store_def.postfix(), None);
+        let prefix = &make_message_primary_key_with_prefix(
+            self.user_prefix(),
+            fid,
+            self.store_def.postfix(),
+            None,
+        );
         self.db.for_each_iterator_by_prefix(
             Some(prefix.to_vec()),
             Some(increment_vec_u8(prefix)),
@@ -980,7 +1075,12 @@ impl<T: StoreDef + Clone> Store<T> {
     ) -> Result<Vec<HubEvent>, HubError> {
         let mut revoke_events = vec![];
 
-        let prefix = &make_message_primary_key(fid, self.store_def.postfix(), None);
+        let prefix = &make_message_primary_key_with_prefix(
+            self.user_prefix(),
+            fid,
+            self.store_def.postfix(),
+            None,
+        );
         self.db.for_each_iterator_by_prefix(
             Some(prefix.to_vec()),
             Some(increment_vec_u8(prefix)),
@@ -1019,7 +1119,12 @@ impl<T: StoreDef + Clone> Store<T> {
         stop_time: Option<u32>,
         page_options: &PageOptions,
     ) -> Result<MessagesPage, HubError> {
-        let prefix = make_message_primary_key(fid, self.store_def.postfix(), None);
+        let prefix = make_message_primary_key_with_prefix(
+            self.user_prefix(),
+            fid,
+            self.store_def.postfix(),
+            None,
+        );
         let messages = get_messages_page_by_prefix(&self.db, &prefix, &page_options, |message| {
             is_message_in_time_range(start_time, stop_time, message)
                 && (self.store_def.is_add_type(&message)
@@ -1039,7 +1144,10 @@ impl<T: StoreDef + Clone> Store<T> {
             return Err(HubError::invalid_parameter("compact state not supported"));
         }
 
-        match self.store_def.make_compact_state_prefix(fid) {
+        match self
+            .store_def
+            .make_compact_state_prefix(fid, self.state_context)
+        {
             Ok(prefix) => {
                 let messages =
                     get_messages_page_by_prefix(&self.db, &prefix, &page_options, |message| {

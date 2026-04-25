@@ -187,22 +187,72 @@ where
             });
         }
 
-        // Fetch recent casts from each followed user and merge-sort
-        let limit = limit.min(100); // Cap at 100
+        // Fetch recent casts from followed users in parallel batches
+        let limit = limit.min(100);
         let mut heap: BinaryHeap<TimestampedCast> = BinaryHeap::new();
 
-        for followed_fid in following.iter().take(self.config.max_following_fetch) {
-            let casts = self
-                .fetch_user_casts(*followed_fid, start_timestamp, limit)
-                .await?;
-            for cast in casts {
-                if let Some(data) = &cast.data {
-                    heap.push(TimestampedCast {
-                        timestamp: data.timestamp,
-                        fid: data.fid,
-                        hash: cast.hash.clone(),
-                        cast,
-                    });
+        // Cap timestamp to prevent forward-dated casts from dominating
+        // Farcaster epoch = 2021-01-01, so max reasonable timestamp is ~10 years out
+        let now_farcaster = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 1609459200) as u32;
+        let max_timestamp = now_farcaster + 60; // Allow 60s clock skew, no more
+
+        let following_fids: Vec<u64> = following
+            .into_iter()
+            .take(self.config.max_following_fetch)
+            .collect();
+
+        // Fetch casts concurrently in chunks
+        let chunk_size = 50;
+        for chunk in following_fids.chunks(chunk_size) {
+            let mut handles = Vec::with_capacity(chunk.len());
+            for &followed_fid in chunk {
+                let hub = self.hub_service.clone();
+                let ts = start_timestamp;
+                let lim = limit;
+                handles.push(tokio::spawn(async move {
+                    let request = proto::FidRequest {
+                        fid: followed_fid,
+                        page_size: Some(lim as u32),
+                        page_token: None,
+                        reverse: Some(true),
+                    };
+                    match hub.get_casts_by_fid(Request::new(request)).await {
+                        Ok(resp) => {
+                            let mut casts = resp.into_inner().messages;
+                            if let Some(before) = ts {
+                                casts.retain(|m| {
+                                    m.data
+                                        .as_ref()
+                                        .map(|d| d.timestamp < before)
+                                        .unwrap_or(false)
+                                });
+                            }
+                            casts
+                        }
+                        Err(_) => vec![],
+                    }
+                }));
+            }
+            for handle in handles {
+                if let Ok(casts) = handle.await {
+                    for cast in casts {
+                        if let Some(data) = &cast.data {
+                            // Skip forward-dated casts
+                            if data.timestamp > max_timestamp {
+                                continue;
+                            }
+                            heap.push(TimestampedCast {
+                                timestamp: data.timestamp,
+                                fid: data.fid,
+                                hash: cast.hash.clone(),
+                                cast,
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -309,39 +359,6 @@ where
         })
     }
 
-    /// Fetch casts from a user, optionally filtered by timestamp.
-    async fn fetch_user_casts(
-        &self,
-        fid: u64,
-        before_timestamp: Option<u32>,
-        limit: usize,
-    ) -> Result<Vec<Message>, FeedError> {
-        let request = proto::FidRequest {
-            fid,
-            page_size: Some(limit as u32),
-            page_token: None,
-            reverse: Some(true), // Newest first
-        };
-
-        let response = self
-            .hub_service
-            .get_casts_by_fid(Request::new(request))
-            .await
-            .map_err(|e| FeedError::ServiceError(e.message().to_string()))?;
-
-        let messages = response.into_inner().messages;
-
-        // Filter by timestamp if cursor provided
-        if let Some(ts) = before_timestamp {
-            Ok(messages
-                .into_iter()
-                .filter(|m| m.data.as_ref().map(|d| d.timestamp < ts).unwrap_or(false))
-                .collect())
-        } else {
-            Ok(messages)
-        }
-    }
-
     /// Fetch a single cast.
     async fn fetch_cast(&self, fid: u64, hash: &[u8]) -> Result<Message, FeedError> {
         let cast_id = proto::CastId {
@@ -367,6 +384,61 @@ where
             }
         }
         (0, 0, 0, 0.0)
+    }
+
+    /// Fetch casts from a channel by parent URL.
+    pub async fn get_channel_feed(
+        &self,
+        channel_url: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<FeedResponse, FeedError> {
+        let page_token: Option<Vec<u8>> = cursor.and_then(|c| hex::decode(c).ok());
+
+        let request = proto::CastsByParentRequest {
+            parent: Some(proto::casts_by_parent_request::Parent::ParentUrl(
+                channel_url.to_string(),
+            )),
+            page_size: Some(limit as u32),
+            page_token,
+            reverse: Some(true), // Newest first
+        };
+
+        let response = self
+            .hub_service
+            .get_casts_by_parent(Request::new(request))
+            .await
+            .map_err(|e| FeedError::ServiceError(e.message().to_string()))?;
+
+        let inner = response.into_inner();
+        let messages = inner.messages;
+        let next_cursor = inner
+            .next_page_token
+            .filter(|t| !t.is_empty())
+            .map(|t| hex::encode(&t));
+
+        let mut items = Vec::with_capacity(messages.len());
+        for cast in messages {
+            let (likes, recasts, replies, score) = if let Some(data) = &cast.data {
+                self.get_cast_metrics(data.fid, &cast.hash)
+            } else {
+                (0, 0, 0, 0.0)
+            };
+
+            items.push(FeedItem {
+                cast,
+                likes,
+                recasts,
+                replies,
+                score,
+            });
+        }
+
+        Ok(FeedResponse {
+            items,
+            next_cursor,
+            total: None,
+        })
     }
 }
 
@@ -395,6 +467,22 @@ where
         limit: usize,
     ) -> Result<FeedResponse, FeedError> {
         FeedService::get_trending_feed(self, cursor, limit).await
+    }
+}
+
+/// Implement ChannelFeedHandler trait for type-erased access in HTTP handler.
+#[async_trait]
+impl<S> crate::api::http::ChannelFeedHandler for FeedService<S>
+where
+    S: proto::hub_service_server::HubService + Send + Sync + 'static,
+{
+    async fn get_channel_feed(
+        &self,
+        channel_url: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<FeedResponse, FeedError> {
+        FeedService::get_channel_feed(self, channel_url, cursor, limit).await
     }
 }
 

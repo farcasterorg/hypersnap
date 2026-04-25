@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "snapchain"
-version = "0.11.5"
+version = "0.11.6"
 edition = "2021"
 default-run = "hypersnap"
 
@@ -69,7 +69,7 @@ alloy-signer = "0.8.0"
 alloy-signer-local = "0.8.0"
 ed25519-dalek = { version = "2.1.1", features = ["batch"] }
 pre-commit = "0.5.2"
-rocksdb = {git = "https://github.com/rust-rocksdb/rust-rocksdb.git", rev="1cf906dc4087f06631820f13855e6b27bd21b972", features=["multi-threaded-cf"]}
+rocksdb = {git = "https://github.com/rust-rocksdb/rust-rocksdb.git", rev="a4f178d0ca668c4b48d993ab8aef6f4004780f23", features=["multi-threaded-cf", "jemalloc"]}
 walkdir = "2.5.0"
 once_cell = "1.20.2"
 threadpool = "1.8.1"
@@ -82,6 +82,7 @@ tempfile = "3.13.0"
 foundry-common = { git = "https://github.com/foundry-rs/foundry", rev="6b07c77eb1c1d1c4b56ffa7f79240254b73236d2" }
 bs58 = "0.5.1"
 chrono = "0.4.39"
+csv = "1.3"
 tar = "0.4.40"
 gzp = "0.11.3"
 flate2 = "1.0.28"
@@ -111,6 +112,11 @@ solar-config = "=0.1.1"
 nix = { version = "0.29", features = ["resource"] }
 svm-rs-builds = "0.5.22"
 tikv-jemallocator = "0.6"
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
+uuid = { version = "1.10", features = ["v4", "serde"] }
+hmac = "0.12.1"
+regex = "1.11"
+twox-hash = "1.6"
 
 
 [dev-dependencies]

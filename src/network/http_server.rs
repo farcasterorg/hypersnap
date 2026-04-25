@@ -3267,6 +3267,46 @@ where
         req: Request<hyper::body::Incoming>,
         config: &Config,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        // CORS preflight short-circuit. Browsers send `OPTIONS` before
+        // any cross-origin POST with a non-simple `Content-Type`
+        // (e.g. `application/json`) or any custom header like
+        // `X-Hypersnap-*` / `x-api-key`. Without this branch, the
+        // preflight falls through to the legacy router and gets 404'd,
+        // which blocks every write/batch endpoint when called from a
+        // browser. Reply with 204 + the full set of CORS headers so
+        // the browser proceeds to the actual request.
+        if req.method() == Method::OPTIONS {
+            let requested_headers = req
+                .headers()
+                .get("access-control-request-headers")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+                // Fallback to an explicit list that covers everything
+                // Hypersnap endpoints actually expect from the browser.
+                .unwrap_or_else(|| {
+                    "content-type,x-api-key,\
+                     x-hypersnap-fid,x-hypersnap-op,x-hypersnap-signed-at,\
+                     x-hypersnap-nonce,x-hypersnap-signature"
+                        .to_string()
+                });
+            let response = Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .header(
+                    "Access-Control-Allow-Origin",
+                    HeaderValue::from_str(&config.cors_origin).unwrap(),
+                )
+                .header(
+                    "Access-Control-Allow-Methods",
+                    "GET, POST, PUT, DELETE, OPTIONS",
+                )
+                .header("Access-Control-Allow-Headers", requested_headers)
+                .header("Access-Control-Max-Age", "86400")
+                .header("Vary", "Origin, Access-Control-Request-Headers")
+                .body(Full::new(Bytes::new()).boxed())
+                .unwrap();
+            return Ok(response);
+        }
+
         // Check if this is a v2 API request
         let path = req.uri().path();
         if let Some(ref handler) = self.api_handler {

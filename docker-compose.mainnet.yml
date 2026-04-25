@@ -122,15 +122,22 @@ services:
 
         [api.social_graph]
         enabled = true
+        backfill_on_startup = true
 
         [api.channels]
         enabled = true
+        backfill_on_startup = true
 
         [api.metrics]
         enabled = true
+        backfill_on_startup = true
 
         [api.feeds]
         enabled = true
+
+        [api.search]
+        enabled = true
+        backfill_on_startup = true
 
         [api.conversations]
         enabled = true

@@ -1,8 +1,12 @@
 #!/bin/bash
 
 # This is the bootstrap script for hypersnap. It is used to install the latest version of hypersnap.
-# Simply run the following command to install the latest version of hypersnap:
-# curl <file location> | bash
+#
+# Install stable (default):
+#   curl -sSL <url>/hypersnap-bootstrap.sh | bash
+#
+# Install nightly channel:
+#   curl -sSL <url>/hypersnap-bootstrap.sh | bash -s nightly
 
 REPO="farcasterorg/hypersnap"
 RAWFILE_BASE="https://raw.githubusercontent.com/$REPO"
@@ -78,10 +82,20 @@ do_bootstrap() {
     mv "$tmp_file" ~/hypersnap/hypersnap.sh
     chmod +x ~/hypersnap/hypersnap.sh
 
+    # If a channel was specified (e.g. "nightly"), persist it in .env
+    # so hypersnap.sh picks the right compose file on every run.
+    if [ -n "$HYPERSNAP_CHANNEL" ] && [ "$HYPERSNAP_CHANNEL" != "stable" ]; then
+        echo "HYPERSNAP_CHANNEL=$HYPERSNAP_CHANNEL" >> ~/hypersnap/.env
+        echo "==> Channel set to: $HYPERSNAP_CHANNEL"
+    fi
+
     # Run the hypersnap.sh script
     cd ~/hypersnap
     exec ./hypersnap.sh "upgrade" < /dev/tty
 }
+
+# Parse args
+HYPERSNAP_CHANNEL="${1:-stable}"
 
 # Install jq
 install_jq
