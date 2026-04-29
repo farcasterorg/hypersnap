@@ -4457,4 +4457,316 @@ mod tests {
         let response = ApiHttpHandler::error_response(StatusCode::NOT_FOUND, "Not found");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
+
+    use async_trait::async_trait;
+    use http_body_util::BodyExt;
+
+    struct MockHubQuery {
+        notifications: Vec<crate::proto::Message>,
+        cast_lookup: Option<crate::proto::Message>,
+    }
+
+    #[async_trait]
+    impl HubQueryHandler for MockHubQuery {
+        async fn get_cast_by_hash(
+            &self,
+            _hash: &[u8],
+            _fid_hint: Option<u64>,
+        ) -> Option<crate::proto::Message> {
+            self.cast_lookup.clone()
+        }
+
+        async fn get_casts_by_fid(
+            &self,
+            _fid: u64,
+            _limit: usize,
+            _page_token: Option<Vec<u8>>,
+            _reverse: bool,
+        ) -> Result<(Vec<crate::proto::Message>, Option<Vec<u8>>), String> {
+            Ok((vec![], None))
+        }
+
+        async fn get_reactions_by_cast(
+            &self,
+            _fid: u64,
+            _hash: &[u8],
+            _reaction_type: i32,
+            _limit: usize,
+        ) -> Result<Vec<crate::proto::Message>, String> {
+            Ok(vec![])
+        }
+
+        async fn get_reactions_by_fid(
+            &self,
+            _fid: u64,
+            _reaction_type: Option<i32>,
+            _limit: usize,
+        ) -> Result<Vec<crate::proto::Message>, String> {
+            Ok(vec![])
+        }
+
+        async fn get_fid_by_username(&self, _username: &str) -> Option<u64> {
+            None
+        }
+
+        async fn get_fids_by_address(&self, _address: &[u8]) -> Vec<u64> {
+            vec![]
+        }
+
+        async fn get_username_proof(&self, _name: &[u8]) -> Option<(u64, String, u64, Vec<u8>)> {
+            None
+        }
+
+        async fn get_storage_limits(&self, _fid: u64) -> Option<Vec<(String, u64, u64)>> {
+            None
+        }
+
+        async fn get_onchain_events(
+            &self,
+            _fid: u64,
+            _event_type: i32,
+        ) -> Result<Vec<crate::proto::OnChainEvent>, String> {
+            Ok(vec![])
+        }
+
+        async fn get_signer_events(
+            &self,
+            _fid: u64,
+        ) -> Result<Vec<crate::proto::OnChainEvent>, String> {
+            Ok(vec![])
+        }
+
+        async fn get_notifications(
+            &self,
+            _fid: u64,
+            _limit: usize,
+            _cursor: Option<&str>,
+        ) -> Result<(Vec<crate::proto::Message>, Option<String>), String> {
+            Ok((self.notifications.clone(), None))
+        }
+
+        async fn get_links_by_fid(
+            &self,
+            _fid: u64,
+            _link_type: &str,
+            _limit: usize,
+        ) -> Result<Vec<crate::proto::Message>, String> {
+            Ok(vec![])
+        }
+
+        async fn get_user_data_by_fid(
+            &self,
+            _fid: u64,
+        ) -> Result<Vec<crate::proto::Message>, String> {
+            Ok(vec![])
+        }
+
+        async fn get_casts_by_mention(
+            &self,
+            _fid: u64,
+            _limit: usize,
+        ) -> Result<Vec<crate::proto::Message>, String> {
+            Ok(vec![])
+        }
+
+        async fn get_user_data_value(&self, _fid: u64, _data_type: i32) -> Option<String> {
+            None
+        }
+
+        async fn get_fids(
+            &self,
+            _limit: usize,
+            _cursor: Option<Vec<u8>>,
+        ) -> Result<(Vec<u64>, Option<Vec<u8>>), String> {
+            Ok((vec![], None))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_notifications_endpoint_integration() {
+        let target_fid: u64 = 121;
+        let mentioner_fid: u64 = 122;
+        let reactor_fid: u64 = 123;
+        let follower_fid: u64 = 124;
+
+        // Build a reply (CastAdd) message
+        let reply_msg = crate::proto::Message {
+            data: Some(crate::proto::MessageData {
+                fid: mentioner_fid,
+                r#type: crate::proto::MessageType::CastAdd as i32,
+                timestamp: 1000,
+                network: crate::proto::FarcasterNetwork::Mainnet as i32,
+                body: Some(crate::proto::message_data::Body::CastAddBody(
+                    crate::proto::CastAddBody {
+                        text: "@target hello world".into(),
+                        mentions: vec![target_fid],
+                        mentions_positions: vec![0],
+                        embeds: vec![],
+                        embeds_deprecated: vec![],
+                        parent: Some(crate::proto::cast_add_body::Parent::ParentCastId(
+                            crate::proto::CastId {
+                                fid: target_fid,
+                                hash: vec![1, 2, 3],
+                            },
+                        )),
+                        r#type: crate::proto::CastType::Cast as i32,
+                    },
+                )),
+            }),
+            hash: vec![10, 20, 30],
+            hash_scheme: crate::proto::HashScheme::Blake3 as i32,
+            signature: vec![],
+            signature_scheme: crate::proto::SignatureScheme::Ed25519 as i32,
+            signer: vec![],
+            data_bytes: None,
+        };
+
+        // Build a reaction message (like on target's cast)
+        let target_cast_hash: Vec<u8> = vec![5, 6, 7];
+        let reaction_msg = crate::proto::Message {
+            data: Some(crate::proto::MessageData {
+                fid: reactor_fid,
+                r#type: crate::proto::MessageType::ReactionAdd as i32,
+                timestamp: 2000,
+                network: crate::proto::FarcasterNetwork::Mainnet as i32,
+                body: Some(crate::proto::message_data::Body::ReactionBody(
+                    crate::proto::ReactionBody {
+                        r#type: crate::proto::ReactionType::Like as i32,
+                        target: Some(crate::proto::reaction_body::Target::TargetCastId(
+                            crate::proto::CastId {
+                                fid: target_fid,
+                                hash: target_cast_hash.clone(),
+                            },
+                        )),
+                    },
+                )),
+            }),
+            hash: vec![40, 50, 60],
+            hash_scheme: crate::proto::HashScheme::Blake3 as i32,
+            signature: vec![],
+            signature_scheme: crate::proto::SignatureScheme::Ed25519 as i32,
+            signer: vec![],
+            data_bytes: None,
+        };
+
+        // Build a follow message
+        let follow_msg = crate::proto::Message {
+            data: Some(crate::proto::MessageData {
+                fid: follower_fid,
+                r#type: crate::proto::MessageType::LinkAdd as i32,
+                timestamp: 3000,
+                network: crate::proto::FarcasterNetwork::Mainnet as i32,
+                body: Some(crate::proto::message_data::Body::LinkBody(
+                    crate::proto::LinkBody {
+                        r#type: "follow".into(),
+                        target: Some(crate::proto::link_body::Target::TargetFid(target_fid)),
+                        display_timestamp: None,
+                    },
+                )),
+            }),
+            hash: vec![70, 80, 90],
+            hash_scheme: crate::proto::HashScheme::Blake3 as i32,
+            signature: vec![],
+            signature_scheme: crate::proto::SignatureScheme::Ed25519 as i32,
+            signer: vec![],
+            data_bytes: None,
+        };
+
+        // The cast being reacted to (needs text for hydration)
+        let target_cast_msg = crate::proto::Message {
+            data: Some(crate::proto::MessageData {
+                fid: target_fid,
+                r#type: crate::proto::MessageType::CastAdd as i32,
+                timestamp: 500,
+                network: crate::proto::FarcasterNetwork::Mainnet as i32,
+                body: Some(crate::proto::message_data::Body::CastAddBody(
+                    crate::proto::CastAddBody {
+                        text: "original cast".into(),
+                        mentions: vec![],
+                        mentions_positions: vec![],
+                        embeds: vec![],
+                        embeds_deprecated: vec![],
+                        parent: None,
+                        r#type: crate::proto::CastType::Cast as i32,
+                    },
+                )),
+            }),
+            hash: target_cast_hash,
+            hash_scheme: crate::proto::HashScheme::Blake3 as i32,
+            signature: vec![],
+            signature_scheme: crate::proto::SignatureScheme::Ed25519 as i32,
+            signer: vec![],
+            data_bytes: None,
+        };
+
+        let mock = Arc::new(MockHubQuery {
+            notifications: vec![reply_msg.clone(), reaction_msg.clone(), follow_msg.clone()],
+            cast_lookup: Some(target_cast_msg),
+        });
+
+        let handler = ApiHttpHandler::new(None, None, None, None, None, None);
+        handler.set_hub_query(mock);
+
+        let response = handler.handle_notifications(target_fid, None, 10).await;
+        let response = response.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON response");
+
+        let notifications = json["notifications"]
+            .as_array()
+            .expect("notifications array");
+
+        assert_eq!(notifications.len(), 3, "should return 3 notifications");
+
+        // Reply notification
+        let reply = &notifications[0];
+        assert_eq!(reply["type"].as_str().unwrap(), "reply");
+        assert!(reply["cast"].is_object(), "reply should have hydrated cast");
+        assert!(
+            reply["cast"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("hello world"),
+            "reply cast should contain original text"
+        );
+        assert!(
+            reply["cast"]["hash"].as_str().unwrap().len() > 0,
+            "reply cast should have hash"
+        );
+        assert_eq!(
+            reply["user"]["fid"].as_u64().unwrap(),
+            mentioner_fid,
+            "reply user should be mentioner"
+        );
+
+        // Reaction notification
+        let like = &notifications[1];
+        assert_eq!(like["type"].as_str().unwrap(), "likes");
+        assert!(
+            like["cast"].is_object(),
+            "reaction should have hydrated target cast"
+        );
+        assert_eq!(
+            like["cast"]["text"].as_str().unwrap(),
+            "original cast",
+            "target cast should have original text"
+        );
+        assert_eq!(
+            like["user"]["fid"].as_u64().unwrap(),
+            reactor_fid,
+            "reaction user should be reactor"
+        );
+
+        // Follow notification
+        let follow = &notifications[2];
+        assert_eq!(follow["type"].as_str().unwrap(), "follows");
+        assert!(follow["cast"].is_null(), "follow should have null cast");
+        assert_eq!(
+            follow["user"]["fid"].as_u64().unwrap(),
+            follower_fid,
+            "follow user should be follower"
+        );
+    }
 }
