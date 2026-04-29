@@ -133,13 +133,13 @@ pub trait HubQueryHandler: Send + Sync {
     /// Get signer events for a FID.
     async fn get_signer_events(&self, fid: u64) -> Result<Vec<crate::proto::OnChainEvent>, String>;
 
-    /// Get notifications for a user (reactions + mentions on their casts).
+    /// Get notifications for a user (reactions + mentions on their casts + follows).
     async fn get_notifications(
         &self,
         fid: u64,
         limit: usize,
         cursor: Option<&str>,
-    ) -> Result<Vec<crate::proto::Message>, String>;
+    ) -> Result<(Vec<crate::proto::Message>, Option<String>), String>;
 
     /// Get links by FID and link type (e.g. "follow", "block", "mute").
     async fn get_links_by_fid(
@@ -2645,7 +2645,7 @@ impl ApiHttpHandler {
         };
 
         match hub.get_notifications(fid, limit, cursor).await {
-            Ok(messages) => {
+            Ok((messages, next_cursor)) => {
                 let mut notifications = Vec::new();
                 for msg in &messages {
                     if let Some(data) = &msg.data {
@@ -2669,7 +2669,9 @@ impl ApiHttpHandler {
                     StatusCode::OK,
                     &NotificationsResponse {
                         notifications,
-                        next: NextCursor { cursor: None },
+                        next: NextCursor {
+                            cursor: next_cursor,
+                        },
                     },
                 ))
             }
@@ -2715,7 +2717,7 @@ impl ApiHttpHandler {
 
         // Fetch more notifications than needed so we can filter
         match hub.get_notifications(fid, limit * 10, cursor).await {
-            Ok(messages) => {
+            Ok((messages, next_cursor)) => {
                 let mut notifications = Vec::new();
                 for msg in &messages {
                     if notifications.len() >= limit {
@@ -2763,7 +2765,9 @@ impl ApiHttpHandler {
                     StatusCode::OK,
                     &NotificationsResponse {
                         notifications,
-                        next: NextCursor { cursor: None },
+                        next: NextCursor {
+                            cursor: next_cursor,
+                        },
                     },
                 ))
             }
@@ -2793,7 +2797,7 @@ impl ApiHttpHandler {
         let target_urls: Vec<&str> = parent_urls_param.split(',').map(|s| s.trim()).collect();
 
         match hub.get_notifications(fid, limit * 10, cursor).await {
-            Ok(messages) => {
+            Ok((messages, next_cursor)) => {
                 let mut notifications = Vec::new();
                 for msg in &messages {
                     if notifications.len() >= limit {
@@ -2840,7 +2844,9 @@ impl ApiHttpHandler {
                     StatusCode::OK,
                     &NotificationsResponse {
                         notifications,
-                        next: NextCursor { cursor: None },
+                        next: NextCursor {
+                            cursor: next_cursor,
+                        },
                     },
                 ))
             }
