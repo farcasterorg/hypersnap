@@ -2656,10 +2656,47 @@ impl ApiHttpHandler {
                             Ok(crate::proto::MessageType::LinkAdd) => "follows",
                             _ => "mention",
                         };
+
+                        // Hydrate cast: for replies the message itself is the cast;
+                        // for reactions we look up the target cast.
+                        let cast: Option<Cast> =
+                            match crate::proto::MessageType::try_from(data.r#type) {
+                                Ok(crate::proto::MessageType::CastAdd) => {
+                                    Some(self.message_to_cast(msg).await)
+                                }
+                                Ok(crate::proto::MessageType::ReactionAdd) => {
+                                    if let Some(crate::proto::message_data::Body::ReactionBody(
+                                        body,
+                                    )) = &data.body
+                                    {
+                                        if let Some(
+                                            crate::proto::reaction_body::Target::TargetCastId(
+                                                cast_id,
+                                            ),
+                                        ) = &body.target
+                                        {
+                                            if let Some(target_msg) = hub
+                                                .get_cast_by_hash(&cast_id.hash, Some(cast_id.fid))
+                                                .await
+                                            {
+                                                Some(self.message_to_cast(&target_msg).await)
+                                            } else {
+                                                None
+                                            }
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                }
+                                _ => None,
+                            };
+
                         notifications.push(Notification {
                             object: "notification".to_string(),
                             r#type: notif_type.to_string(),
-                            cast: None,
+                            cast,
                             user,
                             timestamp: format_timestamp(data.timestamp),
                         });
@@ -2753,10 +2790,41 @@ impl ApiHttpHandler {
                         Ok(crate::proto::MessageType::LinkAdd) => "follows",
                         _ => "mention",
                     };
+
+                    let cast: Option<Cast> = match crate::proto::MessageType::try_from(data.r#type)
+                    {
+                        Ok(crate::proto::MessageType::CastAdd) => {
+                            Some(self.message_to_cast(msg).await)
+                        }
+                        Ok(crate::proto::MessageType::ReactionAdd) => {
+                            if let Some(crate::proto::message_data::Body::ReactionBody(body)) =
+                                &data.body
+                            {
+                                if let Some(crate::proto::reaction_body::Target::TargetCastId(
+                                    cast_id,
+                                )) = &body.target
+                                {
+                                    if let Some(target_msg) =
+                                        hub.get_cast_by_hash(&cast_id.hash, Some(cast_id.fid)).await
+                                    {
+                                        Some(self.message_to_cast(&target_msg).await)
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+
                     notifications.push(Notification {
                         object: "notification".to_string(),
                         r#type: notif_type.to_string(),
-                        cast: None,
+                        cast,
                         user,
                         timestamp: format_timestamp(data.timestamp),
                     });
@@ -2832,10 +2900,41 @@ impl ApiHttpHandler {
                         Ok(crate::proto::MessageType::LinkAdd) => "follows",
                         _ => "mention",
                     };
+
+                    let cast: Option<Cast> = match crate::proto::MessageType::try_from(data.r#type)
+                    {
+                        Ok(crate::proto::MessageType::CastAdd) => {
+                            Some(self.message_to_cast(msg).await)
+                        }
+                        Ok(crate::proto::MessageType::ReactionAdd) => {
+                            if let Some(crate::proto::message_data::Body::ReactionBody(body)) =
+                                &data.body
+                            {
+                                if let Some(crate::proto::reaction_body::Target::TargetCastId(
+                                    cast_id,
+                                )) = &body.target
+                                {
+                                    if let Some(target_msg) =
+                                        hub.get_cast_by_hash(&cast_id.hash, Some(cast_id.fid)).await
+                                    {
+                                        Some(self.message_to_cast(&target_msg).await)
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+
                     notifications.push(Notification {
                         object: "notification".to_string(),
                         r#type: notif_type.to_string(),
-                        cast: None,
+                        cast,
                         user,
                         timestamp: format_timestamp(data.timestamp),
                     });
