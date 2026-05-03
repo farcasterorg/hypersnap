@@ -995,15 +995,7 @@ impl ApiHttpHandler {
                     .unwrap_or("following");
                 match feed_type {
                     "filter" => {
-                        let fids_str = match params.get("fids") {
-                            Some(f) => f.clone(),
-                            None => {
-                                return Ok(Self::error_response(
-                                    StatusCode::BAD_REQUEST,
-                                    "fids parameter required for filter feed",
-                                ))
-                            }
-                        };
+                        let fids_str = require_param!(params, "fids");
                         self.handle_filter_feed(&fids_str, cursor.as_deref(), limit)
                             .await
                     }
