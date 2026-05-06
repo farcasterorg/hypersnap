@@ -2,6 +2,7 @@ use super::rpc_extensions::{
     authenticate_request, AsMessagesResponse, AsSingleMessageResponse, FidRequestExt,
     FidTimestampRequestExt, LinksByFidRequestExt, ReactionsByFidRequestExt,
 };
+use crate::connectors::fname::FnameTransferLookup;
 use crate::connectors::onchain_events::{Chain, ChainClients};
 use crate::core::error::HubError;
 use crate::core::types::SnapchainValidatorContext;
@@ -23,10 +24,11 @@ use crate::proto::{
     LinksByFidRequest, LinksByTargetRequest, Message, MessageType, MessagesResponse,
     NameLookupRequest, NameToAddressResponse, OnChainEvent, OnChainEventRequest,
     OnChainEventResponse, ReactionRequest, ReactionType, ReactionsByFidRequest,
-    ReactionsByTargetRequest, ShardChunk, ShardChunksRequest, ShardChunksResponse, SignerEventType,
-    SignerRequest, StorageLimitsResponse, SubscribeRequest, TrieNodeMetadataRequest,
-    TrieNodeMetadataResponse, UserDataRequest, UserNameProof, UserNameType, UsernameProofRequest,
-    UsernameProofsResponse, ValidationResponse, VerificationAddAddressBody, VerificationRequest,
+    ReactionsByTargetRequest, ShardChunk, ShardChunksRequest, ShardChunksResponse, Signer,
+    SignerEventType, SignerRequest, SignerResponse, SignerSource, SignersByFidResponse,
+    StorageLimitsResponse, SubscribeRequest, TrieNodeMetadataRequest, TrieNodeMetadataResponse,
+    UserDataRequest, UserNameProof, UserNameType, UsernameProofRequest, UsernameProofsResponse,
+    ValidationResponse, VerificationAddAddressBody, VerificationRequest,
 };
 use crate::storage::constants::OnChainEventPostfix;
 use crate::storage::constants::RootPrefix;
@@ -34,10 +36,11 @@ use crate::storage::db::PageOptions;
 use crate::storage::db::RocksDbTransactionBatch;
 use crate::storage::store::account::MessagesPage;
 use crate::storage::store::account::UsernameProofStore;
-use crate::storage::store::account::{message_bytes_decode, IntoI32};
 use crate::storage::store::account::{
-    CastStore, LinkStore, ReactionStore, UserDataStore, VerificationStore,
+    get_gasless_key_count, get_gasless_key_record, get_last_used_at, list_gasless_keys_by_fid,
+    CastStore, GaslessKeyRecord, LinkStore, ReactionStore, UserDataStore, VerificationStore,
 };
+use crate::storage::store::account::{message_bytes_decode, IntoI32};
 use crate::storage::store::account::{EventsPage, HubEventIdGenerator};
 use crate::storage::store::block_engine::{self, BlockStores};
 use crate::storage::store::engine::{self, Senders, ShardEngine};
@@ -50,9 +53,10 @@ use moka::policy::EvictionPolicy;
 use moka::sync::{Cache, CacheBuilder};
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::AsciiMetadataValue;
 use tonic::{Request, Response, Status};
@@ -60,6 +64,267 @@ use tracing::{debug, error, info};
 
 pub const MEMPOOL_ADD_REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_millis(100);
+
+// Time budget for recovering from a `MissingFname` validation failure on UserDataAdd
+// Username messages.
+const MISSING_FNAME_RECOVERY_BUDGET: Duration = Duration::from_secs(8);
+const MISSING_FNAME_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const MISSING_FNAME_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Convert a typed engine validation error back into the HubError shape that the
+/// gRPC layer expects.
+fn simulate_error_to_hub_error(err: engine::MessageValidationError) -> HubError {
+    match err {
+        engine::MessageValidationError::StoreError(hub_error) => hub_error,
+        _ => HubError::validation_failure(&err.to_string()),
+    }
+}
+
+/// Returns the fname that should be looked up against the fname registry to
+/// recover from a `MissingFname` validation failure, or `None` if the message
+/// isn't an fname-eligible UserDataAdd Username.
+fn username_for_fname_recovery(message: &proto::Message) -> Option<String> {
+    let data = message.data.as_ref()?;
+    let user_data = match data.body.as_ref()? {
+        proto::message_data::Body::UserDataBody(body) => body,
+        _ => return None,
+    };
+    if user_data.r#type() != proto::UserDataType::Username {
+        return None;
+    }
+    if user_data.value.is_empty() || user_data.value.ends_with(".eth") {
+        return None;
+    }
+    Some(user_data.value.clone())
+}
+
+/// Translate a HubError raised by the gasless / signer stores into a gRPC
+/// `Status`. `bad_request.*` codes (validation_failure, invalid_param, …) come
+/// from caller-supplied input — typically a malformed public key — so they
+/// surface as `invalid_argument` rather than 500. Everything else is a true
+/// storage failure and stays as `internal`.
+fn signer_store_error_to_status(err: HubError) -> Status {
+    if err.code.starts_with("bad_request") {
+        Status::invalid_argument(err.to_string())
+    } else {
+        Status::internal(format!("Store error: {:?}", err))
+    }
+}
+
+/// Build a unified `Signer` record from an on-chain `OnChainEvent` whose body is a
+/// `SignerEventBody`. Off-chain–only fields (scopes, ttl, last_used_at, expires_at,
+/// nonce, request_fid) are intentionally left at their proto defaults; the
+/// originating event is attached so callers that need raw on-chain payload still
+/// get it. `added_at` is the block timestamp (Unix epoch seconds).
+fn signer_from_onchain_event(event: &OnChainEvent) -> Signer {
+    let (key, key_type) = match &event.body {
+        Some(Body::SignerEventBody(body)) => (body.key.clone(), body.key_type),
+        _ => (Vec::new(), 0),
+    };
+    Signer {
+        source: SignerSource::Onchain as i32,
+        key,
+        key_type,
+        fid: event.fid,
+        added_at: Some(event.block_timestamp),
+        last_used_at: None,
+        ttl: None,
+        expires_at: None,
+        scopes: Vec::new(),
+        request_fid: None,
+        nonce: None,
+        onchain_event: Some(event.clone()),
+    }
+}
+
+/// Build a unified `Signer` record from a stored `GaslessKeyRecord`, joining in
+/// `last_used_at` from the sibling store. Returns `None` if the embedded
+/// KEY_ADD message is malformed (missing `data.body.key_add_body`) — by
+/// construction this can't happen for records that successfully merged, but
+/// guarding here keeps the RPC path defensive against future schema changes.
+fn signer_from_gasless_record(
+    record: &GaslessKeyRecord,
+    public_key: &[u8],
+    fid: u64,
+    last_used_at: Option<u64>,
+) -> Option<Signer> {
+    let message = record.message.as_ref()?;
+    let data = message.data.as_ref()?;
+    let key_add = match data.body.as_ref()? {
+        message_data::Body::KeyAddBody(body) => body,
+        _ => return None,
+    };
+    let ttl = key_add.ttl;
+    let added_at_unix = FarcasterTime::new(data.timestamp as u64).to_unix_seconds();
+    let last_used_at_unix = last_used_at.map(|t| FarcasterTime::new(t).to_unix_seconds());
+    let expires_at = match (last_used_at_unix, ttl) {
+        (Some(used), t) if t > 0 => Some(used + t as u64),
+        _ => None,
+    };
+    Some(Signer {
+        source: SignerSource::Offchain as i32,
+        key: public_key.to_vec(),
+        key_type: key_add.key_type,
+        fid,
+        added_at: Some(added_at_unix),
+        last_used_at: last_used_at_unix,
+        ttl: Some(ttl),
+        expires_at,
+        scopes: key_add.scopes.clone(),
+        request_fid: Some(record.request_fid),
+        nonce: Some(key_add.nonce),
+        onchain_event: None,
+    })
+}
+
+/// Look up `(fid, signer)` across both signer indexes, on-chain first then off-chain,
+/// matching the read order in `active_key::get_active_key`. Returns `None` if the
+/// key is not active on either side.
+fn resolve_signer(stores: &Stores, fid: u64, public_key: &[u8]) -> Result<Option<Signer>, Status> {
+    if let Some(event) = stores
+        .onchain_event_store
+        .get_active_signer(fid, public_key.to_vec(), None)
+        .map_err(|e| Status::internal(format!("Store error: {:?}", e)))?
+    {
+        return Ok(Some(signer_from_onchain_event(&event)));
+    }
+
+    let txn = RocksDbTransactionBatch::new();
+    let Some(record) = get_gasless_key_record(&stores.db, &txn, fid, public_key)
+        .map_err(signer_store_error_to_status)?
+    else {
+        return Ok(None);
+    };
+
+    let last_used_at = get_last_used_at(&stores.db, &txn, fid, public_key)
+        .map_err(signer_store_error_to_status)?
+        .map(|t| t as u64);
+
+    Ok(signer_from_gasless_record(
+        &record,
+        public_key,
+        fid,
+        last_used_at,
+    ))
+}
+
+/// Result of merging on-chain + off-chain signer pages for a single FID.
+struct UnifiedSignersPage {
+    signers: Vec<Signer>,
+    next_page_token: Option<Vec<u8>>,
+    /// Total active gasless (off-chain) keys for the FID, sourced from the O(1)
+    /// per-FID counter. Populated regardless of pagination state so callers
+    /// always see the FID-wide total.
+    gasless_signer_count: u32,
+}
+
+/// Composite cursor for `list_signers_for_fid`. Carries one cursor per
+/// underlying store so each side can advance independently, plus an explicit
+/// `*_exhausted` flag per side.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct UnifiedSignerPageToken {
+    onchain: Option<Vec<u8>>,
+    gasless: Option<Vec<u8>>,
+    #[serde(default)]
+    onchain_exhausted: bool,
+    #[serde(default)]
+    gasless_exhausted: bool,
+}
+
+/// Drain both signer indexes for `fid` and return the merged page.
+fn list_signers_for_fid(
+    stores: &Stores,
+    fid: u64,
+    page_options: &PageOptions,
+) -> Result<UnifiedSignersPage, Status> {
+    let cursor: UnifiedSignerPageToken = match &page_options.page_token {
+        None => UnifiedSignerPageToken::default(),
+        Some(bytes) => serde_json::from_slice(bytes)
+            .map_err(|e| Status::invalid_argument(format!("invalid signers page token: {}", e)))?,
+    };
+
+    let global_limit = page_options.page_size;
+
+    let mut signers: Vec<Signer> = Vec::new();
+    let mut next_onchain_token: Option<Vec<u8>> = None;
+    let mut next_gasless_token: Option<Vec<u8>> = None;
+    let mut onchain_exhausted = cursor.onchain_exhausted;
+    let mut gasless_exhausted = cursor.gasless_exhausted;
+
+    if !cursor.onchain_exhausted {
+        let onchain_options = PageOptions {
+            page_size: global_limit,
+            page_token: cursor.onchain,
+            reverse: page_options.reverse,
+        };
+        let onchain_page = stores
+            .onchain_event_store
+            .get_signers(Some(fid), &onchain_options)
+            .map_err(|e| Status::internal(format!("Store error: {:?}", e)))?;
+        signers.extend(
+            onchain_page
+                .onchain_events
+                .iter()
+                .map(signer_from_onchain_event),
+        );
+        if onchain_page.next_page_token.is_none() {
+            onchain_exhausted = true;
+        } else {
+            next_onchain_token = onchain_page.next_page_token;
+        }
+    }
+
+    let remaining = global_limit.map(|cap| cap.saturating_sub(signers.len()));
+    let should_scan_gasless = !cursor.gasless_exhausted && remaining.map_or(true, |r| r > 0);
+
+    let txn = RocksDbTransactionBatch::new();
+
+    if should_scan_gasless {
+        let gasless_options = PageOptions {
+            page_size: remaining,
+            page_token: cursor.gasless,
+            reverse: page_options.reverse,
+        };
+        let gasless_page = list_gasless_keys_by_fid(&stores.db, fid, &gasless_options)
+            .map_err(signer_store_error_to_status)?;
+        for (public_key, record) in &gasless_page.records {
+            let last_used_at = get_last_used_at(&stores.db, &txn, fid, public_key)
+                .map_err(signer_store_error_to_status)?
+                .map(|t| t as u64);
+            if let Some(s) = signer_from_gasless_record(record, public_key, fid, last_used_at) {
+                signers.push(s);
+            }
+        }
+        if gasless_page.next_page_token.is_none() {
+            gasless_exhausted = true;
+        } else {
+            next_gasless_token = gasless_page.next_page_token;
+        }
+    }
+
+    let next_page_token = if onchain_exhausted && gasless_exhausted {
+        None
+    } else {
+        let token = UnifiedSignerPageToken {
+            onchain: next_onchain_token,
+            gasless: next_gasless_token,
+            onchain_exhausted,
+            gasless_exhausted,
+        };
+        Some(serde_json::to_vec(&token).map_err(|e| {
+            Status::internal(format!("failed to serialize signers page token: {}", e))
+        })?)
+    };
+
+    let gasless_signer_count =
+        get_gasless_key_count(&stores.db, &txn, fid).map_err(signer_store_error_to_status)?;
+
+    Ok(UnifiedSignersPage {
+        signers,
+        next_page_token,
+        gasless_signer_count,
+    })
+}
 
 pub struct MyHubService {
     allowed_users: HashMap<String, String>,
@@ -78,6 +343,11 @@ pub struct MyHubService {
     version: String,
     peer_id: String,
     id_registry_cache: Cache<Vec<u8>, OnChainEvent>,
+    // Synchronous lookup against the fname registry. Used to recover from the
+    // race condition where a client submits a UserDataAdd for a username before
+    // the background fname connector has polled the corresponding transfer. None
+    // disables on-demand recovery (e.g. when fnames are configured off).
+    fname_lookup: Option<Arc<dyn FnameTransferLookup>>,
 }
 
 impl MyHubService {
@@ -96,6 +366,7 @@ impl MyHubService {
         chain_clients: ChainClients,
         version: String,
         peer_id: String,
+        fname_lookup: Option<Arc<dyn FnameTransferLookup>>,
     ) -> Self {
         let mut allowed_users = HashMap::new();
         for auth in rpc_auth.split(",") {
@@ -132,6 +403,7 @@ impl MyHubService {
             version,
             peer_id,
             id_registry_cache,
+            fname_lookup,
         };
         service
     }
@@ -147,10 +419,155 @@ impl MyHubService {
 
         let dst_shard = routing::route_message(&self.message_router, &message, self.num_shards);
 
-        self.simulate_message_for_shard(&message, dst_shard).await?;
+        match self
+            .simulate_message_for_shard_typed(&message, dst_shard)
+            .await
+        {
+            Ok(()) => {}
+            Err(engine::MessageValidationError::MissingFname) => {
+                if let Some(fname) = username_for_fname_recovery(&message) {
+                    self.recover_missing_fname(fid, &fname, &message, dst_shard)
+                        .await?;
+                } else {
+                    return Err(HubError::validation_failure(
+                        &engine::MessageValidationError::MissingFname.to_string(),
+                    ));
+                }
+            }
+            Err(err) => return Err(simulate_error_to_hub_error(err)),
+        }
 
         // Process the submitted message
         self.submit_message_to_mempool(message).await
+    }
+
+    /// On-demand recovery for the fname-not-yet-propagated race: query the fname
+    /// registry directly, push any matching transfer through the mempool, then
+    /// poll for the proof to land in the local store before re-running validation.
+    async fn recover_missing_fname(
+        &self,
+        fid: u64,
+        fname: &str,
+        message: &proto::Message,
+        dst_shard: u32,
+    ) -> Result<(), HubError> {
+        let lookup = match &self.fname_lookup {
+            Some(lookup) => lookup,
+            None => {
+                return Err(HubError::validation_failure(
+                    &engine::MessageValidationError::MissingFname.to_string(),
+                ));
+            }
+        };
+
+        self.statsd_client.count(
+            "rpc.submit_message.missing_fname_recovery_attempted",
+            1,
+            vec![],
+        );
+
+        let transfers =
+            match timeout(MISSING_FNAME_LOOKUP_TIMEOUT, lookup.lookup_fname(fname)).await {
+                Ok(Ok(transfers)) => transfers,
+                Ok(Err(err)) => {
+                    error!(
+                        fid,
+                        fname,
+                        err = err.to_string(),
+                        "fname registry lookup failed during missing-fname recovery"
+                    );
+                    self.statsd_client.count(
+                        "rpc.submit_message.missing_fname_recovery_lookup_error",
+                        1,
+                        vec![],
+                    );
+                    return Err(HubError::validation_failure(
+                        &engine::MessageValidationError::MissingFname.to_string(),
+                    ));
+                }
+                Err(_) => {
+                    error!(
+                        fid,
+                        fname, "fname registry lookup timed out during missing-fname recovery"
+                    );
+                    self.statsd_client.count(
+                        "rpc.submit_message.missing_fname_recovery_lookup_timeout",
+                        1,
+                        vec![],
+                    );
+                    return Err(HubError::validation_failure(
+                        &engine::MessageValidationError::MissingFname.to_string(),
+                    ));
+                }
+            };
+
+        let mut submitted_any = false;
+        for transfer in transfers {
+            let target_fid = transfer.proof.as_ref().map(|p| p.fid).unwrap_or(0);
+            if target_fid != fid {
+                continue;
+            }
+            let (tx, rx) = oneshot::channel();
+            if let Err(err) = self.mempool_tx.try_send(MempoolRequest::AddMessage(
+                MempoolMessage::FnameTransfer(transfer),
+                MempoolSource::RPC,
+                Some(tx),
+            )) {
+                error!(
+                    fid,
+                    fname,
+                    err = err.to_string(),
+                    "failed to enqueue fname transfer for missing-fname recovery"
+                );
+                continue;
+            }
+            match timeout(MEMPOOL_ADD_REQUEST_TIMEOUT, rx).await {
+                Ok(Ok(Ok(()))) | Ok(Ok(Err(_))) => submitted_any = true,
+                Ok(Err(_)) | Err(_) => submitted_any = true,
+            }
+        }
+
+        if !submitted_any {
+            self.statsd_client.count(
+                "rpc.submit_message.missing_fname_recovery_no_transfer",
+                1,
+                vec![],
+            );
+            return Err(HubError::validation_failure(
+                &engine::MessageValidationError::MissingFname.to_string(),
+            ));
+        }
+
+        let deadline = std::time::Instant::now() + MISSING_FNAME_RECOVERY_BUDGET;
+        loop {
+            match self
+                .simulate_message_for_shard_typed(message, dst_shard)
+                .await
+            {
+                Ok(()) => {
+                    self.statsd_client.count(
+                        "rpc.submit_message.missing_fname_recovery_success",
+                        1,
+                        vec![],
+                    );
+                    return Ok(());
+                }
+                Err(engine::MessageValidationError::MissingFname) => {
+                    if std::time::Instant::now() >= deadline {
+                        self.statsd_client.count(
+                            "rpc.submit_message.missing_fname_recovery_timeout",
+                            1,
+                            vec![],
+                        );
+                        return Err(HubError::validation_failure(
+                            &engine::MessageValidationError::MissingFname.to_string(),
+                        ));
+                    }
+                    sleep(MISSING_FNAME_POLL_INTERVAL).await;
+                }
+                Err(err) => return Err(simulate_error_to_hub_error(err)),
+            }
+        }
     }
 
     async fn submit_message_to_mempool(
@@ -274,6 +691,19 @@ impl MyHubService {
         message: &proto::Message,
         shard_id: u32,
     ) -> Result<(), HubError> {
+        self.simulate_message_for_shard_typed(message, shard_id)
+            .await
+            .map_err(simulate_error_to_hub_error)
+    }
+
+    /// Same as `simulate_message_for_shard` but returns the typed
+    /// `engine::MessageValidationError` so callers can match on specific
+    /// variants (e.g. `MissingFname` for the on-demand recovery flow).
+    async fn simulate_message_for_shard_typed(
+        &self,
+        message: &proto::Message,
+        shard_id: u32,
+    ) -> Result<(), engine::MessageValidationError> {
         if shard_id == 0 {
             // Handle shard 0 (block engine) specially
             let mut block_engine = block_engine::BlockEngine::new(
@@ -286,13 +716,24 @@ impl MyHubService {
             );
 
             block_engine.simulate_message(message).map_err(|e| match e {
-                block_engine::MessageValidationError::HubError(hub_error) => hub_error,
-                _ => HubError::validation_failure(&e.to_string()),
+                block_engine::MessageValidationError::HubError(hub_error) => {
+                    engine::MessageValidationError::StoreError(hub_error)
+                }
+                block_engine::MessageValidationError::MessageValidationError(v) => {
+                    engine::MessageValidationError::MessageValidationError(v)
+                }
+                other => engine::MessageValidationError::StoreError(HubError::validation_failure(
+                    &other.to_string(),
+                )),
             })
         } else {
             let stores = match self.shard_stores.get(&shard_id) {
                 Some(store) => store,
-                None => return Err(HubError::invalid_parameter("shard not found for fid")),
+                None => {
+                    return Err(engine::MessageValidationError::StoreError(
+                        HubError::invalid_parameter("shard not found for fid"),
+                    ))
+                }
             };
 
             // TODO: This is a hack to get around the fact that self cannot be made mutable
@@ -308,17 +749,10 @@ impl MyHubService {
                 None,
                 None,
             )
-            .await?;
+            .await
+            .map_err(engine::MessageValidationError::StoreError)?;
 
-            readonly_engine
-                .simulate_message(message)
-                .map_err(|err| match err {
-                    engine::MessageValidationError::StoreError(hub_error) => {
-                        // Forward hub errors as is, otherwise we end up wrapping them
-                        hub_error
-                    }
-                    _ => HubError::validation_failure(&err.to_string()),
-                })
+            readonly_engine.simulate_message(message)
         }
     }
 
@@ -2213,6 +2647,41 @@ impl HubService for MyHubService {
             next_page_token: events_page.next_page_token,
         };
         Ok(Response::new(response))
+    }
+
+    async fn get_signer(
+        &self,
+        request: Request<SignerRequest>,
+    ) -> Result<Response<SignerResponse>, Status> {
+        let req = request.into_inner();
+        let fid = req.fid;
+        let stores = self.get_stores_for(fid)?;
+
+        let resolved = resolve_signer(stores, fid, &req.signer)?
+            .ok_or_else(|| Status::not_found("Active signer not found".to_string()))?;
+
+        Ok(Response::new(SignerResponse {
+            signer: Some(resolved),
+        }))
+    }
+
+    async fn get_signers_by_fid(
+        &self,
+        request: Request<FidRequest>,
+    ) -> Result<Response<SignersByFidResponse>, Status> {
+        let req = request.into_inner();
+        let fid = req.fid;
+        let stores = self.get_stores_for(fid)?;
+
+        let page_options = req.page_options();
+        let page = list_signers_for_fid(stores, fid, &page_options)?;
+
+        Ok(Response::new(SignersByFidResponse {
+            signers: page.signers,
+            next_page_token: page.next_page_token,
+            gasless_signer_count: page.gasless_signer_count,
+            gasless_signer_limit: crate::core::validations::key::MAX_GASLESS_KEYS_PER_FID,
+        }))
     }
 
     async fn get_on_chain_events(

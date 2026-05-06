@@ -86,6 +86,9 @@ pub enum MessageValidationError {
     #[error("invalid signer")]
     MissingSigner,
 
+    #[error("message type {msg_type} is not in the scope of the gasless signer")]
+    GaslessKeyOutOfScope { msg_type: i32 },
+
     #[error(transparent)]
     MessageValidationError(#[from] validations::error::ValidationError),
 
@@ -1213,6 +1216,10 @@ impl ShardEngine {
         let mt = MessageType::try_from(data.r#type)
             .or(Err(MessageValidationError::InvalidMessageType(data.r#type)))?;
 
+        let version =
+            EngineVersion::version_for(&FarcasterTime::new(data.timestamp as u64), self.network);
+        let gasless_enabled = version.is_enabled(ProtocolFeature::GaslessSigners);
+
         let event = match mt {
             MessageType::CastAdd | MessageType::CastRemove => vec![self
                 .stores
@@ -1251,6 +1258,30 @@ impl ShardEngine {
                 let store = &self.stores.storage_lend_store;
                 StorageLendStore::merge(store, msg, txn_batch)
                     .map_err(|e| MessageValidationError::StoreError(e))?
+            }
+            MessageType::KeyAdd if gasless_enabled => {
+                // ShardEngine reaches `merge_message` for KEY_ADD only via
+                // `handle_block_event` (BlockEvent replay) — KEY_ADD always routes to
+                // shard 0, so a non-shard-0 ShardEngine never admits one as a user
+                // message. Pass `is_replay = true` so `merge_key_add` skips the
+                // request_fid IdRegister lookup that's redundant here (shard 0 already
+                // validated it) and impossible to honour when request_fid lives on a
+                // different user shard than this one.
+                vec![crate::storage::store::account::merge_key_add(
+                    &self.db,
+                    &self.stores.onchain_event_store,
+                    msg,
+                    txn_batch,
+                    true,
+                )?]
+            }
+            MessageType::KeyRemove if gasless_enabled => {
+                vec![crate::storage::store::account::merge_key_remove(
+                    &self.db,
+                    &self.stores.onchain_event_store,
+                    msg,
+                    txn_batch,
+                )?]
             }
             unhandled_type => {
                 return Err(MessageValidationError::InvalidMessageType(
@@ -1398,15 +1429,20 @@ impl ShardEngine {
         message: &proto::Message,
         timestamp: &FarcasterTime,
         version: EngineVersion,
-        txn_batch: &RocksDbTransactionBatch,
+        txn_batch: &mut RocksDbTransactionBatch,
     ) -> Result<(), MessageValidationError> {
         let now = std::time::Instant::now();
 
-        let txn_batch = if version.is_enabled(ProtocolFeature::DependentMessagesInBulkSubmit) {
-            txn_batch
-        } else {
-            &RocksDbTransactionBatch::new()
-        };
+        // Reads use `read_txn` (in-flight writes when DependentMessagesInBulkSubmit is on,
+        // empty otherwise); writes — specifically the gasless-key `last_used_at` bump
+        // below — always land on the real `txn_batch`.
+        let empty_txn = RocksDbTransactionBatch::new();
+        let read_txn: &RocksDbTransactionBatch =
+            if version.is_enabled(ProtocolFeature::DependentMessagesInBulkSubmit) {
+                &*txn_batch
+            } else {
+                &empty_txn
+            };
 
         // Ensure message data is present
         let message_data = message
@@ -1427,19 +1463,52 @@ impl ShardEngine {
         )?;
 
         // 1. Check that the user has a custody address
-        // If not in the temp cache, fall back to the DB
         self.stores
             .onchain_event_store
-            .get_id_register_event_by_fid(message_data.fid, Some(txn_batch))
+            .get_id_register_event_by_fid(message_data.fid, Some(read_txn))
             .map_err(|_| MessageValidationError::MissingFid)?
             .ok_or(MessageValidationError::MissingFid)?;
 
-        // 2. Check that the user has a valid signer
-        self.stores
-            .onchain_event_store
-            .get_active_signer(message_data.fid, message.signer.clone(), Some(txn_batch))
+        // 2. Check that the user has a valid signer.
+        //
+        // KEY_ADD / KEY_REMOVE authenticate via custody EIP-712 (or, for self-revocation
+        // KEY_REMOVE, via the Ed25519 key being revoked). `message.signer` on these is the
+        // Ed25519 key being added or removed — not yet (KEY_ADD) or about to leave (KEY_REMOVE)
+        // the signer set. Real auth lives in the merge path.
+        let msg_type = MessageType::try_from(message_data.r#type).unwrap_or(MessageType::None);
+        let mut gasless_ttl_for_bump: Option<u32> = None;
+        let is_key_message = msg_type == MessageType::KeyAdd || msg_type == MessageType::KeyRemove;
+        if is_key_message && !version.is_enabled(ProtocolFeature::GaslessSigners) {
+            return Err(MessageValidationError::InvalidMessageType(
+                message_data.r#type,
+            ));
+        }
+        if !is_key_message {
+            let active_key = crate::storage::store::account::get_active_key(
+                &self.stores.onchain_event_store,
+                &self.db,
+                read_txn,
+                message_data.fid,
+                &message.signer,
+            )
             .map_err(|_| MessageValidationError::MissingSigner)?
             .ok_or(MessageValidationError::MissingSigner)?;
+
+            // On-chain signers are scope-free; gasless signers must declare msg_type in scope.
+            if !active_key.admits(msg_type) {
+                return Err(MessageValidationError::GaslessKeyOutOfScope {
+                    msg_type: message_data.r#type,
+                });
+            }
+
+            if let crate::storage::store::account::ActiveKey::Gasless { ttl_seconds, .. } =
+                active_key
+            {
+                if ttl_seconds > 0 {
+                    gasless_ttl_for_bump = Some(ttl_seconds);
+                }
+            }
+        }
 
         // Don't allow storage lends to be merged directly without going through shard 0
         if message_data.r#type() == MessageType::LendStorage {
@@ -1452,24 +1521,39 @@ impl ShardEngine {
         match &message_data.body {
             Some(proto::message_data::Body::UserDataBody(user_data)) => {
                 if user_data.r#type == proto::UserDataType::Username as i32 {
-                    self.validate_username(message_data.fid, &user_data.value, txn_batch)?;
+                    self.validate_username(message_data.fid, &user_data.value, read_txn)?;
                 }
                 if user_data.r#type == proto::UserDataType::UserDataPrimaryAddressEthereum as i32 {
                     self.validate_ethereum_address_ownership(
                         message_data.fid,
                         &user_data.value,
-                        txn_batch,
+                        read_txn,
                     )?;
                 }
                 if user_data.r#type == proto::UserDataType::UserDataPrimaryAddressSolana as i32 {
                     self.validate_solana_address_ownership(
                         message_data.fid,
                         &user_data.value,
-                        txn_batch,
+                        read_txn,
                     )?;
                 }
             }
             _ => {}
+        }
+
+        // 3. Sliding-TTL enforcement for gasless keys. Bump `last_used_at` to the message's
+        // own timestamp; reject if the key has expired since its last use.
+        if let Some(ttl) = gasless_ttl_for_bump {
+            let current_block_timestamp = timestamp.to_u64();
+            crate::storage::store::account::check_and_bump_last_used_at(
+                &self.db,
+                txn_batch,
+                message_data.fid,
+                &message.signer,
+                ttl,
+                message_data.timestamp,
+                current_block_timestamp,
+            )?;
         }
 
         let elapsed = now.elapsed();
@@ -1875,6 +1959,11 @@ impl ShardEngine {
                 commit_shard_root = hex::encode(shard_root),
                 "Cached shard root mismatch"
             );
+            self.metrics.count(
+                "commit.cache_miss",
+                1,
+                vec![("reason", "shard_root_mismatch")],
+            );
             return false;
         }
 
@@ -1887,6 +1976,11 @@ impl ShardEngine {
                 cached_block_events_hash = hex::encode(&cached_txn.block_events_hash),
                 computed_block_events_hash = hex::encode(&computed_hash),
                 "Cached block events hash mismatch"
+            );
+            self.metrics.count(
+                "commit.cache_miss",
+                1,
+                vec![("reason", "block_events_hash_mismatch")],
             );
             return false;
         }
@@ -1904,6 +1998,7 @@ impl ShardEngine {
         if let Some(cached_txn) = self.pending_txn.clone() {
             if self.is_cached_txn_valid(&cached_txn, shard_root, transactions) {
                 applied_cached_txn = true;
+                self.metrics.count("commit.cache_hit", 1, vec![]);
                 self.commit_and_emit_events(
                     shard_chunk,
                     cached_txn.events,
@@ -1912,6 +2007,14 @@ impl ShardEngine {
                 )
                 .await;
             }
+        } else {
+            // is_cached_txn_valid emits its own miss metric when pending_txn
+            // exists but doesn't match. This branch covers the other case:
+            // there was never a prevalidated proposal for this value on this
+            // node (e.g. this node wasn't the proposer and didn't see the
+            // propose round that decided).
+            self.metrics
+                .count("commit.cache_miss", 1, vec![("reason", "no_pending_txn")]);
         }
 
         if !applied_cached_txn {

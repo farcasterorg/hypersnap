@@ -2078,6 +2078,12 @@ fn map_proto_message_data_to_json_message_data(
                 lend_storage_body: Some(result),
             });
         }
+        // KEY_ADD/KEY_REMOVE JSON mappings are added in a follow-up task; for now expose them
+        // as a clear error so callers see the type isn't supported on the JSON surface yet.
+        Some(Body::KeyAddBody(_)) | Some(Body::KeyRemoveBody(_)) => Err(ErrorResponse {
+            error: "Unsupported message type for JSON: KEY_ADD/KEY_REMOVE".to_string(),
+            error_detail: None,
+        }),
         None => Err(ErrorResponse {
             error: "No message data".to_string(),
             error_detail: None,

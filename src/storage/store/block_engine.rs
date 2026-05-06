@@ -60,6 +60,9 @@ pub enum MessageValidationError {
     #[error("invalid signer")]
     MissingSigner,
 
+    #[error("message type {msg_type} is not in the scope of the gasless signer")]
+    GaslessKeyOutOfScope { msg_type: i32 },
+
     #[error("invalid message type")]
     InvalidMessageType,
 
@@ -71,6 +74,25 @@ pub enum MessageValidationError {
 
     #[error(transparent)]
     MessageValidationError(#[from] validations::error::ValidationError),
+}
+
+// `merge_key_add` / `merge_key_remove` in `account::gasless_key_merge` return the
+// ShardEngine-flavored `engine::MessageValidationError` (their historical home). Translate
+// into the block-engine variant so callers here can use `?` on them.
+impl From<crate::storage::store::engine::MessageValidationError> for MessageValidationError {
+    fn from(err: crate::storage::store::engine::MessageValidationError) -> Self {
+        use crate::storage::store::engine::MessageValidationError as E;
+        match err {
+            E::NoMessageData => Self::NoMessageData,
+            E::MissingFid => Self::MissingFid,
+            E::MissingSigner => Self::MissingSigner,
+            E::GaslessKeyOutOfScope { msg_type } => Self::GaslessKeyOutOfScope { msg_type },
+            E::MessageValidationError(v) => Self::MessageValidationError(v),
+            E::InvalidMessageType(_) => Self::InvalidMessageType,
+            E::StoreError(h) => Self::HubError(h),
+            other => Self::HubError(HubError::internal_db_error(&other.to_string())),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -267,12 +289,27 @@ impl BlockEngine {
             .map_err(|_| MessageValidationError::MissingFid)?
             .ok_or(MessageValidationError::MissingFid)?;
 
-        // 2. Check that the user has a valid signer
-        self.stores
-            .onchain_event_store
-            .get_active_signer(message_data.fid, message.signer.clone(), Some(txn_batch))
-            .map_err(|_| MessageValidationError::MissingSigner)?
-            .ok_or(MessageValidationError::MissingSigner)?;
+        // 2. Check that the user has a valid signer.
+        //
+        // KEY_ADD / KEY_REMOVE are special: they authenticate via a custody EIP-712 signature
+        // (and, for self-revocation KEY_REMOVE, via the Ed25519 key being revoked signing
+        // itself). The outer `message.signer` on these messages is the Ed25519 key being
+        // added or removed — by definition either not yet in the signer store (KEY_ADD) or
+        // about to leave it (KEY_REMOVE). Their real authentication happens in the merge
+        // path (see `merge_key_add` / `merge_key_remove`), so skip the active-signer check
+        // here.
+        let msg_type = MessageType::try_from(message_data.r#type).unwrap_or(MessageType::None);
+        let is_key_message = msg_type == MessageType::KeyAdd || msg_type == MessageType::KeyRemove;
+        if is_key_message && !version.is_enabled(ProtocolFeature::GaslessSigners) {
+            return Err(MessageValidationError::InvalidMessageType);
+        }
+        if !is_key_message {
+            self.stores
+                .onchain_event_store
+                .get_active_signer(message_data.fid, message.signer.clone(), Some(txn_batch))
+                .map_err(|_| MessageValidationError::MissingSigner)?
+                .ok_or(MessageValidationError::MissingSigner)?;
+        }
 
         match message_data
             .body
@@ -304,6 +341,13 @@ impl BlockEngine {
                     return Err(MessageValidationError::InsufficientStorage);
                 }
             }
+            // KEY_ADD / KEY_REMOVE have no per-body pre-merge validation to do at the block-
+            // engine level: static body validation (key length, scopes, ttl bound, etc.) ran
+            // upstream in `validate_message`, and state-dependent checks (nonce CAS, custody
+            // recovery, conflict resolution) live in the merge helpers themselves.
+            crate::proto::message_data::Body::KeyAddBody(_)
+            | crate::proto::message_data::Body::KeyRemoveBody(_)
+                if version.is_enabled(ProtocolFeature::GaslessSigners) => {}
             _ => return Err(MessageValidationError::InvalidMessageType),
         }
 
@@ -315,12 +359,41 @@ impl BlockEngine {
         message: &proto::Message,
         txn_batch: &mut RocksDbTransactionBatch,
     ) -> Result<Vec<proto::HubEvent>, MessageValidationError> {
-        match message.msg_type() {
+        let msg_type = message.msg_type();
+        let gasless_enabled = if matches!(msg_type, MessageType::KeyAdd | MessageType::KeyRemove) {
+            let ts = message
+                .data
+                .as_ref()
+                .ok_or(MessageValidationError::NoMessageData)?
+                .timestamp;
+            let version = EngineVersion::version_for(&FarcasterTime::new(ts as u64), self.network);
+            version.is_enabled(ProtocolFeature::GaslessSigners)
+        } else {
+            false
+        };
+        match msg_type {
             MessageType::LendStorage => Ok(StorageLendStore::merge(
                 &self.stores.storage_lend_store,
                 message,
                 txn_batch,
             )?),
+            MessageType::KeyAdd if gasless_enabled => {
+                Ok(vec![crate::storage::store::account::merge_key_add(
+                    &self.stores.db,
+                    &self.stores.onchain_event_store,
+                    message,
+                    txn_batch,
+                    false,
+                )?])
+            }
+            MessageType::KeyRemove if gasless_enabled => {
+                Ok(vec![crate::storage::store::account::merge_key_remove(
+                    &self.stores.db,
+                    &self.stores.onchain_event_store,
+                    message,
+                    txn_batch,
+                )?])
+            }
             _ => return Err(MessageValidationError::InvalidMessageType),
         }
     }
@@ -412,6 +485,16 @@ impl BlockEngine {
                             }
                         }
                     }
+                    MessageType::KeyAdd | MessageType::KeyRemove => {
+                        // No storage-slot accounting needed — gasless keys don't consume
+                        // storage units. Emitted MergeMessageBody propagates to shards via
+                        // BlockEvent so their local DBs can replay the same merge.
+                        if version.is_enabled(ProtocolFeature::GaslessSigners) {
+                            if let Ok(events) = self.merge_message(message, txn_batch) {
+                                hub_events.extend(events);
+                            }
+                        }
+                    }
                     _ => {}
                 },
                 Err(err) => {
@@ -463,14 +546,31 @@ impl BlockEngine {
         hub_events: Vec<HubEvent>,
         txn: &mut RocksDbTransactionBatch,
     ) -> (Vec<BlockEvent>, Vec<u8>) {
+        let version = EngineVersion::version_for(timestamp, self.network);
+        let gasless_enabled = version.is_enabled(ProtocolFeature::GaslessSigners);
         let mut events = vec![];
         let mut max_block_event_seqnum = self.stores.block_event_store.max_seqnum().unwrap();
         for hub_event in hub_events {
             match hub_event.body.unwrap() {
                 proto::hub_event::Body::MergeMessageBody(merge_message_body) => {
                     if let Some(message) = merge_message_body.message {
-                        match message.msg_type() {
-                            MessageType::LendStorage => {
+                        let msg_type = message.msg_type();
+                        let is_key =
+                            matches!(msg_type, MessageType::KeyAdd | MessageType::KeyRemove);
+                        if is_key && !gasless_enabled {
+                            continue;
+                        }
+                        match msg_type {
+                            MessageType::LendStorage
+                            | MessageType::KeyAdd
+                            | MessageType::KeyRemove => {
+                                // All shard-0-hosted user messages propagate the same way:
+                                // wrap the original message in a MergeMessageEvent so shards
+                                // 1..N can replay the merge into their local DBs via
+                                // ShardEngine::handle_block_event. For KEY_ADD / KEY_REMOVE
+                                // this is what makes gasless-key records visible on every
+                                // shard for scope enforcement, TTL checks, and last_used_at
+                                // bumps.
                                 max_block_event_seqnum += 1;
                                 let data = BlockEventData {
                                     seqnum: max_block_event_seqnum,

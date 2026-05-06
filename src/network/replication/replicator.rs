@@ -358,7 +358,12 @@ impl Replicator {
 
         // Handle each store type directly
         let messages = match user_message_type {
-            proto::MessageType::FrameAction | proto::MessageType::None => {
+            proto::MessageType::FrameAction
+            | proto::MessageType::None
+            | proto::MessageType::KeyAdd
+            | proto::MessageType::KeyRemove => {
+                // KEY_ADD/KEY_REMOVE replication is wired up in a follow-up task once the
+                // gasless key store lands; until then they are not replicated here.
                 return Err(ReplicationError::InvalidMessage(format!(
                     "Invalid message type for FID {}: {:?}",
                     fid, user_message_type

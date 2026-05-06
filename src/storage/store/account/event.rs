@@ -248,6 +248,9 @@ impl HubEventStorageExt for HubEvent {
         let stop_event_id = HubEventIdGenerator::make_event_id_for_block_number(stop_height);
         let start_event_key = make_event_key(0);
         let stop_event_key = make_event_key(stop_event_id);
+        // Event pruning is a large cold sweep across HubEvents; bypass the
+        // shared block cache so this scan doesn't evict the hot consensus
+        // working set.
         let total_pruned = db
             .delete_paginated(
                 Some(start_event_key),
@@ -257,6 +260,7 @@ impl HubEventStorageExt for HubEvent {
                 Some(|total_pruned: u32| {
                     info!("Pruning events... pruned: {}", total_pruned);
                 }),
+                true, // skip_cache
             )
             .await?;
         Ok(total_pruned)
