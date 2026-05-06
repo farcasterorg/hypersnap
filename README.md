@@ -80,8 +80,7 @@ git clone git@github.com:informalsystems/malachite.git
 cd malachite
 git checkout 13bca14cd209d985c3adf101a02924acde8723a5
 cd ..
-git clone git@github.com:farcasterxyz/snapchain.git
-cd snapchain
+cd hypersnap
 cargo build
 ```
 
