@@ -4293,4 +4293,110 @@ mod tests {
             "each cast must produce exactly one merge event, not duplicated by hyper"
         );
     }
+
+    // -- Gasless KEY_ADD end-to-end on ShardEngine -------------------------------------------
+    //
+    // Exercises the cross-shard replication contract: KEY_ADD always routes to shard 0
+    // (BlockEngine), where it merges into the gasless_key_store and emits a
+    // MergeMessageEventBody BlockEvent. Every other shard's ShardEngine receives that
+    // BlockEvent via consensus and replays it through `merge_message` with `is_replay=true`,
+    // which writes the gasless_key_store to the *shard's* local DB. Subsequent user messages
+    // signed by the gasless Ed25519 key validate against `get_active_key`, which must surface
+    // the gasless record (rather than failing with `MissingSigner` like the on-chain-only
+    // path).
+    //
+    // The test simulates this end-to-end against a single ShardEngine on shard 1: build the
+    // KEY_ADD via the messages_factory, wrap it in a BlockEvent, feed it via
+    // `commit_block_events`, then commit a CastAdd signed by the gasless key. If any link in
+    // the chain (replay merge, gasless_key_store write, get_active_key resolution, scope
+    // admit, sliding-TTL bump) breaks, the cast either fails to merge or the active-key
+    // sanity check at the end fails.
+    mod gasless_key_e2e {
+        use super::*;
+        use crate::storage::store::account::{get_active_key, ActiveKey};
+        use alloy_signer_local::PrivateKeySigner;
+
+        const REQUEST_FID: u64 = FID_FOR_TEST + 100;
+
+        async fn register_eth(
+            engine: &mut ShardEngine,
+            fid: u64,
+            custody: &PrivateKeySigner,
+            signer: ed25519_dalek::SigningKey,
+        ) {
+            register_user(fid, signer, custody.address().as_slice().to_vec(), engine).await;
+        }
+
+        #[tokio::test]
+        async fn cast_signed_by_gasless_key_validates_after_block_event_replay() {
+            let (mut engine, _temp_dir) = test_helper::new_engine().await;
+            let fid_custody = PrivateKeySigner::random();
+            let app_custody = PrivateKeySigner::random();
+            let gasless = generate_signer();
+
+            // Both fid + request_fid need on-chain custody addresses.
+            register_eth(&mut engine, FID_FOR_TEST, &fid_custody, generate_signer()).await;
+            register_eth(&mut engine, REQUEST_FID, &app_custody, generate_signer()).await;
+
+            // Build a KEY_ADD scoped to CastAdd. `deadline` is far enough in the future that
+            // the EIP-712 deadline check passes; `nonce = 1` is the first user nonce.
+            let timestamp = factory::time::farcaster_time();
+            let key_add = factory::messages_factory::keys::create_key_add(
+                FID_FOR_TEST,
+                &fid_custody,
+                REQUEST_FID,
+                &app_custody,
+                &gasless,
+                vec![proto::MessageType::CastAdd],
+                3600, // ttl seconds
+                1,    // nonce
+                timestamp + 1_000_000,
+                Some(timestamp),
+            );
+
+            // Wrap in a BlockEvent — simulates what shard 0's BlockEngine emits after merging
+            // the KEY_ADD. Feeding it via `commit_block_events` exercises ShardEngine's
+            // `handle_block_event` → `merge_message` (KeyAdd arm, is_replay=true) chain that
+            // writes the gasless_key_store on this shard.
+            let block_event = create_merge_message_event(key_add, 1);
+            commit_block_events(&mut engine, vec![&block_event]).await;
+
+            // The cast is signed by the gasless Ed25519 envelope key. If validation goes
+            // through the on-chain-only `get_active_signer` path it will MissingSigner here;
+            // success requires the unified `get_active_key` to find the gasless record this
+            // shard's DB just received via replay.
+            let cast = messages_factory::casts::create_cast_add(
+                FID_FOR_TEST,
+                "hello from gasless",
+                Some(timestamp + 2),
+                Some(&gasless),
+            );
+            commit_message(&mut engine, &cast).await;
+            assert!(
+                message_exists_in_trie(&mut engine, &cast),
+                "cast signed by gasless key must merge after KEY_ADD replay"
+            );
+
+            // Sanity-check the active-key resolution surfaces the gasless variant rather than
+            // an on-chain SignerEvent — that's the discriminator between this code path and
+            // the legacy one.
+            let txn = RocksDbTransactionBatch::new();
+            let stores = engine.get_stores();
+            let pubkey = gasless.verifying_key().to_bytes();
+            let active = get_active_key(
+                &stores.onchain_event_store,
+                &stores.db,
+                &txn,
+                FID_FOR_TEST,
+                &pubkey,
+            )
+            .unwrap()
+            .expect("active key must resolve after KEY_ADD replay");
+            assert!(
+                matches!(active, ActiveKey::Gasless { .. }),
+                "expected gasless active-key variant, got: {:?}",
+                active
+            );
+        }
+    }
 }

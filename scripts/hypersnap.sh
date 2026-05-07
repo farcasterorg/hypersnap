@@ -26,6 +26,7 @@ else
     LATEST_TAG="@latest"
 fi
 
+VALIDATORS_FILE_PATH="validators.toml"
 SCRIPT_FILE_PATH="scripts/hypersnap.sh"
 GRAFANA_DASHBOARD_JSON_PATH="grafana/grafana-dashboard.json"
 GRAFANA_INI_PATH="grafana/grafana.ini"
@@ -129,6 +130,7 @@ self_upgrade() {
 # Fetch the docker-compose.yml and grafana-dashboard.json files
 fetch_latest_docker_compose_and_dashboard() {
     fetch_file_from_repo "$DOCKER_COMPOSE_FILE_PATH" "docker-compose.yml"
+    fetch_file_from_repo "$VALIDATORS_FILE_PATH" "validators.toml"
     fetch_file_from_repo "$GRAFANA_DASHBOARD_JSON_PATH" "grafana-dashboard.json"
     mkdir -p grafana
     chmod 777 grafana

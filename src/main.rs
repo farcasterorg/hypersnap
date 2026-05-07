@@ -103,6 +103,17 @@ async fn start_servers(
         });
     }
 
+    let fname_lookup: Option<Arc<dyn snapchain::connectors::fname::FnameTransferLookup>> =
+        if !app_config.fnames.disable && !app_config.fnames.url.is_empty() {
+            Some(Arc::new(
+                snapchain::connectors::fname::HttpFnameTransferLookup::new(
+                    app_config.fnames.url.clone(),
+                ),
+            ))
+        } else {
+            None
+        };
+
     let service = Arc::new(MyHubService::new(
         app_config.rpc_auth.clone(),
         block_stores.clone(),
@@ -118,6 +129,7 @@ async fn start_servers(
         chain_clients,
         VERSION.unwrap_or("unknown").to_string(),
         gossip.swarm.local_peer_id().to_string(),
+        fname_lookup.clone(),
     ));
 
     // Create a separate API service backed by hyper (un-pruned) stores.
@@ -139,6 +151,7 @@ async fn start_servers(
         },
         VERSION.unwrap_or("unknown").to_string(),
         gossip.swarm.local_peer_id().to_string(),
+        fname_lookup,
     ));
 
     // Wire late-bound API handlers that depend on the hub service
@@ -356,12 +369,22 @@ async fn schedule_background_jobs(
         }
     }
 
+    let event_pruning_schedule = app_config
+        .pruning
+        .event_pruning_schedule
+        .as_deref()
+        .unwrap_or("0 0 0 * * *"); // default: midnight UTC every day
     let event_pruning_job = snapchain::jobs::event_pruning::event_pruning_job(
-        "0 0 0 * * *", // midnight UTC every day
+        event_pruning_schedule,
         app_config.pruning.event_retention,
         shard_stores.clone(),
     )
-    .unwrap();
+    .unwrap_or_else(|e| {
+        panic!(
+            "invalid pruning.event_pruning_schedule {:?} (expected 6-field cron 'sec min hour day month dow'): {:?}",
+            event_pruning_schedule, e
+        )
+    });
     jobs.push(event_pruning_job);
 
     if app_config.snapshot.snapshot_upload_enabled() {

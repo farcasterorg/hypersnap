@@ -1,9 +1,9 @@
+use crate::core::validations::contract_signature::{self, Verification};
 use crate::core::validations::error::ValidationError;
 use crate::proto::{self, FarcasterNetwork, VerificationAddAddressBody};
 use alloy_dyn_abi::TypedData;
 use alloy_provider::Provider;
 use alloy_transport::Transport;
-use eth_signature_verifier::Verification;
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -303,7 +303,7 @@ where
 
     let hash = prehash.unwrap();
 
-    match eth_signature_verifier::verify_signature(
+    match contract_signature::verify_signature(
         alloy_primitives::Bytes::from(body.claim_signature.clone()),
         alloy_primitives::Address::from(&body.address.clone().try_into().unwrap()),
         hash,

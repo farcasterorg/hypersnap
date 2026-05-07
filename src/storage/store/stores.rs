@@ -142,6 +142,10 @@ impl Limits {
             MessageType::UsernameProof => StoreType::UsernameProofs,
             MessageType::FrameAction => StoreType::None,
             MessageType::LendStorage => StoreType::StorageLends,
+            // KEY_ADD/KEY_REMOVE live outside the per-store quota system (they have their own
+            // global per-FID cap on active gasless keys, enforced by the gasless key store).
+            MessageType::KeyAdd => StoreType::None,
+            MessageType::KeyRemove => StoreType::None,
             MessageType::None => StoreType::None,
         }
     }

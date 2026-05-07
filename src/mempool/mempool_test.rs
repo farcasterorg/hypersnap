@@ -169,10 +169,10 @@ mod tests {
         )
         .await;
         let cast = create_cast_add(1234, "hello", None, None);
-        let valid = mempool.message_is_valid(1, &MempoolMessage::UserMessage(cast.clone()));
+        let valid = mempool.message_is_valid(1, &MempoolMessage::UserMessage(cast.clone()), true);
         assert!(valid.is_ok());
         test_helper::commit_message(&mut engine, &cast).await;
-        let valid = mempool.message_is_valid(1, &MempoolMessage::UserMessage(cast.clone()));
+        let valid = mempool.message_is_valid(1, &MempoolMessage::UserMessage(cast.clone()), true);
         assert!(!valid.is_ok())
     }
 
@@ -187,6 +187,7 @@ mod tests {
                 for_shard: 1,
                 message: block_event.clone(),
             },
+            true,
         );
         assert!(valid.is_ok());
 
@@ -197,6 +198,7 @@ mod tests {
                 for_shard: 1,
                 message: block_event.clone(),
             },
+            true,
         );
         assert!(!valid.is_ok())
     }
@@ -212,12 +214,18 @@ mod tests {
             false,
             proto::FarcasterNetwork::Devnet,
         );
-        let valid =
-            mempool.message_is_valid(1, &MempoolMessage::OnchainEvent(onchain_event.clone()));
+        let valid = mempool.message_is_valid(
+            1,
+            &MempoolMessage::OnchainEvent(onchain_event.clone()),
+            true,
+        );
         assert!(valid.is_ok());
         test_helper::commit_event(&mut engine, &onchain_event).await;
-        let valid =
-            mempool.message_is_valid(1, &MempoolMessage::OnchainEvent(onchain_event.clone()));
+        let valid = mempool.message_is_valid(
+            1,
+            &MempoolMessage::OnchainEvent(onchain_event.clone()),
+            true,
+        );
         // Mempool allows duplicate on-chain events
         assert!(valid.is_ok())
     }
@@ -236,15 +244,19 @@ mod tests {
         let signer = alloy_signer_local::PrivateKeySigner::random();
         let fname_transfer =
             username_factory::create_transfer(1, "farcaster", None, None, None, signer.clone());
-        let valid =
-            mempool.message_is_valid(1, &MempoolMessage::FnameTransfer(fname_transfer.clone()));
+        let valid = mempool.message_is_valid(
+            1,
+            &MempoolMessage::FnameTransfer(fname_transfer.clone()),
+            true,
+        );
         assert!(valid.is_ok());
         test_helper::commit_fname_transfer(&mut engine, &fname_transfer).await;
 
         // Transferring the same fname again should be valid
         let fname_transfer =
             username_factory::create_transfer(2, "farcaster", None, Some(1), None, signer);
-        let valid = mempool.message_is_valid(1, &MempoolMessage::FnameTransfer(fname_transfer));
+        let valid =
+            mempool.message_is_valid(1, &MempoolMessage::FnameTransfer(fname_transfer), true);
         assert!(valid.is_ok())
     }
 
@@ -270,13 +282,13 @@ mod tests {
         commit_event(&mut engine, &signer_event).await;
 
         let cast = create_cast_add(FID_FOR_TEST, "hello", None, None);
-        let valid = mempool.message_is_valid(1, &MempoolMessage::UserMessage(cast));
+        let valid = mempool.message_is_valid(1, &MempoolMessage::UserMessage(cast), true);
         assert!(!valid.is_ok());
 
         commit_event(&mut engine, &default_storage_event(FID_FOR_TEST)).await;
 
         let cast = create_cast_add(FID_FOR_TEST, "hello", None, None);
-        let valid = mempool.message_is_valid(1, &MempoolMessage::UserMessage(cast));
+        let valid = mempool.message_is_valid(1, &MempoolMessage::UserMessage(cast), true);
         assert!(valid.is_ok());
     }
 

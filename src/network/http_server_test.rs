@@ -287,6 +287,20 @@ pub mod tests {
             Ok(Response::new(response))
         }
 
+        async fn get_signer(
+            &self,
+            _request: Request<SignerRequest>,
+        ) -> Result<Response<crate::proto::SignerResponse>, Status> {
+            Ok(Response::new(crate::proto::SignerResponse::default()))
+        }
+
+        async fn get_signers_by_fid(
+            &self,
+            _request: Request<FidRequest>,
+        ) -> Result<Response<crate::proto::SignersByFidResponse>, Status> {
+            Ok(Response::new(crate::proto::SignersByFidResponse::default()))
+        }
+
         async fn get_on_chain_events(
             &self,
             _request: Request<OnChainEventRequest>,
