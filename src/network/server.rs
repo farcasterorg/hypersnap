@@ -48,10 +48,13 @@ use crate::storage::store::mempool_poller::MempoolMessage;
 use crate::storage::store::stores::Stores;
 use crate::utils::statsd_wrapper::StatsdClientWrapper;
 use crate::version::version::{EngineVersion, ProtocolFeature};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use hex::ToHex;
 use moka::policy::EvictionPolicy;
 use moka::sync::{Cache, CacheBuilder};
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -349,6 +352,30 @@ pub struct MyHubService {
     // disables on-demand recovery (e.g. when fnames are configured off).
     fname_lookup: Option<Arc<dyn FnameTransferLookup>>,
 }
+
+/// Opaque cursor for notifications pagination.
+#[derive(Debug, Serialize, Deserialize)]
+struct NotificationsCursor {
+    before_timestamp: u32,
+    before_hash: String,
+}
+
+fn encode_notifications_cursor(ts: u32, hash_hex: &str) -> String {
+    let cursor = NotificationsCursor {
+        before_timestamp: ts,
+        before_hash: hash_hex.to_string(),
+    };
+    let json = serde_json::to_string(&cursor).unwrap_or_default();
+    URL_SAFE_NO_PAD.encode(json.as_bytes())
+}
+
+fn decode_notifications_cursor(cursor: &str) -> Option<NotificationsCursor> {
+    let bytes = URL_SAFE_NO_PAD.decode(cursor.as_bytes()).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Per-shard reaction cap. Keep small to bound per-cast fan-out.
+const REACTIONS_PER_CAST_CAP: usize = 10;
 
 impl MyHubService {
     pub fn new(
@@ -3235,31 +3262,129 @@ impl crate::api::HubQueryHandler for MyHubService {
         &self,
         fid: u64,
         limit: usize,
-        _cursor: Option<&str>,
-    ) -> Result<Vec<Message>, String> {
-        // Notifications = reactions on user's casts + mentions of user + new followers.
-        // For now, return reactions targeting user's casts and mentions.
-        let mut notifications = Vec::new();
+        cursor: Option<&str>,
+    ) -> Result<(Vec<Message>, Option<String>), String> {
+        let mut notifications: Vec<Message> = Vec::new();
+        let fetch_limit = limit.max(25);
 
-        // Get mentions of this user
+        // Parse cursor
+        let cursor_filter = cursor.and_then(|c| decode_notifications_cursor(c));
+
+        // Collect the user's recent cast targets for reaction lookup.
+        // Casts are keyed by author FID on a specific shard, but reactions
+        // to those casts are stored on the reactor's shard.  We gather
+        // targets first, then query reactions across all shards.
+        let mut cast_targets: Vec<crate::proto::CastId> = Vec::new();
+
         for stores in self.shard_stores.values() {
-            let options = PageOptions {
-                page_size: Some(limit),
+            // 1. Mentions of this user (replies)
+            let mention_options = PageOptions {
+                page_size: Some(fetch_limit),
                 page_token: None,
                 reverse: true,
             };
-            if let Ok(page) = CastStore::get_casts_by_mention(&stores.cast_store, fid, &options) {
+            if let Ok(page) =
+                CastStore::get_casts_by_mention(&stores.cast_store, fid, &mention_options)
+            {
                 notifications.extend(page.messages);
+            }
+
+            // 2. Collect user's recent cast targets
+            let casts_limit = (limit * 3).min(100);
+            let cast_options = PageOptions {
+                page_size: Some(casts_limit),
+                page_token: None,
+                reverse: true,
+            };
+            if let Ok(casts_page) =
+                CastStore::get_cast_adds_by_fid(&stores.cast_store, fid, &cast_options)
+            {
+                for cast_msg in &casts_page.messages {
+                    if cast_msg.data.is_some() {
+                        cast_targets.push(crate::proto::CastId {
+                            fid,
+                            hash: cast_msg.hash.clone(),
+                        });
+                    }
+                }
+            }
+
+            // 3. Follows targeting this user
+            let follow_target = crate::proto::link_body::Target::TargetFid(fid);
+            let follow_options = PageOptions {
+                page_size: Some(fetch_limit),
+                page_token: None,
+                reverse: true,
+            };
+            if let Ok(follows) = LinkStore::get_links_by_target(
+                &stores.link_store,
+                &follow_target,
+                "follow".to_string(),
+                &follow_options,
+            ) {
+                notifications.extend(follows.messages);
             }
         }
 
+        // 4. Reactions on user's casts — query across ALL shards for each target
+        for stores in self.shard_stores.values() {
+            for cast_id in &cast_targets {
+                let target = crate::proto::reaction_body::Target::TargetCastId(cast_id.clone());
+                let reaction_options = PageOptions {
+                    page_size: Some(REACTIONS_PER_CAST_CAP),
+                    page_token: None,
+                    reverse: true,
+                };
+                if let Ok(reactions) = ReactionStore::get_reactions_by_target(
+                    &stores.reaction_store,
+                    &target,
+                    crate::proto::ReactionType::None as i32,
+                    &reaction_options,
+                ) {
+                    for msg in reactions.messages {
+                        if msg.data.as_ref().map(|d| d.fid).unwrap_or(0) != fid {
+                            notifications.push(msg);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Deduplicate by (fid, hash) since messages may appear across shards
+        let mut seen: HashSet<(u64, Vec<u8>)> = HashSet::new();
+        notifications.retain(|msg| {
+            let fid = msg.data.as_ref().map(|d| d.fid).unwrap_or(0);
+            seen.insert((fid, msg.hash.clone()))
+        });
+
+        // Sort by timestamp descending, hash as tie-breaker
         notifications.sort_by(|a, b| {
             let ts_a = a.data.as_ref().map(|d| d.timestamp).unwrap_or(0);
             let ts_b = b.data.as_ref().map(|d| d.timestamp).unwrap_or(0);
-            ts_b.cmp(&ts_a)
+            ts_b.cmp(&ts_a).then_with(|| b.hash.cmp(&a.hash))
         });
+
+        // Apply cursor filter: only items strictly before the cursor boundary
+        if let Some(ref cf) = cursor_filter {
+            notifications.retain(|msg| {
+                let ts = msg.data.as_ref().map(|d| d.timestamp).unwrap_or(0);
+                let hash_hex = hex::encode(&msg.hash);
+                ts < cf.before_timestamp || (ts == cf.before_timestamp && hash_hex < cf.before_hash)
+            });
+        }
+
+        // Determine next cursor (one past the last item we'll return)
+        let next_cursor = if notifications.len() > limit {
+            let boundary = &notifications[limit - 1];
+            let ts = boundary.data.as_ref().map(|d| d.timestamp).unwrap_or(0);
+            let hash_hex = hex::encode(&boundary.hash);
+            Some(encode_notifications_cursor(ts, &hash_hex))
+        } else {
+            None
+        };
+
         notifications.truncate(limit);
-        Ok(notifications)
+        Ok((notifications, next_cursor))
     }
 
     async fn get_onchain_events(

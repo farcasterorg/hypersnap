@@ -2536,4 +2536,479 @@ mod tests {
         assert!(response.is_err());
         assert_eq!(response.unwrap_err().code(), tonic::Code::NotFound);
     }
+
+    // === Notifications Tests ===
+
+    #[tokio::test]
+    async fn test_notifications_returns_mentions() {
+        use crate::api::HubQueryHandler;
+        let (
+            stores,
+            _senders,
+            [mut engine1, mut engine2],
+            _block_engine,
+            service,
+            _shard_decision_tx,
+            _block_decision_tx,
+        ) = make_server(None).await;
+        let target_fid = SHARD1_FID;
+        let mentioner_fid = SHARD2_FID;
+        let signer = test_helper::default_signer();
+        let custody = test_helper::default_custody_address();
+
+        test_helper::register_user(target_fid, signer.clone(), custody.clone(), &mut engine1).await;
+        test_helper::register_user(
+            mentioner_fid,
+            test_helper::default_signer(),
+            test_helper::default_custody_address(),
+            &mut engine2,
+        )
+        .await;
+
+        let mention_cast = messages_factory::casts::create_cast_add_rich(
+            mentioner_fid,
+            "@target hello",
+            None,
+            vec![],
+            None,
+            vec![target_fid],
+            None,
+            None,
+        );
+        // Merge directly into the shard 2 cast store to avoid trie assertion
+        let shard2_stores = stores.get(&2u32).unwrap();
+        let mut txn = RocksDbTransactionBatch::new();
+        shard2_stores
+            .cast_store
+            .merge(&mention_cast, &mut txn)
+            .unwrap();
+        shard2_stores.db.commit(txn).unwrap();
+
+        let (messages, _cursor) = service
+            .get_notifications(target_fid, 50, None)
+            .await
+            .unwrap();
+        assert!(
+            !messages.is_empty(),
+            "Expected at least one mention notification"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.data.as_ref().map(|d| d.fid).unwrap_or(0) == mentioner_fid),
+            "Expected mention from mentioner FID"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_notifications_returns_reactions() {
+        use crate::api::HubQueryHandler;
+        let (
+            stores,
+            _senders,
+            [mut engine1, mut engine2],
+            _block_engine,
+            service,
+            _shard_decision_tx,
+            _block_decision_tx,
+        ) = make_server(None).await;
+        let target_fid = SHARD1_FID;
+        let reactor_fid = SHARD2_FID;
+        let signer = test_helper::default_signer();
+        let custody = test_helper::default_custody_address();
+
+        test_helper::register_user(target_fid, signer.clone(), custody.clone(), &mut engine1).await;
+        test_helper::register_user(
+            reactor_fid,
+            test_helper::default_signer(),
+            test_helper::default_custody_address(),
+            &mut engine2,
+        )
+        .await;
+
+        // Target user's cast on shard 1
+        let author_cast =
+            messages_factory::casts::create_cast_add(target_fid, "hello world", None, None);
+        let shard1_stores = stores.get(&1u32).unwrap();
+        let mut txn = RocksDbTransactionBatch::new();
+        shard1_stores
+            .cast_store
+            .merge(&author_cast, &mut txn)
+            .unwrap();
+        shard1_stores.db.commit(txn).unwrap();
+
+        // Reactor's reaction on shard 2
+        let reaction = messages_factory::reactions::create_reaction_add(
+            reactor_fid,
+            proto::ReactionType::Like,
+            proto::reaction_body::Target::TargetCastId(proto::CastId {
+                fid: target_fid,
+                hash: author_cast.hash.clone(),
+            }),
+            None,
+            None,
+        );
+        let shard2_stores = stores.get(&2u32).unwrap();
+        let mut txn = RocksDbTransactionBatch::new();
+        shard2_stores
+            .reaction_store
+            .merge(&reaction, &mut txn)
+            .unwrap();
+        shard2_stores.db.commit(txn).unwrap();
+
+        let (messages, _cursor) = service
+            .get_notifications(target_fid, 50, None)
+            .await
+            .unwrap();
+        let has_reaction = messages.iter().any(|m| {
+            m.data.as_ref().map(|d| d.fid).unwrap_or(0) == reactor_fid
+                && m.data.as_ref().map(|d| d.r#type).unwrap_or(0)
+                    == proto::MessageType::ReactionAdd as i32
+        });
+        assert!(has_reaction, "Expected reaction notification from reactor");
+    }
+
+    #[tokio::test]
+    async fn test_notifications_returns_follows() {
+        use crate::api::HubQueryHandler;
+        let (
+            stores,
+            _senders,
+            [mut engine1, mut engine2],
+            _block_engine,
+            service,
+            _shard_decision_tx,
+            _block_decision_tx,
+        ) = make_server(None).await;
+        let target_fid = SHARD1_FID;
+        let follower_fid = SHARD2_FID;
+        let signer = test_helper::default_signer();
+        let custody = test_helper::default_custody_address();
+
+        test_helper::register_user(target_fid, signer.clone(), custody.clone(), &mut engine1).await;
+        test_helper::register_user(
+            follower_fid,
+            test_helper::default_signer(),
+            test_helper::default_custody_address(),
+            &mut engine2,
+        )
+        .await;
+
+        let follow = messages_factory::links::create_link_add(
+            follower_fid,
+            "follow",
+            target_fid,
+            None,
+            None,
+        );
+        let shard2_stores = stores.get(&2u32).unwrap();
+        let mut txn = RocksDbTransactionBatch::new();
+        shard2_stores.link_store.merge(&follow, &mut txn).unwrap();
+        shard2_stores.db.commit(txn).unwrap();
+
+        let (messages, _cursor) = service
+            .get_notifications(target_fid, 50, None)
+            .await
+            .unwrap();
+        let has_follow = messages.iter().any(|m| {
+            m.data.as_ref().map(|d| d.fid).unwrap_or(0) == follower_fid
+                && m.data.as_ref().map(|d| d.r#type).unwrap_or(0)
+                    == proto::MessageType::LinkAdd as i32
+        });
+        assert!(has_follow, "Expected follow notification from follower");
+    }
+
+    #[tokio::test]
+    async fn test_notifications_excludes_self_reactions() {
+        use crate::api::HubQueryHandler;
+        let (
+            stores,
+            _senders,
+            [mut engine1, _engine2],
+            _block_engine,
+            service,
+            _shard_decision_tx,
+            _block_decision_tx,
+        ) = make_server(None).await;
+        let fid = SHARD1_FID;
+        let signer = test_helper::default_signer();
+        let custody = test_helper::default_custody_address();
+
+        test_helper::register_user(fid, signer.clone(), custody.clone(), &mut engine1).await;
+
+        let cast = messages_factory::casts::create_cast_add(fid, "my cast", None, None);
+        let shard1_stores = stores.get(&1u32).unwrap();
+        let mut txn = RocksDbTransactionBatch::new();
+        shard1_stores.cast_store.merge(&cast, &mut txn).unwrap();
+        shard1_stores.db.commit(txn).unwrap();
+
+        let self_reaction = messages_factory::reactions::create_reaction_add(
+            fid,
+            proto::ReactionType::Like,
+            proto::reaction_body::Target::TargetCastId(proto::CastId {
+                fid,
+                hash: cast.hash.clone(),
+            }),
+            None,
+            None,
+        );
+        let mut txn = RocksDbTransactionBatch::new();
+        shard1_stores
+            .reaction_store
+            .merge(&self_reaction, &mut txn)
+            .unwrap();
+        shard1_stores.db.commit(txn).unwrap();
+
+        let (messages, _cursor) = service.get_notifications(fid, 50, None).await.unwrap();
+        let has_self_reaction = messages.iter().any(|m| {
+            m.data.as_ref().map(|d| d.r#type).unwrap_or(0) == proto::MessageType::ReactionAdd as i32
+                && m.data.as_ref().map(|d| d.fid).unwrap_or(0) == fid
+        });
+        assert!(
+            !has_self_reaction,
+            "Self-reactions should be excluded from notifications"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_notifications_sorted_newest_first() {
+        use crate::api::HubQueryHandler;
+        let (
+            stores,
+            _senders,
+            [mut engine1, mut engine2],
+            _block_engine,
+            service,
+            _shard_decision_tx,
+            _block_decision_tx,
+        ) = make_server(None).await;
+        let target_fid = SHARD1_FID;
+        let other_fid = SHARD2_FID;
+        let signer = test_helper::default_signer();
+        let custody = test_helper::default_custody_address();
+
+        test_helper::register_user(target_fid, signer.clone(), custody.clone(), &mut engine1).await;
+        test_helper::register_user(
+            other_fid,
+            test_helper::default_signer(),
+            test_helper::default_custody_address(),
+            &mut engine2,
+        )
+        .await;
+
+        let base_ts = messages_factory::farcaster_time();
+        let mention1 = messages_factory::casts::create_cast_add_rich(
+            other_fid,
+            "first",
+            None,
+            vec![],
+            None,
+            vec![target_fid],
+            Some(base_ts + 10),
+            None,
+        );
+        let mention2 = messages_factory::casts::create_cast_add_rich(
+            other_fid,
+            "second",
+            None,
+            vec![],
+            None,
+            vec![target_fid],
+            Some(base_ts + 20),
+            None,
+        );
+        let mention3 = messages_factory::casts::create_cast_add_rich(
+            other_fid,
+            "third",
+            None,
+            vec![],
+            None,
+            vec![target_fid],
+            Some(base_ts + 30),
+            None,
+        );
+
+        let shard2_stores = stores.get(&2u32).unwrap();
+        for msg in &[mention1, mention2, mention3] {
+            let mut txn = RocksDbTransactionBatch::new();
+            shard2_stores.cast_store.merge(msg, &mut txn).unwrap();
+            shard2_stores.db.commit(txn).unwrap();
+        }
+
+        let (messages, _cursor) = service
+            .get_notifications(target_fid, 50, None)
+            .await
+            .unwrap();
+
+        let timestamps: Vec<u32> = messages
+            .iter()
+            .filter_map(|m| m.data.as_ref().map(|d| d.timestamp))
+            .collect();
+        for w in timestamps.windows(2) {
+            assert!(w[0] >= w[1], "Notifications should be sorted newest-first");
+        }
+        assert!(
+            timestamps.contains(&(base_ts + 30)),
+            "Should contain newest mention"
+        );
+        assert!(
+            timestamps.contains(&(base_ts + 10)),
+            "Should contain oldest mention"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_notifications_limit_truncation() {
+        use crate::api::HubQueryHandler;
+        let (
+            stores,
+            _senders,
+            [mut engine1, mut engine2],
+            _block_engine,
+            service,
+            _shard_decision_tx,
+            _block_decision_tx,
+        ) = make_server(None).await;
+        let target_fid = SHARD1_FID;
+        let mentioner_fid = SHARD2_FID;
+        let signer = test_helper::default_signer();
+        let custody = test_helper::default_custody_address();
+
+        test_helper::register_user(target_fid, signer.clone(), custody.clone(), &mut engine1).await;
+        test_helper::register_user(
+            mentioner_fid,
+            test_helper::default_signer(),
+            test_helper::default_custody_address(),
+            &mut engine2,
+        )
+        .await;
+
+        let base_ts = messages_factory::farcaster_time();
+        let shard2_stores = stores.get(&2u32).unwrap();
+        for i in 0..5u32 {
+            let cast = messages_factory::casts::create_cast_add_rich(
+                mentioner_fid,
+                &format!("msg {}", i),
+                None,
+                vec![],
+                None,
+                vec![target_fid],
+                Some(base_ts + i),
+                None,
+            );
+            let mut txn = RocksDbTransactionBatch::new();
+            shard2_stores.cast_store.merge(&cast, &mut txn).unwrap();
+            shard2_stores.db.commit(txn).unwrap();
+        }
+
+        let (messages, _cursor) = service
+            .get_notifications(target_fid, 3, None)
+            .await
+            .unwrap();
+        assert_eq!(messages.len(), 3, "Should respect limit of 3");
+    }
+
+    #[tokio::test]
+    async fn test_notifications_cursor_pagination_no_duplicates() {
+        use crate::api::HubQueryHandler;
+        let (
+            stores,
+            _senders,
+            [mut engine1, mut engine2],
+            _block_engine,
+            service,
+            _shard_decision_tx,
+            _block_decision_tx,
+        ) = make_server(None).await;
+        let target_fid = SHARD1_FID;
+        let mentioner_fid = SHARD2_FID;
+        let signer = test_helper::default_signer();
+        let custody = test_helper::default_custody_address();
+
+        test_helper::register_user(target_fid, signer.clone(), custody.clone(), &mut engine1).await;
+        test_helper::register_user(
+            mentioner_fid,
+            test_helper::default_signer(),
+            test_helper::default_custody_address(),
+            &mut engine2,
+        )
+        .await;
+
+        let base_ts = messages_factory::farcaster_time();
+        let shard2_stores = stores.get(&2u32).unwrap();
+        for i in 0..5u32 {
+            let cast = messages_factory::casts::create_cast_add_rich(
+                mentioner_fid,
+                &format!("msg {}", i),
+                None,
+                vec![],
+                None,
+                vec![target_fid],
+                Some(base_ts + i),
+                None,
+            );
+            let mut txn = RocksDbTransactionBatch::new();
+            shard2_stores.cast_store.merge(&cast, &mut txn).unwrap();
+            shard2_stores.db.commit(txn).unwrap();
+        }
+
+        // Page 1
+        let (page1, cursor1) = service
+            .get_notifications(target_fid, 2, None)
+            .await
+            .unwrap();
+        assert_eq!(page1.len(), 2, "Page 1 should have 2 items");
+        assert!(cursor1.is_some(), "Should have next cursor");
+
+        // Page 2
+        let (page2, cursor2) = service
+            .get_notifications(target_fid, 2, cursor1.as_deref())
+            .await
+            .unwrap();
+        assert_eq!(page2.len(), 2, "Page 2 should have 2 items");
+        assert!(cursor2.is_some(), "Should have next cursor");
+
+        // Page 3 (last page, 1 remaining)
+        let (page3, cursor3) = service
+            .get_notifications(target_fid, 2, cursor2.as_deref())
+            .await
+            .unwrap();
+        assert_eq!(page3.len(), 1, "Page 3 should have 1 remaining item");
+        assert!(cursor3.is_none(), "Last page should have no cursor");
+
+        // Collect all hashes to verify no duplicates across pages
+        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        for msg in page1.iter().chain(page2.iter()).chain(page3.iter()) {
+            assert!(
+                seen.insert(msg.hash.clone()),
+                "Duplicate message found across pages"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_notifications_empty_result() {
+        use crate::api::HubQueryHandler;
+        let (
+            _stores,
+            _senders,
+            [mut engine1, _engine2],
+            _block_engine,
+            service,
+            _shard_decision_tx,
+            _block_decision_tx,
+        ) = make_server(None).await;
+        let fid = SHARD1_FID;
+        let signer = test_helper::default_signer();
+        let custody = test_helper::default_custody_address();
+
+        test_helper::register_user(fid, signer.clone(), custody.clone(), &mut engine1).await;
+
+        let (messages, cursor) = service.get_notifications(fid, 50, None).await.unwrap();
+        assert!(
+            messages.is_empty(),
+            "Expected empty notifications for new user"
+        );
+        assert!(cursor.is_none(), "Expected no cursor for empty result");
+    }
 }
