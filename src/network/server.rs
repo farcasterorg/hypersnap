@@ -377,6 +377,9 @@ fn decode_notifications_cursor(cursor: &str) -> Option<NotificationsCursor> {
 /// Per-shard reaction cap. Keep small to bound per-cast fan-out.
 const REACTIONS_PER_CAST_CAP: usize = 10;
 
+/// Per-shard reply cap (parent-based). Keep small to bound per-cast fan-out.
+const REPLIES_PER_CAST_CAP: usize = 10;
+
 impl MyHubService {
     pub fn new(
         rpc_auth: String,
@@ -3342,6 +3345,28 @@ impl crate::api::HubQueryHandler for MyHubService {
                     &reaction_options,
                 ) {
                     for msg in reactions.messages {
+                        if msg.data.as_ref().map(|d| d.fid).unwrap_or(0) != fid {
+                            notifications.push(msg);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 5. Replies via parent_cast_id (casts replying to the user's casts).
+        //    This catches replies that don't explicitly @mention the user.
+        for stores in self.shard_stores.values() {
+            for cast_id in &cast_targets {
+                let parent = cast_add_body::Parent::ParentCastId(cast_id.clone());
+                let reply_options = PageOptions {
+                    page_size: Some(REPLIES_PER_CAST_CAP),
+                    page_token: None,
+                    reverse: true,
+                };
+                if let Ok(replies) =
+                    CastStore::get_casts_by_parent(&stores.cast_store, &parent, &reply_options)
+                {
+                    for msg in replies.messages {
                         if msg.data.as_ref().map(|d| d.fid).unwrap_or(0) != fid {
                             notifications.push(msg);
                         }

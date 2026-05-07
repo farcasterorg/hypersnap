@@ -3011,4 +3011,143 @@ mod tests {
         );
         assert!(cursor.is_none(), "Expected no cursor for empty result");
     }
+
+    #[tokio::test]
+    async fn test_notifications_replies_via_parent_without_mention() {
+        use crate::api::HubQueryHandler;
+        let (
+            stores,
+            _senders,
+            [mut engine1, mut engine2],
+            _block_engine,
+            service,
+            _shard_decision_tx,
+            _block_decision_tx,
+        ) = make_server(None).await;
+        let target_fid = SHARD1_FID;
+        let replier_fid = SHARD2_FID;
+        let signer = test_helper::default_signer();
+        let custody = test_helper::default_custody_address();
+
+        test_helper::register_user(target_fid, signer.clone(), custody.clone(), &mut engine1).await;
+        test_helper::register_user(
+            replier_fid,
+            test_helper::default_signer(),
+            test_helper::default_custody_address(),
+            &mut engine2,
+        )
+        .await;
+
+        // Create target user's cast
+        let target_cast =
+            messages_factory::casts::create_cast_add(target_fid, "my original cast", None, None);
+        let shard1_stores = stores.get(&1u32).unwrap();
+        let mut txn = RocksDbTransactionBatch::new();
+        shard1_stores
+            .cast_store
+            .merge(&target_cast, &mut txn)
+            .unwrap();
+        shard1_stores.db.commit(txn).unwrap();
+
+        // Create a reply via parent_cast_id WITHOUT mentioning the target user
+        let reply_cast = messages_factory::casts::create_cast_with_parent(
+            replier_fid,
+            "nice cast!",
+            target_fid,
+            &target_cast.hash,
+            None,
+            None,
+        );
+        let shard2_stores = stores.get(&2u32).unwrap();
+        let mut txn = RocksDbTransactionBatch::new();
+        shard2_stores
+            .cast_store
+            .merge(&reply_cast, &mut txn)
+            .unwrap();
+        shard2_stores.db.commit(txn).unwrap();
+
+        let (messages, _cursor) = service
+            .get_notifications(target_fid, 50, None)
+            .await
+            .unwrap();
+        let reply_messages: Vec<_> = messages
+            .iter()
+            .filter(|m| {
+                m.data
+                    .as_ref()
+                    .map(|d| d.fid == replier_fid && d.r#type == proto::MessageType::CastAdd as i32)
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert!(
+            !reply_messages.is_empty(),
+            "Expected parent-based reply notification even without explicit mention"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_notifications_replies_excludes_self() {
+        use crate::api::HubQueryHandler;
+        let (
+            stores,
+            _senders,
+            [mut engine1, mut engine2],
+            _block_engine,
+            service,
+            _shard_decision_tx,
+            _block_decision_tx,
+        ) = make_server(None).await;
+        let target_fid = SHARD1_FID;
+        let signer = test_helper::default_signer();
+        let custody = test_helper::default_custody_address();
+
+        test_helper::register_user(target_fid, signer.clone(), custody.clone(), &mut engine1).await;
+        test_helper::register_user(
+            SHARD2_FID,
+            test_helper::default_signer(),
+            test_helper::default_custody_address(),
+            &mut engine2,
+        )
+        .await;
+
+        // Create target user's cast
+        let target_cast =
+            messages_factory::casts::create_cast_add(target_fid, "my original cast", None, None);
+        let shard1_stores = stores.get(&1u32).unwrap();
+        let mut txn = RocksDbTransactionBatch::new();
+        shard1_stores
+            .cast_store
+            .merge(&target_cast, &mut txn)
+            .unwrap();
+        shard1_stores.db.commit(txn).unwrap();
+
+        // Self-reply: user replying to their own cast
+        let self_reply = messages_factory::casts::create_cast_with_parent(
+            target_fid,
+            "replying to myself",
+            target_fid,
+            &target_cast.hash,
+            None,
+            None,
+        );
+        let mut txn = RocksDbTransactionBatch::new();
+        shard1_stores
+            .cast_store
+            .merge(&self_reply, &mut txn)
+            .unwrap();
+        shard1_stores.db.commit(txn).unwrap();
+
+        let (messages, _cursor) = service
+            .get_notifications(target_fid, 50, None)
+            .await
+            .unwrap();
+        let self_replies: Vec<_> = messages
+            .iter()
+            .filter(|m| m.hash == self_reply.hash)
+            .collect();
+        assert!(
+            self_replies.is_empty(),
+            "Self-replies should be excluded from notifications"
+        );
+    }
 }
