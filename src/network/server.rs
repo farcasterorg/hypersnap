@@ -3329,10 +3329,12 @@ impl crate::api::HubQueryHandler for MyHubService {
             }
         }
 
-        // 4. Reactions on user's casts — query across ALL shards for each target
+        // 4. Reactions and parent-based replies on user's casts —
+        //    query across ALL shards for each target.
         for stores in self.shard_stores.values() {
             for cast_id in &cast_targets {
-                let target = crate::proto::reaction_body::Target::TargetCastId(cast_id.clone());
+                let reaction_target =
+                    crate::proto::reaction_body::Target::TargetCastId(cast_id.clone());
                 let reaction_options = PageOptions {
                     page_size: Some(REACTIONS_PER_CAST_CAP),
                     page_token: None,
@@ -3340,7 +3342,7 @@ impl crate::api::HubQueryHandler for MyHubService {
                 };
                 if let Ok(reactions) = ReactionStore::get_reactions_by_target(
                     &stores.reaction_store,
-                    &target,
+                    &reaction_target,
                     crate::proto::ReactionType::None as i32,
                     &reaction_options,
                 ) {
@@ -3350,13 +3352,8 @@ impl crate::api::HubQueryHandler for MyHubService {
                         }
                     }
                 }
-            }
-        }
 
-        // 5. Replies via parent_cast_id (casts replying to the user's casts).
-        //    This catches replies that don't explicitly @mention the user.
-        for stores in self.shard_stores.values() {
-            for cast_id in &cast_targets {
+                // Also find replies via parent_cast_id (without explicit @mention).
                 let parent = cast_add_body::Parent::ParentCastId(cast_id.clone());
                 let reply_options = PageOptions {
                     page_size: Some(REPLIES_PER_CAST_CAP),
