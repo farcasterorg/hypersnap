@@ -377,6 +377,9 @@ fn decode_notifications_cursor(cursor: &str) -> Option<NotificationsCursor> {
 /// Per-shard reaction cap. Keep small to bound per-cast fan-out.
 const REACTIONS_PER_CAST_CAP: usize = 10;
 
+/// Per-shard reply cap (parent-based). Keep small to bound per-cast fan-out.
+const REPLIES_PER_CAST_CAP: usize = 10;
+
 impl MyHubService {
     pub fn new(
         rpc_auth: String,
@@ -3326,10 +3329,12 @@ impl crate::api::HubQueryHandler for MyHubService {
             }
         }
 
-        // 4. Reactions on user's casts — query across ALL shards for each target
+        // 4. Reactions and parent-based replies on user's casts —
+        //    query across ALL shards for each target.
         for stores in self.shard_stores.values() {
             for cast_id in &cast_targets {
-                let target = crate::proto::reaction_body::Target::TargetCastId(cast_id.clone());
+                let reaction_target =
+                    crate::proto::reaction_body::Target::TargetCastId(cast_id.clone());
                 let reaction_options = PageOptions {
                     page_size: Some(REACTIONS_PER_CAST_CAP),
                     page_token: None,
@@ -3337,11 +3342,28 @@ impl crate::api::HubQueryHandler for MyHubService {
                 };
                 if let Ok(reactions) = ReactionStore::get_reactions_by_target(
                     &stores.reaction_store,
-                    &target,
+                    &reaction_target,
                     crate::proto::ReactionType::None as i32,
                     &reaction_options,
                 ) {
                     for msg in reactions.messages {
+                        if msg.data.as_ref().map(|d| d.fid).unwrap_or(0) != fid {
+                            notifications.push(msg);
+                        }
+                    }
+                }
+
+                // Also find replies via parent_cast_id (without explicit @mention).
+                let parent = cast_add_body::Parent::ParentCastId(cast_id.clone());
+                let reply_options = PageOptions {
+                    page_size: Some(REPLIES_PER_CAST_CAP),
+                    page_token: None,
+                    reverse: true,
+                };
+                if let Ok(replies) =
+                    CastStore::get_casts_by_parent(&stores.cast_store, &parent, &reply_options)
+                {
+                    for msg in replies.messages {
                         if msg.data.as_ref().map(|d| d.fid).unwrap_or(0) != fid {
                             notifications.push(msg);
                         }
