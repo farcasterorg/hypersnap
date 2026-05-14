@@ -275,8 +275,8 @@ impl Display for Hash {
     }
 }
 
-// Malachite Height and Value trait impls are now in snapchain-proto crate
-// Most FullProposal methods are now in snapchain-proto crate
+// Malachite Height and Value trait impls are now in hypersnap-proto crate
+// Most FullProposal methods are now in hypersnap-proto crate
 
 // Extension trait for FullProposal that depends on main crate types (Address)
 pub trait FullProposalExt {
@@ -296,6 +296,11 @@ pub struct SnapchainValidator {
     pub public_key: PublicKey,
     pub rpc_address: Option<String>,
     pub current_height: u64,
+    /// BLS12-381 G1 public key (48 bytes, compressed). `None` for validators
+    /// that haven't registered a BLS key yet — pre-rollout, hyperblock signing
+    /// is disabled. Once a validator has a BLS pubkey, they participate in
+    /// hyperblock threshold signing per FIP-proof-of-work-tokenization.
+    pub bls_public_key: Option<Vec<u8>>,
 }
 
 impl SnapchainValidator {
@@ -311,7 +316,13 @@ impl SnapchainValidator {
             public_key,
             rpc_address,
             current_height,
+            bls_public_key: None,
         }
+    }
+
+    pub fn with_bls_public_key(mut self, bls_pk: Vec<u8>) -> Self {
+        self.bls_public_key = Some(bls_pk);
+        self
     }
 }
 
@@ -587,7 +598,7 @@ impl informalsystems_malachitebft_core_types::ProposalPart<SnapchainValidatorCon
     }
 }
 
-// impl Eq for FullProposal is now in the snapchain-proto crate
+// impl Eq for FullProposal is now in the hypersnap-proto crate
 
 impl informalsystems_malachitebft_core_types::Proposal<SnapchainValidatorContext> for Proposal {
     fn height(&self) -> Height {

@@ -18,5 +18,55 @@ message GossipMessage {
     ReadNodeMessage read_node_message = 5;
     ContactInfo contact_info_message = 6;
     HyperEnvelope hyper_envelope = 7;
+    // Hyper-layer wire frames (FIP proof-of-work-tokenization).
+    HyperWireMessage hyper_wire = 8;
   }
+}
+
+// =====================================================================
+// Hyper-layer wire envelope: every hyper-topic gossip frame is one of
+// these. Splitting variants (block / message / DKG) avoids loading the
+// general GossipMessage with hyper-specific concerns.
+// =====================================================================
+message HyperWireMessage {
+  oneof body {
+    // Full signed block + the locks/transfers in its payload, as gossiped
+    // on TOPIC_HYPER_BLOCKS. Importers need both to validate state
+    // transition.
+    HyperWireBlock block = 1;
+    // A pending hyper message (lock / transfer / validator event) for
+    // TOPIC_HYPER_MESSAGES.
+    HyperMessage message = 2;
+    // A DKG round message for TOPIC_HYPER_DKG.
+    HyperWireDkg dkg = 3;
+    // Slashing evidence for TOPIC_HYPER_EVIDENCE: two distinct blocks
+    // signed under the same epoch's threshold key at the same height.
+    HyperWireEvidence evidence = 4;
+  }
+}
+
+message HyperWireBlock {
+  HyperBlock block = 1;
+  repeated HyperLockEvent locks = 2;
+  repeated HyperTransferTx transfers = 3;
+}
+
+message HyperWireDkg {
+  uint64 target_epoch = 1;
+  // Round number: 1, 2, or 3.
+  uint32 round = 2;
+  // Prost-encoded round message bytes. The actor decodes based on `round`.
+  // Keeping these opaque on the wire avoids leaking BLS12-381 types into
+  // proto schemas.
+  bytes encoded = 3;
+}
+
+// Conflicting-blocks slashing evidence. Two distinct HyperBlocks at the
+// same canonical_block_id, both bearing valid threshold sigs from the
+// same epoch's group key, prove that the epoch's signers misbehaved.
+// Verifiers re-detect the conflict locally — this message is purely a
+// transport carrier for the two blocks.
+message HyperWireEvidence {
+  HyperBlock block_a = 1;
+  HyperBlock block_b = 2;
 }

@@ -103,6 +103,22 @@ impl ReadValidator {
             proto::decided_value::Value::Block(block) => {
                 block.header.as_ref().unwrap().height.unwrap()
             }
+
+            proto::decided_value::Value::HyperBlock(hb) => {
+                // Hyperblocks have their own consensus path. This helper is not
+                // meant to handle them, but we provide a best-effort height in
+                // case of accidental routing.
+                let canonical = hb
+                    .envelope
+                    .as_ref()
+                    .and_then(|e| e.metadata.as_ref())
+                    .map(|m| m.canonical_block_id)
+                    .unwrap_or(0);
+                Height {
+                    shard_index: 0,
+                    block_number: canonical,
+                }
+            }
         }
     }
 
@@ -113,6 +129,14 @@ impl ReadValidator {
             }
 
             proto::decided_value::Value::Block(block) => block.commits.as_ref().unwrap(),
+
+            proto::decided_value::Value::HyperBlock(_) => {
+                // Hyperblocks carry threshold BLS signatures, not Ed25519
+                // commits. They are verified against the per-epoch group public
+                // key on a separate path; this Ed25519-quorum verifier is not
+                // applicable.
+                return false;
+            }
         };
 
         verify_signatures(&commits, &self.validator_sets)

@@ -1,4 +1,4 @@
-use snapchain::perf::engine_only_perftest;
+use hypersnap::perf::engine_only_perftest;
 use std::error::Error;
 
 #[tokio::main]

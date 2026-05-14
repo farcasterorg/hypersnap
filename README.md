@@ -1,134 +1,118 @@
-# Snapchain
+# Hypersnap
 
-The open-source, canonical implementation of Farcaster's [Snapchain](https://github.com/farcasterxyz/protocol/discussions/207) network. 
+A fork of [Snapchain](https://github.com/farcasterxyz/protocol/discussions/207)
+extended with the **hyper layer**: a deterministic, threshold-signed
+overlay that adds in-protocol Proof-of-Quality scoring, validator
+selection, reward issuance, and trust gating on top of the base
+Farcaster data network.
 
-![snapchain](https://github.com/user-attachments/assets/e5a041db-e3ae-4250-ad6b-7043ad648d34)
+The base data layer (cast/like/follow/reaction storage) remains
+wire-compatible with snapchain so a hypersnap node can ingest and
+serve standard Farcaster traffic. The hyper-layer messages travel on
+their own gossip topic and are processed by the `HyperRuntime` actor —
+they never enter snapchain blocks or the legacy merkle trie.
 
+## What it adds on top of snapchain
 
-<!-- TODO:  links to installation, user docs, contributor docs -->
+- **Proof-of-Quality scoring** (`crates/proof-of-quality`): per-FID
+  EigenTrust + sustained-mutual-engagement + ring-symmetry penalties,
+  ported from the offline retro tool to a deterministic in-protocol
+  computation that every validator runs at every epoch boundary.
+- **Hyperblocks**: BLS12-381 threshold-signed blocks anchored to
+  snapchain blocks via `snapchain_anchor_block` + `snapchain_anchor_hash`
+  + a Merkle root over the snapchain block range covered.
+- **Validator FID binding** (FIP-hyper-validator-selection): every
+  validator slot is cross-signed by an Ed25519 identity key + the FID's
+  custody key (EIP-712), capped at 3 per FID, gated on a trust score.
+- **Three work markets** (FIP-proof-of-work-tokenization §C-2): Data
+  Availability, Growth, and App Usage rewards each with their own
+  per-epoch budget. Per-FID per-market replay protection.
+- **Pedersen DKG ceremony** at every epoch boundary, threshold-signed
+  trust snapshot rotation, scheduler-driven block production with
+  proposer gating.
 
-## What is Snapchain?
+## Status
 
-Snapchain is a data storage layer for the Farcaster social protocol. It is a blockchain-like decentralized p2p network that stores data created by Farcaster users. Learn more about Snapchain's design from the [whitepaper](https://github.com/farcasterxyz/protocol/discussions/207).
+Hypersnap is being built towards mainnet cutover. The cutover from the
+static-PoA snapchain validator set to the epoch-based hyper-validator
+set is block-pinned (FIP §4.3 — every node runs the same transition at
+a configured snapchain block).
 
-The main goals of this implementation are:
+## Running a node
 
-1. **High Throughput**: Written in Rust and will process at least 10,000 transactions per second. 
-
-2. **Data Availability**: Can be run for < $1,000/month and provide real-time access to user data. 
-
-3. **Canonical Implementation**: Is the most accurate reference for how Snapchain and Farcaster should work. 
-
-## Status 
-
-Snapchain is in the migration phase. Please check the [release docs](https://www.notion.so/warpcast/Snapchain-Mainnet-Public-1b96a6c0c101809493cfda3998a65c7a) for more details on timelines. 
-
-## Running a Node
-
-A snapchain node lets you read and write messages to the network. You will need a machine with the following system requirements to get started: 
+A hypersnap node ingests and serves the standard snapchain network plus
+the hyper-layer gossip topic. You'll need:
 
 - 16 GB of RAM
 - 4 CPU cores or vCPUs
-- 1.5TB of free storage
+- 1.5 TB of free storage
 - A public IP address
-- Ports 3381 - 3383 exposed on both TCP and UDP. 
+- Ports 3381 – 3383 exposed on TCP and UDP
 
-You can start a new node or upgrade an existing node with the following command: 
+(More detailed runbook is in `HYPER_OPERATOR_RUNBOOK.md`.)
 
-```bash
-curl -sSL https://raw.githubusercontent.com/farcasterxyz/snapchain/refs/heads/main/scripts/snapchain-bootstrap.sh | bash
-```
-You can manage your node using the snapchain.sh script. It uses docker compose to run the node in a container. The script provides commands to start, stop, and check the logs of your node.
-A brand new node will download historical snapshots to catchup to the latest state before it begins sync. This can take up to 2 hours. Check the node's status by running `curl http://localhost:3381/v1/info`. You should see `maxHeight` increasing and `blockDelay` decreasing until it approaches zero. 
+## Compatibility note
 
-## Upgrade
+Some identifiers in this codebase intentionally retain the
+"snapchain" name — they are part of the wire-compatible network layer
+shared with upstream snapchain:
 
-To upgrade your Snapchain node to the latest version, follow these steps:
+- `proto/definitions/blocks.proto`, `gossip.proto`, `message.proto`,
+  `onchain_event.proto` (the snapchain wire format)
+- gossip topic name prefixes for the snapchain-compatible streams
+- `RootPrefix` enum values in `src/storage/constants.rs` that name the
+  legacy snapchain stores
 
-```bash
-cd snapchain
-./snapchain.sh upgrade
-```
-
-This ensures your node is always running the latest available version.
-
-## Contributing 
-
-We welcome contributions from developers of all skill levels. Please look for issues labeled with "help wanted" to find good tickets to work on. If you are working on something that is not explicitly a ticket, we may or may not accept it. We encourage checking with someone on the team before spending a lot of time on something. 
-
-We will ban and report accounts that appear to engage in reputating farming by using LLMs or automated tools to generate PRs. 
+Hyper-layer additions live under the `Hyper*` proto messages,
+`hypersnap-*` gossip topics (in `src/hyper/topics.rs`), and the
+`Hyper*` `RootPrefix` values. Documentation, runbooks, and module-level
+descriptions throughout this repository refer to the project as
+**hypersnap**.
 
 ## Installation
 
 ### Prerequisites
 
-Before you begin, ensure you have the following installed:
-- Rust (latest stable version)
-- Cargo (comes with Rust)
+- Rust (latest stable)
+- Cargo
 - Protocol Buffers compiler (`brew install protobuf`)
-- cmake (`brew install cmake`) 
+- cmake (`brew install cmake`)
 
-### Installation
+### Build
 
-Clone the snapchain and dependent repos and build snapchain:
-```
+```sh
+# Sibling-checkout deps used by the hyper layer.
 git clone git@github.com:CassOnMars/eth-signature-verifier.git
-cd eth-signature-verifier
-git checkout 8deb4a091982c345949dc66bf8684489d9f11889
-cd ..
+cd eth-signature-verifier && git checkout 8deb4a091982c345949dc66bf8684489d9f11889 && cd ..
+
 git clone git@github.com:informalsystems/malachite.git
-cd malachite
-git checkout 13bca14cd209d985c3adf101a02924acde8723a5
-cd ..
-git clone git@github.com:farcasterxyz/snapchain.git
-cd snapchain
+cd malachite && git checkout 13bca14cd209d985c3adf101a02924acde8723a5 && cd ..
+
+# This repo.
+cd hypersnap
 cargo build
 ```
 
-### Testing
+### Tests
 
-After setting up your Rust toolchain above, you can run tests with:
-
-```
+```sh
 cargo test
 ```
 
-### Running the Application
+The hyper-layer tests (840+ across the snapchain crate, the
+`proof-of-quality` crate, and the integration tests) live under
+`src/hyper/` and `crates/proof-of-quality/`. The base snapchain tests
+under `src/storage/`, `src/network/`, etc. continue to validate the
+wire-compatible layer.
 
-For development, you can run multiple nodes by running:
-```
+### Local devnet
+
+```sh
 make dev
 ```
 
-These will be configured to communicate with each other.
+## Contributing
 
-To query a node, you can run `grpcurl` from within the container:
-
-```
-docker compose exec node1 grpcurl -import-path proto -proto proto/rpc.proto list
-```
-
-If you need fresh keypairs for your node, you can generate them with:
-
-```
-cargo run --bin generate_keys
-```
-
-### Clean up
-
-You can remove any cached items by running:
-
-```
-make clean
-```
-
-## Publishing
-
-1. Update `package.version` in `Cargo.toml`
-2. Run `cargo build`, to make sure everything is working and update cargo.lock
-3. Update the changelog by running `SNAPCHAIN_VERSION=0.x.y make changelog`
-4. Commit the change and create and merge the PR
-5. Ensure you have the release commit `git checkout main && git pull`
-6. Tag the commit using `git tag v0.x.y`, and push it with `git push origin HEAD --tags` to trigger the docker build
-7. Also tag with @latest using `git tag -f @latest`, and push it (with --force) so install scripts will use the latest version
-8. Once automated build is complete, confirm the Docker image was [published](https://hub.docker.com/r/farcasterxyz/snapchain)
+PRs are welcome. Please tag an issue with "help wanted" or sync with
+the team before opening a large change. PRs that look LLM-generated
+without engineering judgment will be closed.

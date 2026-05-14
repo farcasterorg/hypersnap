@@ -3249,6 +3249,7 @@ where
 pub struct Router<Service: HubService> {
     service: Arc<HubHttpServiceImpl<Service>>,
     api_handler: Option<ApiHttpHandler>,
+    hyper_handler: Option<crate::hyper::http_handler::HyperHttpHandler>,
 }
 
 impl<Service> Router<Service>
@@ -3259,12 +3260,23 @@ where
         Self {
             service: Arc::new(service),
             api_handler: None,
+            hyper_handler: None,
         }
     }
 
     /// Set the API handler for v2 API endpoints.
     pub fn with_api_handler(mut self, handler: ApiHttpHandler) -> Self {
         self.api_handler = Some(handler);
+        self
+    }
+
+    /// Attach the hyper-protocol HTTP handler (`/hyper/v1/*`).
+    /// Operator constructs it from the spawned `HyperActor`'s handles.
+    pub fn with_hyper_handler(
+        mut self,
+        handler: crate::hyper::http_handler::HyperHttpHandler,
+    ) -> Self {
+        self.hyper_handler = Some(handler);
         self
     }
 
@@ -3318,6 +3330,28 @@ where
         if let Some(ref handler) = self.api_handler {
             if handler.can_handle(req.method(), path) {
                 let mut response = handler.handle(req).await?;
+                response.headers_mut().append(
+                    "Access-Control-Allow-Origin",
+                    HeaderValue::from_str(&config.cors_origin).unwrap(),
+                );
+                return Ok(response);
+            }
+        }
+
+        // Hyper-protocol routes: `/hyper/v1/*`. Short-circuit before the
+        // legacy router so paths like `/hyper/v1/head` don't get
+        // misinterpreted as the legacy hub API.
+        if let Some(ref hyper_handler) = self.hyper_handler {
+            if hyper_handler.can_handle(req.method(), path) {
+                let method = req.method().clone();
+                let path = path.to_string();
+                let body = req
+                    .into_body()
+                    .collect()
+                    .await
+                    .map(|c| c.to_bytes())
+                    .unwrap_or_else(|_| Bytes::new());
+                let mut response = hyper_handler.handle(&method, &path, body).await;
                 response.headers_mut().append(
                     "Access-Control-Allow-Origin",
                     HeaderValue::from_str(&config.cors_origin).unwrap(),

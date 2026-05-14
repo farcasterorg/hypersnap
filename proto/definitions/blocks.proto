@@ -3,6 +3,7 @@ syntax = "proto3";
 import "message.proto";
 import "username_proof.proto";
 import "onchain_event.proto";
+import "hyper.proto";
 
 // Common types
 
@@ -83,6 +84,7 @@ message DecidedValue {
   oneof value {
     Block block = 2;
     ShardChunk shard = 3;
+    HyperBlock hyper_block = 4;
   }
 }
 
