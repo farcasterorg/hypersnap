@@ -973,6 +973,15 @@ impl ApiHttpHandler {
                                 ));
                             }
                         };
+                        if parsed < crate::storage::store::account::MIN_CASTS_BY_FOLLOWING_LIMIT {
+                            return Ok(Self::error_response(
+                                StatusCode::BAD_REQUEST,
+                                &format!(
+                                    "limit must be at least {}",
+                                    crate::storage::store::account::MIN_CASTS_BY_FOLLOWING_LIMIT
+                                ),
+                            ));
+                        }
                         if parsed > crate::storage::store::account::MAX_CASTS_BY_FOLLOWING_LIMIT {
                             return Ok(Self::error_response(
                                 StatusCode::BAD_REQUEST,
@@ -982,7 +991,7 @@ impl ApiHttpHandler {
                                 ),
                             ));
                         }
-                        parsed.max(crate::storage::store::account::MIN_CASTS_BY_FOLLOWING_LIMIT)
+                        parsed
                     }
                 };
                 let start_timestamp = params.get("start_timestamp").and_then(|s| s.parse().ok());

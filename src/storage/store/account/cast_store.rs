@@ -19,20 +19,26 @@ type Parent = message::cast_add_body::Parent;
 
 /// Default page size for casts-by-following requests.
 pub const DEFAULT_CASTS_BY_FOLLOWING_PER_FID_LIMIT: usize = 100;
-/// Minimum page size (a request for 0 is treated as 1).
-pub const MIN_CASTS_BY_FOLLOWING_LIMIT: usize = 1;
+/// Minimum page size per request.
+pub const MIN_CASTS_BY_FOLLOWING_LIMIT: usize = 10;
 /// Hard maximum page size per request (per followed FID on each shard).
 pub const MAX_CASTS_BY_FOLLOWING_LIMIT: usize = 1000;
 
 /// Validates and normalizes a casts-by-following page size.
 pub fn validate_casts_by_following_page_size(page_size: usize) -> Result<usize, HubError> {
+    if page_size < MIN_CASTS_BY_FOLLOWING_LIMIT {
+        return Err(HubError::invalid_parameter(&format!(
+            "page_size must be at least {}",
+            MIN_CASTS_BY_FOLLOWING_LIMIT
+        )));
+    }
     if page_size > MAX_CASTS_BY_FOLLOWING_LIMIT {
         return Err(HubError::invalid_parameter(&format!(
             "page_size must not exceed {}",
             MAX_CASTS_BY_FOLLOWING_LIMIT
         )));
     }
-    Ok(page_size.max(MIN_CASTS_BY_FOLLOWING_LIMIT))
+    Ok(page_size)
 }
 
 /**
@@ -577,44 +583,58 @@ impl CastStore {
         })
     }
 
-    /// Returns cast adds from the given FIDs on this shard, filtered by timestamp range.
-    /// Results are sorted by timestamp; `reverse` true is newest first, false is oldest first.
-    /// Fetches at most `limit` casts per followed FID via `get_all_messages_by_fid`.
-    pub fn get_casts_by_following(
+    /// Returns one page of cast adds for a FID, filtered by timestamp range.
+    /// `page_options.page_size` counts cast adds only (removes are skipped without
+    /// consuming the page budget).
+    pub fn get_cast_adds_by_fid_page(
         store: &Store<CastStoreDef>,
-        following_fids: &[u64],
+        fid: u64,
         start_time: Option<u32>,
         stop_time: Option<u32>,
-        reverse: bool,
-        limit: usize,
-    ) -> Result<Vec<Message>, HubError> {
-        let mut casts = Vec::new();
-        let page_options = PageOptions {
-            page_size: Some(limit),
-            page_token: None,
-            reverse,
-        };
+        page_options: &PageOptions,
+    ) -> Result<MessagesPage, HubError> {
+        let target = page_options.page_size.unwrap_or(PAGE_SIZE_MAX);
+        let mut messages = Vec::new();
+        let mut page_token = page_options.page_token.clone();
+        let mut next_page_token = None;
 
-        for &fid in following_fids {
-            let page = store.get_all_messages_by_fid(fid, start_time, stop_time, &page_options)?;
+        while messages.len() < target {
+            let remaining = target - messages.len();
+            let page = store.get_all_messages_by_fid(
+                fid,
+                start_time,
+                stop_time,
+                &PageOptions {
+                    page_size: Some(remaining),
+                    page_token: page_token.clone(),
+                    reverse: page_options.reverse,
+                },
+            )?;
+            page_token = page.next_page_token.clone();
+
             for message in page.messages {
                 if store.store_def().is_add_type(&message) {
-                    casts.push(message);
+                    messages.push(message);
+                    if messages.len() >= target {
+                        break;
+                    }
                 }
+            }
+
+            if messages.len() >= target {
+                next_page_token = page_token;
+                break;
+            }
+            if page_token.is_none() {
+                next_page_token = None;
+                break;
             }
         }
 
-        casts.sort_by(|a, b| {
-            let ts_a = a.data.as_ref().map(|d| d.timestamp).unwrap_or(0);
-            let ts_b = b.data.as_ref().map(|d| d.timestamp).unwrap_or(0);
-            if reverse {
-                ts_b.cmp(&ts_a)
-            } else {
-                ts_a.cmp(&ts_b)
-            }
-        });
-
-        Ok(casts)
+        Ok(MessagesPage {
+            messages,
+            next_page_token,
+        })
     }
 
     pub fn get_casts_by_mention(

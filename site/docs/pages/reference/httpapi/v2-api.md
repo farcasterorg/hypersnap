@@ -36,8 +36,11 @@ enabled = true
 | ------- | ------- | ----------- |
 | `[api] enabled` | `false` | Master switch for the v2 API and indexing |
 | `[api.feeds] casts_by_following_enabled` | `true` | Enables `GET /v2/farcaster/casts/following` and gRPC `GetCastsByFollowing` |
+| `[api.feeds] following_limit` | `500` | Max followed FIDs scanned per request (link type `follow`) |
 
 Set `casts_by_following_enabled = false` to turn it off. When disabled, the HTTP route returns `503` and gRPC returns `FAILED_PRECONDITION`.
+
+This endpoint is a convenience read path for clients. Production consumers should index their own following timelines. Each FID account lives on a single shard, so work scales with `following_limit` (one cast store per followed FID), not with total shard count.
 
 ### HTTP
 
@@ -46,7 +49,7 @@ Set `casts_by_following_enabled = false` to turn it off. When disabled, the HTTP
 | Parameter | Required | Default | Description |
 | --------- | -------- | ------- | ----------- |
 | `fid` | Yes | — | FID whose `follow` links define the timeline |
-| `limit` | No | `100` | Max casts per page (minimum `1`, maximum `1000`; values above `1000` return `400`) |
+| `limit` | No | `100` | Max casts per page (minimum `10`, maximum `1000`; out of range returns `400`) |
 | `cursor` | No | — | Pagination cursor from `next.cursor` (hex-encoded page token) |
 | `reverse` | No | `true` | `true` = newest first; `false` = oldest first |
 | `start_timestamp` | No | — | Inclusive lower bound (Farcaster time, same as message timestamps) |
@@ -78,6 +81,8 @@ curl "http://127.0.0.1:3381/v2/farcaster/casts/following?fid=6833&limit=50&start
 ```
 
 Pass `next.cursor` as the `cursor` query parameter on the next request. An empty or omitted cursor means no further pages.
+
+Pagination uses an opaque cursor (JSON, hex-encoded for HTTP) that records a per-followed-FID RocksDB continuation token plus any buffered casts not yet returned, and a `(timestamp, hash)` boundary for stable ordering. This avoids offset-based replay of the full timeline on every page.
 
 ### gRPC
 

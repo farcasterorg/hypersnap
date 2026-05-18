@@ -28,15 +28,17 @@ Used to retrieve valid casts or tombstones for deleted casts
 | Field           | Type              | Label    | Description                                                         |
 | --------------- | ----------------- | -------- | ------------------------------------------------------------------- |
 | fid             | [uint64](#uint64) | optional | FID whose following list is used to build the timeline              |
-| page_size       | [uint32](#uint32) | optional | Number of results per page (default: 100, min: 1, max: 1000)        |
-| page_token      | [bytes](#bytes)   | optional | Token for pagination                                                |
+| page_size       | [uint32](#uint32) | optional | Number of results per page (default: 100, min: 10, max: 1000)       |
+| page_token      | [bytes](#bytes)   | optional | Opaque cursor (per-FID scan positions + timeline boundary); see below |
 | reverse         | [bool](#bool)     | optional | Sort order; defaults to `true` (newest casts first)                 |
 | start_timestamp | [uint64](#uint64) | optional | Inclusive lower bound on cast timestamp (Farcaster time)            |
 | stop_timestamp  | [uint64](#uint64) | optional | Inclusive upper bound on cast timestamp (Farcaster time)            |
 
-Returns cast adds authored by FIDs that `fid` follows (link type `follow`). Casts are merged across shards, sorted by timestamp, and paginated. Up to **`page_size` casts per followed FID** are read per shard (hard cap **1000**), then the merged timeline is capped to **`page_size`** results. Requests with `page_size` above 1000 return `INVALID_ARGUMENT`. The requesting user's own casts are not included.
+Returns cast adds authored by FIDs that `fid` follows (link type `follow`). Casts are merged with a k-way merge, sorted by `(timestamp, hash)`, and paginated via an opaque `page_token` that continues each followed FID's RocksDB scan and carries a `(timestamp, hash)` boundary (not an offset). Each request reads only enough per-FID batches to produce **`page_size`** results (`page_size` must be 10–1000). The requesting user's own casts are not included.
 
-Enabled by default when `[api.feeds]` is configured. Set `[api.feeds] casts_by_following_enabled = false` to disable (also gates the v2 HTTP route `GET /v2/farcaster/casts/following`).
+At most **`[api.feeds] following_limit`** followed FIDs (default **500**) are considered per request. Each followed FID lives on one shard, so cost scales with that cap, not with total shards. This is a convenience endpoint; clients that need full or low-latency following feeds should index their own data.
+
+Enabled by default when `[api.feeds]` is configured. Set `[api.feeds] casts_by_following_enabled = false` to disable (also gates the v2 HTTP route `GET /v2/farcaster/casts/following`). Configure `following_limit` under `[api.feeds]`.
 
 ## FidTimestampRequest
 

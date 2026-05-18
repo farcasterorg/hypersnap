@@ -239,6 +239,11 @@ pub struct FeedConfig {
     /// Expensive: scans casts for every followed FID. Enabled by default when `[api.feeds]` is configured.
     #[serde(default = "default_true")]
     pub casts_by_following_enabled: bool,
+
+    /// Maximum number of followed FIDs considered per request (link type `follow`).
+    /// Each followed FID lives on a single shard, so work scales with this cap, not shard count.
+    #[serde(default = "default_casts_by_following_following_limit")]
+    pub following_limit: usize,
 }
 
 impl Default for FeedConfig {
@@ -248,8 +253,13 @@ impl Default for FeedConfig {
             max_following_fetch: default_max_following_fetch(),
             default_page_size: default_feed_page_size(),
             casts_by_following_enabled: true,
+            following_limit: default_casts_by_following_following_limit(),
         }
     }
+}
+
+pub fn default_casts_by_following_following_limit() -> usize {
+    500
 }
 
 fn default_max_following_fetch() -> usize {

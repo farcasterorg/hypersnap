@@ -39,8 +39,9 @@ use crate::storage::store::account::UsernameProofStore;
 use crate::storage::store::account::PAGE_SIZE_MAX;
 use crate::storage::store::account::{
     get_gasless_key_count, get_gasless_key_record, get_last_used_at, list_gasless_keys_by_fid,
-    validate_casts_by_following_page_size, CastStore, GaslessKeyRecord, LinkStore, ReactionStore,
-    Store, UserDataStore, VerificationStore, DEFAULT_CASTS_BY_FOLLOWING_PER_FID_LIMIT,
+    validate_casts_by_following_page_size, CastStore, CastStoreDef, GaslessKeyRecord, LinkStore,
+    ReactionStore, Store, UserDataStore, VerificationStore,
+    DEFAULT_CASTS_BY_FOLLOWING_PER_FID_LIMIT,
 };
 use crate::storage::store::account::{message_bytes_decode, IntoI32};
 use crate::storage::store::account::{EventsPage, HubEventIdGenerator};
@@ -72,18 +73,51 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_millis(100);
 const DEFAULT_CASTS_BY_FOLLOWING_PAGE_SIZE: usize = DEFAULT_CASTS_BY_FOLLOWING_PER_FID_LIMIT;
 const LINK_TYPE_FOLLOW: &str = "follow";
 
-#[derive(Serialize, Deserialize)]
-struct CastsByFollowingPageToken {
-    offset: usize,
+#[derive(Serialize, Deserialize, Default, Clone)]
+pub(crate) struct CastsByFollowingPageToken {
+    #[serde(default)]
+    fid_cursors: HashMap<u64, FidFollowingCursor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    boundary: Option<CastsByFollowingBoundary>,
 }
 
-fn compare_casts_by_following_timeline(
-    a: &proto::Message,
-    b: &proto::Message,
+#[derive(Serialize, Deserialize, Default, Clone)]
+struct FidFollowingCursor {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    db_page_token: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending: Vec<PendingFollowingCast>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct PendingFollowingCast {
+    fid: u64,
+    timestamp: u32,
+    hash: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct CastsByFollowingBoundary {
+    timestamp: u32,
+    hash: Vec<u8>,
+}
+
+struct FidMergeState {
+    fid: u64,
+    shard_id: u32,
+    buffer: Vec<Message>,
+    buffer_idx: usize,
+    db_page_token: Option<Vec<u8>>,
+    exhausted: bool,
+}
+
+fn compare_timeline_points(
+    ts_a: u32,
+    hash_a: &[u8],
+    ts_b: u32,
+    hash_b: &[u8],
     reverse: bool,
 ) -> std::cmp::Ordering {
-    let ts_a = a.data.as_ref().map(|d| d.timestamp).unwrap_or(0);
-    let ts_b = b.data.as_ref().map(|d| d.timestamp).unwrap_or(0);
     let ts_cmp = if reverse {
         ts_b.cmp(&ts_a)
     } else {
@@ -91,11 +125,86 @@ fn compare_casts_by_following_timeline(
     };
     ts_cmp.then_with(|| {
         if reverse {
-            b.hash.cmp(&a.hash)
+            hash_b.cmp(hash_a)
         } else {
-            a.hash.cmp(&b.hash)
+            hash_a.cmp(hash_b)
         }
     })
+}
+
+fn compare_casts_by_following_timeline(
+    a: &proto::Message,
+    b: &proto::Message,
+    reverse: bool,
+) -> std::cmp::Ordering {
+    compare_timeline_points(
+        a.data.as_ref().map(|d| d.timestamp).unwrap_or(0),
+        &a.hash,
+        b.data.as_ref().map(|d| d.timestamp).unwrap_or(0),
+        &b.hash,
+        reverse,
+    )
+}
+
+fn cast_is_before_timeline_boundary(
+    msg: &Message,
+    boundary: &CastsByFollowingBoundary,
+    reverse: bool,
+) -> bool {
+    compare_timeline_points(
+        msg.data.as_ref().map(|d| d.timestamp).unwrap_or(0),
+        &msg.hash,
+        boundary.timestamp,
+        &boundary.hash,
+        reverse,
+    ) == std::cmp::Ordering::Less
+}
+
+fn fetch_fid_cast_batch(
+    state: &mut FidMergeState,
+    cast_store: &Store<CastStoreDef>,
+    start_ts: Option<u32>,
+    stop_ts: Option<u32>,
+    reverse: bool,
+    batch_size: usize,
+) -> Result<(), HubError> {
+    if state.exhausted {
+        return Ok(());
+    }
+    let page = CastStore::get_cast_adds_by_fid_page(
+        cast_store,
+        state.fid,
+        start_ts,
+        stop_ts,
+        &PageOptions {
+            page_size: Some(batch_size),
+            page_token: state.db_page_token.clone(),
+            reverse,
+        },
+    )?;
+    state.db_page_token = page.next_page_token.clone();
+    if page.next_page_token.is_none() {
+        state.exhausted = true;
+    }
+    state.buffer.extend(page.messages);
+    state
+        .buffer
+        .sort_by(|a, b| compare_casts_by_following_timeline(a, b, reverse));
+    Ok(())
+}
+
+fn ensure_fid_cast_available(
+    state: &mut FidMergeState,
+    cast_store: &Store<CastStoreDef>,
+    start_ts: Option<u32>,
+    stop_ts: Option<u32>,
+    reverse: bool,
+    batch_size: usize,
+) -> Result<(), HubError> {
+    while state.buffer_idx >= state.buffer.len() && !state.exhausted {
+        fetch_fid_cast_batch(state, cast_store, start_ts, stop_ts, reverse, batch_size)?;
+    }
+    Ok(())
 }
 
 fn link_target_fid(message: &proto::Message) -> Option<u64> {
@@ -112,17 +221,23 @@ fn link_target_fid(message: &proto::Message) -> Option<u64> {
 fn collect_following_fids(
     link_store: &Store<LinkStore>,
     user_fid: u64,
+    following_limit: usize,
 ) -> Result<Vec<u64>, HubError> {
     let mut following_fids = Vec::new();
     let mut page_token = None;
 
     loop {
+        if following_fids.len() >= following_limit {
+            break;
+        }
+
+        let remaining = following_limit - following_fids.len();
         let page = LinkStore::get_link_adds_by_fid(
             link_store,
             user_fid,
             LINK_TYPE_FOLLOW.to_string(),
             &PageOptions {
-                page_size: Some(PAGE_SIZE_MAX),
+                page_size: Some(PAGE_SIZE_MAX.min(remaining)),
                 page_token: page_token.clone(),
                 reverse: false,
             },
@@ -131,11 +246,14 @@ fn collect_following_fids(
         for message in page.messages {
             if let Some(target_fid) = link_target_fid(&message) {
                 following_fids.push(target_fid);
+                if following_fids.len() >= following_limit {
+                    break;
+                }
             }
         }
 
         page_token = page.next_page_token;
-        if page_token.is_none() {
+        if page_token.is_none() || following_fids.len() >= following_limit {
             break;
         }
     }
@@ -445,6 +563,8 @@ pub struct MyHubService {
     fname_lookup: Option<Arc<dyn FnameTransferLookup>>,
     /// When false, `GetCastsByFollowing` returns unavailable. Defaults to enabled.
     casts_by_following_enabled: bool,
+    /// Hard cap on followed FIDs scanned per request.
+    following_limit: usize,
 }
 
 /// Opaque cursor for notifications pagination.
@@ -492,6 +612,7 @@ impl MyHubService {
         peer_id: String,
         fname_lookup: Option<Arc<dyn FnameTransferLookup>>,
         casts_by_following_enabled: bool,
+        following_limit: usize,
     ) -> Self {
         let mut allowed_users = HashMap::new();
         for auth in rpc_auth.split(",") {
@@ -530,69 +651,173 @@ impl MyHubService {
             id_registry_cache,
             fname_lookup,
             casts_by_following_enabled,
+            following_limit,
         };
         service
     }
 
-    fn get_casts_by_following_messages(
+    pub(crate) fn get_casts_by_following_messages(
         &self,
         user_fid: u64,
         start_ts: Option<u32>,
         stop_ts: Option<u32>,
         reverse: bool,
         page_size: usize,
-        offset: usize,
+        page_token: Option<CastsByFollowingPageToken>,
     ) -> Result<(Vec<Message>, Option<Vec<u8>>), HubError> {
         let page_size = validate_casts_by_following_page_size(page_size)?;
         let user_stores = self.get_stores_for(user_fid).map_err(status_to_hub_error)?;
-        let following_fids = collect_following_fids(&user_stores.link_store, user_fid)?;
+        let mut following_fids =
+            collect_following_fids(&user_stores.link_store, user_fid, self.following_limit)?;
 
         if following_fids.is_empty() {
             return Ok((vec![], None));
         }
 
-        let mut fids_by_shard: HashMap<u32, Vec<u64>> = HashMap::new();
-        for followed_fid in following_fids {
-            let shard_id = self.message_router.route_fid(followed_fid, self.num_shards);
-            fids_by_shard
-                .entry(shard_id)
-                .or_default()
-                .push(followed_fid);
+        following_fids.sort_unstable();
+        following_fids.dedup();
+
+        let saved_token = page_token.unwrap_or_default();
+        let timeline_boundary = saved_token.boundary;
+
+        let mut fid_states: HashMap<u64, FidMergeState> = HashMap::new();
+        for &fid in &following_fids {
+            let shard_id = self.message_router.route_fid(fid, self.num_shards);
+            let cursor = saved_token
+                .fid_cursors
+                .get(&fid)
+                .cloned()
+                .unwrap_or_default();
+
+            let mut buffer = Vec::new();
+            if let Ok(stores) = self.get_stores_for_shard(shard_id) {
+                for pending in &cursor.pending {
+                    if let Ok(Some(msg)) = CastStore::get_cast_add(
+                        &stores.cast_store,
+                        pending.fid,
+                        pending.hash.clone(),
+                    ) {
+                        buffer.push(msg);
+                    }
+                }
+            }
+            buffer.sort_by(|a, b| compare_casts_by_following_timeline(a, b, reverse));
+
+            let exhausted = saved_token.fid_cursors.contains_key(&fid)
+                && cursor.db_page_token.is_none()
+                && cursor.pending.is_empty();
+            fid_states.insert(
+                fid,
+                FidMergeState {
+                    fid,
+                    shard_id,
+                    buffer,
+                    buffer_idx: 0,
+                    db_page_token: cursor.db_page_token,
+                    exhausted,
+                },
+            );
         }
 
-        let mut shard_ids: Vec<u32> = fids_by_shard.keys().copied().collect();
-        shard_ids.sort_unstable();
+        let mut results: Vec<Message> = Vec::with_capacity(page_size);
+        while results.len() < page_size {
+            for &fid in &following_fids {
+                let state = fid_states.get_mut(&fid).expect("fid_states complete");
+                let stores = self
+                    .get_stores_for_shard(state.shard_id)
+                    .map_err(status_to_hub_error)?;
+                ensure_fid_cast_available(
+                    state,
+                    &stores.cast_store,
+                    start_ts,
+                    stop_ts,
+                    reverse,
+                    page_size,
+                )?;
 
-        let mut all_casts: Vec<Message> = Vec::new();
-        for shard_id in shard_ids {
-            let mut fids = fids_by_shard
-                .remove(&shard_id)
-                .expect("shard_id from keys()");
-            fids.sort_unstable();
-            let stores = self
-                .get_stores_for_shard(shard_id)
-                .map_err(status_to_hub_error)?;
-            let shard_casts = CastStore::get_casts_by_following(
-                &stores.cast_store,
-                &fids,
-                start_ts,
-                stop_ts,
-                reverse,
-                page_size,
-            )?;
-            all_casts.extend(shard_casts);
+                while state.buffer_idx < state.buffer.len() {
+                    let candidate = &state.buffer[state.buffer_idx];
+                    if timeline_boundary
+                        .as_ref()
+                        .map(|boundary| {
+                            cast_is_before_timeline_boundary(candidate, boundary, reverse)
+                        })
+                        .unwrap_or(true)
+                    {
+                        break;
+                    }
+                    state.buffer_idx += 1;
+                }
+            }
+
+            let mut best_fid: Option<u64> = None;
+            let mut best_head: Option<Message> = None;
+            for &fid in &following_fids {
+                let state = fid_states.get(&fid).expect("fid_states complete");
+                if state.buffer_idx >= state.buffer.len() {
+                    continue;
+                }
+                let head = state.buffer[state.buffer_idx].clone();
+                let replace_best = match &best_head {
+                    None => true,
+                    Some(current_best) => {
+                        compare_casts_by_following_timeline(&head, current_best, reverse)
+                            == std::cmp::Ordering::Less
+                    }
+                };
+                if replace_best {
+                    best_fid = Some(fid);
+                    best_head = Some(head);
+                }
+            }
+
+            let Some(fid) = best_fid else {
+                break;
+            };
+
+            let state = fid_states.get_mut(&fid).expect("best fid present");
+            results.push(state.buffer[state.buffer_idx].clone());
+            state.buffer_idx += 1;
         }
 
-        all_casts.sort_by(|a, b| compare_casts_by_following_timeline(a, b, reverse));
+        if results.len() < page_size {
+            return Ok((results, None));
+        }
 
-        let total = all_casts.len();
-        let page_messages: Vec<Message> =
-            all_casts.into_iter().skip(offset).take(page_size).collect();
-        let next_offset = offset + page_messages.len();
-        let next_page_token = if next_offset < total {
+        let boundary = results.last().map(|msg| CastsByFollowingBoundary {
+            timestamp: msg.data.as_ref().map(|d| d.timestamp).unwrap_or(0),
+            hash: msg.hash.clone(),
+        });
+
+        let mut has_more = false;
+        let mut fid_cursors = HashMap::new();
+        for &fid in &following_fids {
+            let state = fid_states.get(&fid).expect("fid_states complete");
+            let pending: Vec<PendingFollowingCast> = state.buffer[state.buffer_idx..]
+                .iter()
+                .map(|msg| PendingFollowingCast {
+                    fid,
+                    timestamp: msg.data.as_ref().map(|d| d.timestamp).unwrap_or(0),
+                    hash: msg.hash.clone(),
+                })
+                .collect();
+            if !state.exhausted || !pending.is_empty() {
+                has_more = true;
+                fid_cursors.insert(
+                    fid,
+                    FidFollowingCursor {
+                        db_page_token: state.db_page_token.clone(),
+                        pending,
+                    },
+                );
+            }
+        }
+
+        let next_page_token = if has_more {
             Some(
                 serde_json::to_vec(&CastsByFollowingPageToken {
-                    offset: next_offset,
+                    fid_cursors,
+                    boundary,
                 })
                 .map_err(|e| HubError::internal_db_error(&e.to_string()))?,
             )
@@ -600,7 +825,7 @@ impl MyHubService {
             None
         };
 
-        Ok((page_messages, next_page_token))
+        Ok((results, next_page_token))
     }
 
     async fn submit_message_internal(
@@ -2354,17 +2579,18 @@ impl HubService for MyHubService {
         )
         .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
-        let offset = if let Some(token_bytes) = req.page_token {
-            serde_json::from_slice::<CastsByFollowingPageToken>(&token_bytes)
-                .map(|token| token.offset)
-                .map_err(|e| Status::invalid_argument(format!("Invalid page token: {}", e)))?
+        let page_token = if let Some(token_bytes) = req.page_token {
+            Some(
+                serde_json::from_slice::<CastsByFollowingPageToken>(&token_bytes)
+                    .map_err(|e| Status::invalid_argument(format!("Invalid page token: {}", e)))?,
+            )
         } else {
-            0
+            None
         };
 
         let (messages, next_page_token) = self
             .get_casts_by_following_messages(
-                user_fid, start_ts, stop_ts, reverse, page_size, offset,
+                user_fid, start_ts, stop_ts, reverse, page_size, page_token,
             )
             .map_err(hub_error_to_status)?;
 
@@ -3762,12 +3988,13 @@ impl crate::api::HubQueryHandler for MyHubService {
             return Err("GetCastsByFollowing is disabled on this node".to_string());
         }
 
-        let offset = if let Some(token_bytes) = page_token {
-            serde_json::from_slice::<CastsByFollowingPageToken>(&token_bytes)
-                .map(|token| token.offset)
-                .map_err(|e| format!("Invalid page token: {}", e))?
+        let page_token = if let Some(token_bytes) = page_token {
+            Some(
+                serde_json::from_slice::<CastsByFollowingPageToken>(&token_bytes)
+                    .map_err(|e| format!("Invalid page token: {}", e))?,
+            )
         } else {
-            0
+            None
         };
 
         self.get_casts_by_following_messages(
@@ -3776,7 +4003,7 @@ impl crate::api::HubQueryHandler for MyHubService {
             stop_timestamp,
             reverse,
             page_size,
-            offset,
+            page_token,
         )
         .map_err(|e| e.to_string())
     }
