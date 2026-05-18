@@ -559,6 +559,39 @@ impl CastStore {
         })
     }
 
+    /// Returns cast adds from the given FIDs on this shard, filtered by timestamp range.
+    /// Results are sorted by timestamp descending (most recent first).
+    pub fn get_casts_by_following(
+        store: &Store<CastStoreDef>,
+        following_fids: &[u64],
+        start_time: Option<u32>,
+        stop_time: Option<u32>,
+    ) -> Result<Vec<Message>, HubError> {
+        let mut casts = Vec::new();
+        let page_options = PageOptions {
+            page_size: None,
+            page_token: None,
+            reverse: true,
+        };
+
+        for &fid in following_fids {
+            let page = store.get_all_messages_by_fid(fid, start_time, stop_time, &page_options)?;
+            for message in page.messages {
+                if store.store_def().is_add_type(&message) {
+                    casts.push(message);
+                }
+            }
+        }
+
+        casts.sort_by(|a, b| {
+            let ts_a = a.data.as_ref().map(|d| d.timestamp).unwrap_or(0);
+            let ts_b = b.data.as_ref().map(|d| d.timestamp).unwrap_or(0);
+            ts_b.cmp(&ts_a)
+        });
+
+        Ok(casts)
+    }
+
     pub fn get_casts_by_mention(
         store: &Store<CastStoreDef>,
         mention: u64,

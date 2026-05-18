@@ -1482,6 +1482,151 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_casts_by_following_returns_followed_casts_in_time_range() {
+        const VIEWER_FID: u64 = SHARD1_FID;
+        const FOLLOWED_SAME_SHARD: u64 = 123;
+        const FOLLOWED_OTHER_SHARD: u64 = SHARD2_FID;
+
+        let (
+            _stores,
+            _senders,
+            [mut engine1, mut engine2],
+            _block_engine,
+            service,
+            _shard_decision_tx,
+            _block_decision_tx,
+        ) = make_server(None).await;
+
+        for fid in [VIEWER_FID, FOLLOWED_SAME_SHARD] {
+            test_helper::register_user(
+                fid,
+                test_helper::default_signer(),
+                test_helper::default_custody_address(),
+                &mut engine1,
+            )
+            .await;
+        }
+        test_helper::register_user(
+            FOLLOWED_OTHER_SHARD,
+            test_helper::default_signer(),
+            test_helper::default_custody_address(),
+            &mut engine2,
+        )
+        .await;
+
+        let follow_same_shard = messages_factory::links::create_link_add(
+            VIEWER_FID,
+            "follow",
+            FOLLOWED_SAME_SHARD,
+            None,
+            None,
+        );
+        let follow_other_shard = messages_factory::links::create_link_add(
+            VIEWER_FID,
+            "follow",
+            FOLLOWED_OTHER_SHARD,
+            None,
+            None,
+        );
+        test_helper::commit_message(&mut engine1, &follow_same_shard).await;
+        test_helper::commit_message(&mut engine1, &follow_other_shard).await;
+
+        let cast_same_shard = messages_factory::casts::create_cast_add(
+            FOLLOWED_SAME_SHARD,
+            "cast from same shard",
+            Some(1100),
+            None,
+        );
+        let cast_other_shard = messages_factory::casts::create_cast_add(
+            FOLLOWED_OTHER_SHARD,
+            "cast from other shard",
+            Some(1200),
+            None,
+        );
+        let cast_viewer =
+            messages_factory::casts::create_cast_add(VIEWER_FID, "viewer cast", Some(1300), None);
+        let cast_out_of_range = messages_factory::casts::create_cast_add(
+            FOLLOWED_OTHER_SHARD,
+            "out of range",
+            Some(2000),
+            None,
+        );
+
+        test_helper::commit_message(&mut engine1, &cast_same_shard).await;
+        test_helper::commit_message(&mut engine2, &cast_other_shard).await;
+        test_helper::commit_message(&mut engine1, &cast_viewer).await;
+        test_helper::commit_message(&mut engine2, &cast_out_of_range).await;
+
+        let response = service
+            .get_casts_by_following(Request::new(proto::CastsByFollowingRequest {
+                fid: Some(VIEWER_FID),
+                page_size: None,
+                page_token: None,
+                reverse: None,
+                start_timestamp: Some(1000),
+                stop_timestamp: Some(1500),
+            }))
+            .await
+            .unwrap();
+
+        test_helper::assert_contains_all_messages(
+            &response,
+            &[&cast_other_shard, &cast_same_shard],
+        );
+        assert!(
+            !response
+                .get_ref()
+                .messages
+                .iter()
+                .any(|m| m.hash == cast_viewer.hash),
+            "viewer's own casts should not be included"
+        );
+        assert!(
+            !response
+                .get_ref()
+                .messages
+                .iter()
+                .any(|m| m.hash == cast_out_of_range.hash),
+            "casts outside the timestamp range should not be included"
+        );
+
+        let timestamps: Vec<u32> = response
+            .get_ref()
+            .messages
+            .iter()
+            .filter_map(|m| m.data.as_ref().map(|d| d.timestamp))
+            .collect();
+        assert_eq!(timestamps, vec![1200, 1100]);
+
+        let page_one = service
+            .get_casts_by_following(Request::new(proto::CastsByFollowingRequest {
+                fid: Some(VIEWER_FID),
+                page_size: Some(1),
+                page_token: None,
+                reverse: None,
+                start_timestamp: Some(1000),
+                stop_timestamp: Some(1500),
+            }))
+            .await
+            .unwrap();
+        test_helper::assert_contains_all_messages(&page_one, &[&cast_other_shard]);
+
+        let page_two = service
+            .get_casts_by_following(Request::new(proto::CastsByFollowingRequest {
+                fid: Some(VIEWER_FID),
+                page_size: Some(1),
+                page_token: page_one.get_ref().next_page_token.clone(),
+                reverse: None,
+                start_timestamp: Some(1000),
+                stop_timestamp: Some(1500),
+            }))
+            .await
+            .unwrap();
+        test_helper::assert_contains_all_messages(&page_two, &[&cast_same_shard]);
+        assert!(page_two.get_ref().next_page_token.is_none());
+    }
+
+    #[tokio::test]
     async fn test_storage_limits() {
         // Works with no storage
         let (

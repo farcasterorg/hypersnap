@@ -1,6 +1,6 @@
 use super::rpc_extensions::{
-    authenticate_request, AsMessagesResponse, AsSingleMessageResponse, FidRequestExt,
-    FidTimestampRequestExt, LinksByFidRequestExt, ReactionsByFidRequestExt,
+    authenticate_request, AsMessagesResponse, AsSingleMessageResponse, CastsByFollowingRequestExt,
+    FidRequestExt, FidTimestampRequestExt, LinksByFidRequestExt, ReactionsByFidRequestExt,
 };
 use crate::connectors::fname::FnameTransferLookup;
 use crate::connectors::onchain_events::{Chain, ChainClients};
@@ -16,10 +16,10 @@ use crate::proto::hub_service_server::HubService;
 use crate::proto::{
     self, cast_add_body, casts_by_parent_request, link_body, links_by_target_request, message_data,
     on_chain_event::Body, reaction_body, reactions_by_target_request, AddressLookupRequest,
-    AddressMatch, AddressToFidResponse, Block, BlocksRequest, CastId, CastsByParentRequest,
-    DbStats, EventRequest, EventsRequest, EventsResponse, FidAddressTypeRequest,
-    FidAddressTypeResponse, FidRequest, FidResponse, FidTimestampRequest, FidsRequest,
-    FidsResponse, GetConnectedPeersRequest, GetConnectedPeersResponse, GetInfoRequest,
+    AddressMatch, AddressToFidResponse, Block, BlocksRequest, CastId, CastsByFollowingRequest,
+    CastsByParentRequest, DbStats, EventRequest, EventsRequest, EventsResponse,
+    FidAddressTypeRequest, FidAddressTypeResponse, FidRequest, FidResponse, FidTimestampRequest,
+    FidsRequest, FidsResponse, GetConnectedPeersRequest, GetConnectedPeersResponse, GetInfoRequest,
     GetInfoResponse, Height, HubEvent, IdRegistryEventByAddressRequest, LinkRequest,
     LinksByFidRequest, LinksByTargetRequest, Message, MessageType, MessagesResponse,
     NameLookupRequest, NameToAddressResponse, OnChainEvent, OnChainEventRequest,
@@ -36,9 +36,10 @@ use crate::storage::db::PageOptions;
 use crate::storage::db::RocksDbTransactionBatch;
 use crate::storage::store::account::MessagesPage;
 use crate::storage::store::account::UsernameProofStore;
+use crate::storage::store::account::PAGE_SIZE_MAX;
 use crate::storage::store::account::{
     get_gasless_key_count, get_gasless_key_record, get_last_used_at, list_gasless_keys_by_fid,
-    CastStore, GaslessKeyRecord, LinkStore, ReactionStore, UserDataStore, VerificationStore,
+    CastStore, GaslessKeyRecord, LinkStore, ReactionStore, Store, UserDataStore, VerificationStore,
 };
 use crate::storage::store::account::{message_bytes_decode, IntoI32};
 use crate::storage::store::account::{EventsPage, HubEventIdGenerator};
@@ -67,6 +68,58 @@ use tracing::{debug, error, info};
 
 pub const MEMPOOL_ADD_REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_millis(100);
+const DEFAULT_CASTS_BY_FOLLOWING_PAGE_SIZE: usize = 100;
+const LINK_TYPE_FOLLOW: &str = "follow";
+
+#[derive(Serialize, Deserialize)]
+struct CastsByFollowingPageToken {
+    offset: usize,
+}
+
+fn link_target_fid(message: &proto::Message) -> Option<u64> {
+    message.data.as_ref().and_then(|data| {
+        if let Some(message_data::Body::LinkBody(link_body)) = &data.body {
+            if let Some(link_body::Target::TargetFid(target_fid)) = link_body.target {
+                return Some(target_fid);
+            }
+        }
+        None
+    })
+}
+
+fn collect_following_fids(
+    link_store: &Store<LinkStore>,
+    user_fid: u64,
+) -> Result<Vec<u64>, HubError> {
+    let mut following_fids = Vec::new();
+    let mut page_token = None;
+
+    loop {
+        let page = LinkStore::get_link_adds_by_fid(
+            link_store,
+            user_fid,
+            LINK_TYPE_FOLLOW.to_string(),
+            &PageOptions {
+                page_size: Some(PAGE_SIZE_MAX),
+                page_token: page_token.clone(),
+                reverse: false,
+            },
+        )?;
+
+        for message in page.messages {
+            if let Some(target_fid) = link_target_fid(&message) {
+                following_fids.push(target_fid);
+            }
+        }
+
+        page_token = page.next_page_token;
+        if page_token.is_none() {
+            break;
+        }
+    }
+
+    Ok(following_fids)
+}
 
 // Time budget for recovering from a `MissingFname` validation failure on UserDataAdd
 // Username messages.
@@ -2158,6 +2211,100 @@ impl HubService for MyHubService {
         };
 
         Ok(Response::new(response))
+    }
+
+    async fn get_casts_by_following(
+        &self,
+        request: Request<CastsByFollowingRequest>,
+    ) -> Result<Response<MessagesResponse>, Status> {
+        let req = request.into_inner();
+        let user_fid = match req.fid {
+            Some(fid) => fid,
+            None => {
+                return Err(Status::invalid_argument(
+                    "fid must be specified".to_string(),
+                ))
+            }
+        };
+        let (start_ts, stop_ts) = req.timestamps();
+        let reverse = req.reverse.unwrap_or(true);
+        let page_size = req
+            .page_size
+            .map(|s| s as usize)
+            .unwrap_or(DEFAULT_CASTS_BY_FOLLOWING_PAGE_SIZE);
+
+        let offset = if let Some(token_bytes) = req.page_token {
+            serde_json::from_slice::<CastsByFollowingPageToken>(&token_bytes)
+                .map(|token| token.offset)
+                .map_err(|e| Status::invalid_argument(format!("Invalid page token: {}", e)))?
+        } else {
+            0
+        };
+
+        let user_stores = self.get_stores_for(user_fid)?;
+        let following_fids = collect_following_fids(&user_stores.link_store, user_fid)
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        if following_fids.is_empty() {
+            return Ok(Response::new(MessagesResponse {
+                messages: vec![],
+                next_page_token: None,
+            }));
+        }
+
+        let mut fids_by_shard: HashMap<u32, Vec<u64>> = HashMap::new();
+        for followed_fid in following_fids {
+            let shard_id = self.message_router.route_fid(followed_fid, self.num_shards);
+            fids_by_shard
+                .entry(shard_id)
+                .or_default()
+                .push(followed_fid);
+        }
+
+        let mut all_casts: Vec<Message> = Vec::new();
+        for (shard_id, fids) in fids_by_shard {
+            let stores = self.get_stores_for_shard(shard_id)?;
+            let shard_casts =
+                CastStore::get_casts_by_following(&stores.cast_store, &fids, start_ts, stop_ts)
+                    .unwrap_or_default();
+            all_casts.extend(shard_casts);
+        }
+
+        if reverse {
+            all_casts.sort_by(|a, b| {
+                let ts_a = a.data.as_ref().map(|d| d.timestamp).unwrap_or(0);
+                let ts_b = b.data.as_ref().map(|d| d.timestamp).unwrap_or(0);
+                ts_b.cmp(&ts_a)
+            });
+        } else {
+            all_casts.sort_by(|a, b| {
+                let ts_a = a.data.as_ref().map(|d| d.timestamp).unwrap_or(0);
+                let ts_b = b.data.as_ref().map(|d| d.timestamp).unwrap_or(0);
+                ts_a.cmp(&ts_b)
+            });
+        }
+
+        let total = all_casts.len();
+        let page_messages: Vec<Message> =
+            all_casts.into_iter().skip(offset).take(page_size).collect();
+        let next_offset = offset + page_messages.len();
+        let next_page_token = if next_offset < total {
+            Some(
+                serde_json::to_vec(&CastsByFollowingPageToken {
+                    offset: next_offset,
+                })
+                .map_err(|e| {
+                    Status::internal(format!("Failed to serialize next_page_token: {}", e))
+                })?,
+            )
+        } else {
+            None
+        };
+
+        Ok(Response::new(MessagesResponse {
+            messages: page_messages,
+            next_page_token,
+        }))
     }
 
     async fn get_casts_by_mention(

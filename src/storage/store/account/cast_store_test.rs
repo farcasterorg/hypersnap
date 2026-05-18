@@ -748,6 +748,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_casts_by_following_returns_casts_sorted_by_timestamp() {
+        let (store, db, _temp_dir) = create_test_store();
+        let followed_fid_a = FID_FOR_TEST;
+        let followed_fid_b = FID_FOR_TEST + 1;
+
+        let cast_older =
+            messages_factory::casts::create_cast_add(followed_fid_a, "older cast", Some(100), None);
+        let cast_newer =
+            messages_factory::casts::create_cast_add(followed_fid_b, "newer cast", Some(200), None);
+        let cast_out_of_range = messages_factory::casts::create_cast_add(
+            followed_fid_a,
+            "out of range",
+            Some(500),
+            None,
+        );
+
+        merge_messages(
+            &store,
+            &db,
+            vec![&cast_older, &cast_newer, &cast_out_of_range],
+        );
+
+        let casts = CastStore::get_casts_by_following(
+            &store,
+            &[followed_fid_a, followed_fid_b],
+            Some(50),
+            Some(300),
+        )
+        .unwrap();
+
+        assert_eq!(casts.len(), 2);
+        assert_eq!(casts[0].hash, cast_newer.hash);
+        assert_eq!(casts[1].hash, cast_older.hash);
+    }
+
+    #[tokio::test]
     async fn test_merge_fails_with_invalid_message_type() {
         let (store, _db, _temp_dir) = create_test_store();
 
