@@ -17,6 +17,30 @@ use std::{borrow::Borrow, sync::Arc};
 
 type Parent = message::cast_add_body::Parent;
 
+/// Default page size for casts-by-following requests.
+pub const DEFAULT_CASTS_BY_FOLLOWING_PER_FID_LIMIT: usize = 100;
+/// Minimum page size per request.
+pub const MIN_CASTS_BY_FOLLOWING_LIMIT: usize = 10;
+/// Hard maximum page size per request (per followed FID on each shard).
+pub const MAX_CASTS_BY_FOLLOWING_LIMIT: usize = 1000;
+
+/// Validates and normalizes a casts-by-following page size.
+pub fn validate_casts_by_following_page_size(page_size: usize) -> Result<usize, HubError> {
+    if page_size < MIN_CASTS_BY_FOLLOWING_LIMIT {
+        return Err(HubError::invalid_parameter(&format!(
+            "page_size must be at least {}",
+            MIN_CASTS_BY_FOLLOWING_LIMIT
+        )));
+    }
+    if page_size > MAX_CASTS_BY_FOLLOWING_LIMIT {
+        return Err(HubError::invalid_parameter(&format!(
+            "page_size must not exceed {}",
+            MAX_CASTS_BY_FOLLOWING_LIMIT
+        )));
+    }
+    Ok(page_size)
+}
+
 /**
  * CastStore persists Cast messages in RocksDB using a two-phase CRDT set to guarantee eventual
  * consistency.
@@ -552,6 +576,60 @@ impl CastStore {
         } else {
             None
         };
+
+        Ok(MessagesPage {
+            messages,
+            next_page_token,
+        })
+    }
+
+    /// Returns one page of cast adds for a FID, filtered by timestamp range.
+    /// `page_options.page_size` counts cast adds only (removes are skipped without
+    /// consuming the page budget).
+    pub fn get_cast_adds_by_fid_page(
+        store: &Store<CastStoreDef>,
+        fid: u64,
+        start_time: Option<u32>,
+        stop_time: Option<u32>,
+        page_options: &PageOptions,
+    ) -> Result<MessagesPage, HubError> {
+        let target = page_options.page_size.unwrap_or(PAGE_SIZE_MAX);
+        let mut messages = Vec::new();
+        let mut page_token = page_options.page_token.clone();
+        let mut next_page_token = None;
+
+        while messages.len() < target {
+            let remaining = target - messages.len();
+            let page = store.get_all_messages_by_fid(
+                fid,
+                start_time,
+                stop_time,
+                &PageOptions {
+                    page_size: Some(remaining),
+                    page_token: page_token.clone(),
+                    reverse: page_options.reverse,
+                },
+            )?;
+            page_token = page.next_page_token.clone();
+
+            for message in page.messages {
+                if store.store_def().is_add_type(&message) {
+                    messages.push(message);
+                    if messages.len() >= target {
+                        break;
+                    }
+                }
+            }
+
+            if messages.len() >= target {
+                next_page_token = page_token;
+                break;
+            }
+            if page_token.is_none() {
+                next_page_token = None;
+                break;
+            }
+        }
 
         Ok(MessagesPage {
             messages,

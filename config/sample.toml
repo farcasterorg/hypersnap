@@ -41,6 +41,10 @@ enabled = true
 
 [api.feeds]
 enabled = true
+# Hub-backed following timeline (GET /v2/farcaster/casts/following, gRPC GetCastsByFollowing).
+# On by default; set false to disable — see site docs reference/httpapi/v2-api.md.
+# casts_by_following_enabled = true
+# following_limit = 500  # max followed FIDs scanned per request (default 500)
 
 [api.conversations]
 enabled = true

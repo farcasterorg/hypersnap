@@ -130,6 +130,8 @@ async fn start_servers(
         VERSION.unwrap_or("unknown").to_string(),
         gossip.swarm.local_peer_id().to_string(),
         fname_lookup.clone(),
+        app_config.api.feeds.casts_by_following_enabled,
+        app_config.api.feeds.following_limit,
     ));
 
     // Create a separate API service backed by hyper (un-pruned) stores.
@@ -152,6 +154,8 @@ async fn start_servers(
         VERSION.unwrap_or("unknown").to_string(),
         gossip.swarm.local_peer_id().to_string(),
         fname_lookup,
+        app_config.api.feeds.casts_by_following_enabled,
+        app_config.api.feeds.following_limit,
     ));
 
     // Wire late-bound API handlers that depend on the hub service

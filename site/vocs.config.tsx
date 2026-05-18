@@ -75,6 +75,13 @@ export default defineConfig({
             ],
             collapsed: true
           },
+          {
+            text: 'Farcaster v2 API',
+            items: [
+              { text: 'Overview', link: '/reference/httpapi/v2-api' },
+            ],
+            collapsed: true
+          },
         ],
       },
     ],
