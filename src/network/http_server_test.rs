@@ -13,7 +13,6 @@ pub mod tests {
             NameLookupRequest as HttpNameLookupRequest,
         },
         proto::{hub_service_server::HubService, *},
-        utils::factory::messages_factory,
     };
 
     #[derive(Clone)]
@@ -163,40 +162,21 @@ pub mod tests {
             Ok(Response::new(response))
         }
 
-        async fn get_casts_by_following(
-            &self,
-            request: Request<CastsByFollowingRequest>,
-        ) -> Result<Response<MessagesResponse>, Status> {
-            self.call_counts
-                .lock()
-                .await
-                .entry("get_casts_by_following".to_string())
-                .and_modify(|count| *count += 1)
-                .or_insert(1);
-
-            let req = request.into_inner();
-            assert_eq!(req.fid, Some(121));
-            assert_eq!(req.start_timestamp, Some(1000));
-            assert_eq!(req.stop_timestamp, Some(1500));
-            assert_eq!(req.page_size, Some(10));
-
-            Ok(Response::new(MessagesResponse {
-                messages: vec![messages_factory::casts::create_cast_add(
-                    121,
-                    "followed cast",
-                    Some(1200),
-                    None,
-                )],
-                next_page_token: None,
-            }))
-        }
-
         async fn get_casts_by_mention(
             &self,
             _request: Request<FidRequest>,
         ) -> Result<Response<MessagesResponse>, Status> {
             let response = MessagesResponse::default();
             Ok(Response::new(response))
+        }
+
+        async fn get_casts_by_following(
+            &self,
+            _request: Request<CastsByFollowingRequest>,
+        ) -> Result<Response<MessagesResponse>, Status> {
+            Err(Status::failed_precondition(
+                "GetCastsByFollowing is disabled on this node",
+            ))
         }
 
         async fn get_reaction(
@@ -580,41 +560,5 @@ pub mod tests {
         assert_eq!(response.matches.len(), 2);
         assert!(response.matches[0].is_custody);
         assert!(response.matches[1].is_verified);
-    }
-
-    #[tokio::test]
-    async fn test_get_casts_by_following_http_handler() {
-        let mock_hub_service = MockHubService::new();
-        let call_counts = mock_hub_service.call_counts.clone();
-        let http_service = HubHttpServiceImpl {
-            service: Arc::new(mock_hub_service),
-        };
-
-        let response = http_service
-            .get_casts_by_following(crate::network::http_server::CastsByFollowingRequest {
-                fid: Some(121),
-                page_size: Some(10),
-                page_token: None,
-                reverse: None,
-                start_timestamp: Some(1000),
-                stop_timestamp: Some(1500),
-                pageSize: None,
-                pageToken: None,
-                startTimestamp: None,
-                stopTimestamp: None,
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(response.messages.len(), 1);
-        assert_eq!(
-            call_counts
-                .lock()
-                .await
-                .get("get_casts_by_following")
-                .copied()
-                .unwrap_or(0),
-            1
-        );
     }
 }

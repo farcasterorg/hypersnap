@@ -234,6 +234,11 @@ pub struct FeedConfig {
     /// Default page size for feed responses.
     #[serde(default = "default_feed_page_size")]
     pub default_page_size: usize,
+
+    /// Hub-backed following cast timeline at `GET /v2/farcaster/casts/following`.
+    /// Expensive: scans casts for every followed FID. Enabled by default when `[api.feeds]` is configured.
+    #[serde(default = "default_true")]
+    pub casts_by_following_enabled: bool,
 }
 
 impl Default for FeedConfig {
@@ -242,6 +247,7 @@ impl Default for FeedConfig {
             enabled: false,
             max_following_fetch: default_max_following_fetch(),
             default_page_size: default_feed_page_size(),
+            casts_by_following_enabled: true,
         }
     }
 }

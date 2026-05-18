@@ -4,6 +4,7 @@
 //! with existing Farcaster SDK clients.
 
 use crate::api::channels::ChannelsIndexer;
+use crate::api::config::FeedConfig;
 use crate::api::conversations::{Conversation as ConversationData, ConversationError};
 use crate::api::feeds::{FeedError, FeedHandler};
 use crate::api::indexer::Indexer;
@@ -168,6 +169,17 @@ pub trait HubQueryHandler: Send + Sync {
         limit: usize,
         cursor: Option<Vec<u8>>,
     ) -> Result<(Vec<u64>, Option<Vec<u8>>), String>;
+
+    /// Casts from users the given FID follows, with optional timestamp bounds.
+    async fn get_casts_by_following(
+        &self,
+        fid: u64,
+        page_size: usize,
+        page_token: Option<Vec<u8>>,
+        reverse: bool,
+        start_timestamp: Option<u32>,
+        stop_timestamp: Option<u32>,
+    ) -> Result<(Vec<crate::proto::Message>, Option<Vec<u8>>), String>;
 }
 
 /// Farcaster HTTP handler for v2 API endpoints.
@@ -185,6 +197,7 @@ pub struct ApiHttpHandler {
     user_data_index: Option<Arc<crate::api::user_data_index::UserDataIndexer>>,
     conversations: Arc<std::sync::RwLock<Option<Arc<dyn ConversationHandler>>>>,
     feeds: Arc<std::sync::RwLock<Option<Arc<dyn FeedHandler>>>>,
+    feeds_config: Arc<std::sync::RwLock<FeedConfig>>,
     channel_feeds: Arc<std::sync::RwLock<Option<Arc<dyn ChannelFeedHandler>>>>,
     search: Arc<std::sync::RwLock<Option<Arc<SearchIndexer>>>>,
     user_hydrator: Arc<std::sync::RwLock<Option<Arc<dyn UserHydrator>>>>,
@@ -230,6 +243,7 @@ impl ApiHttpHandler {
             user_data_index,
             conversations: Arc::new(std::sync::RwLock::new(None)),
             feeds: Arc::new(std::sync::RwLock::new(None)),
+            feeds_config: Arc::new(std::sync::RwLock::new(FeedConfig::default())),
             channel_feeds: Arc::new(std::sync::RwLock::new(None)),
             search: Arc::new(std::sync::RwLock::new(None)),
             user_hydrator: Arc::new(std::sync::RwLock::new(None)),
@@ -304,6 +318,10 @@ impl ApiHttpHandler {
     /// Set the feed handler (callable after construction).
     pub fn set_feeds(&self, handler: Arc<dyn FeedHandler>) {
         *self.feeds.write().unwrap() = Some(handler);
+    }
+
+    pub fn set_feeds_config(&self, config: FeedConfig) {
+        *self.feeds_config.write().unwrap() = config;
     }
 
     /// Set the channel feed handler (callable after construction).
@@ -508,6 +526,7 @@ impl ApiHttpHandler {
             | "/v2/farcaster/cast"
             | "/v2/farcaster/cast/bulk"
             | "/v2/farcaster/casts"
+            | "/v2/farcaster/casts/following"
             | "/v2/farcaster/cast/search"
             | "/v2/farcaster/cast/conversation"
             | "/v2/farcaster/cast/conversation/summary"
@@ -937,6 +956,24 @@ impl ApiHttpHandler {
                 let id_type = params.get("type").map(|s| s.as_str()).unwrap_or("hash");
                 let fid: Option<u64> = params.get("fid").and_then(|s| s.parse().ok());
                 self.handle_cast_lookup(&identifier, id_type, fid).await
+            }
+            "/v2/farcaster/casts/following" => {
+                let fid: u64 = require_fid!(params);
+                let start_timestamp = params.get("start_timestamp").and_then(|s| s.parse().ok());
+                let stop_timestamp = params.get("stop_timestamp").and_then(|s| s.parse().ok());
+                let reverse = params
+                    .get("reverse")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(true);
+                self.handle_casts_by_following(
+                    fid,
+                    cursor.as_deref(),
+                    limit,
+                    start_timestamp,
+                    stop_timestamp,
+                    reverse,
+                )
+                .await
             }
             "/v2/farcaster/cast/bulk" | "/v2/farcaster/casts" => {
                 // /casts uses "casts" param, /cast/bulk uses "hashes"
@@ -3509,6 +3546,77 @@ impl ApiHttpHandler {
 
     // === User feed endpoints ===
 
+    /// Handle GET /v2/farcaster/casts/following?fid=N
+    async fn handle_casts_by_following(
+        &self,
+        fid: u64,
+        cursor: Option<&str>,
+        limit: usize,
+        start_timestamp: Option<u64>,
+        stop_timestamp: Option<u64>,
+        reverse: bool,
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        if !self.feeds_config.read().unwrap().casts_by_following_enabled {
+            return Ok(Self::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Casts-by-following timeline is disabled on this node",
+            ));
+        }
+
+        let hub = self.hub_query.read().unwrap().clone();
+        let Some(hub) = hub else {
+            return Ok(Self::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Hub query service not available",
+            ));
+        };
+
+        let page_token: Option<Vec<u8>> = cursor.and_then(|c| hex::decode(c).ok());
+        let start_ts = start_timestamp.map(|ts| ts as u32);
+        let stop_ts = stop_timestamp.map(|ts| ts as u32);
+
+        match hub
+            .get_casts_by_following(fid, limit, page_token, reverse, start_ts, stop_ts)
+            .await
+        {
+            Ok((messages, next_token)) => {
+                let mut casts = Vec::with_capacity(messages.len());
+                for msg in &messages {
+                    casts.push(self.message_to_cast(msg).await);
+                }
+                if let Some(ref metrics) = self.metrics {
+                    for cast in &mut casts {
+                        if let Ok(hash_bytes) = hex::decode(&cast.hash) {
+                            if let Ok(m) = metrics.get_cast_metrics(cast.author.fid, &hash_bytes) {
+                                cast.reactions = CastReactions {
+                                    likes_count: m.likes,
+                                    recasts_count: m.recasts,
+                                    likes: Vec::new(),
+                                    recasts: Vec::new(),
+                                };
+                                cast.replies = CastReplies { count: m.replies };
+                            }
+                        }
+                    }
+                }
+                let response = FeedResponse {
+                    casts,
+                    next: NextCursor {
+                        cursor: next_token.map(|t| hex::encode(&t)),
+                    },
+                };
+                Ok(Self::json_response(StatusCode::OK, &response))
+            }
+            Err(e) if e.contains("disabled on this node") => {
+                Ok(Self::error_response(StatusCode::SERVICE_UNAVAILABLE, &e))
+            }
+            Err(e) => Ok(Self::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to get casts by following: {}", e),
+            )),
+        }
+    }
+
     /// Handle GET /v2/farcaster/feed/user/casts?fid=N
     async fn handle_user_casts_feed(
         &self,
@@ -4294,6 +4402,7 @@ mod tests {
 
         // Casts alias + quotes + metrics
         assert!(handler.can_handle(&Method::GET, "/v2/farcaster/casts"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/casts/following"));
         assert!(handler.can_handle(&Method::GET, "/v2/farcaster/cast/quotes"));
         assert!(handler.can_handle(&Method::GET, "/v2/farcaster/cast/metrics"));
         assert!(handler.can_handle(&Method::GET, "/v2/farcaster/cast/conversation/summary"));
@@ -4580,6 +4689,171 @@ mod tests {
         ) -> Result<(Vec<u64>, Option<Vec<u8>>), String> {
             Ok((vec![], None))
         }
+
+        async fn get_casts_by_following(
+            &self,
+            _fid: u64,
+            _page_size: usize,
+            _page_token: Option<Vec<u8>>,
+            _reverse: bool,
+            _start_timestamp: Option<u32>,
+            _stop_timestamp: Option<u32>,
+        ) -> Result<(Vec<crate::proto::Message>, Option<Vec<u8>>), String> {
+            Ok((vec![], None))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_casts_by_following_disabled_returns_unavailable() {
+        let handler = ApiHttpHandler::new(None, None, None, None, None, None);
+        handler.set_feeds_config(FeedConfig {
+            casts_by_following_enabled: false,
+            ..FeedConfig::default()
+        });
+        let response = handler
+            .handle_casts_by_following(121, None, 25, None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_casts_by_following_enabled_calls_hub() {
+        use crate::utils::factory::messages_factory;
+
+        let cast = messages_factory::casts::create_cast_add(122, "hello", Some(1200), None);
+        let handler = ApiHttpHandler::new(None, None, None, None, None, None);
+        handler.set_feeds_config(FeedConfig::default());
+
+        struct FollowingHub {
+            cast: crate::proto::Message,
+        }
+
+        #[async_trait]
+        impl HubQueryHandler for FollowingHub {
+            async fn get_cast_by_hash(
+                &self,
+                _hash: &[u8],
+                _fid_hint: Option<u64>,
+            ) -> Option<crate::proto::Message> {
+                None
+            }
+            async fn get_casts_by_fid(
+                &self,
+                _fid: u64,
+                _limit: usize,
+                _page_token: Option<Vec<u8>>,
+                _reverse: bool,
+            ) -> Result<(Vec<crate::proto::Message>, Option<Vec<u8>>), String> {
+                Ok((vec![], None))
+            }
+            async fn get_reactions_by_cast(
+                &self,
+                _fid: u64,
+                _hash: &[u8],
+                _reaction_type: i32,
+                _limit: usize,
+            ) -> Result<Vec<crate::proto::Message>, String> {
+                Ok(vec![])
+            }
+            async fn get_reactions_by_fid(
+                &self,
+                _fid: u64,
+                _reaction_type: Option<i32>,
+                _limit: usize,
+            ) -> Result<Vec<crate::proto::Message>, String> {
+                Ok(vec![])
+            }
+            async fn get_fid_by_username(&self, _username: &str) -> Option<u64> {
+                None
+            }
+            async fn get_fids_by_address(&self, _address: &[u8]) -> Vec<u64> {
+                vec![]
+            }
+            async fn get_username_proof(
+                &self,
+                _name: &[u8],
+            ) -> Option<(u64, String, u64, Vec<u8>)> {
+                None
+            }
+            async fn get_storage_limits(&self, _fid: u64) -> Option<Vec<(String, u64, u64)>> {
+                None
+            }
+            async fn get_onchain_events(
+                &self,
+                _fid: u64,
+                _event_type: i32,
+            ) -> Result<Vec<crate::proto::OnChainEvent>, String> {
+                Ok(vec![])
+            }
+            async fn get_signer_events(
+                &self,
+                _fid: u64,
+            ) -> Result<Vec<crate::proto::OnChainEvent>, String> {
+                Ok(vec![])
+            }
+            async fn get_notifications(
+                &self,
+                _fid: u64,
+                _limit: usize,
+                _cursor: Option<&str>,
+            ) -> Result<(Vec<crate::proto::Message>, Option<String>), String> {
+                Ok((vec![], None))
+            }
+            async fn get_links_by_fid(
+                &self,
+                _fid: u64,
+                _link_type: &str,
+                _limit: usize,
+            ) -> Result<Vec<crate::proto::Message>, String> {
+                Ok(vec![])
+            }
+            async fn get_user_data_by_fid(
+                &self,
+                _fid: u64,
+            ) -> Result<Vec<crate::proto::Message>, String> {
+                Ok(vec![])
+            }
+            async fn get_casts_by_mention(
+                &self,
+                _fid: u64,
+                _limit: usize,
+            ) -> Result<Vec<crate::proto::Message>, String> {
+                Ok(vec![])
+            }
+            async fn get_user_data_value(&self, _fid: u64, _data_type: i32) -> Option<String> {
+                None
+            }
+            async fn get_fids(
+                &self,
+                _limit: usize,
+                _cursor: Option<Vec<u8>>,
+            ) -> Result<(Vec<u64>, Option<Vec<u8>>), String> {
+                Ok((vec![], None))
+            }
+            async fn get_casts_by_following(
+                &self,
+                _fid: u64,
+                _page_size: usize,
+                _page_token: Option<Vec<u8>>,
+                _reverse: bool,
+                _start_timestamp: Option<u32>,
+                _stop_timestamp: Option<u32>,
+            ) -> Result<(Vec<crate::proto::Message>, Option<Vec<u8>>), String> {
+                Ok((vec![self.cast.clone()], None))
+            }
+        }
+
+        handler.set_hub_query(Arc::new(FollowingHub { cast: cast.clone() }));
+
+        let response = handler
+            .handle_casts_by_following(121, None, 25, Some(1000), Some(1500), true)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: FeedResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json.casts.len(), 1);
     }
 
     #[tokio::test]

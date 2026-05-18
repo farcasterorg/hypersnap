@@ -404,6 +404,8 @@ pub struct MyHubService {
     // the background fname connector has polled the corresponding transfer. None
     // disables on-demand recovery (e.g. when fnames are configured off).
     fname_lookup: Option<Arc<dyn FnameTransferLookup>>,
+    /// When false, `GetCastsByFollowing` returns unavailable. Defaults to enabled.
+    casts_by_following_enabled: bool,
 }
 
 /// Opaque cursor for notifications pagination.
@@ -450,6 +452,7 @@ impl MyHubService {
         version: String,
         peer_id: String,
         fname_lookup: Option<Arc<dyn FnameTransferLookup>>,
+        casts_by_following_enabled: bool,
     ) -> Self {
         let mut allowed_users = HashMap::new();
         for auth in rpc_auth.split(",") {
@@ -487,8 +490,78 @@ impl MyHubService {
             peer_id,
             id_registry_cache,
             fname_lookup,
+            casts_by_following_enabled,
         };
         service
+    }
+
+    fn get_casts_by_following_messages(
+        &self,
+        user_fid: u64,
+        start_ts: Option<u32>,
+        stop_ts: Option<u32>,
+        reverse: bool,
+        page_size: usize,
+        offset: usize,
+    ) -> Result<(Vec<Message>, Option<Vec<u8>>), HubError> {
+        let user_stores = self
+            .get_stores_for(user_fid)
+            .map_err(|e| HubError::invalid_parameter(&e.message()))?;
+        let following_fids = collect_following_fids(&user_stores.link_store, user_fid)?;
+
+        if following_fids.is_empty() {
+            return Ok((vec![], None));
+        }
+
+        let mut fids_by_shard: HashMap<u32, Vec<u64>> = HashMap::new();
+        for followed_fid in following_fids {
+            let shard_id = self.message_router.route_fid(followed_fid, self.num_shards);
+            fids_by_shard
+                .entry(shard_id)
+                .or_default()
+                .push(followed_fid);
+        }
+
+        let mut all_casts: Vec<Message> = Vec::new();
+        for (shard_id, fids) in fids_by_shard {
+            let stores = self
+                .get_stores_for_shard(shard_id)
+                .map_err(|e| HubError::invalid_parameter(&e.message()))?;
+            let shard_casts =
+                CastStore::get_casts_by_following(&stores.cast_store, &fids, start_ts, stop_ts)?;
+            all_casts.extend(shard_casts);
+        }
+
+        if reverse {
+            all_casts.sort_by(|a, b| {
+                let ts_a = a.data.as_ref().map(|d| d.timestamp).unwrap_or(0);
+                let ts_b = b.data.as_ref().map(|d| d.timestamp).unwrap_or(0);
+                ts_b.cmp(&ts_a)
+            });
+        } else {
+            all_casts.sort_by(|a, b| {
+                let ts_a = a.data.as_ref().map(|d| d.timestamp).unwrap_or(0);
+                let ts_b = b.data.as_ref().map(|d| d.timestamp).unwrap_or(0);
+                ts_a.cmp(&ts_b)
+            });
+        }
+
+        let total = all_casts.len();
+        let page_messages: Vec<Message> =
+            all_casts.into_iter().skip(offset).take(page_size).collect();
+        let next_offset = offset + page_messages.len();
+        let next_page_token = if next_offset < total {
+            Some(
+                serde_json::to_vec(&CastsByFollowingPageToken {
+                    offset: next_offset,
+                })
+                .map_err(|e| HubError::internal_db_error(&e.to_string()))?,
+            )
+        } else {
+            None
+        };
+
+        Ok((page_messages, next_page_token))
     }
 
     async fn submit_message_internal(
@@ -2217,6 +2290,12 @@ impl HubService for MyHubService {
         &self,
         request: Request<CastsByFollowingRequest>,
     ) -> Result<Response<MessagesResponse>, Status> {
+        if !self.casts_by_following_enabled {
+            return Err(Status::failed_precondition(
+                "GetCastsByFollowing is disabled on this node".to_string(),
+            ));
+        }
+
         let req = request.into_inner();
         let user_fid = match req.fid {
             Some(fid) => fid,
@@ -2241,68 +2320,14 @@ impl HubService for MyHubService {
             0
         };
 
-        let user_stores = self.get_stores_for(user_fid)?;
-        let following_fids = collect_following_fids(&user_stores.link_store, user_fid)
+        let (messages, next_page_token) = self
+            .get_casts_by_following_messages(
+                user_fid, start_ts, stop_ts, reverse, page_size, offset,
+            )
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        if following_fids.is_empty() {
-            return Ok(Response::new(MessagesResponse {
-                messages: vec![],
-                next_page_token: None,
-            }));
-        }
-
-        let mut fids_by_shard: HashMap<u32, Vec<u64>> = HashMap::new();
-        for followed_fid in following_fids {
-            let shard_id = self.message_router.route_fid(followed_fid, self.num_shards);
-            fids_by_shard
-                .entry(shard_id)
-                .or_default()
-                .push(followed_fid);
-        }
-
-        let mut all_casts: Vec<Message> = Vec::new();
-        for (shard_id, fids) in fids_by_shard {
-            let stores = self.get_stores_for_shard(shard_id)?;
-            let shard_casts =
-                CastStore::get_casts_by_following(&stores.cast_store, &fids, start_ts, stop_ts)
-                    .unwrap_or_default();
-            all_casts.extend(shard_casts);
-        }
-
-        if reverse {
-            all_casts.sort_by(|a, b| {
-                let ts_a = a.data.as_ref().map(|d| d.timestamp).unwrap_or(0);
-                let ts_b = b.data.as_ref().map(|d| d.timestamp).unwrap_or(0);
-                ts_b.cmp(&ts_a)
-            });
-        } else {
-            all_casts.sort_by(|a, b| {
-                let ts_a = a.data.as_ref().map(|d| d.timestamp).unwrap_or(0);
-                let ts_b = b.data.as_ref().map(|d| d.timestamp).unwrap_or(0);
-                ts_a.cmp(&ts_b)
-            });
-        }
-
-        let total = all_casts.len();
-        let page_messages: Vec<Message> =
-            all_casts.into_iter().skip(offset).take(page_size).collect();
-        let next_offset = offset + page_messages.len();
-        let next_page_token = if next_offset < total {
-            Some(
-                serde_json::to_vec(&CastsByFollowingPageToken {
-                    offset: next_offset,
-                })
-                .map_err(|e| {
-                    Status::internal(format!("Failed to serialize next_page_token: {}", e))
-                })?,
-            )
-        } else {
-            None
-        };
-
         Ok(Response::new(MessagesResponse {
-            messages: page_messages,
+            messages,
             next_page_token,
         }))
     }
@@ -3680,5 +3705,37 @@ impl crate::api::HubQueryHandler for MyHubService {
         all_fids.dedup();
         all_fids.truncate(limit);
         Ok((all_fids, None))
+    }
+
+    async fn get_casts_by_following(
+        &self,
+        fid: u64,
+        page_size: usize,
+        page_token: Option<Vec<u8>>,
+        reverse: bool,
+        start_timestamp: Option<u32>,
+        stop_timestamp: Option<u32>,
+    ) -> Result<(Vec<Message>, Option<Vec<u8>>), String> {
+        if !self.casts_by_following_enabled {
+            return Err("GetCastsByFollowing is disabled on this node".to_string());
+        }
+
+        let offset = if let Some(token_bytes) = page_token {
+            serde_json::from_slice::<CastsByFollowingPageToken>(&token_bytes)
+                .map(|token| token.offset)
+                .map_err(|e| format!("Invalid page token: {}", e))?
+        } else {
+            0
+        };
+
+        self.get_casts_by_following_messages(
+            fid,
+            start_timestamp,
+            stop_timestamp,
+            reverse,
+            page_size,
+            offset,
+        )
+        .map_err(|e| e.to_string())
     }
 }

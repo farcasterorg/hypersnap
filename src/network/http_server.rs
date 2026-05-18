@@ -532,52 +532,6 @@ impl CastsByParentRequest {
     }
 }
 
-#[allow(non_snake_case)]
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct CastsByFollowingRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fid: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub page_size: Option<u32>,
-    #[serde(
-        default,
-        with = "serdebase64opt",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub page_token: Option<Vec<u8>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reverse: Option<bool>,
-    pub start_timestamp: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stop_timestamp: Option<u64>,
-
-    // For backwards compatibility
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pageSize: Option<u32>,
-    #[serde(
-        default,
-        with = "serdebase64opt",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub pageToken: Option<Vec<u8>>,
-    pub startTimestamp: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stopTimestamp: Option<u64>,
-}
-
-impl CastsByFollowingRequest {
-    pub fn to_proto(self) -> proto::CastsByFollowingRequest {
-        proto::CastsByFollowingRequest {
-            fid: self.fid,
-            page_size: self.page_size.or(self.pageSize),
-            page_token: self.page_token.or(self.pageToken),
-            reverse: self.reverse,
-            start_timestamp: self.start_timestamp.or(self.startTimestamp),
-            stop_timestamp: self.stop_timestamp.or(self.stopTimestamp),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ReactionRequest {
     fid: u64,
@@ -2390,10 +2344,6 @@ pub trait HubHttpService {
         &self,
         req: CastsByParentRequest,
     ) -> Result<PagedResponse, ErrorResponse>;
-    async fn get_casts_by_following(
-        &self,
-        req: CastsByFollowingRequest,
-    ) -> Result<PagedResponse, ErrorResponse>;
     async fn get_reaction_by_id(&self, req: ReactionRequest) -> Result<Message, ErrorResponse>;
     async fn get_reactions_by_fid(
         &self,
@@ -2619,23 +2569,6 @@ where
                 error_detail: Some(e.to_string()),
             })?;
 
-        let proto_resp = response.into_inner();
-        map_proto_messages_response_to_json_paged_response(proto_resp)
-    }
-
-    async fn get_casts_by_following(
-        &self,
-        req: CastsByFollowingRequest,
-    ) -> Result<PagedResponse, ErrorResponse> {
-        let service = &self.service;
-        let grpc_req = tonic::Request::new(req.to_proto());
-        let response = service
-            .get_casts_by_following(grpc_req)
-            .await
-            .map_err(|e| ErrorResponse {
-                error: "Failed to get casts by following".to_string(),
-                error_detail: Some(e.to_string()),
-            })?;
         let proto_resp = response.into_inner();
         map_proto_messages_response_to_json_paged_response(proto_resp)
     }
@@ -3431,15 +3364,6 @@ where
                 self.handle_request::<CastsByParentRequest, PagedResponse, _>(
                     req,
                     |service, req| Box::pin(async move { service.get_casts_by_parent(req).await }),
-                )
-                .await
-            }
-            (&Method::GET, "/v1/castsByFollowing") => {
-                self.handle_request::<CastsByFollowingRequest, PagedResponse, _>(
-                    req,
-                    |service, req| {
-                        Box::pin(async move { service.get_casts_by_following(req).await })
-                    },
                 )
                 .await
             }

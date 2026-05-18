@@ -150,61 +150,6 @@ curl http://127.0.0.1:3381/v1/castsByParent?fid=226&hash=0xa48dd46161d8e57725f5e
 }
 ```
 
-## castsByFollowing
-
-Fetch casts from users that a given FID follows, optionally filtered by timestamp. Results are merged across shards and sorted by cast timestamp (newest first by default). Only active cast adds are returned; the requesting user's own casts are not included.
-
-**Query Parameters**
-| Parameter      | Description                                                                 | Example                     |
-| -------------- | --------------------------------------------------------------------------- | --------------------------- |
-| fid            | The FID whose following list is used to build the timeline                  | `fid=6833`                  |
-| pageSize       | Optional page size (default: 100)                                           | `pageSize=50`               |
-| pageToken      | Optional page token for pagination (base64-encoded)                         | `pageToken=DAEDAAAGlQ...`   |
-| reverse        | Optional sort order; defaults to `true` (newest casts first)                | `reverse=true`              |
-| startTimestamp | Optional inclusive lower bound on cast timestamp (Farcaster time)           | `startTimestamp=48994400`   |
-| stopTimestamp  | Optional inclusive upper bound on cast timestamp (Farcaster time)         | `stopTimestamp=48994500`    |
-
-**Note**
-
-- Only users linked with type `follow` are included.
-- Timestamps use the same Farcaster-time units as `message.data.timestamp` in cast responses (same as `castsByFid`).
-- When more results exist, `nextPageToken` is set; pass it on the next request unchanged.
-
-**Example**
-
-```bash
-curl "http://127.0.0.1:3381/v1/castsByFollowing?fid=6833&pageSize=50&startTimestamp=48994400&stopTimestamp=48994500"
-```
-
-**Response**
-
-```json
-{
-  "messages": [
-    {
-      "data": {
-        "type": "MESSAGE_TYPE_CAST_ADD",
-        "fid": 42,
-        "timestamp": 48994466,
-        "network": "FARCASTER_NETWORK_MAINNET",
-        "castAddBody": {
-          "text": "Cast from someone you follow",
-          "mentions": [],
-          "mentionsPositions": [],
-          "embeds": []
-        }
-      },
-      "hash": "0xd2b1ddc6c88e865a33cb1a565e0058d757042974",
-      "hashScheme": "HASH_SCHEME_BLAKE3",
-      "signature": "3msLXzxB4eEYeF0Le...dHrY1vkxcPAA==",
-      "signatureScheme": "SIGNATURE_SCHEME_ED25519",
-      "signer": "0x78ff9a768cf1...2eca647b6d62558c"
-    }
-  ],
-  "nextPageToken": "eyJvZmZzZXQiOjUwfQ=="
-}
-```
-
 ## castsByMention
 
 Fetch all casts that mention an FID

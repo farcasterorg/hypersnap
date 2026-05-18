@@ -450,6 +450,7 @@ impl NodeForTest {
             "".to_string(),
             "".to_string(),
             None,
+            false,
         );
 
         let handle = tokio::spawn(async move {
