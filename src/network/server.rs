@@ -160,6 +160,52 @@ fn cast_is_before_timeline_boundary(
     ) == std::cmp::Ordering::Less
 }
 
+/// Removes cast entries already passed by `buffer_idx` so dead prefix does not accumulate.
+fn compact_consumed_fid_cast_prefix(state: &mut FidMergeState) {
+    if state.buffer_idx == 0 {
+        return;
+    }
+    if state.buffer_idx >= state.buffer.len() {
+        state.buffer.clear();
+    } else {
+        state.buffer.drain(..state.buffer_idx);
+    }
+    state.buffer_idx = 0;
+}
+
+/// Merges two timeline-ordered cast lists. `incoming` is sorted in place; `existing` must
+/// already be sorted.
+fn merge_timeline_sorted_cast_batches(
+    existing: Vec<Message>,
+    mut incoming: Vec<Message>,
+    reverse: bool,
+) -> Vec<Message> {
+    if incoming.is_empty() {
+        return existing;
+    }
+    incoming.sort_by(|a, b| compare_casts_by_following_timeline(a, b, reverse));
+    if existing.is_empty() {
+        return incoming;
+    }
+
+    let mut merged = Vec::with_capacity(existing.len() + incoming.len());
+    let (mut left_idx, mut right_idx) = (0, 0);
+    while left_idx < existing.len() && right_idx < incoming.len() {
+        if compare_casts_by_following_timeline(&existing[left_idx], &incoming[right_idx], reverse)
+            != std::cmp::Ordering::Greater
+        {
+            merged.push(existing[left_idx].clone());
+            left_idx += 1;
+        } else {
+            merged.push(incoming[right_idx].clone());
+            right_idx += 1;
+        }
+    }
+    merged.extend(existing[left_idx..].iter().cloned());
+    merged.extend(incoming[right_idx..].iter().cloned());
+    merged
+}
+
 fn fetch_fid_cast_batch(
     state: &mut FidMergeState,
     cast_store: &Store<CastStoreDef>,
@@ -171,6 +217,9 @@ fn fetch_fid_cast_batch(
     if state.exhausted {
         return Ok(());
     }
+    // `ensure_fid_cast_available` only fetches once the cursor has consumed the buffer.
+    compact_consumed_fid_cast_prefix(state);
+
     let page = CastStore::get_cast_adds_by_fid_page(
         cast_store,
         state.fid,
@@ -186,10 +235,11 @@ fn fetch_fid_cast_batch(
     if page.next_page_token.is_none() {
         state.exhausted = true;
     }
-    state.buffer.extend(page.messages);
-    state
-        .buffer
-        .sort_by(|a, b| compare_casts_by_following_timeline(a, b, reverse));
+    state.buffer = merge_timeline_sorted_cast_batches(
+        std::mem::take(&mut state.buffer),
+        page.messages,
+        reverse,
+    );
     Ok(())
 }
 
@@ -747,6 +797,7 @@ impl MyHubService {
                         break;
                     }
                     state.buffer_idx += 1;
+                    compact_consumed_fid_cast_prefix(state);
                 }
             }
 
@@ -778,6 +829,7 @@ impl MyHubService {
             let state = fid_states.get_mut(&fid).expect("best fid present");
             results.push(state.buffer[state.buffer_idx].clone());
             state.buffer_idx += 1;
+            compact_consumed_fid_cast_prefix(state);
         }
 
         if results.len() < page_size {
@@ -4006,5 +4058,70 @@ impl crate::api::HubQueryHandler for MyHubService {
             page_token,
         )
         .map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod casts_by_following_buffer_tests {
+    use super::*;
+    use crate::utils::factory::messages_factory;
+
+    fn cast_at(fid: u64, ts: u32) -> Message {
+        messages_factory::casts::create_cast_add(fid, &format!("cast-{ts}"), Some(ts), None)
+    }
+
+    fn fid_state(buffer: Vec<Message>, buffer_idx: usize) -> FidMergeState {
+        FidMergeState {
+            fid: 1,
+            shard_id: 1,
+            buffer,
+            buffer_idx,
+            db_page_token: None,
+            exhausted: false,
+        }
+    }
+
+    fn timestamps(messages: &[Message]) -> Vec<u32> {
+        messages
+            .iter()
+            .map(|m| m.data.as_ref().map(|d| d.timestamp).unwrap_or(0))
+            .collect()
+    }
+
+    #[test]
+    fn compact_drops_consumed_prefix() {
+        let mut state = fid_state(vec![cast_at(1, 100), cast_at(1, 200), cast_at(1, 300)], 2);
+        compact_consumed_fid_cast_prefix(&mut state);
+        assert_eq!(state.buffer_idx, 0);
+        assert_eq!(state.buffer.len(), 1);
+        assert_eq!(state.buffer[0].data.as_ref().unwrap().timestamp, 300);
+    }
+
+    #[test]
+    fn compact_clears_fully_consumed_buffer() {
+        let mut state = fid_state(vec![cast_at(1, 100), cast_at(1, 200)], 2);
+        compact_consumed_fid_cast_prefix(&mut state);
+        assert!(state.buffer.is_empty());
+        assert_eq!(state.buffer_idx, 0);
+    }
+
+    #[test]
+    fn merge_timeline_sorted_cast_batches_newest_first() {
+        let merged = merge_timeline_sorted_cast_batches(
+            vec![cast_at(1, 300), cast_at(1, 100)],
+            vec![cast_at(1, 200)],
+            true,
+        );
+        assert_eq!(timestamps(&merged), vec![300, 200, 100]);
+    }
+
+    #[test]
+    fn merge_timeline_sorted_cast_batches_oldest_first() {
+        let merged = merge_timeline_sorted_cast_batches(
+            vec![cast_at(1, 100), cast_at(1, 300)],
+            vec![cast_at(1, 200)],
+            false,
+        );
+        assert_eq!(timestamps(&merged), vec![100, 200, 300]);
     }
 }
