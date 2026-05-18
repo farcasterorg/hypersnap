@@ -182,6 +182,22 @@ mod tests {
         service.submit_bulk_messages(request).await
     }
 
+    struct MakeServerOpts {
+        rpc_auth: Option<String>,
+        following_limit: Option<usize>,
+        unlimited_store_limits: bool,
+    }
+
+    impl Default for MakeServerOpts {
+        fn default() -> Self {
+            Self {
+                rpc_auth: None,
+                following_limit: None,
+                unlimited_store_limits: false,
+            }
+        }
+    }
+
     async fn make_server(
         rpc_auth: Option<String>,
     ) -> (
@@ -193,12 +209,34 @@ mod tests {
         broadcast::Sender<ShardChunk>,
         broadcast::Sender<Block>,
     ) {
-        make_server_with_following_limit(rpc_auth, None).await
+        make_server_with_opts(MakeServerOpts {
+            rpc_auth,
+            ..Default::default()
+        })
+        .await
     }
 
-    async fn make_server_with_following_limit(
-        rpc_auth: Option<String>,
+    async fn make_server_for_casts_by_following(
         following_limit: Option<usize>,
+    ) -> (
+        HashMap<u32, Stores>,
+        HashMap<u32, Senders>,
+        [ShardEngine; 2],
+        BlockEngine,
+        MyHubService,
+        broadcast::Sender<ShardChunk>,
+        broadcast::Sender<Block>,
+    ) {
+        make_server_with_opts(MakeServerOpts {
+            following_limit,
+            unlimited_store_limits: true,
+            ..Default::default()
+        })
+        .await
+    }
+
+    async fn make_server_with_opts(
+        opts: MakeServerOpts,
     ) -> (
         HashMap<u32, Stores>,
         HashMap<u32, Senders>,
@@ -215,7 +253,11 @@ mod tests {
             true,
         );
 
-        let limits = test_helper::limits::unlimited_store_limits();
+        let limits = if opts.unlimited_store_limits {
+            test_helper::limits::unlimited_store_limits()
+        } else {
+            test_helper::limits::test_store_limits()
+        };
         let (engine1, _) = test_helper::new_engine_with_options(test_helper::EngineOptions {
             limits: Some(limits.clone()),
             messages_request_tx: Some(msgs_request_tx.clone()),
@@ -254,7 +296,9 @@ mod tests {
         let senders = HashMap::from([(1, shard1_senders), (2, shard2_senders)]);
         let num_shards = senders.len() as u32;
 
-        let auth = rpc_auth.unwrap_or_else(|| format!("{}:{}", USER_NAME, PASSWORD));
+        let auth = opts
+            .rpc_auth
+            .unwrap_or_else(|| format!("{}:{}", USER_NAME, PASSWORD));
 
         let message_router = Box::new(routing::EvenOddRouterForTest {});
         assert_eq!(message_router.route_fid(SHARD1_FID, 2), 1);
@@ -318,7 +362,7 @@ mod tests {
                 "asddef".to_string(),
                 None,
                 true,
-                following_limit
+                opts.following_limit
                     .unwrap_or_else(crate::api::config::default_casts_by_following_following_limit),
             ),
             shard_decision_tx,
@@ -1515,7 +1559,7 @@ mod tests {
             service,
             _shard_decision_tx,
             _block_decision_tx,
-        ) = make_server(None).await;
+        ) = make_server_for_casts_by_following(None).await;
 
         for fid in [VIEWER_FID, FOLLOWED_SAME_SHARD] {
             test_helper::register_user(
@@ -1651,7 +1695,7 @@ mod tests {
             service,
             _shard_decision_tx,
             _block_decision_tx,
-        ) = make_server(None).await;
+        ) = make_server_for_casts_by_following(None).await;
 
         for fid in [VIEWER_FID, FOLLOWED_SAME_SHARD] {
             test_helper::register_user(
@@ -1745,7 +1789,7 @@ mod tests {
             service,
             _shard_decision_tx,
             _block_decision_tx,
-        ) = make_server(None).await;
+        ) = make_server_for_casts_by_following(None).await;
 
         for fid in [VIEWER_FID, FOLLOWED_SAME_SHARD] {
             test_helper::register_user(
@@ -1827,7 +1871,7 @@ mod tests {
             service,
             _shard_decision_tx,
             _block_decision_tx,
-        ) = make_server(None).await;
+        ) = make_server_for_casts_by_following(None).await;
 
         for fid in [VIEWER_FID, FOLLOWED_FID] {
             test_helper::register_user(
@@ -1902,7 +1946,7 @@ mod tests {
             service,
             _shard_decision_tx,
             _block_decision_tx,
-        ) = make_server(None).await;
+        ) = make_server_for_casts_by_following(None).await;
 
         let err = service
             .get_casts_by_following(Request::new(proto::CastsByFollowingRequest {
@@ -1934,7 +1978,7 @@ mod tests {
             service,
             _shard_decision_tx,
             _block_decision_tx,
-        ) = make_server_with_following_limit(None, Some(2)).await;
+        ) = make_server_for_casts_by_following(Some(2)).await;
 
         for fid in [
             VIEWER_FID,
@@ -2004,7 +2048,7 @@ mod tests {
             service,
             _shard_decision_tx,
             _block_decision_tx,
-        ) = make_server(None).await;
+        ) = make_server_for_casts_by_following(None).await;
 
         let err = service
             .get_casts_by_following(Request::new(proto::CastsByFollowingRequest {
