@@ -527,8 +527,13 @@ impl MyHubService {
             let stores = self
                 .get_stores_for_shard(shard_id)
                 .map_err(|e| HubError::invalid_parameter(&e.message()))?;
-            let shard_casts =
-                CastStore::get_casts_by_following(&stores.cast_store, &fids, start_ts, stop_ts)?;
+            let shard_casts = CastStore::get_casts_by_following(
+                &stores.cast_store,
+                &fids,
+                start_ts,
+                stop_ts,
+                reverse,
+            )?;
             all_casts.extend(shard_casts);
         }
 

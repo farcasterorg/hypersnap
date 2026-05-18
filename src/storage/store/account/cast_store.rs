@@ -560,18 +560,19 @@ impl CastStore {
     }
 
     /// Returns cast adds from the given FIDs on this shard, filtered by timestamp range.
-    /// Results are sorted by timestamp descending (most recent first).
+    /// Results are sorted by timestamp; `reverse` true is newest first, false is oldest first.
     pub fn get_casts_by_following(
         store: &Store<CastStoreDef>,
         following_fids: &[u64],
         start_time: Option<u32>,
         stop_time: Option<u32>,
+        reverse: bool,
     ) -> Result<Vec<Message>, HubError> {
         let mut casts = Vec::new();
         let page_options = PageOptions {
             page_size: None,
             page_token: None,
-            reverse: true,
+            reverse,
         };
 
         for &fid in following_fids {
@@ -586,7 +587,11 @@ impl CastStore {
         casts.sort_by(|a, b| {
             let ts_a = a.data.as_ref().map(|d| d.timestamp).unwrap_or(0);
             let ts_b = b.data.as_ref().map(|d| d.timestamp).unwrap_or(0);
-            ts_b.cmp(&ts_a)
+            if reverse {
+                ts_b.cmp(&ts_a)
+            } else {
+                ts_a.cmp(&ts_b)
+            }
         });
 
         Ok(casts)

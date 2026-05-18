@@ -775,12 +775,26 @@ mod tests {
             &[followed_fid_a, followed_fid_b],
             Some(50),
             Some(300),
+            true,
         )
         .unwrap();
 
         assert_eq!(casts.len(), 2);
         assert_eq!(casts[0].hash, cast_newer.hash);
         assert_eq!(casts[1].hash, cast_older.hash);
+
+        let casts_ascending = CastStore::get_casts_by_following(
+            &store,
+            &[followed_fid_a, followed_fid_b],
+            Some(50),
+            Some(300),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(casts_ascending.len(), 2);
+        assert_eq!(casts_ascending[0].hash, cast_older.hash);
+        assert_eq!(casts_ascending[1].hash, cast_newer.hash);
     }
 
     #[tokio::test]
