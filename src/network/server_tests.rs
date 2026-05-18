@@ -1628,6 +1628,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_casts_by_following_stable_pagination_with_equal_timestamps() {
+        const VIEWER_FID: u64 = SHARD1_FID;
+        const FOLLOWED_SAME_SHARD: u64 = 123;
+        const FOLLOWED_OTHER_SHARD: u64 = SHARD2_FID;
+        const SAME_TS: u32 = 1500;
+
+        let (
+            _stores,
+            _senders,
+            [mut engine1, mut engine2],
+            _block_engine,
+            service,
+            _shard_decision_tx,
+            _block_decision_tx,
+        ) = make_server(None).await;
+
+        for fid in [VIEWER_FID, FOLLOWED_SAME_SHARD] {
+            test_helper::register_user(
+                fid,
+                test_helper::default_signer(),
+                test_helper::default_custody_address(),
+                &mut engine1,
+            )
+            .await;
+        }
+        test_helper::register_user(
+            FOLLOWED_OTHER_SHARD,
+            test_helper::default_signer(),
+            test_helper::default_custody_address(),
+            &mut engine2,
+        )
+        .await;
+
+        for target in [FOLLOWED_SAME_SHARD, FOLLOWED_OTHER_SHARD] {
+            let follow =
+                messages_factory::links::create_link_add(VIEWER_FID, "follow", target, None, None);
+            test_helper::commit_message(&mut engine1, &follow).await;
+        }
+
+        let cast_same_shard = messages_factory::casts::create_cast_add(
+            FOLLOWED_SAME_SHARD,
+            "same ts same shard",
+            Some(SAME_TS),
+            None,
+        );
+        let cast_other_shard = messages_factory::casts::create_cast_add(
+            FOLLOWED_OTHER_SHARD,
+            "same ts other shard",
+            Some(SAME_TS),
+            None,
+        );
+        test_helper::commit_message(&mut engine1, &cast_same_shard).await;
+        test_helper::commit_message(&mut engine2, &cast_other_shard).await;
+
+        let (newer_first, older_second) =
+            if cast_same_shard.hash.cmp(&cast_other_shard.hash) == std::cmp::Ordering::Greater {
+                (&cast_same_shard, &cast_other_shard)
+            } else {
+                (&cast_other_shard, &cast_same_shard)
+            };
+
+        let request_base = || proto::CastsByFollowingRequest {
+            fid: Some(VIEWER_FID),
+            page_size: Some(1),
+            page_token: None,
+            reverse: None,
+            start_timestamp: Some(1000),
+            stop_timestamp: Some(1500),
+        };
+
+        let mut page_one_hashes = Vec::new();
+        let mut page_two_hashes = Vec::new();
+        for _ in 0..5 {
+            let page_one = service
+                .get_casts_by_following(Request::new(request_base()))
+                .await
+                .unwrap();
+            assert_eq!(page_one.get_ref().messages.len(), 1);
+            page_one_hashes.push(page_one.get_ref().messages[0].hash.clone());
+
+            let page_two = service
+                .get_casts_by_following(Request::new(proto::CastsByFollowingRequest {
+                    page_token: page_one.get_ref().next_page_token.clone(),
+                    ..request_base()
+                }))
+                .await
+                .unwrap();
+            assert_eq!(page_two.get_ref().messages.len(), 1);
+            page_two_hashes.push(page_two.get_ref().messages[0].hash.clone());
+            assert!(page_two.get_ref().next_page_token.is_none());
+        }
+
+        assert!(
+            page_one_hashes.iter().all(|h| h == &page_one_hashes[0]),
+            "page 1 cast should be stable across calls"
+        );
+        assert!(
+            page_two_hashes.iter().all(|h| h == &page_two_hashes[0]),
+            "page 2 cast should be stable across calls"
+        );
+        assert_eq!(page_one_hashes[0], newer_first.hash);
+        assert_eq!(page_two_hashes[0], older_second.hash);
+        assert_ne!(page_one_hashes[0], page_two_hashes[0]);
+    }
+
+    #[tokio::test]
     async fn test_get_casts_by_following_rejects_page_size_above_max() {
         let (
             _stores,

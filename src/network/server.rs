@@ -77,6 +77,27 @@ struct CastsByFollowingPageToken {
     offset: usize,
 }
 
+fn compare_casts_by_following_timeline(
+    a: &proto::Message,
+    b: &proto::Message,
+    reverse: bool,
+) -> std::cmp::Ordering {
+    let ts_a = a.data.as_ref().map(|d| d.timestamp).unwrap_or(0);
+    let ts_b = b.data.as_ref().map(|d| d.timestamp).unwrap_or(0);
+    let ts_cmp = if reverse {
+        ts_b.cmp(&ts_a)
+    } else {
+        ts_a.cmp(&ts_b)
+    };
+    ts_cmp.then_with(|| {
+        if reverse {
+            b.hash.cmp(&a.hash)
+        } else {
+            a.hash.cmp(&b.hash)
+        }
+    })
+}
+
 fn link_target_fid(message: &proto::Message) -> Option<u64> {
     message.data.as_ref().and_then(|data| {
         if let Some(message_data::Body::LinkBody(link_body)) = &data.body {
@@ -539,8 +560,15 @@ impl MyHubService {
                 .push(followed_fid);
         }
 
+        let mut shard_ids: Vec<u32> = fids_by_shard.keys().copied().collect();
+        shard_ids.sort_unstable();
+
         let mut all_casts: Vec<Message> = Vec::new();
-        for (shard_id, fids) in fids_by_shard {
+        for shard_id in shard_ids {
+            let mut fids = fids_by_shard
+                .remove(&shard_id)
+                .expect("shard_id from keys()");
+            fids.sort_unstable();
             let stores = self
                 .get_stores_for_shard(shard_id)
                 .map_err(status_to_hub_error)?;
@@ -555,19 +583,7 @@ impl MyHubService {
             all_casts.extend(shard_casts);
         }
 
-        if reverse {
-            all_casts.sort_by(|a, b| {
-                let ts_a = a.data.as_ref().map(|d| d.timestamp).unwrap_or(0);
-                let ts_b = b.data.as_ref().map(|d| d.timestamp).unwrap_or(0);
-                ts_b.cmp(&ts_a)
-            });
-        } else {
-            all_casts.sort_by(|a, b| {
-                let ts_a = a.data.as_ref().map(|d| d.timestamp).unwrap_or(0);
-                let ts_b = b.data.as_ref().map(|d| d.timestamp).unwrap_or(0);
-                ts_a.cmp(&ts_b)
-            });
-        }
+        all_casts.sort_by(|a, b| compare_casts_by_following_timeline(a, b, reverse));
 
         let total = all_casts.len();
         let page_messages: Vec<Message> =
