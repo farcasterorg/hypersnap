@@ -17,6 +17,24 @@ use std::{borrow::Borrow, sync::Arc};
 
 type Parent = message::cast_add_body::Parent;
 
+/// Default page size for casts-by-following requests.
+pub const DEFAULT_CASTS_BY_FOLLOWING_PER_FID_LIMIT: usize = 100;
+/// Minimum page size (a request for 0 is treated as 1).
+pub const MIN_CASTS_BY_FOLLOWING_LIMIT: usize = 1;
+/// Hard maximum page size per request (per followed FID on each shard).
+pub const MAX_CASTS_BY_FOLLOWING_LIMIT: usize = 1000;
+
+/// Validates and normalizes a casts-by-following page size.
+pub fn validate_casts_by_following_page_size(page_size: usize) -> Result<usize, HubError> {
+    if page_size > MAX_CASTS_BY_FOLLOWING_LIMIT {
+        return Err(HubError::invalid_parameter(&format!(
+            "page_size must not exceed {}",
+            MAX_CASTS_BY_FOLLOWING_LIMIT
+        )));
+    }
+    Ok(page_size.max(MIN_CASTS_BY_FOLLOWING_LIMIT))
+}
+
 /**
  * CastStore persists Cast messages in RocksDB using a two-phase CRDT set to guarantee eventual
  * consistency.
@@ -561,16 +579,18 @@ impl CastStore {
 
     /// Returns cast adds from the given FIDs on this shard, filtered by timestamp range.
     /// Results are sorted by timestamp; `reverse` true is newest first, false is oldest first.
+    /// Fetches at most `limit` casts per followed FID via `get_all_messages_by_fid`.
     pub fn get_casts_by_following(
         store: &Store<CastStoreDef>,
         following_fids: &[u64],
         start_time: Option<u32>,
         stop_time: Option<u32>,
         reverse: bool,
+        limit: usize,
     ) -> Result<Vec<Message>, HubError> {
         let mut casts = Vec::new();
         let page_options = PageOptions {
-            page_size: None,
+            page_size: Some(limit),
             page_token: None,
             reverse,
         };

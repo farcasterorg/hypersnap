@@ -7,7 +7,9 @@ mod tests {
     use crate::proto::{self as message, hub_event, CastType, HubEvent, HubEventType};
     use crate::storage::db::{PageOptions, RocksDB, RocksDbTransactionBatch};
     use crate::storage::store::account::{
-        CastStore, CastStoreDef, HubEventStorageExt, Store, StoreEventHandler, StoreOptions,
+        validate_casts_by_following_page_size, CastStore, CastStoreDef, HubEventStorageExt, Store,
+        StoreEventHandler, StoreOptions, DEFAULT_CASTS_BY_FOLLOWING_PER_FID_LIMIT,
+        MAX_CASTS_BY_FOLLOWING_LIMIT, MIN_CASTS_BY_FOLLOWING_LIMIT,
     };
     use crate::utils::factory::{messages_factory, time};
     use std::sync::Arc;
@@ -747,6 +749,27 @@ mod tests {
         assert_eq!(page3.messages, vec![cast2, cast1]);
     }
 
+    #[test]
+    fn test_validate_casts_by_following_page_size() {
+        assert_eq!(
+            validate_casts_by_following_page_size(0).unwrap(),
+            MIN_CASTS_BY_FOLLOWING_LIMIT
+        );
+        assert_eq!(
+            validate_casts_by_following_page_size(1).unwrap(),
+            MIN_CASTS_BY_FOLLOWING_LIMIT
+        );
+        assert_eq!(
+            validate_casts_by_following_page_size(100).unwrap(),
+            DEFAULT_CASTS_BY_FOLLOWING_PER_FID_LIMIT
+        );
+        assert_eq!(
+            validate_casts_by_following_page_size(MAX_CASTS_BY_FOLLOWING_LIMIT).unwrap(),
+            MAX_CASTS_BY_FOLLOWING_LIMIT
+        );
+        assert!(validate_casts_by_following_page_size(MAX_CASTS_BY_FOLLOWING_LIMIT + 1).is_err());
+    }
+
     #[tokio::test]
     async fn test_get_casts_by_following_returns_casts_sorted_by_timestamp() {
         let (store, db, _temp_dir) = create_test_store();
@@ -776,6 +799,7 @@ mod tests {
             Some(50),
             Some(300),
             true,
+            DEFAULT_CASTS_BY_FOLLOWING_PER_FID_LIMIT,
         )
         .unwrap();
 
@@ -789,6 +813,7 @@ mod tests {
             Some(50),
             Some(300),
             false,
+            DEFAULT_CASTS_BY_FOLLOWING_PER_FID_LIMIT,
         )
         .unwrap();
 

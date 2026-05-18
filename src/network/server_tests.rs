@@ -517,8 +517,8 @@ mod tests {
         // Validate the response
         assert!(response.is_err());
         let status = response.unwrap_err();
-        assert_eq!(status.code(), tonic::Code::InvalidArgument);
-        assert_eq!(status.message(), "no shard store for fid");
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(status.message(), "shard 999 is not served by this node");
     }
 
     #[tokio::test]
@@ -544,8 +544,8 @@ mod tests {
 
         assert!(response.is_err());
         let status = response.unwrap_err();
-        assert_eq!(status.code(), tonic::Code::InvalidArgument);
-        assert_eq!(status.message(), "no shard store for fid");
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(status.message(), "shard 0 is not served by this node");
     }
 
     #[tokio::test]
@@ -1625,6 +1625,33 @@ mod tests {
             .unwrap();
         test_helper::assert_contains_all_messages(&page_two, &[&cast_same_shard]);
         assert!(page_two.get_ref().next_page_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_casts_by_following_rejects_page_size_above_max() {
+        let (
+            _stores,
+            _senders,
+            [_engine1, _engine2],
+            _block_engine,
+            service,
+            _shard_decision_tx,
+            _block_decision_tx,
+        ) = make_server(None).await;
+
+        let err = service
+            .get_casts_by_following(Request::new(proto::CastsByFollowingRequest {
+                fid: Some(SHARD1_FID),
+                page_size: Some(1001),
+                page_token: None,
+                reverse: None,
+                start_timestamp: None,
+                stop_timestamp: None,
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
     #[tokio::test]

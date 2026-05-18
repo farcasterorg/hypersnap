@@ -17,6 +17,8 @@ Individual features (social graph, feeds, search, etc.) have their own toggles u
 
 Returns a paginated timeline of cast adds from users that the given FID follows. Results are merged across shards, filtered by optional timestamp bounds, and sorted by cast timestamp (newest first by default). The requesting user's own casts are not included.
 
+When building each page, the hub fetches at most **`limit` casts per followed FID** on each shard (hard maximum **1000**), merges and sorts the results, then returns at most **`limit` casts** for the page. Requests with `limit` greater than 1000 are rejected with HTTP `400`.
+
 This endpoint is computationally expensive because it loads casts for every followed FID. It is **enabled by default** when `[api.feeds]` is configured.
 
 ### Configuration
@@ -44,7 +46,7 @@ Set `casts_by_following_enabled = false` to turn it off. When disabled, the HTTP
 | Parameter | Required | Default | Description |
 | --------- | -------- | ------- | ----------- |
 | `fid` | Yes | — | FID whose `follow` links define the timeline |
-| `limit` | No | `25` | Max casts per page (capped at 100) |
+| `limit` | No | `100` | Max casts per page (minimum `1`, maximum `1000`; values above `1000` return `400`) |
 | `cursor` | No | — | Pagination cursor from `next.cursor` (hex-encoded page token) |
 | `reverse` | No | `true` | `true` = newest first; `false` = oldest first |
 | `start_timestamp` | No | — | Inclusive lower bound (Farcaster time, same as message timestamps) |

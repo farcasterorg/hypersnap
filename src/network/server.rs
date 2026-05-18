@@ -39,7 +39,8 @@ use crate::storage::store::account::UsernameProofStore;
 use crate::storage::store::account::PAGE_SIZE_MAX;
 use crate::storage::store::account::{
     get_gasless_key_count, get_gasless_key_record, get_last_used_at, list_gasless_keys_by_fid,
-    CastStore, GaslessKeyRecord, LinkStore, ReactionStore, Store, UserDataStore, VerificationStore,
+    validate_casts_by_following_page_size, CastStore, GaslessKeyRecord, LinkStore, ReactionStore,
+    Store, UserDataStore, VerificationStore, DEFAULT_CASTS_BY_FOLLOWING_PER_FID_LIMIT,
 };
 use crate::storage::store::account::{message_bytes_decode, IntoI32};
 use crate::storage::store::account::{EventsPage, HubEventIdGenerator};
@@ -68,7 +69,7 @@ use tracing::{debug, error, info};
 
 pub const MEMPOOL_ADD_REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_millis(100);
-const DEFAULT_CASTS_BY_FOLLOWING_PAGE_SIZE: usize = 100;
+const DEFAULT_CASTS_BY_FOLLOWING_PAGE_SIZE: usize = DEFAULT_CASTS_BY_FOLLOWING_PER_FID_LIMIT;
 const LINK_TYPE_FOLLOW: &str = "follow";
 
 #[derive(Serialize, Deserialize)]
@@ -164,6 +165,23 @@ fn signer_store_error_to_status(err: HubError) -> Status {
         Status::invalid_argument(err.to_string())
     } else {
         Status::internal(format!("Store error: {:?}", err))
+    }
+}
+
+fn status_to_hub_error(status: Status) -> HubError {
+    HubError::unavailable(status.message())
+}
+
+fn hub_error_to_status(err: HubError) -> Status {
+    match err.code.as_str() {
+        "unavailable" => Status::unavailable(err.message),
+        "bad_request.invalid_param"
+        | "bad_request.validation_failure"
+        | "bad_request.decode_error"
+        | "bad_request.duplicate"
+        | "bad_request.rate_limited" => Status::invalid_argument(err.to_string()),
+        "not_found" => Status::not_found(err.message),
+        _ => Status::internal(err.to_string()),
     }
 }
 
@@ -504,9 +522,8 @@ impl MyHubService {
         page_size: usize,
         offset: usize,
     ) -> Result<(Vec<Message>, Option<Vec<u8>>), HubError> {
-        let user_stores = self
-            .get_stores_for(user_fid)
-            .map_err(|e| HubError::invalid_parameter(&e.message()))?;
+        let page_size = validate_casts_by_following_page_size(page_size)?;
+        let user_stores = self.get_stores_for(user_fid).map_err(status_to_hub_error)?;
         let following_fids = collect_following_fids(&user_stores.link_store, user_fid)?;
 
         if following_fids.is_empty() {
@@ -526,13 +543,14 @@ impl MyHubService {
         for (shard_id, fids) in fids_by_shard {
             let stores = self
                 .get_stores_for_shard(shard_id)
-                .map_err(|e| HubError::invalid_parameter(&e.message()))?;
+                .map_err(status_to_hub_error)?;
             let shard_casts = CastStore::get_casts_by_following(
                 &stores.cast_store,
                 &fids,
                 start_ts,
                 stop_ts,
                 reverse,
+                page_size,
             )?;
             all_casts.extend(shard_casts);
         }
@@ -836,9 +854,10 @@ impl MyHubService {
     fn get_stores_for_shard(&self, shard_id: u32) -> Result<&Stores, Status> {
         match self.shard_stores.get(&shard_id) {
             Some(store) => Ok(store),
-            None => Err(Status::invalid_argument(
-                "no shard store for fid".to_string(),
-            )),
+            None => Err(Status::unavailable(format!(
+                "shard {} is not served by this node",
+                shard_id
+            ))),
         }
     }
 
@@ -2312,10 +2331,12 @@ impl HubService for MyHubService {
         };
         let (start_ts, stop_ts) = req.timestamps();
         let reverse = req.reverse.unwrap_or(true);
-        let page_size = req
-            .page_size
-            .map(|s| s as usize)
-            .unwrap_or(DEFAULT_CASTS_BY_FOLLOWING_PAGE_SIZE);
+        let page_size = validate_casts_by_following_page_size(
+            req.page_size
+                .map(|s| s as usize)
+                .unwrap_or(DEFAULT_CASTS_BY_FOLLOWING_PAGE_SIZE),
+        )
+        .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
         let offset = if let Some(token_bytes) = req.page_token {
             serde_json::from_slice::<CastsByFollowingPageToken>(&token_bytes)
@@ -2329,7 +2350,7 @@ impl HubService for MyHubService {
             .get_casts_by_following_messages(
                 user_fid, start_ts, stop_ts, reverse, page_size, offset,
             )
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(hub_error_to_status)?;
 
         Ok(Response::new(MessagesResponse {
             messages,

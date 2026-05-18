@@ -28,13 +28,13 @@ Used to retrieve valid casts or tombstones for deleted casts
 | Field           | Type              | Label    | Description                                                         |
 | --------------- | ----------------- | -------- | ------------------------------------------------------------------- |
 | fid             | [uint64](#uint64) | optional | FID whose following list is used to build the timeline              |
-| page_size       | [uint32](#uint32) | optional | Number of results to return per page (default: 100)                 |
+| page_size       | [uint32](#uint32) | optional | Number of results per page (default: 100, min: 1, max: 1000)        |
 | page_token      | [bytes](#bytes)   | optional | Token for pagination                                                |
 | reverse         | [bool](#bool)     | optional | Sort order; defaults to `true` (newest casts first)                 |
 | start_timestamp | [uint64](#uint64) | optional | Inclusive lower bound on cast timestamp (Farcaster time)            |
 | stop_timestamp  | [uint64](#uint64) | optional | Inclusive upper bound on cast timestamp (Farcaster time)            |
 
-Returns cast adds authored by FIDs that `fid` follows (link type `follow`). Casts are merged across shards, sorted by timestamp, and paginated. The requesting user's own casts are not included.
+Returns cast adds authored by FIDs that `fid` follows (link type `follow`). Casts are merged across shards, sorted by timestamp, and paginated. Up to **`page_size` casts per followed FID** are read per shard (hard cap **1000**), then the merged timeline is capped to **`page_size`** results. Requests with `page_size` above 1000 return `INVALID_ARGUMENT`. The requesting user's own casts are not included.
 
 Enabled by default when `[api.feeds]` is configured. Set `[api.feeds] casts_by_following_enabled = false` to disable (also gates the v2 HTTP route `GET /v2/farcaster/casts/following`).
 

@@ -959,6 +959,32 @@ impl ApiHttpHandler {
             }
             "/v2/farcaster/casts/following" => {
                 let fid: u64 = require_fid!(params);
+                let following_limit = match params.get("limit") {
+                    None => {
+                        crate::storage::store::account::DEFAULT_CASTS_BY_FOLLOWING_PER_FID_LIMIT
+                    }
+                    Some(s) => {
+                        let parsed = match s.parse::<usize>() {
+                            Ok(n) => n,
+                            Err(_) => {
+                                return Ok(Self::error_response(
+                                    StatusCode::BAD_REQUEST,
+                                    "Invalid limit",
+                                ));
+                            }
+                        };
+                        if parsed > crate::storage::store::account::MAX_CASTS_BY_FOLLOWING_LIMIT {
+                            return Ok(Self::error_response(
+                                StatusCode::BAD_REQUEST,
+                                &format!(
+                                    "limit must not exceed {}",
+                                    crate::storage::store::account::MAX_CASTS_BY_FOLLOWING_LIMIT
+                                ),
+                            ));
+                        }
+                        parsed.max(crate::storage::store::account::MIN_CASTS_BY_FOLLOWING_LIMIT)
+                    }
+                };
                 let start_timestamp = params.get("start_timestamp").and_then(|s| s.parse().ok());
                 let stop_timestamp = params.get("stop_timestamp").and_then(|s| s.parse().ok());
                 let reverse = params
@@ -968,7 +994,7 @@ impl ApiHttpHandler {
                 self.handle_casts_by_following(
                     fid,
                     cursor.as_deref(),
-                    limit,
+                    following_limit,
                     start_timestamp,
                     stop_timestamp,
                     reverse,
@@ -3610,6 +3636,10 @@ impl ApiHttpHandler {
             Err(e) if e.contains("disabled on this node") => {
                 Ok(Self::error_response(StatusCode::SERVICE_UNAVAILABLE, &e))
             }
+            Err(e) if e.starts_with("unavailable/") => Ok(Self::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &format!("Failed to get casts by following: {}", e),
+            )),
             Err(e) => Ok(Self::error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &format!("Failed to get casts by following: {}", e),

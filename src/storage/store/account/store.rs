@@ -1125,7 +1125,7 @@ impl<T: StoreDef + Clone> Store<T> {
             self.store_def.postfix(),
             None,
         );
-        let messages = get_messages_page_by_prefix(&self.db, &prefix, &page_options, |message| {
+        let messages = get_messages_page_by_prefix(&self.db, &prefix, page_options, |message| {
             is_message_in_time_range(start_time, stop_time, message)
                 && (self.store_def.is_add_type(&message)
                     || (self.store_def.remove_type_supported()
