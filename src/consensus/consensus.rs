@@ -40,6 +40,12 @@ pub enum SystemMessage {
 pub struct ValidatorSetConfig {
     pub effective_at: u64,
     pub validator_public_keys: Vec<String>,
+    /// Optional parallel array of BLS12-381 G1 public keys (hex-encoded, 48
+    /// bytes each). If non-empty, length must match `validator_public_keys`;
+    /// index `i` is validator `i`'s BLS key. Empty during the rollout phase
+    /// before BLS keys are registered.
+    #[serde(default)]
+    pub validator_bls_public_keys: Vec<String>,
     pub shard_ids: Vec<u32>,
 }
 
@@ -109,6 +115,7 @@ impl Config {
             return vec![ValidatorSetConfig {
                 effective_at: 0,
                 validator_public_keys: addresses.clone(),
+                validator_bls_public_keys: vec![],
                 shard_ids: vec![shard_id],
             }];
         }

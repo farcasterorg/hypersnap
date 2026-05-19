@@ -1,4 +1,4 @@
-use snapchain::perf::perftest;
+use hypersnap::perf::perftest;
 use std::error::Error;
 
 #[tokio::main]

@@ -1,10 +1,10 @@
 use std::error::Error;
 use std::marker::PhantomData;
 
+use hypersnap::consensus::malachite::snapchain_codec::SnapchainCodec;
 use informalsystems_malachitebft_core_types::Context;
 use informalsystems_malachitebft_engine::wal::{WalCodec, WalEntry};
 use informalsystems_malachitebft_wal as wal;
-use snapchain::consensus::malachite::snapchain_codec::SnapchainCodec;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let Some(wal_file) = std::env::args().nth(1) else {

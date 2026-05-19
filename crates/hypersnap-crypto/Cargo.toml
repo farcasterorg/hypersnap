@@ -1,0 +1,35 @@
+[package]
+name = "hypersnap-crypto"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+description = "Cryptographic primitives for hypersnap: BLS12-381 threshold signatures, Pedersen DKG, KZG commitments, Decaf448 token primitives"
+
+[dependencies]
+blst = "0.3"
+bls12_381 = "0.8"
+group = "0.13"
+ff = "0.13"
+ed448-goldilocks-plus = "0.16"
+ed448-bulletproofs = { path = "../ed448-bulletproofs" }
+merlin = "3"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+sha3 = "0.10"
+rand = "0.8"
+rand_core = "0.6"
+subtle = "2"
+thiserror = "1"
+
+hex = "0.4"
+alloy-primitives = { version = "0.8.14", features = ["k256"] }
+
+# BLS → DKLS23 migration: vendored DKLS23 + supporting types. Wire
+# encoding for round messages goes through bincode + serde.
+dkls23 = { path = "../dkls23" }
+k256 = { version = "0.13", features = ["serde", "ecdsa"] }
+elliptic-curve = { version = "0.13", features = ["serde", "sec1"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"

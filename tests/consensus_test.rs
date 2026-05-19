@@ -1,32 +1,32 @@
 use ed25519_dalek::SigningKey;
 use hex;
+use hypersnap::connectors::onchain_events::ChainClients;
+use hypersnap::consensus::consensus::{SystemMessage, ValidatorSetConfig};
+use hypersnap::consensus::proposer::GENESIS_MESSAGE;
+use hypersnap::mempool::block_receiver::{self, BlockReceiver};
+use hypersnap::mempool::mempool::{
+    self, Mempool, MempoolMessagesRequest, MempoolRequest, MempoolSource,
+};
+use hypersnap::mempool::routing::{self, MessageRouter, ShardRouter};
+use hypersnap::network::gossip::SnapchainGossip;
+use hypersnap::network::server::MyHubService;
+use hypersnap::node::snapchain_node::SnapchainNode;
+use hypersnap::node::snapchain_read_node::SnapchainReadNode;
+use hypersnap::proto::hub_service_server::HubServiceServer;
+use hypersnap::proto::{self, Height, StorageUnitType};
+use hypersnap::proto::{Block, FarcasterNetwork, IdRegisterEventType, SignerEventType};
+use hypersnap::storage::db::{PageOptions, RocksDB, RocksDbTransactionBatch};
+use hypersnap::storage::store::account::{CastStore, OnchainEventStore, UserDataStore};
+use hypersnap::storage::store::block_engine::BlockStores;
+use hypersnap::storage::store::mempool_poller::MempoolMessage;
+use hypersnap::storage::store::node_local_state::LocalStateStore;
+use hypersnap::storage::store::stores::Stores;
+use hypersnap::storage::trie::merkle_trie::{self, TrieKey};
+use hypersnap::utils::factory::{self, messages_factory};
+use hypersnap::utils::statsd_wrapper::StatsdClientWrapper;
 use informalsystems_malachitebft_metrics::SharedRegistry;
 use libp2p::identity::ed25519::Keypair;
 use serial_test::serial;
-use snapchain::connectors::onchain_events::ChainClients;
-use snapchain::consensus::consensus::{SystemMessage, ValidatorSetConfig};
-use snapchain::consensus::proposer::GENESIS_MESSAGE;
-use snapchain::mempool::block_receiver::{self, BlockReceiver};
-use snapchain::mempool::mempool::{
-    self, Mempool, MempoolMessagesRequest, MempoolRequest, MempoolSource,
-};
-use snapchain::mempool::routing::{self, MessageRouter, ShardRouter};
-use snapchain::network::gossip::SnapchainGossip;
-use snapchain::network::server::MyHubService;
-use snapchain::node::snapchain_node::SnapchainNode;
-use snapchain::node::snapchain_read_node::SnapchainReadNode;
-use snapchain::proto::hub_service_server::HubServiceServer;
-use snapchain::proto::{self, Height, StorageUnitType};
-use snapchain::proto::{Block, FarcasterNetwork, IdRegisterEventType, SignerEventType};
-use snapchain::storage::db::{PageOptions, RocksDB, RocksDbTransactionBatch};
-use snapchain::storage::store::account::{CastStore, OnchainEventStore, UserDataStore};
-use snapchain::storage::store::block_engine::BlockStores;
-use snapchain::storage::store::mempool_poller::MempoolMessage;
-use snapchain::storage::store::node_local_state::LocalStateStore;
-use snapchain::storage::store::stores::Stores;
-use snapchain::storage::trie::merkle_trie::{self, TrieKey};
-use snapchain::utils::factory::{self, messages_factory};
-use snapchain::utils::statsd_wrapper::StatsdClientWrapper;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -227,9 +227,9 @@ impl ReadNodeForTest {
             true,
         );
 
-        let config = snapchain::network::gossip::Config::new(gossip_address, bootstrap_address);
+        let config = hypersnap::network::gossip::Config::new(gossip_address, bootstrap_address);
 
-        let mut consensus_config = snapchain::consensus::consensus::Config::default();
+        let mut consensus_config = hypersnap::consensus::consensus::Config::default();
         consensus_config =
             consensus_config.with((1..=num_shards).collect(), validator_sets.clone());
 
@@ -318,10 +318,10 @@ impl NodeForTest {
             true,
         );
         let config =
-            snapchain::network::gossip::Config::new(gossip_address.clone(), bootstrap_address)
+            hypersnap::network::gossip::Config::new(gossip_address.clone(), bootstrap_address)
                 .with_announce_address(gossip_address);
 
-        let mut consensus_config = snapchain::consensus::consensus::Config::default();
+        let mut consensus_config = hypersnap::consensus::consensus::Config::default();
         consensus_config =
             consensus_config.with((1..=num_shards).collect(), validator_sets.clone());
         consensus_config.block_time = time::Duration::from_millis(250);
@@ -529,7 +529,7 @@ impl NodeForTest {
         &self,
         message: MempoolMessage,
         source: MempoolSource,
-        rx: Option<tokio::sync::oneshot::Sender<Result<(), snapchain::core::error::HubError>>>,
+        rx: Option<tokio::sync::oneshot::Sender<Result<(), hypersnap::core::error::HubError>>>,
     ) -> Result<(), mpsc::error::SendError<MempoolRequest>> {
         self.mempool_tx
             .send(MempoolRequest::AddMessage(message, source, rx))
@@ -565,6 +565,7 @@ impl TestNetwork {
         let validator_sets = vec![ValidatorSetConfig {
             effective_at: 0,
             validator_public_keys: validator_addresses,
+            validator_bls_public_keys: vec![],
             shard_ids: (1..=num_shards).collect(),
         }];
         Self {

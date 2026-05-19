@@ -1,15 +1,26 @@
 [workspace]
-members = ["proto"]
+members = [
+    "proto",
+    "crates/hypersnap-crypto",
+    "crates/proof-of-quality",
+    "crates/hypersnap-bridge-ceremony",
+    # Vendored from sibling repos. Keeping them in-tree so a fresh
+    # clone of `hypersnap` builds without external monorepo paths.
+    # To update: re-rsync from the upstream sources, exclude target/
+    # and Cargo.lock.
+    "crates/dkls23",
+    "crates/ed448-bulletproofs",
+]
 resolver = "2"
 
 [package]
-name = "snapchain"
+name = "hypersnap"
 version = "0.11.6"
 edition = "2021"
 default-run = "hypersnap"
 
 [lib]
-name = "snapchain"
+name = "hypersnap"
 path = "src/lib.rs"
 
 [[bin]]
@@ -17,7 +28,10 @@ name = "hypersnap"
 path = "src/main.rs"
 
 [dependencies]
-snapchain-proto = { path = "proto" }
+hypersnap-proto = { path = "proto" }
+hypersnap-crypto = { path = "crates/hypersnap-crypto" }
+proof-of-quality = { path = "crates/proof-of-quality" }
+bincode = "1.3"
 tokio = { version = "1.40.0", features = ["full"] }
 tokio-stream = "0.1"
 serde = { version = "1.0", features = ["derive"] }
@@ -74,6 +88,7 @@ walkdir = "2.5.0"
 once_cell = "1.20.2"
 threadpool = "1.8.1"
 rand = "0.8.5"
+rand_chacha = "0.3"
 humantime-serde = "1.1.1"
 humantime = "2.1.0"
 itertools = "0.13.0"

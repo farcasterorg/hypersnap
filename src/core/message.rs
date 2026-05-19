@@ -5,7 +5,7 @@ use crate::proto::HubEvent;
 use crate::storage::store::engine::MessageValidationError;
 
 // impl proto::Message, impl proto::FullProposal::shard_id, impl ConsensusMessage::shard_id
-// are now in the snapchain-proto crate
+// are now in the hypersnap-proto crate
 
 // Extension trait for HubEvent that depends on main crate types (HubError, MessageValidationError)
 pub trait HubEventExt {

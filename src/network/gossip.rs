@@ -160,6 +160,10 @@ pub enum GossipEvent<Ctx: SnapchainContext> {
     BroadcastFullProposal(proto::FullProposal),
     BroadcastMempoolMessage(MempoolMessage),
     BroadcastHyperEnvelope(HyperEnvelope),
+    /// Publish a `HyperWireMessage` (block / message / DKG) on its target
+    /// hyper topic. The actor → gossip pump emits these; the gossip task
+    /// translates them to `gossipsub.publish` calls.
+    BroadcastHyperWire(&'static str, proto::HyperWireMessage),
     BroadcastStatus(sync::Status<SnapchainValidatorContext>),
     SyncRequest(
         MalachitePeerId,
@@ -178,6 +182,9 @@ pub enum GossipTopic {
     ReadNodePeerStatuses,
     Mempool,
     Hyper,
+    /// Versioned hyper-protocol topic. Carries the topic name verbatim so
+    /// the dispatcher can publish without a separate constant.
+    HyperWire(&'static str),
     SyncRequest(MalachitePeerId, oneshot::Sender<OutboundRequestId>),
     SyncReply(InboundRequestId),
 }
@@ -194,6 +201,10 @@ pub struct SnapchainGossip {
     pub tx: mpsc::Sender<GossipEvent<SnapchainValidatorContext>>,
     rx: mpsc::Receiver<GossipEvent<SnapchainValidatorContext>>,
     system_tx: Option<Sender<SystemMessage>>,
+    /// When wired by the operator, every decoded `HyperWireMessage` from
+    /// the hyper gossip topics is forwarded here. The receiver — typically
+    /// a `HyperActor` — owns the runtime and applies the events.
+    pub(crate) hyper_actor_tx: Option<mpsc::Sender<crate::hyper::actor::HyperActorEvent>>,
     sync_channels: HashMap<InboundRequestId, sync::ResponseChannel>,
     read_node: bool,
     enable_autodiscovery: bool,
@@ -401,8 +412,35 @@ impl SnapchainGossip {
             peers: BTreeMap::new(),
             capabilities,
             hyper_enabled,
+            hyper_actor_tx: None,
         })
     }
+
+    /// Plug an actor into the hyper gossip topics. Once set, every
+    /// inbound `HyperWireMessage` is decoded and forwarded as a
+    /// `HyperActorEvent`. Subscribes the swarm to the hyper topics
+    /// declared in `crate::hyper::topics`.
+    pub fn attach_hyper_actor(
+        &mut self,
+        tx: mpsc::Sender<crate::hyper::actor::HyperActorEvent>,
+        validator: bool,
+    ) {
+        let topics: &[&str] = if validator {
+            crate::hyper::topics::all_validator_topics()
+        } else {
+            crate::hyper::topics::all_observer_topics()
+        };
+        for t in topics {
+            let topic = gossipsub::IdentTopic::new(*t);
+            if let Err(e) = self.swarm.behaviour_mut().gossipsub.subscribe(&topic) {
+                warn!("Failed to subscribe to hyper topic {}: {:?}", t, e);
+            }
+        }
+        self.hyper_actor_tx = Some(tx);
+    }
+
+    // Outbound publish is done through `tx`'s `BroadcastHyperWire` event;
+    // see `crate::hyper::network_loop::run_outbound_pump`.
 
     async fn get_announce_rpc_address(
         fc_network: FarcasterNetwork,
@@ -666,6 +704,7 @@ impl SnapchainGossip {
                                 GossipTopic::ReadNodePeerStatuses => self.publish(encoded_message.clone(), READ_NODE_PEER_STATUSES),
                                 GossipTopic::Mempool => self.publish(encoded_message.clone(), MEMPOOL_TOPIC),
                                 GossipTopic::Hyper => self.publish(encoded_message.clone(), HYPER_TOPIC),
+                                GossipTopic::HyperWire(topic) => self.publish(encoded_message.clone(), topic),
                                 GossipTopic::SyncRequest(peer_id, reply_tx) => {
                                     let peer = peer_id.to_libp2p();
                                     let request_id = self.swarm.behaviour_mut().rpc.send_request(peer, Bytes::from(encoded_message.clone()));
@@ -847,6 +886,30 @@ impl SnapchainGossip {
                     );
                     None
                 }
+                Some(proto::gossip_message::GossipMessage::HyperWire(wire)) => {
+                    if let Some(tx) = self.hyper_actor_tx.as_ref() {
+                        match crate::hyper::gossip_adapter::wire_to_event(wire) {
+                            Ok(event) => {
+                                if let Err(e) = tx.try_send(event) {
+                                    warn!(
+                                        "Hyper actor channel full / closed; dropping event: {}",
+                                        e
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to decode HyperWireMessage: {}", e);
+                            }
+                        }
+                    } else {
+                        warn!(
+                            "Received HyperWireMessage but no actor attached (peer {})",
+                            peer_id
+                        );
+                    }
+                    // Hyper events ride a dedicated channel, not SystemMessage.
+                    None
+                }
                 Some(proto::gossip_message::GossipMessage::MempoolMessage(message)) => {
                     if let Some(mempool_message_proto) = message.mempool_message {
                         let mempool_message = match mempool_message_proto {
@@ -1008,6 +1071,16 @@ impl SnapchainGossip {
             Some(GossipEvent::BroadcastHyperEnvelope(envelope)) => self
                 .encode_hyper_envelope(envelope)
                 .map(|bytes| (vec![GossipTopic::Hyper], bytes)),
+            Some(GossipEvent::BroadcastHyperWire(topic, wire)) => {
+                if !self.hyper_enabled {
+                    warn!("Hyper wire broadcast requested but node is not hyper-enabled");
+                    return None;
+                }
+                let outer = proto::GossipMessage {
+                    gossip_message: Some(proto::gossip_message::GossipMessage::HyperWire(wire)),
+                };
+                Some((vec![GossipTopic::HyperWire(topic)], outer.encode_to_vec()))
+            }
             Some(GossipEvent::SyncRequest(peer_id, request, reply_tx)) => {
                 let encoded = snapchain_codec.encode(&request);
                 match encoded {

@@ -115,6 +115,17 @@ pub enum MessageValidationError {
 
     #[error("block event missing body")]
     BlockEventMissingBody,
+
+    /// FIP-proof-of-quality §4 fee gate: the sender's hyper fee balance
+    /// is below the trust×uniqueness-discounted cost of this message.
+    /// Returned at merge time before any store mutation. The sender
+    /// must top up via `HYPER_MESSAGE_TYPE_FEE_DEPOSIT` and retry.
+    #[error("hyper fee balance insufficient for fid {fid}: have {available}, need {needed}")]
+    HyperFeeInsufficient {
+        fid: u64,
+        available: u64,
+        needed: u64,
+    },
 }
 
 pub struct MergedReplicatorMessage {
@@ -1220,6 +1231,34 @@ impl ShardEngine {
             EngineVersion::version_for(&FarcasterTime::new(data.timestamp as u64), self.network);
         let gasless_enabled = version.is_enabled(ProtocolFeature::GaslessSigners);
 
+        // FIP-proof-of-quality §4 fee gate. Charged BEFORE the merge so a
+        // rejection on insufficient fee balance leaves the txn batch
+        // pristine. For non-fee-bearing types `stage_fee` is a no-op.
+        // The fingerprint insert for CastAdd happens AFTER the merge
+        // succeeds (the message is now part of the visible state).
+        let fee_charger = crate::hyper::fee_charger::FeeCharger::new(self.db.clone());
+        match fee_charger.stage_fee(msg, txn_batch) {
+            Ok(_) => {}
+            Err(crate::hyper::fee_charger::FeeChargeError::Reward(
+                crate::hyper::rewards::RewardError::InsufficientBalance {
+                    fid,
+                    available,
+                    needed,
+                },
+            )) => {
+                return Err(MessageValidationError::HyperFeeInsufficient {
+                    fid,
+                    available,
+                    needed,
+                });
+            }
+            Err(e) => {
+                return Err(MessageValidationError::StoreError(
+                    crate::core::error::HubError::invalid_internal_state(&e.to_string()),
+                ));
+            }
+        }
+
         let event = match mt {
             MessageType::CastAdd | MessageType::CastRemove => vec![self
                 .stores
@@ -1289,6 +1328,12 @@ impl ShardEngine {
                 ));
             }
         };
+        // Now that the merge succeeded, record the CastAdd fingerprint
+        // so subsequent casts in the 30-day window see this content as
+        // a near-dup. This write goes directly to the DB (not the txn
+        // batch) because the fingerprint store is best-effort scoring
+        // data — losing one on a crash before commit is acceptable.
+        let _ = fee_charger.record_fingerprint_if_cast(msg);
         let elapsed = now.elapsed();
         self.metrics
             .time_with_shard("merge_message_time_us", elapsed.as_micros() as u64);

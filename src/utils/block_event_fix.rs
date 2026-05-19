@@ -1,7 +1,7 @@
 use crate::storage::db::RocksDbTransactionBatch;
 use crate::storage::store::block_engine::BlockStores;
 use crate::storage::store::stores::Stores;
-use snapchain_proto::BlockEventType;
+use hypersnap_proto::BlockEventType;
 use tracing::info;
 
 pub async fn reconcile_heartbeat_events(

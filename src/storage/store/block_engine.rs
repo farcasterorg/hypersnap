@@ -246,6 +246,18 @@ impl BlockEngine {
             })
     }
 
+    /// Trie keys beginning with `prefix`.
+    pub fn trie_values_with_prefix(
+        &mut self,
+        ctx: &merkle_trie::Context,
+        prefix: &[u8],
+    ) -> Vec<Vec<u8>> {
+        self.stores
+            .trie
+            .get_all_values(ctx, &self.db, prefix)
+            .unwrap_or_default()
+    }
+
     fn set_height(&self, version: &EngineVersion, height: Height) {
         if version.is_enabled(ProtocolFeature::EventIdBugFix) {
             self.stores
