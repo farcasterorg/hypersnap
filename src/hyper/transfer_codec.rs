@@ -7,8 +7,10 @@
 //! ergonomics are essentially the same.
 
 use crate::proto;
+use hypersnap_crypto::bulletproofs::curve_adapter::{Point, Scalar};
 use hypersnap_crypto::tokens::{
-    Nullifier, PedersenCommitment, SchnorrSignature, TransferInput, TransferOutput, TransferTx,
+    point_from_compressed_bytes, point_to_compressed_bytes, Nullifier, PedersenCommitment,
+    SchnorrSignature, TransferInput, TransferOutput, TransferTx,
 };
 
 #[derive(thiserror::Error, Debug, PartialEq)]
@@ -21,6 +23,14 @@ pub enum TransferCodecError {
     BadSignatureLength(usize),
     #[error("invalid spend signature (R or s not canonical)")]
     BadSignature,
+    #[error("blinding_diff_scalar must be 56 bytes (got {0})")]
+    BadBlindingDiffLength(usize),
+    #[error("blinding_diff_scalar not a canonical Decaf448 scalar")]
+    BadBlindingDiffScalar,
+    #[error("one_time_pubkey on output {0} must be 56 bytes (got {1})")]
+    BadOneTimePubkeyLength(usize, usize),
+    #[error("one_time_pubkey on output {0} not a canonical Decaf448 point")]
+    BadOneTimePubkey(usize),
 }
 
 pub fn input_to_proto(t: &TransferInput) -> proto::HyperTransferInput {
@@ -61,6 +71,7 @@ pub fn output_to_proto(t: &TransferOutput) -> proto::HyperTransferOutput {
     proto::HyperTransferOutput {
         commitment: t.commitment.to_bytes().to_vec(),
         range_proof: t.range_proof.clone(),
+        one_time_pubkey: Vec::new(),
     }
 }
 
@@ -80,7 +91,80 @@ pub fn tx_to_proto(t: &TransferTx) -> proto::HyperTransferTx {
         inputs: t.inputs.iter().map(input_to_proto).collect(),
         outputs: t.outputs.iter().map(output_to_proto).collect(),
         fee_atoms: t.fee_atoms,
+        blinding_diff_scalar: Vec::new(),
     }
+}
+
+/// Wire encoder that also populates the strong-validation fields:
+/// each output's one-time pubkey (recorded by the runtime so future
+/// spenders can recover the verification key) and the prover-supplied
+/// blinding-factor delta `r_in − r_out − r_fee` (`verify_balance_with_blinding_diff`).
+///
+/// `output_pubkeys.len()` must equal `t.outputs.len()`; otherwise the
+/// extras are dropped and the missing ones are encoded as empty
+/// (which the strong-validation decoder rejects). Callers should
+/// produce one pubkey per output.
+pub fn tx_to_proto_full(
+    t: &TransferTx,
+    blinding_diff: &Scalar,
+    output_pubkeys: &[Point],
+) -> proto::HyperTransferTx {
+    let outputs = t
+        .outputs
+        .iter()
+        .enumerate()
+        .map(|(i, o)| {
+            let mut proto_out = output_to_proto(o);
+            if let Some(pk) = output_pubkeys.get(i) {
+                proto_out.one_time_pubkey = point_to_compressed_bytes(pk).to_vec();
+            }
+            proto_out
+        })
+        .collect();
+    proto::HyperTransferTx {
+        inputs: t.inputs.iter().map(input_to_proto).collect(),
+        outputs,
+        fee_atoms: t.fee_atoms,
+        blinding_diff_scalar: blinding_diff.to_bytes().to_vec(),
+    }
+}
+
+/// Extract the prover-supplied blinding-factor delta from the wire.
+/// Used by `HyperRuntime::submit_message` to feed
+/// `verify_balance_with_blinding_diff` before mempool admission.
+pub fn extract_blinding_diff(p: &proto::HyperTransferTx) -> Result<Scalar, TransferCodecError> {
+    if p.blinding_diff_scalar.len() != 56 {
+        return Err(TransferCodecError::BadBlindingDiffLength(
+            p.blinding_diff_scalar.len(),
+        ));
+    }
+    let mut buf = [0u8; 56];
+    buf.copy_from_slice(&p.blinding_diff_scalar);
+    Scalar::from_canonical_bytes(buf).ok_or(TransferCodecError::BadBlindingDiffScalar)
+}
+
+/// Extract each output's recipient one-time pubkey. Used by the
+/// runtime when an output is applied — `record_note(commitment,
+/// one_time_pubkey)` populates the note store so subsequent spends
+/// resolve the right verification key.
+pub fn extract_output_pubkeys(
+    p: &proto::HyperTransferTx,
+) -> Result<Vec<Point>, TransferCodecError> {
+    let mut out = Vec::with_capacity(p.outputs.len());
+    for (i, o) in p.outputs.iter().enumerate() {
+        if o.one_time_pubkey.len() != 56 {
+            return Err(TransferCodecError::BadOneTimePubkeyLength(
+                i,
+                o.one_time_pubkey.len(),
+            ));
+        }
+        let mut buf = [0u8; 56];
+        buf.copy_from_slice(&o.one_time_pubkey);
+        let pk =
+            point_from_compressed_bytes(&buf).ok_or(TransferCodecError::BadOneTimePubkey(i))?;
+        out.push(pk);
+    }
+    Ok(out)
 }
 
 pub fn tx_from_proto(p: &proto::HyperTransferTx) -> Result<TransferTx, TransferCodecError> {

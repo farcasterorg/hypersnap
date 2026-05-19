@@ -1419,5 +1419,175 @@ async fn build_hyper_handler(
         |item| tracing::info!(?item, "hyper actor non-network outbound"),
     ));
 
+    // Block production scheduler + DKG supervisor are spawned only on
+    // signing validators (operator identity fully configured). Read
+    // nodes skip both — they import blocks others produce and never
+    // participate in DKG.
+    if let (Some(validator_pubkey_hex), Some(local_share)) = (
+        file_cfg.operator_validator_pubkey_hex.clone(),
+        file_cfg.local_dkls_share_path.clone(),
+    ) {
+        let _ = local_share;
+        let validator_key = match hex::decode(
+            validator_pubkey_hex
+                .strip_prefix("0x")
+                .unwrap_or(&validator_pubkey_hex),
+        ) {
+            Ok(v) if v.len() == 32 => v,
+            _ => {
+                tracing::warn!(
+                    "operator_validator_pubkey_hex did not decode to 32 bytes; \
+                     scheduler + DKG supervisor disabled"
+                );
+                Vec::new()
+            }
+        };
+        if !validator_key.is_empty() {
+            use hypersnap::hyper::scheduler::{BlockProductionScheduler, LatestAnchor};
+            use std::sync::Arc;
+            use std::time::Duration;
+            use tokio::sync::Mutex;
+
+            // Conservative defaults; operators can re-tune via config
+            // fields if/when those land.
+            let block_time = Duration::from_secs(3);
+            let extra_rules_version = 0u32;
+            let supervisor_tick = Duration::from_secs(5);
+            let supervisor_lead_blocks = hypersnap::hyper::epoch::EPOCH_LENGTH / 10;
+            let dkls_threshold = 1u8;
+
+            let scheduler = BlockProductionScheduler::new(
+                actor_handles_inbound_for_scheduler(&client),
+                block_time,
+                extra_rules_version,
+            );
+            let head_handle = scheduler.head_handle();
+            let ctx_handle = scheduler.proposer_ctx_handle();
+
+            // Shared "latest snapchain anchor" — scheduler uses the
+            // full struct, supervisor only needs the block number.
+            // Both poll from the actor's last-imported block since
+            // direct BlockEventStore access is operator-side and not
+            // exposed via this handler.
+            let scheduler_anchor: Arc<Mutex<LatestAnchor>> =
+                Arc::new(Mutex::new(LatestAnchor::default()));
+            let supervisor_anchor: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
+            spawn_anchor_poller(
+                client.clone(),
+                scheduler_anchor.clone(),
+                supervisor_anchor.clone(),
+                Duration::from_secs(1),
+            );
+
+            // Periodic refresh of the proposer context (active set
+            // + local key) so the scheduler's leader-rotation gate
+            // sees the right validators each epoch.
+            tokio::spawn(BlockProductionScheduler::refresh_proposer_context_loop(
+                ctx_handle,
+                client.clone(),
+                validator_key.clone(),
+                scheduler_anchor.clone(),
+                Duration::from_secs(5),
+            ));
+
+            // Periodic poll of `last_block_height` → ChainHead so the
+            // scheduler's next-height calculation tracks blocks
+            // imported from peers.
+            spawn_chain_head_poller(client.clone(), head_handle, block_time / 4);
+
+            tokio::spawn(scheduler.run());
+
+            tokio::spawn(hypersnap::hyper::dkls_supervisor::run(
+                hypersnap::hyper::dkls_supervisor::DklsSupervisorInputs {
+                    local_validator_key: validator_key,
+                    threshold: dkls_threshold,
+                    latest_anchor: supervisor_anchor,
+                    tick_interval: supervisor_tick,
+                    start_lead_blocks: supervisor_lead_blocks,
+                },
+                actor_handles_inbound_for_scheduler(&client),
+                client.clone(),
+            ));
+
+            tracing::info!("hyper scheduler + DKG supervisor spawned");
+        }
+    } else {
+        tracing::info!(
+            "hyper scheduler + DKG supervisor not spawned (operator identity not configured); \
+             running as read node"
+        );
+    }
+
     Ok(HyperHttpHandler::new(client, inbound_for_http))
+}
+
+/// `HyperActorClient` only exposes an `ask` API; the scheduler +
+/// supervisor need the raw inbound `mpsc::Sender` to enqueue
+/// `ProduceBlockDkls` / `StartDkls` / `AdvanceDkls`. The client
+/// internally holds a sender clone — we reach in via a known field.
+fn actor_handles_inbound_for_scheduler(
+    client: &hypersnap::hyper::actor::HyperActorClient,
+) -> tokio::sync::mpsc::Sender<hypersnap::hyper::actor::HyperActorEvent> {
+    client.inbound_sender().clone()
+}
+
+/// Periodically poll the actor for the latest imported block and
+/// fan its `snapchain_anchor_*` metadata into the shared anchor
+/// handles the scheduler + supervisor read from.
+fn spawn_anchor_poller(
+    client: hypersnap::hyper::actor::HyperActorClient,
+    scheduler_anchor: std::sync::Arc<tokio::sync::Mutex<hypersnap::hyper::scheduler::LatestAnchor>>,
+    supervisor_anchor: std::sync::Arc<tokio::sync::Mutex<u64>>,
+    interval: std::time::Duration,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let height = match client.last_block_height().await {
+                Ok(Some(h)) => h,
+                _ => continue,
+            };
+            let block = match client.get_block_by_height(height).await {
+                Ok(Some(b)) => b,
+                _ => continue,
+            };
+            let meta = match block.envelope.as_ref().and_then(|e| e.metadata.as_ref()) {
+                Some(m) => m,
+                None => continue,
+            };
+            let snapshot = hypersnap::hyper::scheduler::LatestAnchor {
+                block: meta.snapchain_anchor_block,
+                hash: meta.snapchain_anchor_hash.clone(),
+                timestamp: meta.snapchain_anchor_timestamp,
+            };
+            *scheduler_anchor.lock().await = snapshot;
+            *supervisor_anchor.lock().await = meta.snapchain_anchor_block;
+        }
+    });
+}
+
+/// Mirror `last_block_height` + `last_block_hash` into the
+/// scheduler's `ChainHead` so the next-height calculation tracks
+/// peer-imported blocks (not just blocks the local actor produced).
+fn spawn_chain_head_poller(
+    client: hypersnap::hyper::actor::HyperActorClient,
+    head: std::sync::Arc<tokio::sync::Mutex<hypersnap::hyper::scheduler::ChainHead>>,
+    interval: std::time::Duration,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let height = client.last_block_height().await.ok().flatten();
+            let hash = client.last_block_hash().await.ok().flatten();
+            let mut g = head.lock().await;
+            g.height = height;
+            g.parent_hash = hash.map(|h| h.to_vec()).unwrap_or_default();
+        }
+    });
 }

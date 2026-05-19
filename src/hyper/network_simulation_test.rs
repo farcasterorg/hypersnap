@@ -35,7 +35,6 @@ mod tests {
             srs,
             mempool_capacity: 100,
             score_weights: ScoreWeights::default(),
-            starting_epoch: 0,
             bootstrap_validators: vec![],
             max_reward_per_epoch: None,
             max_reward_per_epoch_per_market: std::collections::HashMap::new(),
@@ -246,45 +245,64 @@ mod tests {
         use crate::hyper::slashing::ConflictingBlocksEvidence;
         use crate::hyper::topics::TOPIC_HYPER_EVIDENCE;
         use crate::hyper::{HyperBlock, HyperBlockMetadata, HyperBlockSignature, HyperEnvelope};
+        use alloy_primitives::keccak256;
 
         let mut rng = OsRng;
         let srs = Arc::new(KzgSrs::random_unsafe(&mut rng, VERKLE_DOMAIN));
-        let (runtime, _dir) = make_runtime(srs);
+        let (mut runtime, _dir) = make_runtime(srs);
 
-        // Step 1: Conflict synthesis. The "publisher" builds an evidence
-        // outbound that the local actor would emit, then we shove it
-        // through the same wire path a peer's actor would use.
-        let mk = |state_root: u8| HyperBlock {
-            envelope: HyperEnvelope {
-                metadata: HyperBlockMetadata {
-                    canonical_block_id: 17,
-                    parent_hash: vec![0u8; 32],
-                    hyper_state_root: vec![state_root; 48],
-                    extra_rules_version: 0,
-                    retained_message_count: 0,
-                    missed_proposals: vec![],
-                    snapchain_anchor_block: 0,
-                    snapchain_anchor_hash: vec![],
-                    snapchain_range_start_block: 0,
-                    snapchain_range_root: vec![],
-                    snapchain_anchor_timestamp: 0,
+        // Install a 1-of-1 group key for epoch 9 so the actor's
+        // signature gate has an address to verify against (the
+        // unauthenticated-evidence gate is enforced at
+        // `HyperActor::dispatch::InboundEvidence`).
+        let dkg =
+            hypersnap_crypto::dkls_threshold::run_honest_dkg(1, 1, [0xee; 32]).expect("1-of-1 dkg");
+        runtime.install_local_dkls_share(9, 1, dkg.parties[0].clone(), dkg.group_address);
+
+        let mut mk = |state_root: u8| {
+            let mut block = HyperBlock {
+                envelope: HyperEnvelope {
+                    metadata: HyperBlockMetadata {
+                        canonical_block_id: 17,
+                        parent_hash: vec![0u8; 32],
+                        hyper_state_root: vec![state_root; 48],
+                        extra_rules_version: 0,
+                        retained_message_count: 0,
+                        missed_proposals: vec![],
+                        snapchain_anchor_block: 0,
+                        snapchain_anchor_hash: vec![],
+                        snapchain_range_start_block: 0,
+                        snapchain_range_root: vec![],
+                        snapchain_anchor_timestamp: 0,
+                    },
+                    payload: vec![],
                 },
-                payload: vec![],
-            },
-            signature: HyperBlockSignature {
-                epoch: 9,
-                signer_indices: vec![1, 2],
-                group_address: Vec::new(),
-                ecdsa_signature: Vec::new(),
-            },
+                signature: HyperBlockSignature {
+                    epoch: 9,
+                    signer_indices: vec![1],
+                    group_address: dkg.group_address.as_slice().to_vec(),
+                    ecdsa_signature: Vec::new(),
+                },
+            };
+            let payload = block
+                .envelope
+                .metadata
+                .signing_payload(block.signature.epoch);
+            let digest = keccak256(&payload);
+            let sig = hypersnap_crypto::dkls_sign::run_local_dkls_sign(&dkg.parties[0], digest)
+                .expect("local sign");
+            block.signature.ecdsa_signature = sig.to_bytes().to_vec();
+            block
         };
+        let block_a = mk(0xaa);
+        let block_b = mk(0xbb);
         let evidence = ConflictingBlocksEvidence {
             epoch: 9,
             canonical_block_id: 17,
-            block_a_hash: [0xaa; 32],
-            block_b_hash: [0xbb; 32],
-            block_a: Box::new(mk(0xaa)),
-            block_b: Box::new(mk(0xbb)),
+            block_a_hash: crate::hyper::chain::hyper_block_hash(&block_a),
+            block_b_hash: crate::hyper::chain::hyper_block_hash(&block_b),
+            block_a: Box::new(block_a),
+            block_b: Box::new(block_b),
         };
 
         // Step 2: Wire-encode (publisher side).

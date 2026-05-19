@@ -128,20 +128,24 @@ impl HyperMempool {
         Ok(())
     }
 
+    /// Admit a confidential `HyperTransferTx` to the mempool.
+    ///
+    /// Pre-admission **strong** validation (Pedersen balance closure +
+    /// per-input Schnorr verification against the note-store-recovered
+    /// owner pubkey + nullifier-not-spent check) is performed by the
+    /// caller — typically `HyperRuntime::submit_message`, which has
+    /// access to the runtime's `note_store` and reads the
+    /// `blinding_diff_scalar` field from the wire. This function only
+    /// performs the structural decode + mempool-level dedupe (no
+    /// nullifier overlap across pending transfers).
     pub fn submit_transfer(&mut self, tx: proto::HyperTransferTx) -> Result<(), MempoolError> {
-        // Decode and validate structurally.
         let typed = tx_from_proto(&tx)?;
-        typed
-            .validate()
-            .map_err(|e| MempoolError::TransferValidation(format!("{:?}", e)))?;
-
         if typed.inputs.is_empty() {
             return Err(MempoolError::TransferValidation(
                 "transfer must have at least one input".into(),
             ));
         }
 
-        // Reject if any nullifier overlaps with another pending transfer.
         for input in &typed.inputs {
             if self
                 .pending_nullifiers
@@ -151,7 +155,6 @@ impl HyperMempool {
             }
         }
 
-        // Index by first nullifier (deterministic per transfer).
         let key = typed.inputs[0].nullifier.0.to_vec();
         if self.transfers.contains_key(&key) {
             return Err(MempoolError::DuplicateNullifier);
@@ -313,7 +316,6 @@ mod tests {
         let mut mp = HyperMempool::new();
         let tx = sample_transfer(7);
         mp.submit_transfer(tx.clone()).unwrap();
-        // Same transfer shouldn't be re-acceptable.
         assert!(matches!(
             mp.submit_transfer(tx),
             Err(MempoolError::DuplicateNullifier)
@@ -350,14 +352,11 @@ mod tests {
         let first_nullifier = tx.inputs[0].nullifier.clone();
         mp.submit_transfer(tx.clone()).unwrap();
 
-        // Re-submit the *exact same* tx (same nullifiers) → must fail.
         assert!(matches!(
             mp.submit_transfer(tx.clone()),
             Err(MempoolError::DuplicateNullifier)
         ));
 
-        // After forgetting, the nullifiers are free again — re-submission of
-        // the exact same tx now succeeds.
         assert!(mp.forget_transfer(&first_nullifier));
         assert_eq!(mp.transfer_count(), 0);
         assert!(mp.submit_transfer(tx).is_ok());
@@ -371,11 +370,9 @@ mod tests {
         mp.submit_lock(sample_lock(3)).unwrap();
         assert_eq!(mp.lock_count(), 3);
 
-        // Submitting a 4th evicts the oldest (lock 1).
         mp.submit_lock(sample_lock(4)).unwrap();
         assert_eq!(mp.lock_count(), 3);
         let ids: Vec<_> = mp.locks().map(|l| l.lock_id[0]).collect();
-        // BTreeMap iteration is sorted, so the surviving locks are sorted by lock_id.
         assert_eq!(ids, vec![2, 3, 4]);
     }
 
@@ -386,10 +383,8 @@ mod tests {
         mp.submit_transfer(sample_transfer(7)).unwrap();
         assert_eq!(mp.total_count(), 2);
 
-        // Adding another lock evicts the oldest message regardless of type.
         mp.submit_lock(sample_lock(2)).unwrap();
         assert_eq!(mp.total_count(), 2);
-        // Lock 1 evicted, transfer + lock 2 remain.
         assert_eq!(mp.lock_count(), 1);
         assert_eq!(mp.transfer_count(), 1);
     }

@@ -8,5 +8,6 @@ description = "Deterministic in-protocol scoring for hypersnap: EigenTrust + sus
 [dependencies]
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
+twox-hash = "1.6"
 
 [dev-dependencies]

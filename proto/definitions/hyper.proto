@@ -150,6 +150,11 @@ enum HyperMessageType {
   // challenges in epoch N. One message per (signing_committee_epoch,
   // target_epoch) pair.
   HYPER_MESSAGE_TYPE_DA_EPOCH_SEED = 153;
+  // FIP-proof-of-quality §5 / FIP-proof-of-work-tokenization §12:
+  // per-FID fee-balance top-up. Moves atoms from the sender's
+  // RewardStore balance into a separate fee-balance ledger used to
+  // pay the trust×uniqueness-discounted message fee at merge time.
+  HYPER_MESSAGE_TYPE_FEE_DEPOSIT = 154;
   // FIP-native-miniapp-index: miniapp registry + user collections.
   // 120-129 reserved by the FIP for this family.
   HYPER_MESSAGE_TYPE_MINIAPP_REGISTER = 120;
@@ -183,12 +188,23 @@ message HyperTransferOutput {
   bytes commitment = 1;
   // Bulletproofs range proof bytes proving 0 ≤ value < 2^DEFAULT_RANGE_BITS.
   bytes range_proof = 2;
+  // 56-byte compressed Decaf448 one-time pubkey the recipient must
+  // demonstrate knowledge of when later spending this output. Recorded
+  // alongside the commitment in the runtime's note store, so future
+  // `validate_against_store` lookups recover the right verification
+  // key. REQUIRED — empty rejects.
+  bytes one_time_pubkey = 3;
 }
 
 message HyperTransferTx {
   repeated HyperTransferInput inputs = 1;
   repeated HyperTransferOutput outputs = 2;
   uint64 fee_atoms = 3;
+  // 56-byte Decaf448 scalar published by the prover: the
+  // blinding-factor difference `r_in − r_out − r_fee`. Required for
+  // `verify_balance_with_blinding_diff` to enforce Pedersen balance
+  // closure without secret knowledge. Empty rejects.
+  bytes blinding_diff_scalar = 4;
 }
 
 // User-initiated event locking some amount of HYPER on the source side, to
@@ -1056,7 +1072,28 @@ message HyperMessage {
     MiniappRemoveBody miniapp_remove = 22;
     DaChallengeResponseBody da_challenge_response = 23;
     DaEpochSeedBody da_epoch_seed = 24;
+    FeeDepositBody fee_deposit = 25;
   }
+}
+
+// FIP-proof-of-quality §5 — top up the sender's fee-balance ledger.
+// At apply time the runtime debits `amount` from the sender's primary
+// token balance (RewardStore) and credits the same amount to the
+// per-FID `FeeBalanceStore`. Subsequent CastAdd / LinkAdd / ReactionAdd
+// / UserDataAdd / VerificationAdd messages consume from the fee balance
+// at the trust×uniqueness-discounted rate.
+//
+// Signing/replay model matches `TokenTransferBody`:
+//   - `signer_pubkey` must be an authorized signer for `sender_fid`
+//   - `nonce` shares the per-FID monotonic counter with TokenTransfer/TokenLock
+message FeeDepositBody {
+  uint64 sender_fid = 1;
+  // Atoms to move from RewardStore balance → FeeBalanceStore. Must
+  // be ≤ sender's available balance.
+  uint64 amount = 2;
+  uint64 nonce = 3;
+  bytes signer_pubkey = 4;
+  bytes signature = 5;
 }
 
 // FIP §5 DA-PoW threat-model #300 (DA-6 grinding elimination):

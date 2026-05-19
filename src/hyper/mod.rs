@@ -44,10 +44,6 @@
 //! - `dkls_supervisor` — epoch-boundary supervisor that fires
 //!   `StartDkls` on the actor with a fresh driver.
 //!
-//! ## Bridge
-//! - `claim_verifier` — pure Rust reference implementation of the L1
-//!   `HypersnapBridge::claim` verification path. Solidity port pending.
-//!
 //! ## Storage indexes
 //! - `note_store` — RocksDB-backed `NoteStore` impl for transfer validation.
 //!
@@ -121,7 +117,6 @@ pub mod bridge_burn_store;
 pub mod bridge_burn_watcher;
 pub mod builder;
 pub mod chain;
-pub mod claim_verifier;
 pub mod config;
 pub mod custody_escrow;
 pub mod da_pow;
@@ -136,6 +131,9 @@ pub mod dkls_supervisor;
 pub mod dkls_wire_codec;
 pub mod epoch;
 pub mod epoch_resolver;
+pub mod fee_charger;
+pub mod fee_deposit;
+pub mod fingerprint_store;
 pub mod genesis;
 pub mod gossip_adapter;
 pub mod http_handler;

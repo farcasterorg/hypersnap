@@ -26,6 +26,13 @@ pub enum SlashingStoreError {
     Decode(#[from] prost::DecodeError),
 }
 
+/// Max distinct conflict pairs persisted per `(epoch, canonical_block_id)`.
+/// One pair is sufficient to slash; the cap bounds storage growth
+/// in the degenerate case of a byzantine committee producing many
+/// distinct valid conflicts at the same height. The (k+1)th submission
+/// at the same (epoch, height) is silently dropped after sig-verify.
+pub const MAX_DISTINCT_CONFLICTS_PER_HEIGHT: usize = 8;
+
 /// Append-only store of confirmed conflicting-blocks evidence.
 pub struct SlashingEvidenceStore {
     db: Arc<RocksDB>,
@@ -37,17 +44,57 @@ impl SlashingEvidenceStore {
     }
 
     /// Persist evidence. Re-recording the same conflict is idempotent.
+    /// Once `MAX_DISTINCT_CONFLICTS_PER_HEIGHT` distinct rows exist at
+    /// the same `(epoch, canonical_block_id)`, additional distinct
+    /// rows are silently dropped.
     pub fn record(&self, ev: &ConflictingBlocksEvidence) -> Result<(), SlashingStoreError> {
+        let key = Self::make_key(ev);
+        let exists = self.db.get(&key).map_err(HubError::from)?.is_some();
+        if !exists
+            && self.count_for_height(ev.epoch, ev.canonical_block_id)?
+                >= MAX_DISTINCT_CONFLICTS_PER_HEIGHT
+        {
+            return Ok(());
+        }
         let wire = proto::HyperWireEvidence {
             block_a: Some(encode_block(&ev.block_a)),
             block_b: Some(encode_block(&ev.block_b)),
         };
         let mut buf = Vec::with_capacity(wire.encoded_len());
         wire.encode(&mut buf).map_err(SlashingStoreError::Encode)?;
-        self.db
-            .put(&Self::make_key(ev), &buf)
-            .map_err(HubError::from)?;
+        self.db.put(&key, &buf).map_err(HubError::from)?;
         Ok(())
+    }
+
+    /// Count of distinct evidence rows already persisted at
+    /// `(epoch, canonical_block_id)`. Used by `record` to enforce
+    /// `MAX_DISTINCT_CONFLICTS_PER_HEIGHT`.
+    fn count_for_height(
+        &self,
+        epoch: u64,
+        canonical_block_id: u64,
+    ) -> Result<usize, SlashingStoreError> {
+        let mut start = vec![RootPrefix::HyperSlashingEvidence as u8];
+        start.extend_from_slice(&epoch.to_be_bytes());
+        start.extend_from_slice(&canonical_block_id.to_be_bytes());
+        let mut stop = start.clone();
+        // Bump the last byte to scan only this (epoch, height) prefix.
+        // The full key adds 64 bytes (two hashes) after, so any byte
+        // change past `start.len()` produces a strict upper bound.
+        stop.push(0xff);
+        let mut count = 0usize;
+        self.db
+            .for_each_iterator_by_prefix(
+                Some(start),
+                Some(stop),
+                &PageOptions::default(),
+                |_key, _value| {
+                    count += 1;
+                    Ok(false)
+                },
+            )
+            .map_err(HubError::from)?;
+        Ok(count)
     }
 
     /// Fetch every piece of evidence for `epoch`. Returns them in
@@ -253,5 +300,21 @@ mod tests {
     fn empty_epoch_returns_empty() {
         let (store, _dir) = make_store();
         assert!(store.get_for_epoch(99).unwrap().is_empty());
+    }
+
+    /// Distinct conflicts at the same (epoch, height) are capped at
+    /// `MAX_DISTINCT_CONFLICTS_PER_HEIGHT`. Beyond the cap, new rows
+    /// are silently dropped; previously-recorded rows stay.
+    #[test]
+    fn distinct_conflicts_per_height_are_capped() {
+        let (store, _dir) = make_store();
+        for i in 0..(MAX_DISTINCT_CONFLICTS_PER_HEIGHT as u8 + 4) {
+            // Each iteration produces distinct hashes via root_b.
+            store.record(&evidence(5, 10, 0xaa, 0xc0 + i)).unwrap();
+        }
+        assert_eq!(
+            store.get_for_epoch(5).unwrap().len(),
+            MAX_DISTINCT_CONFLICTS_PER_HEIGHT
+        );
     }
 }

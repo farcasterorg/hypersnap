@@ -66,9 +66,11 @@ use std::collections::{BTreeMap, BTreeSet};
 pub mod app_pow;
 pub mod da_pow;
 pub mod eligibility;
+pub mod fees;
 pub mod metrics;
 pub mod reader;
 pub mod scoring;
+pub mod uniqueness;
 
 pub use reader::{InMemoryReader, SnapchainStateReader};
 

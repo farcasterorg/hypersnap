@@ -325,6 +325,34 @@ pub enum RootPrefix {
     /// Key: `[85][epoch BE u64]`, value: 65-byte ECDSA signature.
     HyperDaEpochSeed = 85,
 
+    /// FIP-proof-of-quality §5 / FIP-proof-of-work-tokenization §12 per-FID
+    /// fee balance. Funded via `FeeDepositBody`; debited at merge time for
+    /// CastAdd / LinkAdd / ReactionAdd / UserDataAdd / VerificationAdd at
+    /// the trust×uniqueness-discounted rate.
+    /// Key: `[86][fid BE u64]`, value: BE u64 atoms.
+    HyperFeeBalance = 86,
+
+    /// FIP-proof-of-quality §3 / r9k content fingerprint window. Rolling
+    /// 30-day SimHash store used by the live uniqueness scorer.
+    /// Key: `[87][simhash_high u64 BE][ts BE u64][fid BE u64]`
+    /// value: 16-byte little-endian full SimHash u128.
+    /// `simhash_high = full_simhash >> 64`; prefix-scan over this bucket
+    /// yields all stored fingerprints whose high half matches, and we
+    /// hamming-compare to find near-dups.
+    HyperContentFingerprint = 87,
+
+    /// FIP-proof-of-work-tokenization §12 cumulative burned atoms (the
+    /// 60% portion of every collected message fee). Single global counter.
+    /// Key: `[88]`, value: BE u128 (16 bytes).
+    HyperTotalFeeBurned = 88,
+
+    /// FIP-proof-of-work-tokenization §12 pending proposer fee pot (the
+    /// 40% portion of every collected message fee). Drained to the
+    /// proposer FID at hyperblock finalization via
+    /// `RewardStore::drain_proposer_fee_pot`.
+    /// Key: `[89]`, value: BE u64 atoms (8 bytes).
+    HyperProposerFeePot = 89,
+
     // Hyper-mode prefixes: shadow key space that retains messages pruned
     // from the snapchain-compatible stores. These MUST NOT collide with
     // any snapchain prefix so the legacy key space stays 1:1 compatible.

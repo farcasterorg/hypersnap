@@ -135,6 +135,10 @@ impl HyperHttpHandler {
             (&Method::GET, ["epoch", n, "evidence"]) => self.evidence(n).await,
             (&Method::GET, ["epoch", n, "slashed"]) => self.slashed(n).await,
             (&Method::GET, ["nullifier", hex]) => self.nullifier_spent(hex).await,
+            (&Method::GET, ["nullifier", hex, "proof"]) => self.nullifier_proof(hex).await,
+            (&Method::GET, ["note-commitment", hex, "proof"]) => {
+                self.note_commitment_proof(hex).await
+            }
             (&Method::POST, ["messages"]) => self.submit_message(body).await,
             (&Method::POST, ["validator", "register"]) => {
                 self.submit_validator_event(body, proto::HyperValidatorEventType::Register)
@@ -906,6 +910,58 @@ impl HyperHttpHandler {
             .map_err(client_err)?;
         Ok(json_response(StatusCode::OK, &NullifierResponse { spent }))
     }
+
+    async fn nullifier_proof(
+        &self,
+        hash_hex: &str,
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, HandlerError> {
+        let nullifier = parse_hash32(hash_hex)?;
+        match self
+            .client
+            .nullifier_inclusion_proof(nullifier)
+            .await
+            .map_err(client_err)?
+        {
+            Ok(Some(bytes)) => Ok(json_response(
+                StatusCode::OK,
+                &InclusionProofResponse {
+                    proof_hex: hex(&bytes),
+                },
+            )),
+            Ok(None) => Err(HandlerError::NotFound),
+            Err(e) => Err(HandlerError::Internal(e)),
+        }
+    }
+
+    async fn note_commitment_proof(
+        &self,
+        hash_hex: &str,
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, HandlerError> {
+        let bytes = parse_hex(hash_hex)?;
+        if bytes.len() != 56 {
+            return Err(HandlerError::BadRequest(format!(
+                "expected 56-byte hex, got {} bytes",
+                bytes.len()
+            )));
+        }
+        let mut commitment = [0u8; 56];
+        commitment.copy_from_slice(&bytes);
+        match self
+            .client
+            .note_commitment_inclusion_proof(commitment)
+            .await
+            .map_err(client_err)?
+        {
+            Ok(Some(bytes)) => Ok(json_response(
+                StatusCode::OK,
+                &InclusionProofResponse {
+                    proof_hex: hex(&bytes),
+                },
+            )),
+            Ok(None) => Err(HandlerError::NotFound),
+            Err(e) => Err(HandlerError::Internal(e)),
+        }
+    }
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -1056,6 +1112,13 @@ struct SlashedResponse {
 #[derive(Serialize)]
 struct NullifierResponse {
     spent: bool,
+}
+
+/// 404 when the key isn't in the verkle tree (`proof: None`); else
+/// `proof_hex` is the bincode-encoded `VerkleProof`.
+#[derive(Serialize)]
+struct InclusionProofResponse {
+    proof_hex: String,
 }
 
 #[derive(Serialize)]
@@ -1342,7 +1405,6 @@ mod tests {
             srs,
             mempool_capacity: 100,
             score_weights: ScoreWeights::default(),
-            starting_epoch: 0,
             bootstrap_validators: bootstrap,
             max_reward_per_epoch: None,
             max_reward_per_epoch_per_market: std::collections::HashMap::new(),

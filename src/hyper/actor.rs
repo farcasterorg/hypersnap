@@ -14,7 +14,9 @@ use crate::hyper::builder::BuilderError;
 use crate::hyper::importer::ImportError;
 use crate::hyper::router::RoutingError;
 use crate::hyper::runtime::{HyperRuntime, RuntimeProduceError};
-use crate::hyper::slashing::{detect_conflicting_blocks, ConflictingBlocksEvidence, EvidenceError};
+use crate::hyper::slashing::{
+    detect_conflicting_blocks, verify_evidence_signatures, ConflictingBlocksEvidence, EvidenceError,
+};
 use crate::hyper::HyperBlock;
 use crate::proto;
 use crate::utils::statsd_wrapper::StatsdClientWrapper;
@@ -185,6 +187,18 @@ pub enum HyperActorQuery {
     IsNullifierSpent {
         nullifier: [u8; 32],
         reply: oneshot::Sender<bool>,
+    },
+    /// Verkle inclusion proof for a spent nullifier. Result encoded
+    /// as the hex of `bincode::serialize(&VerkleProof)` so the wire
+    /// shape stays stable across crate-level type changes.
+    NullifierInclusionProof {
+        nullifier: [u8; 32],
+        reply: oneshot::Sender<Result<Option<Vec<u8>>, String>>,
+    },
+    /// Verkle inclusion proof for a note commitment.
+    NoteCommitmentInclusionProof {
+        commitment: [u8; 56],
+        reply: oneshot::Sender<Result<Option<Vec<u8>>, String>>,
     },
     /// Pending mempool size across types.
     PendingCount {
@@ -387,6 +401,14 @@ impl std::fmt::Debug for HyperActorQuery {
             Self::IsNullifierSpent { nullifier, .. } => f
                 .debug_struct("IsNullifierSpent")
                 .field("nullifier_prefix", &hex_prefix(nullifier))
+                .finish(),
+            Self::NullifierInclusionProof { nullifier, .. } => f
+                .debug_struct("NullifierInclusionProof")
+                .field("nullifier_prefix", &hex_prefix(nullifier))
+                .finish(),
+            Self::NoteCommitmentInclusionProof { commitment, .. } => f
+                .debug_struct("NoteCommitmentInclusionProof")
+                .field("commitment_prefix", &hex_prefix(commitment))
                 .finish(),
             Self::PendingCount { .. } => f.write_str("PendingCount"),
             Self::LastImportedAtUnixMs { .. } => f.write_str("LastImportedAtUnixMs"),
@@ -632,6 +654,14 @@ impl HyperActorClient {
         Self { inbound }
     }
 
+    /// Raw access to the underlying inbound channel. The scheduler +
+    /// DKG supervisor need this to fanout `ProduceBlockDkls` /
+    /// `StartDkls` / `AdvanceDkls` events directly rather than going
+    /// through the request-response `ask` API.
+    pub fn inbound_sender(&self) -> &mpsc::Sender<HyperActorEvent> {
+        &self.inbound
+    }
+
     async fn ask<T: Send + 'static>(
         &self,
         build: impl FnOnce(oneshot::Sender<T>) -> HyperActorQuery,
@@ -680,6 +710,24 @@ impl HyperActorClient {
         nullifier: [u8; 32],
     ) -> Result<bool, HyperActorClientError> {
         self.ask(move |reply| HyperActorQuery::IsNullifierSpent { nullifier, reply })
+            .await
+    }
+
+    /// Bincode-serialized verkle inclusion proof; `Ok(None)` if the
+    /// nullifier hasn't been recorded.
+    pub async fn nullifier_inclusion_proof(
+        &self,
+        nullifier: [u8; 32],
+    ) -> Result<Result<Option<Vec<u8>>, String>, HyperActorClientError> {
+        self.ask(move |reply| HyperActorQuery::NullifierInclusionProof { nullifier, reply })
+            .await
+    }
+
+    pub async fn note_commitment_inclusion_proof(
+        &self,
+        commitment: [u8; 56],
+    ) -> Result<Result<Option<Vec<u8>>, String>, HyperActorClientError> {
+        self.ask(move |reply| HyperActorQuery::NoteCommitmentInclusionProof { commitment, reply })
             .await
     }
 
@@ -917,7 +965,13 @@ pub struct HyperActor {
     da_response_producer: Option<Arc<dyn crate::hyper::da_pow_driver::DaResponseProducer>>,
     last_da_responded_epoch: Option<u64>,
     last_da_seed_signed_for_epoch: Option<u64>,
+    /// Bounded LRU of evidence frames already accepted this process
+    /// lifetime, keyed on `(epoch, sorted block hashes)`. Short-
+    /// circuits sig-verify on gossip replays.
+    recent_evidence: std::collections::VecDeque<(u64, [u8; 32], [u8; 32])>,
 }
+
+const RECENT_EVIDENCE_CAP: usize = 256;
 
 struct ActiveDkls {
     driver: crate::hyper::dkls_driver::DklsDriver,
@@ -1004,6 +1058,7 @@ impl HyperActor {
             da_response_producer,
             last_da_responded_epoch: None,
             last_da_seed_signed_for_epoch: None,
+            recent_evidence: std::collections::VecDeque::with_capacity(RECENT_EVIDENCE_CAP),
         };
         tokio::spawn(actor.run());
         HyperActorHandles {
@@ -1037,6 +1092,7 @@ impl HyperActor {
             da_response_producer: None,
             last_da_responded_epoch: None,
             last_da_seed_signed_for_epoch: None,
+            recent_evidence: std::collections::VecDeque::with_capacity(RECENT_EVIDENCE_CAP),
         };
         for ev in events {
             in_tx.send(ev).await.unwrap();
@@ -1287,11 +1343,37 @@ impl HyperActor {
             }
             HyperActorEvent::InboundEvidence { block_a, block_b } => {
                 let evidence = detect_conflicting_blocks(&block_a, &block_b)?;
-                // Persist before surfacing — readers downstream see the
-                // store as authoritative.
+                let (lo, hi) = if evidence.block_a_hash <= evidence.block_b_hash {
+                    (evidence.block_a_hash, evidence.block_b_hash)
+                } else {
+                    (evidence.block_b_hash, evidence.block_a_hash)
+                };
+                let dedupe_key = (evidence.epoch, lo, hi);
+                if self.recent_evidence.contains(&dedupe_key) {
+                    // Gossip replay — store + downstream readers
+                    // already have this pair. Drop before sig-verify.
+                    self.metric_count("hyper.evidence.dropped_replay", 1);
+                    return Ok(());
+                }
+                // Authenticate both blocks under the conflict epoch's
+                // group key before persisting. Without this, any peer
+                // can submit two unsigned blocks naming arbitrary
+                // `signer_indices` and slash arbitrary validators via
+                // the next-epoch active-set filter.
+                let group_address = self
+                    .runtime
+                    .dkls_group_address_for_epoch(evidence.epoch)
+                    .ok_or(EvidenceError::UnknownEpochGroupKey {
+                        epoch: evidence.epoch,
+                    })?;
+                verify_evidence_signatures(&evidence, &group_address)?;
                 if let Err(e) = self.runtime.record_evidence(&evidence) {
                     tracing::warn!("failed to persist slashing evidence: {}", e);
                 }
+                if self.recent_evidence.len() >= RECENT_EVIDENCE_CAP {
+                    self.recent_evidence.pop_front();
+                }
+                self.recent_evidence.push_back(dedupe_key);
                 self.metric_count("hyper.evidence.confirmed", 1);
                 let _ = self
                     .outbound
@@ -1307,7 +1389,7 @@ impl HyperActor {
         }
     }
 
-    fn handle_query(&self, q: HyperActorQuery) {
+    fn handle_query(&mut self, q: HyperActorQuery) {
         match q {
             HyperActorQuery::LastBlockHeight { reply } => {
                 let _ = reply.send(self.runtime.last_block_height());
@@ -1328,6 +1410,22 @@ impl HyperActor {
             }
             HyperActorQuery::IsNullifierSpent { nullifier, reply } => {
                 let _ = reply.send(self.runtime.is_nullifier_spent_in_tree(&nullifier));
+            }
+            HyperActorQuery::NullifierInclusionProof { nullifier, reply } => {
+                let r = match self.runtime.prove_nullifier_inclusion(&nullifier) {
+                    Ok(Some(p)) => Ok(Some(p.to_bytes())),
+                    Ok(None) => Ok(None),
+                    Err(e) => Err(format!("{}", e)),
+                };
+                let _ = reply.send(r);
+            }
+            HyperActorQuery::NoteCommitmentInclusionProof { commitment, reply } => {
+                let r = match self.runtime.prove_note_commitment_inclusion(&commitment) {
+                    Ok(Some(p)) => Ok(Some(p.to_bytes())),
+                    Ok(None) => Ok(None),
+                    Err(e) => Err(format!("{}", e)),
+                };
+                let _ = reply.send(r);
             }
             HyperActorQuery::PendingCount { reply } => {
                 let _ = reply.send(self.runtime.pending_count());
@@ -1639,6 +1737,7 @@ impl HyperActor {
             Some(Body::MiniappRemove(_)) => "miniapp_remove",
             Some(Body::DaChallengeResponse(_)) => "da_challenge_response",
             Some(Body::DaEpochSeed(_)) => "da_epoch_seed",
+            Some(Body::FeeDeposit(_)) => "fee_deposit",
             None => "none",
         };
         self.metric_count_tagged("hyper.message.inbound", 1, "kind", kind);
@@ -2901,7 +3000,6 @@ mod tests {
             srs,
             mempool_capacity: 100,
             score_weights: ScoreWeights::default(),
-            starting_epoch: 0,
             bootstrap_validators: vec![],
             max_reward_per_epoch: None,
             max_reward_per_epoch_per_market: std::collections::HashMap::new(),
@@ -3704,7 +3802,6 @@ mod tests {
             srs,
             mempool_capacity: 100,
             score_weights: ScoreWeights::default(),
-            starting_epoch: 0,
             bootstrap_validators: bootstrap.clone(),
             max_reward_per_epoch: None,
             max_reward_per_epoch_per_market: std::collections::HashMap::new(),
@@ -3758,7 +3855,6 @@ mod tests {
             srs,
             mempool_capacity: 100,
             score_weights: ScoreWeights::default(),
-            starting_epoch: 0,
             bootstrap_validators: bootstrap.clone(),
             max_reward_per_epoch: None,
             max_reward_per_epoch_per_market: std::collections::HashMap::new(),
@@ -3862,37 +3958,54 @@ mod tests {
     #[tokio::test]
     async fn inbound_evidence_emits_evidence_confirmed_for_valid_conflict() {
         use crate::hyper::{HyperBlockMetadata, HyperBlockSignature, HyperEnvelope};
+        use alloy_primitives::keccak256;
 
         let mut rng = OsRng;
         let srs = Arc::new(KzgSrs::random_unsafe(&mut rng, VERKLE_DOMAIN));
-        let (runtime, _dir) = make_runtime_with_srs(srs);
+        let (mut runtime, _dir) = make_runtime_with_srs(srs);
 
-        // Two blocks at the same height, same epoch, distinct state roots.
-        let make = |state_root: u8| HyperBlock {
-            envelope: HyperEnvelope {
-                metadata: HyperBlockMetadata {
-                    canonical_block_id: 7,
-                    parent_hash: vec![0u8; 32],
-                    hyper_state_root: vec![state_root; 48],
-                    extra_rules_version: 0,
-                    retained_message_count: 0,
-                    missed_proposals: vec![],
-                    snapchain_anchor_block: 0,
-                    snapchain_anchor_hash: vec![],
+        // Install a 1-of-1 DKG for the conflict epoch so the actor's
+        // signature gate has a group key to verify against.
+        let dkg =
+            hypersnap_crypto::dkls_threshold::run_honest_dkg(1, 1, [0xee; 32]).expect("1-of-1 dkg");
+        runtime.install_local_dkls_share(3, 1, dkg.parties[0].clone(), dkg.group_address);
 
-                    snapchain_range_start_block: 0,
-
-                    snapchain_range_root: vec![],
-                    snapchain_anchor_timestamp: 0,
+        // Two blocks at same height + epoch, distinct state roots,
+        // each properly signed under the epoch-3 group key.
+        let mut make = |state_root: u8| {
+            let mut block = HyperBlock {
+                envelope: HyperEnvelope {
+                    metadata: HyperBlockMetadata {
+                        canonical_block_id: 7,
+                        parent_hash: vec![0u8; 32],
+                        hyper_state_root: vec![state_root; 48],
+                        extra_rules_version: 0,
+                        retained_message_count: 0,
+                        missed_proposals: vec![],
+                        snapchain_anchor_block: 0,
+                        snapchain_anchor_hash: vec![],
+                        snapchain_range_start_block: 0,
+                        snapchain_range_root: vec![],
+                        snapchain_anchor_timestamp: 0,
+                    },
+                    payload: vec![],
                 },
-                payload: vec![],
-            },
-            signature: HyperBlockSignature {
-                epoch: 3,
-                signer_indices: vec![1, 2, 3],
-                group_address: Vec::new(),
-                ecdsa_signature: Vec::new(),
-            },
+                signature: HyperBlockSignature {
+                    epoch: 3,
+                    signer_indices: vec![1],
+                    group_address: dkg.group_address.as_slice().to_vec(),
+                    ecdsa_signature: Vec::new(),
+                },
+            };
+            let payload = block
+                .envelope
+                .metadata
+                .signing_payload(block.signature.epoch);
+            let digest = keccak256(&payload);
+            let sig = hypersnap_crypto::dkls_sign::run_local_dkls_sign(&dkg.parties[0], digest)
+                .expect("local sign");
+            block.signature.ecdsa_signature = sig.to_bytes().to_vec();
+            block
         };
 
         let outbound = HyperActor::drive_events(
@@ -3913,6 +4026,214 @@ mod tests {
             "expected one EvidenceConfirmed; got {:?}",
             outbound
         );
+    }
+
+    /// Regression: unauthenticated InboundEvidence frames MUST be
+    /// rejected before persistence. Without this gate, any gossip
+    /// peer could publish two unsigned blocks naming arbitrary
+    /// `signer_indices` and slash arbitrary validators at the next
+    /// epoch boundary.
+    #[tokio::test]
+    async fn inbound_evidence_rejects_unsigned_blocks() {
+        use crate::hyper::{HyperBlockMetadata, HyperBlockSignature, HyperEnvelope};
+
+        let mut rng = OsRng;
+        let srs = Arc::new(KzgSrs::random_unsafe(&mut rng, VERKLE_DOMAIN));
+        let (mut runtime, _dir) = make_runtime_with_srs(srs);
+        let dkg =
+            hypersnap_crypto::dkls_threshold::run_honest_dkg(1, 1, [0xee; 32]).expect("1-of-1 dkg");
+        runtime.install_local_dkls_share(3, 1, dkg.parties[0].clone(), dkg.group_address);
+
+        let make = |state_root: u8| HyperBlock {
+            envelope: HyperEnvelope {
+                metadata: HyperBlockMetadata {
+                    canonical_block_id: 7,
+                    parent_hash: vec![0u8; 32],
+                    hyper_state_root: vec![state_root; 48],
+                    extra_rules_version: 0,
+                    retained_message_count: 0,
+                    missed_proposals: vec![],
+                    snapchain_anchor_block: 0,
+                    snapchain_anchor_hash: vec![],
+                    snapchain_range_start_block: 0,
+                    snapchain_range_root: vec![],
+                    snapchain_anchor_timestamp: 0,
+                },
+                payload: vec![],
+            },
+            // Attacker-shaped signature: chosen signer_indices, no
+            // ECDSA material. Pre-fix this was sufficient to slash
+            // every named index.
+            signature: HyperBlockSignature {
+                epoch: 3,
+                signer_indices: vec![1, 2, 3, 4, 5],
+                group_address: Vec::new(),
+                ecdsa_signature: Vec::new(),
+            },
+        };
+
+        let outbound = HyperActor::drive_events(
+            runtime,
+            vec![HyperActorEvent::InboundEvidence {
+                block_a: make(0xaa),
+                block_b: make(0xbb),
+            }],
+        )
+        .await;
+
+        assert!(
+            outbound
+                .iter()
+                .any(|o| matches!(o, HyperActorOutbound::EventError(_))),
+            "expected EventError for unsigned evidence; got {:?}",
+            outbound
+        );
+        assert!(
+            !outbound
+                .iter()
+                .any(|o| matches!(o, HyperActorOutbound::EvidenceConfirmed(_))),
+            "unsigned evidence must NOT be confirmed; got {:?}",
+            outbound
+        );
+    }
+
+    /// InboundEvidence for an epoch whose group key isn't yet known
+    /// is rejected — prevents an attacker from front-running with
+    /// evidence for a future epoch.
+    #[tokio::test]
+    async fn inbound_evidence_rejects_unknown_epoch_group_key() {
+        use crate::hyper::{HyperBlockMetadata, HyperBlockSignature, HyperEnvelope};
+
+        let mut rng = OsRng;
+        let srs = Arc::new(KzgSrs::random_unsafe(&mut rng, VERKLE_DOMAIN));
+        let (runtime, _dir) = make_runtime_with_srs(srs);
+        // NB: no group address installed for epoch 99.
+
+        let make = |state_root: u8| HyperBlock {
+            envelope: HyperEnvelope {
+                metadata: HyperBlockMetadata {
+                    canonical_block_id: 7,
+                    parent_hash: vec![0u8; 32],
+                    hyper_state_root: vec![state_root; 48],
+                    extra_rules_version: 0,
+                    retained_message_count: 0,
+                    missed_proposals: vec![],
+                    snapchain_anchor_block: 0,
+                    snapchain_anchor_hash: vec![],
+                    snapchain_range_start_block: 0,
+                    snapchain_range_root: vec![],
+                    snapchain_anchor_timestamp: 0,
+                },
+                payload: vec![],
+            },
+            signature: HyperBlockSignature {
+                epoch: 99,
+                signer_indices: vec![1],
+                group_address: Vec::new(),
+                ecdsa_signature: vec![0xab; 65],
+            },
+        };
+
+        let outbound = HyperActor::drive_events(
+            runtime,
+            vec![HyperActorEvent::InboundEvidence {
+                block_a: make(0xaa),
+                block_b: make(0xbb),
+            }],
+        )
+        .await;
+
+        assert!(outbound
+            .iter()
+            .any(|o| matches!(o, HyperActorOutbound::EventError(_))));
+        assert!(!outbound
+            .iter()
+            .any(|o| matches!(o, HyperActorOutbound::EvidenceConfirmed(_))));
+    }
+
+    /// Replay of an already-confirmed evidence frame short-circuits
+    /// before sig-verify and emits no second `EvidenceConfirmed`.
+    #[tokio::test]
+    async fn inbound_evidence_dedupes_replays() {
+        use crate::hyper::{HyperBlockMetadata, HyperBlockSignature, HyperEnvelope};
+        use alloy_primitives::keccak256;
+
+        let mut rng = OsRng;
+        let srs = Arc::new(KzgSrs::random_unsafe(&mut rng, VERKLE_DOMAIN));
+        let (mut runtime, _dir) = make_runtime_with_srs(srs);
+        let dkg =
+            hypersnap_crypto::dkls_threshold::run_honest_dkg(1, 1, [0xee; 32]).expect("1-of-1 dkg");
+        runtime.install_local_dkls_share(3, 1, dkg.parties[0].clone(), dkg.group_address);
+
+        let make = |state_root: u8| {
+            let mut block = HyperBlock {
+                envelope: HyperEnvelope {
+                    metadata: HyperBlockMetadata {
+                        canonical_block_id: 7,
+                        parent_hash: vec![0u8; 32],
+                        hyper_state_root: vec![state_root; 48],
+                        extra_rules_version: 0,
+                        retained_message_count: 0,
+                        missed_proposals: vec![],
+                        snapchain_anchor_block: 0,
+                        snapchain_anchor_hash: vec![],
+                        snapchain_range_start_block: 0,
+                        snapchain_range_root: vec![],
+                        snapchain_anchor_timestamp: 0,
+                    },
+                    payload: vec![],
+                },
+                signature: HyperBlockSignature {
+                    epoch: 3,
+                    signer_indices: vec![1],
+                    group_address: dkg.group_address.as_slice().to_vec(),
+                    ecdsa_signature: Vec::new(),
+                },
+            };
+            let payload = block
+                .envelope
+                .metadata
+                .signing_payload(block.signature.epoch);
+            let digest = keccak256(&payload);
+            let sig = hypersnap_crypto::dkls_sign::run_local_dkls_sign(&dkg.parties[0], digest)
+                .expect("local sign");
+            block.signature.ecdsa_signature = sig.to_bytes().to_vec();
+            block
+        };
+
+        let a = make(0xaa);
+        let b = make(0xbb);
+        let outbound = HyperActor::drive_events(
+            runtime,
+            vec![
+                HyperActorEvent::InboundEvidence {
+                    block_a: a.clone(),
+                    block_b: b.clone(),
+                },
+                // Replay — should be deduped.
+                HyperActorEvent::InboundEvidence {
+                    block_a: a,
+                    block_b: b,
+                },
+            ],
+        )
+        .await;
+
+        let confirmed = outbound
+            .iter()
+            .filter(|o| matches!(o, HyperActorOutbound::EvidenceConfirmed(_)))
+            .count();
+        assert_eq!(
+            confirmed, 1,
+            "replay should not produce a second EvidenceConfirmed; got {:?}",
+            outbound
+        );
+        // No EventError either — replay is a quiet drop.
+        let errors = outbound
+            .iter()
+            .filter(|o| matches!(o, HyperActorOutbound::EventError(_)))
+            .count();
+        assert_eq!(errors, 0);
     }
 
     #[tokio::test]
@@ -4068,6 +4389,7 @@ mod tests {
             da_response_producer: None,
             last_da_responded_epoch: None,
             last_da_seed_signed_for_epoch: None,
+            recent_evidence: std::collections::VecDeque::with_capacity(RECENT_EVIDENCE_CAP),
         };
         // First observation: anchor 0 (epoch 0) → just initialize.
         actor.maybe_trigger_scoring(0, 1_700_000_000).await;
@@ -4159,6 +4481,7 @@ mod tests {
             da_response_producer: Some(producer),
             last_da_responded_epoch: None,
             last_da_seed_signed_for_epoch: None,
+            recent_evidence: std::collections::VecDeque::with_capacity(RECENT_EVIDENCE_CAP),
         };
 
         // No seed for epoch 5 yet → skip silently, watermark unchanged.
@@ -4282,6 +4605,7 @@ mod tests {
             da_response_producer: Some(producer),
             last_da_responded_epoch: None,
             last_da_seed_signed_for_epoch: None,
+            recent_evidence: std::collections::VecDeque::with_capacity(RECENT_EVIDENCE_CAP),
         };
 
         // Sign + submit the seed for epoch 5.
@@ -4383,6 +4707,7 @@ mod tests {
             da_response_producer: None,
             last_da_responded_epoch: None,
             last_da_seed_signed_for_epoch: None,
+            recent_evidence: std::collections::VecDeque::with_capacity(RECENT_EVIDENCE_CAP),
         };
 
         // Multi-party trigger — should populate pending_dkls_messages
@@ -4471,6 +4796,7 @@ mod tests {
             da_response_producer: None,
             last_da_responded_epoch: None,
             last_da_seed_signed_for_epoch: None,
+            recent_evidence: std::collections::VecDeque::with_capacity(RECENT_EVIDENCE_CAP),
         };
 
         actor.maybe_sign_da_epoch_seed(EPOCH_LENGTH * 5).await;

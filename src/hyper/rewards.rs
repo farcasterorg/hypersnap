@@ -73,6 +73,13 @@ impl RewardStore {
         k
     }
 
+    fn fee_balance_key(fid: u64) -> Vec<u8> {
+        let mut k = Vec::with_capacity(9);
+        k.push(RootPrefix::HyperFeeBalance as u8);
+        k.extend_from_slice(&fid.to_be_bytes());
+        k
+    }
+
     fn issued_key(epoch: u64, fid: u64, market: i32) -> Vec<u8> {
         let mut k = Vec::with_capacity(21);
         k.push(RootPrefix::HyperRewardIssued as u8);
@@ -410,6 +417,229 @@ impl RewardStore {
         }
         self.db.commit(batch).map_err(HubError::from)?;
         Ok(())
+    }
+
+    /// Read the fee balance for a single FID. Returns 0 for FIDs that
+    /// haven't topped up yet.
+    pub fn fee_balance_of(&self, fid: u64) -> Result<u64, RewardError> {
+        match self
+            .db
+            .get(&Self::fee_balance_key(fid))
+            .map_err(HubError::from)?
+        {
+            Some(bytes) if bytes.len() == 8 => {
+                let mut be = [0u8; 8];
+                be.copy_from_slice(&bytes);
+                Ok(u64::from_be_bytes(be))
+            }
+            _ => Ok(0),
+        }
+    }
+
+    /// FIP-proof-of-quality §5: move `amount` atoms from sender's primary
+    /// token balance into their fee balance. Per-FID monotonic nonce is
+    /// shared with `apply_transfer` / `apply_lock`.
+    pub fn apply_fee_deposit(
+        &self,
+        sender_fid: u64,
+        amount: u64,
+        nonce: u64,
+    ) -> Result<(), RewardError> {
+        let current_nonce = self.nonce_of(sender_fid)?;
+        let expected = current_nonce.saturating_add(1);
+        if nonce != expected {
+            return Err(RewardError::NonceMismatch {
+                fid: sender_fid,
+                expected,
+                got: nonce,
+            });
+        }
+        let sender_bal = self.balance_of(sender_fid)?;
+        if sender_bal < amount {
+            return Err(RewardError::InsufficientBalance {
+                fid: sender_fid,
+                available: sender_bal,
+                needed: amount,
+            });
+        }
+        let new_balance = sender_bal - amount;
+        let new_fee_balance = self
+            .fee_balance_of(sender_fid)?
+            .checked_add(amount)
+            .ok_or(RewardError::BalanceOverflow { fid: sender_fid })?;
+
+        let mut batch = self.db.txn();
+        batch.put(
+            Self::balance_key(sender_fid),
+            new_balance.to_be_bytes().to_vec(),
+        );
+        batch.put(
+            Self::fee_balance_key(sender_fid),
+            new_fee_balance.to_be_bytes().to_vec(),
+        );
+        batch.put(Self::nonce_key(sender_fid), nonce.to_be_bytes().to_vec());
+        self.db.commit(batch).map_err(HubError::from)?;
+        Ok(())
+    }
+
+    /// Debit `amount` atoms from a FID's fee balance. Used by the
+    /// snapchain merge path to charge per-message fees. Returns
+    /// `InsufficientBalance` if the FID has not topped up enough.
+    /// Caller is responsible for accumulating the burn/proposer split.
+    pub fn charge_fee(&self, fid: u64, amount: u64) -> Result<(), RewardError> {
+        if amount == 0 {
+            return Ok(());
+        }
+        let cur = self.fee_balance_of(fid)?;
+        if cur < amount {
+            return Err(RewardError::InsufficientBalance {
+                fid,
+                available: cur,
+                needed: amount,
+            });
+        }
+        let new = cur - amount;
+        self.db
+            .put(&Self::fee_balance_key(fid), &new.to_be_bytes())
+            .map_err(HubError::from)?;
+        Ok(())
+    }
+
+    /// Credit the proposer's primary token balance with the proposer
+    /// share of collected fees. Used by the block-production
+    /// fee-distribution step.
+    pub fn credit_balance(&self, fid: u64, amount: u64) -> Result<(), RewardError> {
+        if amount == 0 {
+            return Ok(());
+        }
+        let new = self
+            .balance_of(fid)?
+            .checked_add(amount)
+            .ok_or(RewardError::BalanceOverflow { fid })?;
+        self.db
+            .put(&Self::balance_key(fid), &new.to_be_bytes())
+            .map_err(HubError::from)?;
+        Ok(())
+    }
+
+    // ----- Per-message fee charging (snapchain merge-path hook) -----
+
+    fn total_burned_key() -> [u8; 1] {
+        [RootPrefix::HyperTotalFeeBurned as u8]
+    }
+
+    fn proposer_pot_key() -> [u8; 1] {
+        [RootPrefix::HyperProposerFeePot as u8]
+    }
+
+    /// Read the cumulative burned atoms (the 60% portion of all charged
+    /// message fees to date).
+    pub fn total_fee_burned(&self) -> Result<u128, RewardError> {
+        match self
+            .db
+            .get(&Self::total_burned_key())
+            .map_err(HubError::from)?
+        {
+            Some(b) if b.len() == 16 => {
+                let mut be = [0u8; 16];
+                be.copy_from_slice(&b);
+                Ok(u128::from_be_bytes(be))
+            }
+            _ => Ok(0),
+        }
+    }
+
+    /// Read the current pending proposer fee pot.
+    pub fn proposer_fee_pot(&self) -> Result<u64, RewardError> {
+        match self
+            .db
+            .get(&Self::proposer_pot_key())
+            .map_err(HubError::from)?
+        {
+            Some(b) if b.len() == 8 => {
+                let mut be = [0u8; 8];
+                be.copy_from_slice(&b);
+                Ok(u64::from_be_bytes(be))
+            }
+            _ => Ok(0),
+        }
+    }
+
+    /// Stage a per-message fee charge on `batch`:
+    ///   * debit `total` atoms from `sender_fid`'s fee balance,
+    ///   * burn 60% (increment `HyperTotalFeeBurned`),
+    ///   * accrue 40% to the proposer fee pot (`HyperProposerFeePot`).
+    ///
+    /// Returns `InsufficientBalance` without staging anything if the
+    /// sender's fee balance is below `total`. Caller is responsible for
+    /// committing `batch`.
+    pub fn stage_charge_message_fee(
+        &self,
+        sender_fid: u64,
+        total: u64,
+        batch: &mut crate::storage::db::RocksDbTransactionBatch,
+    ) -> Result<(), RewardError> {
+        if total == 0 {
+            return Ok(());
+        }
+        let cur = self.fee_balance_of(sender_fid)?;
+        if cur < total {
+            return Err(RewardError::InsufficientBalance {
+                fid: sender_fid,
+                available: cur,
+                needed: total,
+            });
+        }
+        let new_fee_balance = cur - total;
+        let (burn, proposer_share) = proof_of_quality::fees::split_burn_proposer(total);
+
+        let new_burned = self
+            .total_fee_burned()?
+            .checked_add(burn as u128)
+            .ok_or(RewardError::BalanceOverflow { fid: 0 })?;
+        let new_pot = self
+            .proposer_fee_pot()?
+            .checked_add(proposer_share)
+            .ok_or(RewardError::BalanceOverflow { fid: 0 })?;
+
+        batch.put(
+            Self::fee_balance_key(sender_fid).to_vec(),
+            new_fee_balance.to_be_bytes().to_vec(),
+        );
+        batch.put(
+            Self::total_burned_key().to_vec(),
+            new_burned.to_be_bytes().to_vec(),
+        );
+        batch.put(
+            Self::proposer_pot_key().to_vec(),
+            new_pot.to_be_bytes().to_vec(),
+        );
+        Ok(())
+    }
+
+    /// Drain the accumulated proposer fee pot to `proposer_fid`'s
+    /// primary balance and zero the pot. Returns the amount paid out.
+    /// Wired into the hyperblock-finalization path by the producer.
+    pub fn drain_proposer_fee_pot(&self, proposer_fid: u64) -> Result<u64, RewardError> {
+        let pot = self.proposer_fee_pot()?;
+        if pot == 0 {
+            return Ok(0);
+        }
+        let new_balance = self
+            .balance_of(proposer_fid)?
+            .checked_add(pot)
+            .ok_or(RewardError::BalanceOverflow { fid: proposer_fid })?;
+        let mut batch = self.db.txn();
+        batch.put(
+            Self::balance_key(proposer_fid),
+            new_balance.to_be_bytes().to_vec(),
+        );
+        batch.put(
+            Self::proposer_pot_key().to_vec(),
+            0u64.to_be_bytes().to_vec(),
+        );
+        self.db.commit(batch).map_err(HubError::from)?;
+        Ok(pot)
     }
 }
 

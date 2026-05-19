@@ -12,10 +12,11 @@
 //! `HyperBlockMetadata::signing_payload(epoch)`.
 
 use crate::hyper::lock_event::{insert_lock_into_tree, LockError};
-use crate::hyper::transfer_codec::{tx_from_proto, TransferCodecError};
+use crate::hyper::transfer_codec::{extract_output_pubkeys, tx_from_proto, TransferCodecError};
 use crate::hyper::{HyperBlockMetadata, HyperEnvelope};
 use crate::proto;
 use hypersnap_crypto::kzg::KzgError;
+use hypersnap_crypto::tokens::{NoteStoreMut, Nullifier as TokenNullifier, PedersenCommitment};
 use hypersnap_crypto::verkle::VerkleTree;
 
 // Domain-separated key prefixes within the verkle tree so different message
@@ -116,17 +117,10 @@ impl<'a> HyperBlockBuilder<'a> {
                 Ok(())
             }
             PendingMessage::Transfer(tx_proto) => {
-                // Decode and apply transfer state changes to the verkle tree.
-                // For each input: insert its nullifier with value `[1]` so
-                // double-spend can be proven via verkle inclusion.
-                // For each output: insert its commitment so future spenders
-                // can prove ownership of the note.
                 let tx = tx_from_proto(tx_proto)?;
                 for input in &tx.inputs {
-                    self.tree.insert(
-                        &nullifier_verkle_key(&input.nullifier.0),
-                        vec![1u8], // presence marker
-                    );
+                    self.tree
+                        .insert(&nullifier_verkle_key(&input.nullifier.0), vec![1u8]);
                 }
                 for output in &tx.outputs {
                     let commitment_bytes = output.commitment.to_bytes();
@@ -138,6 +132,46 @@ impl<'a> HyperBlockBuilder<'a> {
                 Ok(())
             }
         }
+    }
+
+    /// Apply one message, additionally writing to a `NoteStoreMut`
+    /// so future `validate_against_store` lookups resolve owner
+    /// pubkeys for the new outputs and detect double-spend on the
+    /// new nullifiers. Production callers (block import + restart
+    /// replay) use this variant so the note store stays in sync
+    /// with the verkle tree.
+    pub fn apply_message_with_notes<S: NoteStoreMut>(
+        &mut self,
+        msg: &PendingMessage,
+        note_store: &mut S,
+    ) -> Result<(), BuilderError> {
+        self.apply_message(msg)?;
+        if let PendingMessage::Transfer(tx_proto) = msg {
+            // Output one-time pubkeys are wire-level. If extraction
+            // fails the transfer should never have been admitted —
+            // bubble up as a codec error.
+            let output_pubkeys = extract_output_pubkeys(tx_proto)?;
+            for (i, out) in tx_proto.outputs.iter().enumerate() {
+                let commitment = PedersenCommitment::from_bytes(&out.commitment).ok_or(
+                    BuilderError::TransferCodec(TransferCodecError::BadCommitment),
+                )?;
+                let pk = output_pubkeys
+                    .get(i)
+                    .copied()
+                    .ok_or(BuilderError::TransferCodec(
+                        TransferCodecError::BadOneTimePubkeyLength(i, 0),
+                    ))?;
+                note_store.record_note(commitment, pk);
+            }
+            for input in &tx_proto.inputs {
+                let mut nf = [0u8; 32];
+                if input.nullifier.len() == 32 {
+                    nf.copy_from_slice(&input.nullifier);
+                    note_store.mark_spent(TokenNullifier(nf));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Apply a batch of messages, then build the envelope. Returns the new

@@ -83,15 +83,11 @@ pub trait SnapchainStateReader {
     }
 
     /// FIP §8.3 F0 input: count of distinct other FIDs that name
-    /// `fid` as their `requestFid` in signer metadata. The
-    /// production reader needs a reverse index over signer events
-    /// to answer this efficiently — until that lands, the default
-    /// stub returns 0, which causes F0 to always pass (i.e. no
-    /// FID is treated as an app yet). Wire a real implementation
-    /// when the signer-by-requester index ships.
-    fn signer_authorizations(&self, _fid: u64) -> Result<u32, ScoringError> {
-        Ok(0)
-    }
+    /// `fid` as their `requestFid` in signer metadata. Required
+    /// — no default; F0 (app detection) breaks silently if a
+    /// reader returns 0 when there's a real reverse index it
+    /// should consult.
+    fn signer_authorizations(&self, fid: u64) -> Result<u32, ScoringError>;
 
     /// FIP threat-model #295: clustered `signer_authorizations`
     /// across FIDs sharing `fid`'s custody address. Catches the

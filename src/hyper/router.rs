@@ -36,6 +36,10 @@ pub enum RoutingError {
     TrustSnapshotUpdate(String),
     #[error("token transfer rejected: {0}")]
     TokenTransfer(String),
+    #[error("fee deposit rejected: {0}")]
+    FeeDeposit(String),
+    #[error("confidential transfer rejected: {0}")]
+    Transfer(String),
     #[error("token lock rejected: {0}")]
     TokenLock(String),
     #[error("lock merkle root update rejected: {0}")]
@@ -126,9 +130,19 @@ impl HyperRouter {
                 self.mempool.submit_lock(event)?;
                 Ok(())
             }
-            proto::hyper_message::Body::Transfer(tx) => {
-                self.mempool.submit_transfer(tx)?;
-                Ok(())
+            proto::hyper_message::Body::Transfer(_) => {
+                // Confidential transfers must be admitted through
+                // `HyperRuntime::submit_message` so the strong
+                // validators (`validate_against_store` +
+                // `verify_balance_with_blinding_diff`) can run
+                // against the runtime's note store and the
+                // wire-supplied blinding-difference scalar. The
+                // router alone can only run the structural stub —
+                // refuse here so a misuse can't bypass the gate.
+                Err(RoutingError::Transfer(
+                    "must route through HyperRuntime::submit_message for strong validation"
+                        .to_string(),
+                ))
             }
             proto::hyper_message::Body::ValidatorEvent(event) => {
                 let registry = self
@@ -280,6 +294,11 @@ impl HyperRouter {
             proto::hyper_message::Body::DaEpochSeed(_) => Err(
                 RoutingError::UnsupportedMessageType(proto::HyperMessageType::DaEpochSeed as i32),
             ),
+            proto::hyper_message::Body::FeeDeposit(_) => Err(
+                // FIP-proof-of-quality §5 fee deposit — runtime intercepts
+                // (needs RewardStore + signer-set check).
+                RoutingError::UnsupportedMessageType(proto::HyperMessageType::FeeDeposit as i32),
+            ),
         }
     }
 
@@ -407,12 +426,19 @@ mod tests {
     }
 
     #[test]
-    fn inbound_transfer_routes_to_mempool() {
+    fn inbound_transfer_at_router_layer_is_sealed() {
+        // Confidential transfers must route through
+        // `HyperRuntime::submit_message` so the strong validators
+        // (`validate_against_store` + `verify_balance_with_blinding_diff`)
+        // can run. The router-only path is sealed.
         let mempool = HyperMempool::new();
         let mut router = HyperRouter::new(mempool, None, 0);
         let env = HyperRouter::outbound_transfer(sample_transfer(2));
-        router.route_inbound(env).unwrap();
-        assert_eq!(router.mempool.transfer_count(), 1);
+        let err = router
+            .route_inbound(env)
+            .expect_err("router path is sealed");
+        assert!(matches!(err, RoutingError::Transfer(_)));
+        assert_eq!(router.mempool.transfer_count(), 0);
     }
 
     #[test]
@@ -447,7 +473,7 @@ mod tests {
     }
 
     #[test]
-    fn full_wire_round_trip_transfer() {
+    fn full_wire_round_trip_transfer_sealed_at_router() {
         let tx = sample_transfer(11);
         let outbound = HyperRouter::outbound_transfer(tx.clone());
         let bytes = outbound.encode_to_vec();
@@ -455,11 +481,11 @@ mod tests {
 
         let mempool = HyperMempool::new();
         let mut router = HyperRouter::new(mempool, None, 0);
-        router.route_inbound(inbound).unwrap();
-        assert_eq!(router.mempool.transfer_count(), 1);
-        let recovered = router.mempool.transfers().next().unwrap();
-        assert_eq!(recovered.fee_atoms, tx.fee_atoms);
-        assert_eq!(recovered.inputs.len(), tx.inputs.len());
+        let err = router
+            .route_inbound(inbound)
+            .expect_err("router path is sealed");
+        assert!(matches!(err, RoutingError::Transfer(_)));
+        assert_eq!(router.mempool.transfer_count(), 0);
     }
 
     #[test]

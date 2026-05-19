@@ -121,7 +121,6 @@ pub struct HyperRuntimeConfig {
     pub srs: Arc<KzgSrs>,
     pub mempool_capacity: usize,
     pub score_weights: ScoreWeights,
-    pub starting_epoch: u64,
     /// Genesis validator set: `(validator_key, bls_pubkey, transport_pubkey)`
     /// per validator. Empty for tests / single-validator devnets that
     /// install the active set directly through `install_local_dkg_share`.
@@ -302,6 +301,11 @@ pub struct HyperRuntime {
     /// skips the trie-existence check (still enforcing signature
     /// + signer-set + validator-binding + prefix + deadline).
     pub da_trie_lookup: Option<std::sync::Arc<dyn crate::hyper::da_pow::DaTrieLookup>>,
+    /// Local operator FID. When set, `produce_envelope_with_full_anchor`
+    /// drains the per-block proposer fee pot (40% of charged fees) into
+    /// this FID's primary balance after a successful block build. Read
+    /// nodes and tests leave this as `None`.
+    pub operator_fid: Option<u64>,
 }
 
 /// Per-epoch DKLS23 keying material for a validator participating in
@@ -324,8 +328,6 @@ impl HyperRuntime {
     pub fn new(config: HyperRuntimeConfig) -> Self {
         let manager = EpochManager::new();
         let epoch_resolver = EpochResolver::new(manager);
-        let _ = config.starting_epoch;
-        // (no-op placeholder so config.starting_epoch is consumed)
 
         let block_index = HyperBlockIndex::new(config.db.clone());
         // Restart recovery: if the block index has a head, resume the
@@ -417,7 +419,15 @@ impl HyperRuntime {
             dkls_group_addresses,
             dkls_address_store,
             da_trie_lookup: None,
+            operator_fid: None,
         }
+    }
+
+    /// Set the local operator FID so successful block production drains
+    /// the proposer fee pot to the operator. Producers should call this
+    /// during startup after reading the config.
+    pub fn set_operator_fid(&mut self, fid: u64) {
+        self.operator_fid = if fid == 0 { None } else { Some(fid) };
     }
 
     /// Install a `DaTrieLookup` implementation. Production callers
@@ -663,18 +673,50 @@ impl HyperRuntime {
         )
     }
 
-    /// FIP §13.5 transparent token lock.
+    /// FIP-proof-of-quality §5: move atoms from sender's primary balance
+    /// into their fee-balance ledger. Gates mirror `apply_token_transfer`:
+    /// structural + Ed25519 sig (`validate_fee_deposit`), signer-set auth
+    /// (`get_active_key`), then `reward_store::apply_fee_deposit`
+    /// (nonce + balance + atomic credit).
+    pub fn apply_fee_deposit(&mut self, body: &proto::FeeDepositBody) -> Result<(), RewardError> {
+        use crate::storage::store::account::{
+            get_active_key, OnchainEventStore, StoreEventHandler,
+        };
+        crate::hyper::fee_deposit::validate_fee_deposit(body)
+            .map_err(|e| RewardError::Custom(format!("fee deposit validation: {}", e)))?;
+
+        let handler = StoreEventHandler::new_no_persist();
+        let onchain = OnchainEventStore::new(self.db.clone(), handler);
+        let txn = crate::storage::db::RocksDbTransactionBatch::new();
+        let active = get_active_key(
+            &onchain,
+            &self.db,
+            &txn,
+            body.sender_fid,
+            &body.signer_pubkey,
+        )
+        .map_err(|e| RewardError::Custom(format!("active-key lookup: {}", e)))?;
+        if active.is_none() {
+            return Err(RewardError::SignerNotAuthorized {
+                fid: body.sender_fid,
+            });
+        }
+
+        self.reward_store
+            .apply_fee_deposit(body.sender_fid, body.amount, body.nonce)
+    }
+
+    /// Apply a transparent token lock. Gates: structural + Ed25519
+    /// sig (`validate_token_lock`), signer-set auth
+    /// (`get_active_key`), then `reward_store::apply_lock` (nonce,
+    /// balance, lock_id uniqueness, leaf-bytes persistence).
     ///
-    /// Same three-stage gate as `apply_token_transfer`: structural
-    /// + Ed25519 sig (`validate_token_lock`), signer-set
-    /// authorization (`get_active_key`), then state via
-    /// `reward_store::apply_lock` (nonce, balance, lock_id
-    /// uniqueness, leaf-bytes persistence).
-    ///
-    /// Phase 2a writes only to the RocksDB lock store. Phase 2b
-    /// will additionally insert the leaf into the verkle tree at
-    /// path `lock_id` so external chains can verify locks via
-    /// verkle proof against an anchored state root.
+    /// Bridge claimability flows from the `reward_store`-resident
+    /// `TokenLockState` set into `build_lock_merkle_tree` (keccak
+    /// merkle, OZ-compatible) → threshold-signed root → posted to
+    /// `HypersnapBridge.claim`. No verkle insert is needed for the
+    /// bridge; the verkle state commitment is consulted only for
+    /// internal queries.
     pub fn apply_token_lock(&mut self, body: &proto::TokenLockBody) -> Result<(), RewardError> {
         use crate::storage::store::account::{
             get_active_key, OnchainEventStore, StoreEventHandler,
@@ -3396,6 +3438,48 @@ impl HyperRuntime {
                 .map_err(|e| RoutingError::TokenTransfer(e.to_string()))?;
             return Ok(());
         }
+        // FIP-proof-of-quality §5 fee deposit. Moves atoms from primary
+        // balance to per-FID fee balance; consumed at merge time by the
+        // trust×uniqueness-discounted message-fee schedule.
+        if let Some(proto::hyper_message::Body::FeeDeposit(ref deposit)) = msg.body {
+            self.apply_fee_deposit(deposit)
+                .map_err(|e| RoutingError::FeeDeposit(e.to_string()))?;
+            return Ok(());
+        }
+        // Confidential `Transfer`: strong validation against the
+        // runtime's note store (per-input owner-pubkey lookup +
+        // Schnorr verify + nullifier-not-spent) plus Pedersen
+        // balance closure via the prover-supplied
+        // `blinding_diff_scalar`. Admit to mempool only when both
+        // checks pass. The router-level dispatch below would only
+        // run the structural `TransferTx::validate()` stub, which
+        // is insufficient — without these gates an attacker can
+        // write arbitrary nullifiers + commitments into the verkle
+        // tree on apply.
+        if let Some(proto::hyper_message::Body::Transfer(ref tx_proto)) = msg.body {
+            use crate::hyper::transfer_codec::{extract_blinding_diff, tx_from_proto};
+            let typed = tx_from_proto(tx_proto)
+                .map_err(|e| RoutingError::Transfer(format!("codec: {}", e)))?;
+            let blinding_diff = extract_blinding_diff(tx_proto)
+                .map_err(|e| RoutingError::Transfer(format!("codec: {}", e)))?;
+            typed
+                .validate_against_store(&self.note_store)
+                .map_err(|e| RoutingError::Transfer(format!("{:?}", e)))?;
+            if !typed.verify_balance_with_blinding_diff(&blinding_diff) {
+                return Err(RoutingError::Transfer(
+                    "Pedersen balance closure failed".to_string(),
+                ));
+            }
+            // Output one-time pubkeys must be present + canonical so
+            // `apply_message_with_notes` can populate the note
+            // store deterministically when the block lands.
+            crate::hyper::transfer_codec::extract_output_pubkeys(tx_proto)
+                .map_err(|e| RoutingError::Transfer(format!("codec: {}", e)))?;
+            self.mempool
+                .submit_transfer(tx_proto.clone())
+                .map_err(|e| RoutingError::Transfer(format!("{}", e)))?;
+            return Ok(());
+        }
         // TokenLock: same intercept pattern as TokenTransfer.
         if let Some(proto::hyper_message::Body::TokenLock(ref lock)) = msg.body {
             self.apply_token_lock(lock)
@@ -3599,6 +3683,27 @@ impl HyperRuntime {
     pub fn is_nullifier_spent_in_tree(&self, nullifier: &[u8; 32]) -> bool {
         let key = crate::hyper::builder::nullifier_verkle_key_public(nullifier);
         self.tree.get(&key).is_some()
+    }
+
+    /// Verkle inclusion proof for a spent nullifier. Returns `None`
+    /// when the nullifier hasn't been recorded in the tree. Serves
+    /// light-client / indexer verification flows that don't run a
+    /// full hyper node.
+    pub fn prove_nullifier_inclusion(
+        &mut self,
+        nullifier: &[u8],
+    ) -> Result<Option<hypersnap_crypto::verkle::VerkleProof>, crate::hyper::proofs::ProofError>
+    {
+        crate::hyper::proofs::prove_nullifier_spent(&mut self.tree, nullifier)
+    }
+
+    /// Verkle inclusion proof for a note commitment.
+    pub fn prove_note_commitment_inclusion(
+        &mut self,
+        commitment: &[u8],
+    ) -> Result<Option<hypersnap_crypto::verkle::VerkleProof>, crate::hyper::proofs::ProofError>
+    {
+        crate::hyper::proofs::prove_note_commitment_present(&mut self.tree, commitment)
     }
 
     /// Look up validator score for a given epoch.
@@ -4022,6 +4127,43 @@ impl HyperRuntime {
             .dkls_group_address_for_epoch(block.signature.epoch)
             .ok_or(crate::hyper::importer::ImportError::SignatureVerificationFailed)?;
 
+        // Re-run the strong validation on every transfer in the
+        // block before any state change. The mempool admission gate
+        // (`HyperRuntime::submit_message`) already does this when
+        // the transfer enters via gossip; this re-check defends
+        // against a malicious proposer who included a transfer
+        // off-mempool. Each transfer must verify against the
+        // current note store + carry a balance-closing blinding
+        // delta.
+        use crate::hyper::transfer_codec::{extract_blinding_diff, tx_from_proto};
+        for (i, tx_proto) in transfers_in_block.iter().enumerate() {
+            let typed = tx_from_proto(tx_proto).map_err(|e| {
+                crate::hyper::importer::ImportError::TransferValidation(format!(
+                    "transfer[{}] codec: {}",
+                    i, e
+                ))
+            })?;
+            let blinding_diff = extract_blinding_diff(tx_proto).map_err(|e| {
+                crate::hyper::importer::ImportError::TransferValidation(format!(
+                    "transfer[{}] blinding-diff codec: {}",
+                    i, e
+                ))
+            })?;
+            typed
+                .validate_against_store(&self.note_store)
+                .map_err(|e| {
+                    crate::hyper::importer::ImportError::TransferValidation(format!(
+                        "transfer[{}] {:?}",
+                        i, e
+                    ))
+                })?;
+            if !typed.verify_balance_with_blinding_diff(&blinding_diff) {
+                return Err(crate::hyper::importer::ImportError::TransferValidation(
+                    format!("transfer[{}] Pedersen balance closure failed", i),
+                ));
+            }
+        }
+
         crate::hyper::importer::import_hyper_block_with_index(
             block,
             &dkls_addr,
@@ -4032,6 +4174,35 @@ impl HyperRuntime {
             &mut self.chain,
             &self.block_index,
         )?;
+
+        // Post-apply: sync the note store so the next block's
+        // validations resolve owner pubkeys for the new outputs +
+        // see the new nullifiers as spent. Errors decoding wire
+        // fields here would have been caught above, so unwrap is
+        // safe — but we err on the side of paranoia and skip on any
+        // codec hiccup rather than panic.
+        use hypersnap_crypto::tokens::{NoteStoreMut, Nullifier, PedersenCommitment};
+        for tx_proto in transfers_in_block {
+            if let Ok(output_pubkeys) =
+                crate::hyper::transfer_codec::extract_output_pubkeys(tx_proto)
+            {
+                for (i, out) in tx_proto.outputs.iter().enumerate() {
+                    if let (Some(commitment), Some(&pk)) = (
+                        PedersenCommitment::from_bytes(&out.commitment),
+                        output_pubkeys.get(i),
+                    ) {
+                        self.note_store.record_note(commitment, pk);
+                    }
+                }
+            }
+            for input in &tx_proto.inputs {
+                if input.nullifier.len() == 32 {
+                    let mut nf = [0u8; 32];
+                    nf.copy_from_slice(&input.nullifier);
+                    self.note_store.mark_spent(Nullifier(nf));
+                }
+            }
+        }
 
         // FIP §5.1: credit any missed-proposal entries the block carries.
         // Errors here don't fail the import — the block is already
@@ -4102,6 +4273,19 @@ impl HyperRuntime {
         )
     }
 
+    /// FIP-proof-of-work-tokenization §12 fee settlement. Drains the
+    /// accumulated proposer fee pot (the 40% portion of every charged
+    /// message fee since the last drain) to `proposer_fid`'s primary
+    /// balance. The 60% burn portion is already accounted for at the
+    /// charging site; this call only moves the proposer share.
+    ///
+    /// Producers should call this right after a successful hyperblock
+    /// production with `proposer_fid = local operator FID`. Returns
+    /// the atoms paid out (0 if the pot was empty).
+    pub fn settle_proposer_fees(&self, proposer_fid: u64) -> Result<u64, RewardError> {
+        self.reward_store.drain_proposer_fee_pot(proposer_fid)
+    }
+
     /// Full anchor-aware envelope producer that also commits to the
     /// snapchain anchor block's wall-clock timestamp.
     pub fn produce_envelope_with_full_anchor(
@@ -4138,6 +4322,20 @@ impl HyperRuntime {
                 snapchain_anchor_hash,
                 snapchain_anchor_timestamp,
             )?;
+        // FIP-proof-of-work-tokenization §12: a successful local block
+        // production means this node is the proposer; pay out the
+        // accumulated 40% proposer share to our operator FID. Failures
+        // here are non-fatal — the pot just stays accumulated for the
+        // next successful production.
+        if let Some(fid) = self.operator_fid {
+            if let Err(e) = self.reward_store.drain_proposer_fee_pot(fid) {
+                tracing::warn!(
+                    error = %e,
+                    operator_fid = fid,
+                    "proposer fee pot drain failed; pot will retry on next block"
+                );
+            }
+        }
         Ok((envelope, locks, transfers))
     }
 
@@ -4374,7 +4572,6 @@ mod tests {
             srs,
             mempool_capacity: 100,
             score_weights: ScoreWeights::default(),
-            starting_epoch: 0,
             bootstrap_validators: vec![],
             max_reward_per_epoch: None,
             max_reward_per_epoch_per_market: std::collections::HashMap::new(),
@@ -4453,7 +4650,6 @@ mod tests {
                 srs: srs.clone(),
                 mempool_capacity: 100,
                 score_weights: ScoreWeights::default(),
-                starting_epoch: 0,
                 bootstrap_validators: vec![],
                 max_reward_per_epoch: None,
                 max_reward_per_epoch_per_market: std::collections::HashMap::new(),
@@ -4484,7 +4680,6 @@ mod tests {
             srs: srs.clone(),
             mempool_capacity: 100,
             score_weights: ScoreWeights::default(),
-            starting_epoch: 0,
             bootstrap_validators: vec![],
             max_reward_per_epoch: None,
             max_reward_per_epoch_per_market: std::collections::HashMap::new(),
@@ -4522,7 +4717,6 @@ mod tests {
             srs,
             mempool_capacity: 100,
             score_weights: ScoreWeights::default(),
-            starting_epoch: 0,
             bootstrap_validators: vec![],
             max_reward_per_epoch: None,
             max_reward_per_epoch_per_market: std::collections::HashMap::new(),
@@ -4628,7 +4822,6 @@ mod tests {
             srs,
             mempool_capacity: 100,
             score_weights: ScoreWeights::default(),
-            starting_epoch: 0,
             bootstrap_validators: vec![],
             max_reward_per_epoch: None,
             max_reward_per_epoch_per_market: std::collections::HashMap::new(),
@@ -4653,6 +4846,128 @@ mod tests {
         let (mut rt, _dir) = make_runtime();
         let msg = HyperRouter::outbound_lock(sample_lock(1));
         rt.submit_message(msg).unwrap();
+        assert_eq!(rt.pending_count(), 1);
+    }
+
+    /// Regression for C2: a confidential `HyperTransferTx` with
+    /// attacker-chosen nullifiers + commitments and an empty
+    /// blinding-difference scalar must be rejected at submission.
+    /// Pre-fix, the structural-only `validate()` accepted this and
+    /// the mempool/builder would have written attacker-chosen
+    /// commitments + nullifiers into the verkle tree.
+    #[test]
+    fn submit_message_rejects_unauthenticated_transfer() {
+        use crate::hyper::router::HyperRouter;
+        use hypersnap_crypto::bulletproofs::curve_adapter::Scalar;
+        use hypersnap_crypto::tokens::{
+            prove_value_range, schnorr_sign, Nullifier, PedersenCommitment, TransferInput,
+            TransferOutput, TransferTx, DEFAULT_RANGE_BITS,
+        };
+        use rand::rngs::OsRng;
+
+        let (mut rt, _dir) = make_runtime();
+        let mut rng = OsRng;
+        let r_in = Scalar::random(&mut rng);
+        let r_out = Scalar::random(&mut rng);
+        let x = Scalar::random(&mut rng);
+        let in_commitment = PedersenCommitment::commit(100, &r_in);
+        let nullifier = Nullifier::derive(&x, &in_commitment);
+        let out_commitment = PedersenCommitment::commit(100, &r_out);
+        let (range_proof, _) =
+            prove_value_range(100, &r_out, DEFAULT_RANGE_BITS, &mut rng).unwrap();
+        let tx = TransferTx {
+            inputs: vec![TransferInput {
+                commitment: in_commitment,
+                nullifier,
+                spend_signature: schnorr_sign(&x, &[0u8; 32], &mut rng),
+            }],
+            outputs: vec![TransferOutput {
+                commitment: out_commitment,
+                range_proof,
+            }],
+            fee_atoms: 0,
+        };
+        // Attacker payload: nothing in note store + empty blinding_diff.
+        let tx_proto = crate::hyper::transfer_codec::tx_to_proto(&tx);
+        let msg = HyperRouter::outbound_transfer(tx_proto);
+        let err = rt
+            .submit_message(msg)
+            .expect_err("strong validation must reject");
+        assert!(matches!(err, RoutingError::Transfer(_)), "got: {:?}", err);
+        assert_eq!(rt.pending_count(), 0);
+    }
+
+    /// Regression for C2: a properly-formed transfer — note
+    /// pre-recorded in the runtime's note store, valid Schnorr
+    /// signature under the recorded owner pubkey, balance-closing
+    /// blinding-difference scalar published on the wire — is
+    /// accepted. Proves the strong-validation gate doesn't reject
+    /// honest traffic.
+    #[test]
+    fn submit_message_accepts_properly_authenticated_transfer() {
+        use crate::hyper::router::HyperRouter;
+        use crate::hyper::transfer_codec::tx_to_proto_full;
+        use hypersnap_crypto::bulletproofs::curve_adapter::Scalar;
+        use hypersnap_crypto::tokens::{
+            create_stealth_output, prove_value_range, scan_stealth_note, schnorr_sign,
+            NoteStoreMut, Nullifier, PedersenCommitment, StealthKeypair, TransferInput,
+            TransferOutput, TransferTx, DEFAULT_RANGE_BITS,
+        };
+        use rand::rngs::OsRng;
+
+        let (mut rt, _dir) = make_runtime();
+        let mut rng = OsRng;
+
+        // Recipient keypair + stealth output → input commitment for our spend.
+        let recipient = StealthKeypair::generate(&mut rng);
+        let address = recipient.public_address();
+        let stealth_in = create_stealth_output(&address, &mut rng);
+        let value = 100u64;
+        let r_in = Scalar::random(&mut rng);
+        let in_commitment = PedersenCommitment::commit(value, &r_in);
+        rt.note_store
+            .record_note(in_commitment, stealth_in.one_time_pubkey);
+
+        // Pre-recovery: the recipient scans + derives the spend
+        // secret for the input note.
+        let spend_secret = scan_stealth_note(
+            &recipient,
+            &stealth_in.tx_pubkey,
+            &stealth_in.one_time_pubkey,
+        )
+        .expect("scan");
+        let nullifier = Nullifier::derive(&spend_secret, &in_commitment);
+
+        // Output (same value, fresh blinding) for a new recipient
+        // (same one here for simplicity).
+        let r_out = Scalar::random(&mut rng);
+        let stealth_out = create_stealth_output(&address, &mut rng);
+        let out_commitment = PedersenCommitment::commit(value, &r_out);
+        let (range_proof, _) =
+            prove_value_range(value, &r_out, DEFAULT_RANGE_BITS, &mut rng).unwrap();
+
+        let mut tx = TransferTx {
+            inputs: vec![TransferInput {
+                commitment: in_commitment,
+                nullifier,
+                spend_signature: schnorr_sign(&spend_secret, &[0u8; 32], &mut rng),
+            }],
+            outputs: vec![TransferOutput {
+                commitment: out_commitment,
+                range_proof,
+            }],
+            fee_atoms: 0,
+        };
+        let payload = tx.signing_payload();
+        tx.inputs[0].spend_signature = schnorr_sign(&spend_secret, &payload, &mut rng);
+
+        // Balance: r_in − r_out − fee·B = r_in − r_out (fee=0).
+        let blinding_diff = r_in - r_out;
+
+        let tx_proto = tx_to_proto_full(&tx, &blinding_diff, &[stealth_out.one_time_pubkey]);
+        let msg = HyperRouter::outbound_transfer(tx_proto);
+        rt.submit_message(msg)
+            .expect("properly-authenticated transfer must be accepted");
         assert_eq!(rt.pending_count(), 1);
     }
 
@@ -4889,7 +5204,6 @@ mod tests {
                 srs: srs.clone(),
                 mempool_capacity: 100,
                 score_weights: ScoreWeights::default(),
-                starting_epoch: 0,
                 bootstrap_validators: vec![],
                 max_reward_per_epoch: None,
                 max_reward_per_epoch_per_market: std::collections::HashMap::new(),
@@ -4924,7 +5238,6 @@ mod tests {
                 srs,
                 mempool_capacity: 100,
                 score_weights: ScoreWeights::default(),
-                starting_epoch: 0,
                 bootstrap_validators: vec![],
                 max_reward_per_epoch: None,
                 max_reward_per_epoch_per_market: std::collections::HashMap::new(),
@@ -5034,7 +5347,6 @@ mod tests {
             srs: srs.clone(),
             mempool_capacity: 100,
             score_weights: ScoreWeights::default(),
-            starting_epoch: 0,
             bootstrap_validators: vec![],
             max_reward_per_epoch: None,
             max_reward_per_epoch_per_market: std::collections::HashMap::new(),
@@ -5055,7 +5367,6 @@ mod tests {
             srs,
             mempool_capacity: 100,
             score_weights: ScoreWeights::default(),
-            starting_epoch: 0,
             bootstrap_validators: vec![],
             max_reward_per_epoch: None,
             max_reward_per_epoch_per_market: std::collections::HashMap::new(),
@@ -5205,7 +5516,6 @@ mod tests {
             srs,
             mempool_capacity: 100,
             score_weights: ScoreWeights::default(),
-            starting_epoch: 0,
             bootstrap_validators: vec![],
             max_reward_per_epoch: None,
             max_reward_per_epoch_per_market: std::collections::HashMap::new(),
@@ -5258,7 +5568,6 @@ mod tests {
             srs,
             mempool_capacity: 100,
             score_weights: ScoreWeights::default(),
-            starting_epoch: 0,
             bootstrap_validators: vec![],
             max_reward_per_epoch: None,
             max_reward_per_epoch_per_market: std::collections::HashMap::new(),

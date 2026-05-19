@@ -284,23 +284,10 @@ impl TransferTx {
             }
         }
 
-        // Pedersen balance: sum_in − sum_out − fee·B should be a pure blinding
-        // factor multiple of B_blinding. We can't extract the blinding factor
-        // here without the original randomness, but we can check that the
-        // value component matches: the residual point should be on the
-        // B_blinding generator's subgroup with no B component.
-        //
-        // The clean way to enforce this without secret knowledge is for the
-        // prover to publish the blinding-factor difference and we check the
-        // residual is exactly r_diff · B_blinding. That's an interface
-        // extension we'll add when we wire transfer construction; for now,
-        // the validate API leaves the balance check as a structural marker.
-        //
-        // For this commit, accept the transaction. A separate validate path
-        // ('validate_with_blinding_diff') is planned to enforce the balance
-        // closure end-to-end.
-        let _ = self.compute_residual();
-
+        // Structural-only check. Balance closure + spend signatures
+        // are enforced by `validate_against_store` /
+        // `validate_with_input_pubkeys` + `verify_balance_with_blinding_diff`,
+        // which production callers must use instead of this method.
         Ok(())
     }
 

@@ -249,6 +249,68 @@ pub struct VerkleProof {
     pub value: Vec<u8>,
 }
 
+impl VerkleProof {
+    /// Self-describing wire encoding for serving over HTTP / RPC:
+    ///
+    /// ```text
+    ///   step_count    u32 BE
+    ///   step_count × (commitment 48B || slot 1B || evaluation 32B || proof 48B)
+    ///   value_len     u32 BE
+    ///   value         value_len bytes
+    /// ```
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out =
+            Vec::with_capacity(4 + self.steps.len() * (48 + 1 + 32 + 48) + 4 + self.value.len());
+        out.extend_from_slice(&(self.steps.len() as u32).to_be_bytes());
+        for step in &self.steps {
+            out.extend_from_slice(&step.commitment.to_bytes());
+            out.push(step.slot);
+            out.extend_from_slice(&step.evaluation.to_bytes());
+            out.extend_from_slice(&step.proof.to_bytes());
+        }
+        out.extend_from_slice(&(self.value.len() as u32).to_be_bytes());
+        out.extend_from_slice(&self.value);
+        out
+    }
+
+    /// Inverse of `to_bytes`. `None` on truncated or otherwise
+    /// malformed input (G1 / Fr point that doesn't decode).
+    pub fn from_bytes(mut bytes: &[u8]) -> Option<Self> {
+        fn take<'a>(b: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
+            if b.len() < n {
+                return None;
+            }
+            let (head, tail) = b.split_at(n);
+            *b = tail;
+            Some(head)
+        }
+        let step_count_bytes = take(&mut bytes, 4)?;
+        let mut be4 = [0u8; 4];
+        be4.copy_from_slice(step_count_bytes);
+        let step_count = u32::from_be_bytes(be4) as usize;
+        let mut steps = Vec::with_capacity(step_count);
+        for _ in 0..step_count {
+            let commitment = KzgCommitment::from_bytes(take(&mut bytes, 48)?)?;
+            let slot = take(&mut bytes, 1)?[0];
+            let mut fr_bytes = [0u8; 32];
+            fr_bytes.copy_from_slice(take(&mut bytes, 32)?);
+            let evaluation = Option::from(Fr::from_bytes(&fr_bytes))?;
+            let proof = KzgProof::from_bytes(take(&mut bytes, 48)?)?;
+            steps.push(ProofStep {
+                commitment,
+                slot,
+                evaluation,
+                proof,
+            });
+        }
+        let value_len_bytes = take(&mut bytes, 4)?;
+        be4.copy_from_slice(value_len_bytes);
+        let value_len = u32::from_be_bytes(be4) as usize;
+        let value = take(&mut bytes, value_len)?.to_vec();
+        Some(Self { steps, value })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ProofStep {
     pub commitment: KzgCommitment,
@@ -440,6 +502,10 @@ mod tests {
         assert_eq!(proof.steps.len(), 4);
 
         assert!(verify_inclusion(&root, b"abcd", &proof, &t.srs));
+
+        let bytes = proof.to_bytes();
+        let recovered = VerkleProof::from_bytes(&bytes).expect("round trip");
+        assert!(verify_inclusion(&root, b"abcd", &recovered, &t.srs));
     }
 
     #[test]

@@ -6,7 +6,6 @@
 //! [hyper]
 //! enabled = true
 //! mempool_capacity = 10000
-//! starting_epoch = 0
 //!
 //! [hyper.score_weights]
 //! proposal = 100
@@ -36,8 +35,6 @@ pub struct HyperRuntimeFileConfig {
     pub enabled: bool,
     #[serde(default = "default_mempool_capacity")]
     pub mempool_capacity: usize,
-    #[serde(default)]
-    pub starting_epoch: u64,
     #[serde(default)]
     pub score_weights: ScoreWeightsConfig,
     /// Optional path to a KZG ceremony trusted-setup text file. If `None`, the
@@ -442,7 +439,6 @@ impl HyperRuntimeFileConfig {
             srs,
             mempool_capacity: self.mempool_capacity,
             score_weights: self.score_weights.clone().into(),
-            starting_epoch: self.starting_epoch,
             bootstrap_validators: vec![],
             max_reward_per_epoch: None,
             max_reward_per_epoch_per_market: std::collections::HashMap::new(),
@@ -455,6 +451,9 @@ impl HyperRuntimeFileConfig {
             local_transport_secret_bytes,
         };
         let mut runtime = HyperRuntime::new(runtime_config);
+        if let Some(fid) = self.operator_fid {
+            runtime.set_operator_fid(fid);
+        }
 
         if let Some(path) = &self.genesis_path {
             let text = std::fs::read_to_string(Path::new(path))?;
@@ -694,7 +693,6 @@ bootstrap_validators = [
         HyperRuntimeFileConfig {
             enabled: true,
             mempool_capacity: 100,
-            starting_epoch: 0,
             score_weights: ScoreWeightsConfig::default(),
             kzg_setup_path: None,
             srs_max_degree: 256,

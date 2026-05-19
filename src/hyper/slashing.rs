@@ -12,6 +12,7 @@
 
 use crate::hyper::chain::hyper_block_hash;
 use crate::hyper::HyperBlock;
+use alloy_primitives::Address;
 
 #[derive(Clone, Debug)]
 pub struct ConflictingBlocksEvidence {
@@ -19,9 +20,12 @@ pub struct ConflictingBlocksEvidence {
     pub canonical_block_id: u64,
     pub block_a_hash: [u8; 32],
     pub block_b_hash: [u8; 32],
-    /// Both block hashes carry the threshold signature against the same
-    /// epoch's group_pubkey. Verifiers of this evidence re-check both
-    /// signatures (the producer can't lie about the conflict).
+    /// Both blocks must carry a valid threshold signature against the
+    /// epoch's group key. `detect_conflicting_blocks` does **not**
+    /// verify signatures — that gate lives at the gossip ingest path
+    /// in `HyperActor::dispatch::InboundEvidence` (see
+    /// `verify_evidence_signatures`). Constructing this struct
+    /// directly bypasses that gate.
     pub block_a: Box<HyperBlock>,
     pub block_b: Box<HyperBlock>,
 }
@@ -34,6 +38,10 @@ pub enum EvidenceError {
     DifferentEpochs { a: u64, b: u64 },
     #[error("blocks are byte-identical; no conflict")]
     SameBlock,
+    #[error("no group key known for evidence epoch {epoch}")]
+    UnknownEpochGroupKey { epoch: u64 },
+    #[error("block {which} threshold signature invalid for evidence epoch")]
+    InvalidSignature { which: char },
 }
 
 /// Detect a conflicting-blocks slashing condition.
@@ -70,6 +78,33 @@ pub fn detect_conflicting_blocks(
         block_a: Box::new(a.clone()),
         block_b: Box::new(b.clone()),
     })
+}
+
+/// Verify both evidence blocks carry valid threshold signatures
+/// against `group_address` (the epoch's group key resolved by the
+/// caller). Without this check, any peer can publish two unsigned
+/// blocks naming arbitrary `signer_indices` and slash arbitrary
+/// validators at the next epoch boundary — the persisted record
+/// drives `slashed_validators_for_epoch`.
+pub fn verify_evidence_signatures(
+    ev: &ConflictingBlocksEvidence,
+    group_address: &Address,
+) -> Result<(), EvidenceError> {
+    let expected = crate::hyper::sig_verify::ExpectedGroupKey::ecdsa_only(group_address);
+    for (which, block) in [('a', ev.block_a.as_ref()), ('b', ev.block_b.as_ref())] {
+        let payload = block
+            .envelope
+            .metadata
+            .signing_payload(block.signature.epoch);
+        crate::hyper::sig_verify::verify_hyperblock_signature(
+            &payload,
+            &block.signature.ecdsa_signature,
+            &block.signature.group_address,
+            &expected,
+        )
+        .map_err(|_| EvidenceError::InvalidSignature { which })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

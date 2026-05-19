@@ -129,7 +129,6 @@ mod tests {
             srs,
             mempool_capacity: 100,
             score_weights: ScoreWeights::default(),
-            starting_epoch: 0,
             bootstrap_validators: vec![],
             max_reward_per_epoch: None,
             max_reward_per_epoch_per_market: std::collections::HashMap::new(),

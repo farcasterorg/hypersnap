@@ -35,6 +35,8 @@ pub enum ImportError {
     InvalidSignature,
     #[error("threshold signature verification failed")]
     SignatureVerificationFailed,
+    #[error("transfer validation: {0}")]
+    TransferValidation(String),
     #[error("state root in metadata does not match recomputed verkle root")]
     StateRootMismatch,
     #[error(transparent)]
