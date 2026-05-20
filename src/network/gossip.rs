@@ -143,6 +143,7 @@ impl Config {
         self.bootstrap_peers
             .split(',')
             .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
             .collect()
     }
 

@@ -16,6 +16,10 @@ if [ -f .env ] && grep -q "^HYPERSNAP_CHANNEL=" .env 2>/dev/null; then
     HYPERSNAP_CHANNEL=$(grep "^HYPERSNAP_CHANNEL=" .env | cut -d= -f2)
 fi
 HYPERSNAP_CHANNEL="${HYPERSNAP_CHANNEL:-stable}"
+if [ -f .env ] && grep -q "^HYPERSNAP_MODE=" .env 2>/dev/null; then
+    HYPERSNAP_MODE=$(grep "^HYPERSNAP_MODE=" .env | cut -d= -f2)
+fi
+HYPERSNAP_MODE="${HYPERSNAP_MODE:-full}"
 
 if [ "$HYPERSNAP_CHANNEL" = "nightly" ]; then
     DOCKER_COMPOSE_FILE_PATH="docker-compose.nightly.yml"
@@ -24,6 +28,9 @@ if [ "$HYPERSNAP_CHANNEL" = "nightly" ]; then
 else
     DOCKER_COMPOSE_FILE_PATH="docker-compose.mainnet.yml"
     LATEST_TAG="@latest"
+fi
+if [ "$HYPERSNAP_MODE" = "lite" ]; then
+    DOCKER_COMPOSE_FILE_PATH="docker-compose.lite.yml"
 fi
 
 VALIDATORS_FILE_PATH="validators.toml"
@@ -139,6 +146,11 @@ fetch_latest_docker_compose_and_dashboard() {
 
 # Prompt for hub operator agreement
 prompt_for_hub_operator_agreement() {
+    if [ "$HYPERSNAP_MODE" = "lite" ]; then
+        printf "✅ Lite mode selected. Skipping hub operator agreement.\n"
+        return 0
+    fi
+
     env_file=".env"
 
     update_env_file() {
@@ -256,7 +268,7 @@ write_env_file() {
         echo "STATSD_METRICS_SERVER=statsd:8125" >> .env
     fi
 
-    if ! key_exists "HUB_OPERATOR_FID"; then
+    if [ "$HYPERSNAP_MODE" != "lite" ] && ! key_exists "HUB_OPERATOR_FID"; then
         store_operator_fid_env
     fi
 
@@ -680,6 +692,7 @@ if [ $# -eq 0 ] || [ "$1" == "help" ]; then
     echo "  help     Show this help"
     echo ""
     echo "Channel: $HYPERSNAP_CHANNEL (set HYPERSNAP_CHANNEL=nightly in .env to track nightly builds)"
+    echo "Mode: $HYPERSNAP_MODE (set HYPERSNAP_MODE=lite in .env to run a write-only lite relay)"
     echo "add SKIP_CRONTAB=true to your .env to skip installing the autoupgrade crontab"
     exit 0
 fi

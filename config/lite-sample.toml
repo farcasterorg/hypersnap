@@ -1,0 +1,41 @@
+# Hypersnap Lite sample configuration.
+#
+# Lite mode is a write-only relay for clients that only need to submit signed
+# Farcaster messages. It does not download snapshots, run consensus actors,
+# replicate blocks, backfill API indexes, or serve historical protocol state.
+
+rpc_address = "0.0.0.0:3383"
+http_address = "0.0.0.0:3381"
+rocksdb_dir = ".rocks-lite"
+fc_network = "Mainnet"
+read_node = true
+lite_node = true
+
+[statsd]
+prefix = "snapchain"
+addr = "127.0.0.1:8125"
+use_tags = true
+
+[gossip]
+address = "/ip4/0.0.0.0/udp/3382/quic-v1"
+# bootstrap_peers = "/ip4/..., /ip4/..."
+enable_autodiscovery = true
+
+[consensus]
+shard_ids = [1, 2]
+num_shards = 2
+
+[hyper]
+enabled = false
+
+[api]
+enabled = false
+
+[replication]
+enable = false
+snapshot_interval = 28800
+snapshot_max_age = "24h"
+
+[snapshot]
+load_db_from_snapshot = false
+force_load_db_from_snapshot = false

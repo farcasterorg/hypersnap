@@ -41,6 +41,26 @@ curl -sSL https://raw.githubusercontent.com/farcasterxyz/snapchain/refs/heads/ma
 You can manage your node using the snapchain.sh script. It uses docker compose to run the node in a container. The script provides commands to start, stop, and check the logs of your node.
 A brand new node will download historical snapshots to catchup to the latest state before it begins sync. This can take up to 2 hours. Check the node's status by running `curl http://localhost:3381/v1/info`. You should see `maxHeight` increasing and `blockDelay` decreasing until it approaches zero. 
 
+## Running Hypersnap Lite
+
+Hypersnap Lite is a write-only relay for applications that only need to submit signed Farcaster messages. It joins gossip, accepts `SubmitMessage` and `SubmitBulkMessages` over gRPC or HTTP, performs stateless message validation, and relays accepted messages to the network. It does not download snapshots, sync historical blocks, run consensus actors, replicate snapshots, backfill API indexes, or serve historical reads.
+
+To run the Docker install in lite mode, create `.env` before the first upgrade:
+
+```bash
+mkdir hypersnap && cd hypersnap
+echo "HYPERSNAP_MODE=lite" > .env
+curl -sSL https://raw.githubusercontent.com/farcasterorg/hypersnap/refs/heads/main/scripts/hypersnap-bootstrap.sh | bash
+```
+
+For local development:
+
+```bash
+cargo run -- --config-path config/lite-sample.toml
+```
+
+Lite mode intentionally returns empty or partial data for read APIs. Use a full read node or a managed API for queries that require Farcaster history or current state.
+
 ## Upgrade
 
 To upgrade your Snapchain node to the latest version, follow these steps:

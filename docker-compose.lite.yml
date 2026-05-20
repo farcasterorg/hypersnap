@@ -1,0 +1,87 @@
+services:
+  hypersnap:
+    image: farcasterorg/hypersnap:latest
+    pull_policy: always
+    init: true
+    environment:
+      RUST_BACKTRACE: "full"
+    entrypoint:
+      - "/bin/bash"
+      - "-c"
+      - |
+        #!/bin/bash
+        set -euo pipefail
+        cat > config.toml <<EOF
+
+        rpc_address="0.0.0.0:3383"
+        http_address="0.0.0.0:3381"
+        rocksdb_dir=".rocks-lite"
+        fc_network="Mainnet"
+        read_node=true
+        lite_node=true
+
+        [statsd]
+        prefix="snapchain"
+        addr="statsd:8125"
+        use_tags=true
+
+        [gossip]
+        address="/ip4/0.0.0.0/udp/3382/quic-v1"
+        bootstrap_peers = "/ip4/54.236.164.51/udp/3382/quic-v1, /ip4/54.87.204.167/udp/3382/quic-v1, /ip4/44.197.255.20/udp/3382/quic-v1, /ip4/54.157.62.17/udp/3382/quic-v1, /ip4/34.195.157.114/udp/3382/quic-v1, /ip4/107.20.169.236/udp/3382/quic-v1, /ip4/34.4.32.36/udp/3382/quic-v1"
+        enable_autodiscovery=true
+
+        [consensus]
+        shard_ids = [1,2]
+        num_shards = 2
+
+        [hyper]
+        enabled=false
+
+        [api]
+        enabled=false
+
+        [replication]
+        enable=false
+        snapshot_interval=28800
+        snapshot_max_age="24h"
+
+        [snapshot]
+        load_db_from_snapshot=false
+        force_load_db_from_snapshot=false
+        EOF
+        cat /app/validators.toml >> config.toml
+        exec $0 $@
+    command: [ "./hypersnap", "--config-path", "config.toml" ]
+    restart: always
+    ports:
+      - "3381:3381/tcp"
+      - "3382:3382/udp"
+      - "3383:3383/tcp"
+    volumes:
+      - .rocks-lite:/app/.rocks-lite
+      - ./validators.toml:/app/validators.toml:ro
+    networks:
+      - hypersnap
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+
+  statsd:
+    image: graphiteapp/graphite-statsd:1.1.10-5
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "nc", "-zv", "localhost", "8126"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 1m
+    ports:
+      - '${STATSD_PUBLISH:-8125}:8125/udp'
+      - '${STATSD_ADMIN_PUBLISH:-8126}:8126'
+    networks:
+      - hypersnap
+
+networks:
+  hypersnap:
+    driver: bridge
