@@ -8,6 +8,11 @@ http_address = "0.0.0.0:3381"
 rocksdb_dir = ".rocks"
 fc_network = "Mainnet"
 read_node = true
+# Set lite_node=true to run a write-only relay that does not bootstrap,
+# sync, store, or serve historical protocol state. Lite nodes accept signed
+# SubmitMessage/SubmitBulkMessages requests, perform stateless validation,
+# and gossip the messages to the network.
+lite_node = false
 
 [statsd]
 prefix = "snapchain"

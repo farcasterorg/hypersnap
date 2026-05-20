@@ -44,3 +44,15 @@ curl -sSL https://raw.githubusercontent.com/farcasterxyz/snapchain/refs/heads/ma
 ```
 
 Follow the remaining steps in [Getting Started](/getting-started) to validate and query your node.
+
+## Lite mode for write-only clients
+
+If your application only needs to submit signed Farcaster messages and does not need to serve protocol history, run Hypersnap Lite instead of a full read node:
+
+```bash
+mkdir hypersnap && cd hypersnap
+echo "HYPERSNAP_MODE=lite" > .env
+curl -sSL https://raw.githubusercontent.com/farcasterorg/hypersnap/refs/heads/main/scripts/hypersnap-bootstrap.sh | bash
+```
+
+Lite mode skips snapshot download, historical sync, consensus actors, replication, and API index backfills. It exposes the same submit endpoints (`/v1/submitMessage`, `/v1/submitBulkMessages`, and the matching gRPC methods), but read APIs are intentionally empty or partial.

@@ -111,6 +111,38 @@ mod tests {
 
     #[test]
     #[serial]
+    fn test_lite_node_config() {
+        run_test(vec![], || {
+            let (_tmpdir, file_path) = write_config_file(
+                r#"
+                lite_node = true
+                read_node = true
+
+                [snapshot]
+                load_db_from_snapshot = false
+
+                [replication]
+                enable = false
+            "#,
+            );
+
+            let args = vec![
+                "test_binary".to_string(),
+                "--config-path".to_string(),
+                file_path.to_string(),
+            ];
+
+            let config = load_and_merge_config(args).expect("Failed to load config");
+
+            assert!(config.lite_node);
+            assert!(config.read_node);
+            assert!(!config.snapshot.load_db_from_snapshot);
+            assert!(!config.replication.enable);
+        })
+    }
+
+    #[test]
+    #[serial]
     fn test_load_with_env_vars() {
         run_test(
             vec![

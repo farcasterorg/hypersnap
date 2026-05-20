@@ -21,10 +21,11 @@ use snapchain::proto::hub_service_server::HubServiceServer;
 use snapchain::proto::replication_service_server::ReplicationServiceServer;
 use snapchain::storage::db::snapshot::{download_snapshots, BootstrapMethod};
 use snapchain::storage::db::RocksDB;
-use snapchain::storage::store::block_engine::BlockStores;
+use snapchain::storage::store::block_engine::{BlockEngine, BlockStores};
 use snapchain::storage::store::engine::{PostCommitMessage, Senders};
 use snapchain::storage::store::node_local_state::{self, LocalStateStore};
-use snapchain::storage::store::stores::Stores;
+use snapchain::storage::store::stores::{StoreLimits, Stores};
+use snapchain::storage::trie::merkle_trie::MerkleTrie;
 use snapchain::utils::statsd_wrapper::StatsdClientWrapper;
 use snapchain_hyper::CAPABILITY_HYPER;
 use std::collections::{HashMap, HashSet};
@@ -114,23 +115,39 @@ async fn start_servers(
             None
         };
 
-    let service = Arc::new(MyHubService::new(
-        app_config.rpc_auth.clone(),
-        block_stores.clone(),
-        shard_stores.clone(),
-        hyper_shard_stores.clone(),
-        shard_senders,
-        statsd_client.clone(),
-        app_config.consensus.num_shards,
-        app_config.fc_network,
-        Box::new(routing::ShardRouter {}),
-        mempool_tx.clone(),
-        gossip.tx.clone(),
-        chain_clients,
-        VERSION.unwrap_or("unknown").to_string(),
-        gossip.swarm.local_peer_id().to_string(),
-        fname_lookup.clone(),
-    ));
+    let service = Arc::new(if app_config.lite_node {
+        MyHubService::new_lite(
+            app_config.rpc_auth.clone(),
+            block_stores.clone(),
+            shard_stores.clone(),
+            shard_senders,
+            statsd_client.clone(),
+            app_config.consensus.num_shards,
+            app_config.fc_network,
+            mempool_tx.clone(),
+            gossip.tx.clone(),
+            VERSION.unwrap_or("unknown").to_string(),
+            gossip.swarm.local_peer_id().to_string(),
+        )
+    } else {
+        MyHubService::new(
+            app_config.rpc_auth.clone(),
+            block_stores.clone(),
+            shard_stores.clone(),
+            hyper_shard_stores.clone(),
+            shard_senders,
+            statsd_client.clone(),
+            app_config.consensus.num_shards,
+            app_config.fc_network,
+            Box::new(routing::ShardRouter {}),
+            mempool_tx.clone(),
+            gossip.tx.clone(),
+            chain_clients,
+            VERSION.unwrap_or("unknown").to_string(),
+            gossip.swarm.local_peer_id().to_string(),
+            fname_lookup.clone(),
+        )
+    });
 
     // Create a separate API service backed by hyper (un-pruned) stores.
     // This ensures API consumers see full message history without pruning.
@@ -448,6 +465,50 @@ fn create_replicator(
 
     Ok(Arc::new(replicator))
 }
+
+fn create_lite_stores(
+    app_config: &snapchain::cfg::Config,
+    statsd_client: StatsdClientWrapper,
+    block_cache: Option<rocksdb::Cache>,
+) -> (HashMap<u32, Stores>, HashMap<u32, Senders>, BlockStores) {
+    let block_db =
+        RocksDB::open_shard_db_with_cache(&app_config.rocksdb_dir, 0, block_cache.clone());
+    let block_engine = BlockEngine::new(
+        MerkleTrie::new().unwrap(),
+        statsd_client.clone(),
+        block_db,
+        app_config.consensus.max_messages_per_block,
+        None,
+        app_config.fc_network,
+    );
+    let block_stores = block_engine.stores();
+
+    let mut shard_stores = HashMap::new();
+    let mut shard_senders = HashMap::new();
+    for shard_id in app_config.consensus.shard_ids.clone() {
+        if shard_id == 0 {
+            continue;
+        }
+        let db = RocksDB::open_shard_db_with_cache(
+            &app_config.rocksdb_dir,
+            shard_id,
+            block_cache.clone(),
+        );
+        let stores = Stores::new(
+            db,
+            shard_id,
+            MerkleTrie::new().unwrap(),
+            StoreLimits::default(),
+            app_config.fc_network,
+            statsd_client.clone(),
+        );
+        shard_stores.insert(shard_id, stores);
+        shard_senders.insert(shard_id, Senders::new());
+    }
+
+    (shard_stores, shard_senders, block_stores)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().collect();
@@ -521,7 +582,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let db_is_empty = !fs::exists(app_config.rocksdb_dir.clone()).unwrap()
         || is_dir_empty(&app_config.rocksdb_dir).unwrap();
 
-    if db_is_empty {
+    if app_config.lite_node {
+        info!("Starting lite node without snapshot or replication bootstrap");
+    } else if db_is_empty {
         match app_config.snapshot.bootstrap_method {
             BootstrapMethod::Replicate => {
                 use rustls::crypto::{self, ring};
@@ -606,8 +669,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let gossip_result = SnapchainGossip::create(
         keypair.clone(),
         &app_config.gossip,
-        Some(system_tx.clone()),
-        app_config.read_node,
+        if app_config.lite_node {
+            None
+        } else {
+            Some(system_tx.clone())
+        },
+        app_config.read_node || app_config.lite_node,
         app_config.fc_network,
         statsd_client.clone(),
         node_capabilities,
@@ -621,7 +688,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let gossip = gossip_result?;
     let local_peer_id = gossip.swarm.local_peer_id().clone();
-    let read_or_validator = if app_config.read_node {
+    let read_or_validator = if app_config.lite_node {
+        "lite"
+    } else if app_config.read_node {
         "read"
     } else {
         "validator"
@@ -656,7 +725,56 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
     let local_state_store = LocalStateStore::new(global_db);
 
-    if app_config.read_node {
+    if app_config.lite_node {
+        let (shard_stores, shard_senders, block_stores) = create_lite_stores(
+            &app_config,
+            statsd_client.clone(),
+            Some(shared_block_cache.clone()),
+        );
+
+        let mut mempool = ReadNodeMempool::new(
+            mempool_rx,
+            app_config.consensus.num_shards,
+            shard_stores.clone(),
+            block_stores.clone(),
+            gossip_tx.clone(),
+            statsd_client.clone(),
+            app_config.fc_network,
+        );
+        tokio::spawn(async move { mempool.run().await });
+
+        start_servers(
+            &app_config,
+            gossip,
+            mempool_tx,
+            shutdown_tx,
+            onchain_events_request_tx,
+            fname_request_tx,
+            statsd_client,
+            shard_stores,
+            shard_senders,
+            block_stores,
+            chains_clients,
+            None,
+            local_state_store.clone(),
+            None,
+            None,
+        )
+        .await;
+
+        loop {
+            select! {
+                _ = ctrl_c() => {
+                    info!("Received Ctrl-C, shutting down");
+                    return Ok(());
+                }
+                _ = shutdown_rx.recv() => {
+                    error!("Received shutdown signal, shutting down");
+                    return Ok(());
+                }
+            }
+        }
+    } else if app_config.read_node {
         // Setup post-commit channel if replication is enabled
         let (engine_post_commit_tx, engine_post_commit_rx) = if app_config.replication.enable {
             // TODO: consider increasing the buffer size to prevent blocking across multiple shards

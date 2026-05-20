@@ -1004,8 +1004,7 @@ impl ApiHttpHandler {
                             .await
                     }
                     _ => {
-                        let fid: Option<u64> =
-                            params.get("fid").and_then(|s| s.parse().ok());
+                        let fid: Option<u64> = params.get("fid").and_then(|s| s.parse().ok());
                         self.handle_feed(feed_type, fid, cursor.as_deref(), limit)
                             .await
                     }

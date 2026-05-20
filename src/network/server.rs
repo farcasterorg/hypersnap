@@ -345,6 +345,7 @@ pub struct MyHubService {
     network: proto::FarcasterNetwork,
     version: String,
     peer_id: String,
+    lite_node: bool,
     id_registry_cache: Cache<Vec<u8>, OnChainEvent>,
     // Synchronous lookup against the fname registry. Used to recover from the
     // race condition where a client submits a UserDataAdd for a username before
@@ -432,9 +433,46 @@ impl MyHubService {
             gossip_tx,
             version,
             peer_id,
+            lite_node: false,
             id_registry_cache,
             fname_lookup,
         };
+        service
+    }
+
+    pub fn new_lite(
+        rpc_auth: String,
+        block_stores: BlockStores,
+        shard_stores: HashMap<u32, Stores>,
+        shard_senders: HashMap<u32, Senders>,
+        statsd_client: StatsdClientWrapper,
+        num_shards: u32,
+        network: proto::FarcasterNetwork,
+        mempool_tx: mpsc::Sender<MempoolRequest>,
+        gossip_tx: mpsc::Sender<GossipEvent<SnapchainValidatorContext>>,
+        version: String,
+        peer_id: String,
+    ) -> Self {
+        let mut service = Self::new(
+            rpc_auth,
+            block_stores,
+            shard_stores,
+            HashMap::new(),
+            shard_senders,
+            statsd_client,
+            num_shards,
+            network,
+            Box::new(routing::ShardRouter {}),
+            mempool_tx,
+            gossip_tx,
+            ChainClients {
+                chain_api_map: HashMap::new(),
+            },
+            version,
+            peer_id,
+            None,
+        );
+        service.lite_node = true;
         service
     }
 
@@ -445,6 +483,11 @@ impl MyHubService {
         let fid = message.fid();
         if fid == 0 {
             return Err(HubError::invalid_parameter("fid cannot be 0"));
+        }
+
+        if self.lite_node {
+            self.validate_lite_message(&message)?;
+            return self.submit_lite_message_to_mempool(message).await;
         }
 
         let dst_shard = routing::route_message(&self.message_router, &message, self.num_shards);
@@ -469,6 +512,71 @@ impl MyHubService {
 
         // Process the submitted message
         self.submit_message_to_mempool(message).await
+    }
+
+    fn validate_lite_message(&self, message: &proto::Message) -> Result<(), HubError> {
+        if message.fid() == 0 {
+            return Err(HubError::invalid_parameter("fid cannot be 0"));
+        }
+
+        validations::message::validate_message(
+            message,
+            self.network,
+            false,
+            &FarcasterTime::current(),
+            EngineVersion::current(self.network),
+        )
+        .map_err(|err| HubError::validation_failure(&err.to_string()))
+    }
+
+    async fn submit_lite_message_to_mempool(
+        &self,
+        message: proto::Message,
+    ) -> Result<proto::Message, HubError> {
+        let (tx, rx) = oneshot::channel();
+
+        match self.mempool_tx.try_send(MempoolRequest::AddMessage(
+            MempoolMessage::UserMessage(message.clone()),
+            MempoolSource::RPC,
+            Some(tx),
+        )) {
+            Ok(_) => {
+                self.statsd_client
+                    .count("rpc.submit_message.lite.accepted", 1, vec![]);
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.statsd_client
+                    .count("rpc.submit_message.channel_full", 1, vec![]);
+                return Err(HubError::unavailable("mempool channel is full"));
+            }
+            Err(e) => {
+                error!(
+                    "Error sending lite message to mempool channel: {:?}",
+                    e.to_string()
+                );
+                return Err(HubError::unavailable("mempool channel send error"));
+            }
+        }
+
+        match timeout(MEMPOOL_ADD_REQUEST_TIMEOUT, rx).await {
+            Ok(Ok(Ok(()))) => Ok(message),
+            Ok(Ok(Err(hub_error))) => Err(hub_error),
+            Ok(Err(err)) => {
+                self.statsd_client
+                    .count("rpc.mempool_submit_error", 1, vec![]);
+                error!(
+                    "Error receiving lite message from mempool channel: {:?}",
+                    err.to_string()
+                );
+                Err(HubError::unavailable("Error adding to mempool"))
+            }
+            Err(_) => {
+                self.statsd_client
+                    .count("rpc.mempool_submit_timeout", 1, vec![]);
+                error!("Timeout receiving lite message from mempool channel");
+                Err(HubError::unavailable("Error adding to mempool"))
+            }
+        }
     }
 
     /// On-demand recovery for the fname-not-yet-propagated race: query the fname
@@ -1288,6 +1396,29 @@ impl HubService for MyHubService {
             message_bytes_decode(msg);
         }
 
+        if self.lite_node {
+            let mut results = Vec::with_capacity(num_messages);
+
+            for msg in messages {
+                let message_hash_for_error = msg.hash.clone();
+                let result = match self.validate_lite_message(&msg) {
+                    Ok(()) => self.submit_lite_message_to_mempool(msg).await,
+                    Err(err) => Err(err),
+                };
+
+                results.push(match result {
+                    Ok(message) => proto::BulkMessageResponse {
+                        response: Some(proto::bulk_message_response::Response::Message(message)),
+                    },
+                    Err(err) => create_error_response(message_hash_for_error, err),
+                });
+            }
+
+            return Ok(Response::new(proto::SubmitBulkMessagesResponse {
+                messages: results,
+            }));
+        }
+
         // 1. Group messages by their destination shard
         let mut messages_by_shard: HashMap<u32, Vec<proto::Message>> = HashMap::new();
         for msg in messages {
@@ -2002,6 +2133,22 @@ impl HubService for MyHubService {
         request: Request<Message>,
     ) -> Result<Response<ValidationResponse>, Status> {
         let request = request.into_inner();
+        if self.lite_node {
+            let result = validations::message::validate_message(
+                &request,
+                self.network,
+                false,
+                &FarcasterTime::current(),
+                EngineVersion::current(self.network),
+            )
+            .is_ok();
+
+            return Ok(Response::new(ValidationResponse {
+                valid: result,
+                message: Some(request),
+            }));
+        }
+
         let stores = self.get_stores_for(request.fid())?;
         let is_pro_user = stores
             .is_pro_user(request.fid(), &FarcasterTime::current())
