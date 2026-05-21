@@ -1,7 +1,8 @@
 use crate::core::error::HubError;
 use crate::proto;
 use crate::proto::{
-    CastsByParentRequest, FidRequest, FidTimestampRequest, LinksByFidRequest, ReactionsByFidRequest,
+    CastsByFollowingRequest, CastsByParentRequest, FidRequest, FidTimestampRequest,
+    LinksByFidRequest, ReactionsByFidRequest,
 };
 use crate::storage::db::PageOptions;
 use crate::storage::store::account::MessagesPage;
@@ -118,6 +119,23 @@ pub trait CastsByParentRequestExt {
 impl CastsByParentRequestExt for CastsByParentRequest {
     fn page_options(&self) -> PageOptions {
         page_options(self.page_size, self.page_token.clone(), self.reverse)
+    }
+}
+
+pub trait CastsByFollowingRequestExt {
+    fn page_options(&self) -> PageOptions;
+    fn timestamps(&self) -> (Option<u32>, Option<u32>);
+}
+
+impl CastsByFollowingRequestExt for CastsByFollowingRequest {
+    fn page_options(&self) -> PageOptions {
+        page_options(self.page_size, self.page_token.clone(), self.reverse)
+    }
+
+    fn timestamps(&self) -> (Option<u32>, Option<u32>) {
+        let start_timestamp = self.start_timestamp.map(|ts| ts as u32);
+        let stop_timestamp = self.stop_timestamp.map(|ts| ts as u32);
+        (start_timestamp, stop_timestamp)
     }
 }
 

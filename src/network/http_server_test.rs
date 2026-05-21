@@ -170,6 +170,15 @@ pub mod tests {
             Ok(Response::new(response))
         }
 
+        async fn get_casts_by_following(
+            &self,
+            _request: Request<CastsByFollowingRequest>,
+        ) -> Result<Response<MessagesResponse>, Status> {
+            Err(Status::failed_precondition(
+                "GetCastsByFollowing is disabled on this node",
+            ))
+        }
+
         async fn get_reaction(
             &self,
             _request: Request<ReactionRequest>,

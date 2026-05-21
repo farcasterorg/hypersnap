@@ -481,6 +481,7 @@ pub fn initialize(
         Some(cast_quotes_indexer),
         Some(user_data_indexer),
     );
+    http_handler.set_feeds_config(config.feeds.clone());
 
     // Mini app notifications — two stateful HTTP handlers wired here,
     // one more (the registration management handler) wired from

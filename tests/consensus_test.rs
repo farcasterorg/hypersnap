@@ -450,6 +450,8 @@ impl NodeForTest {
             "".to_string(),
             "".to_string(),
             None,
+            false,
+            snapchain::api::config::default_casts_by_following_following_limit(),
         );
 
         let handle = tokio::spawn(async move {

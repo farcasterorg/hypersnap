@@ -7,7 +7,9 @@ mod tests {
     use crate::proto::{self as message, hub_event, CastType, HubEvent, HubEventType};
     use crate::storage::db::{PageOptions, RocksDB, RocksDbTransactionBatch};
     use crate::storage::store::account::{
-        CastStore, CastStoreDef, HubEventStorageExt, Store, StoreEventHandler, StoreOptions,
+        validate_casts_by_following_page_size, CastStore, CastStoreDef, HubEventStorageExt, Store,
+        StoreEventHandler, StoreOptions, DEFAULT_CASTS_BY_FOLLOWING_PER_FID_LIMIT,
+        MAX_CASTS_BY_FOLLOWING_LIMIT, MIN_CASTS_BY_FOLLOWING_LIMIT,
     };
     use crate::utils::factory::{messages_factory, time};
     use std::sync::Arc;
@@ -745,6 +747,158 @@ mod tests {
         let page3 =
             CastStore::get_casts_by_mention(&store, mention_fid, &page_options_reverse).unwrap();
         assert_eq!(page3.messages, vec![cast2, cast1]);
+    }
+
+    #[test]
+    fn test_validate_casts_by_following_page_size() {
+        assert!(validate_casts_by_following_page_size(0).is_err());
+        assert!(validate_casts_by_following_page_size(9).is_err());
+        assert_eq!(
+            validate_casts_by_following_page_size(MIN_CASTS_BY_FOLLOWING_LIMIT).unwrap(),
+            MIN_CASTS_BY_FOLLOWING_LIMIT
+        );
+        assert_eq!(
+            validate_casts_by_following_page_size(100).unwrap(),
+            DEFAULT_CASTS_BY_FOLLOWING_PER_FID_LIMIT
+        );
+        assert_eq!(
+            validate_casts_by_following_page_size(MAX_CASTS_BY_FOLLOWING_LIMIT).unwrap(),
+            MAX_CASTS_BY_FOLLOWING_LIMIT
+        );
+        assert!(validate_casts_by_following_page_size(MAX_CASTS_BY_FOLLOWING_LIMIT + 1).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_cast_adds_by_fid_page_returns_one_add_per_page() {
+        let (store, db, _temp_dir) = create_test_store();
+
+        let cast_newest =
+            messages_factory::casts::create_cast_add(FID_FOR_TEST, "newest", Some(1300), None);
+        let cast_middle =
+            messages_factory::casts::create_cast_add(FID_FOR_TEST, "middle", Some(1200), None);
+        let cast_oldest =
+            messages_factory::casts::create_cast_add(FID_FOR_TEST, "oldest", Some(1100), None);
+        merge_messages(&store, &db, vec![&cast_newest, &cast_middle, &cast_oldest]);
+
+        let page_one = CastStore::get_cast_adds_by_fid_page(
+            &store,
+            FID_FOR_TEST,
+            Some(1000),
+            Some(1500),
+            &PageOptions {
+                page_size: Some(1),
+                page_token: None,
+                reverse: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(page_one.messages.len(), 1);
+        assert_eq!(page_one.messages[0].hash, cast_newest.hash);
+        assert!(page_one.next_page_token.is_some());
+
+        let page_two = CastStore::get_cast_adds_by_fid_page(
+            &store,
+            FID_FOR_TEST,
+            Some(1000),
+            Some(1500),
+            &PageOptions {
+                page_size: Some(1),
+                page_token: page_one.next_page_token,
+                reverse: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(page_two.messages.len(), 1);
+        assert_eq!(page_two.messages[0].hash, cast_middle.hash);
+    }
+
+    #[tokio::test]
+    async fn test_get_casts_by_following_returns_casts_sorted_by_timestamp() {
+        let (store, db, _temp_dir) = create_test_store();
+        let followed_fid_a = FID_FOR_TEST;
+        let followed_fid_b = FID_FOR_TEST + 1;
+
+        let cast_older =
+            messages_factory::casts::create_cast_add(followed_fid_a, "older cast", Some(100), None);
+        let cast_newer =
+            messages_factory::casts::create_cast_add(followed_fid_b, "newer cast", Some(200), None);
+        let cast_out_of_range = messages_factory::casts::create_cast_add(
+            followed_fid_a,
+            "out of range",
+            Some(500),
+            None,
+        );
+
+        merge_messages(
+            &store,
+            &db,
+            vec![&cast_older, &cast_newer, &cast_out_of_range],
+        );
+
+        let page_options = PageOptions {
+            page_size: Some(DEFAULT_CASTS_BY_FOLLOWING_PER_FID_LIMIT),
+            page_token: None,
+            reverse: true,
+        };
+        let page_a = CastStore::get_cast_adds_by_fid_page(
+            &store,
+            followed_fid_a,
+            Some(50),
+            Some(300),
+            &page_options,
+        )
+        .unwrap();
+        let page_b = CastStore::get_cast_adds_by_fid_page(
+            &store,
+            followed_fid_b,
+            Some(50),
+            Some(300),
+            &page_options,
+        )
+        .unwrap();
+        let mut casts: Vec<_> = page_a.messages.into_iter().chain(page_b.messages).collect();
+        casts.sort_by(|a, b| {
+            let ts_a = a.data.as_ref().map(|d| d.timestamp).unwrap_or(0);
+            let ts_b = b.data.as_ref().map(|d| d.timestamp).unwrap_or(0);
+            ts_b.cmp(&ts_a).then_with(|| b.hash.cmp(&a.hash))
+        });
+
+        assert_eq!(casts.len(), 2);
+        assert_eq!(casts[0].hash, cast_newer.hash);
+        assert_eq!(casts[1].hash, cast_older.hash);
+
+        let page_options_asc = PageOptions {
+            page_size: Some(DEFAULT_CASTS_BY_FOLLOWING_PER_FID_LIMIT),
+            page_token: None,
+            reverse: false,
+        };
+        let page_a = CastStore::get_cast_adds_by_fid_page(
+            &store,
+            followed_fid_a,
+            Some(50),
+            Some(300),
+            &page_options_asc,
+        )
+        .unwrap();
+        let page_b = CastStore::get_cast_adds_by_fid_page(
+            &store,
+            followed_fid_b,
+            Some(50),
+            Some(300),
+            &page_options_asc,
+        )
+        .unwrap();
+        let mut casts_ascending: Vec<_> =
+            page_a.messages.into_iter().chain(page_b.messages).collect();
+        casts_ascending.sort_by(|a, b| {
+            let ts_a = a.data.as_ref().map(|d| d.timestamp).unwrap_or(0);
+            let ts_b = b.data.as_ref().map(|d| d.timestamp).unwrap_or(0);
+            ts_a.cmp(&ts_b).then_with(|| a.hash.cmp(&b.hash))
+        });
+
+        assert_eq!(casts_ascending.len(), 2);
+        assert_eq!(casts_ascending[0].hash, cast_older.hash);
+        assert_eq!(casts_ascending[1].hash, cast_newer.hash);
     }
 
     #[tokio::test]

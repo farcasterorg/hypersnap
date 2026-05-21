@@ -1,6 +1,6 @@
 use super::rpc_extensions::{
-    authenticate_request, AsMessagesResponse, AsSingleMessageResponse, FidRequestExt,
-    FidTimestampRequestExt, LinksByFidRequestExt, ReactionsByFidRequestExt,
+    authenticate_request, AsMessagesResponse, AsSingleMessageResponse, CastsByFollowingRequestExt,
+    FidRequestExt, FidTimestampRequestExt, LinksByFidRequestExt, ReactionsByFidRequestExt,
 };
 use crate::connectors::fname::FnameTransferLookup;
 use crate::connectors::onchain_events::{Chain, ChainClients};
@@ -16,10 +16,10 @@ use crate::proto::hub_service_server::HubService;
 use crate::proto::{
     self, cast_add_body, casts_by_parent_request, link_body, links_by_target_request, message_data,
     on_chain_event::Body, reaction_body, reactions_by_target_request, AddressLookupRequest,
-    AddressMatch, AddressToFidResponse, Block, BlocksRequest, CastId, CastsByParentRequest,
-    DbStats, EventRequest, EventsRequest, EventsResponse, FidAddressTypeRequest,
-    FidAddressTypeResponse, FidRequest, FidResponse, FidTimestampRequest, FidsRequest,
-    FidsResponse, GetConnectedPeersRequest, GetConnectedPeersResponse, GetInfoRequest,
+    AddressMatch, AddressToFidResponse, Block, BlocksRequest, CastId, CastsByFollowingRequest,
+    CastsByParentRequest, DbStats, EventRequest, EventsRequest, EventsResponse,
+    FidAddressTypeRequest, FidAddressTypeResponse, FidRequest, FidResponse, FidTimestampRequest,
+    FidsRequest, FidsResponse, GetConnectedPeersRequest, GetConnectedPeersResponse, GetInfoRequest,
     GetInfoResponse, Height, HubEvent, IdRegistryEventByAddressRequest, LinkRequest,
     LinksByFidRequest, LinksByTargetRequest, Message, MessageType, MessagesResponse,
     NameLookupRequest, NameToAddressResponse, OnChainEvent, OnChainEventRequest,
@@ -36,9 +36,12 @@ use crate::storage::db::PageOptions;
 use crate::storage::db::RocksDbTransactionBatch;
 use crate::storage::store::account::MessagesPage;
 use crate::storage::store::account::UsernameProofStore;
+use crate::storage::store::account::PAGE_SIZE_MAX;
 use crate::storage::store::account::{
     get_gasless_key_count, get_gasless_key_record, get_last_used_at, list_gasless_keys_by_fid,
-    CastStore, GaslessKeyRecord, LinkStore, ReactionStore, UserDataStore, VerificationStore,
+    validate_casts_by_following_page_size, CastStore, CastStoreDef, GaslessKeyRecord, LinkStore,
+    ReactionStore, Store, UserDataStore, VerificationStore,
+    DEFAULT_CASTS_BY_FOLLOWING_PER_FID_LIMIT,
 };
 use crate::storage::store::account::{message_bytes_decode, IntoI32};
 use crate::storage::store::account::{EventsPage, HubEventIdGenerator};
@@ -67,6 +70,246 @@ use tracing::{debug, error, info};
 
 pub const MEMPOOL_ADD_REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_millis(100);
+const DEFAULT_CASTS_BY_FOLLOWING_PAGE_SIZE: usize = DEFAULT_CASTS_BY_FOLLOWING_PER_FID_LIMIT;
+const LINK_TYPE_FOLLOW: &str = "follow";
+
+#[derive(Serialize, Deserialize, Default, Clone)]
+pub(crate) struct CastsByFollowingPageToken {
+    #[serde(default)]
+    fid_cursors: HashMap<u64, FidFollowingCursor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    boundary: Option<CastsByFollowingBoundary>,
+}
+
+#[derive(Serialize, Deserialize, Default, Clone)]
+struct FidFollowingCursor {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    db_page_token: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending: Vec<PendingFollowingCast>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct PendingFollowingCast {
+    fid: u64,
+    timestamp: u32,
+    hash: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct CastsByFollowingBoundary {
+    timestamp: u32,
+    hash: Vec<u8>,
+}
+
+struct FidMergeState {
+    fid: u64,
+    shard_id: u32,
+    buffer: Vec<Message>,
+    buffer_idx: usize,
+    db_page_token: Option<Vec<u8>>,
+    exhausted: bool,
+}
+
+fn compare_timeline_points(
+    ts_a: u32,
+    hash_a: &[u8],
+    ts_b: u32,
+    hash_b: &[u8],
+    reverse: bool,
+) -> std::cmp::Ordering {
+    let ts_cmp = if reverse {
+        ts_b.cmp(&ts_a)
+    } else {
+        ts_a.cmp(&ts_b)
+    };
+    ts_cmp.then_with(|| {
+        if reverse {
+            hash_b.cmp(hash_a)
+        } else {
+            hash_a.cmp(hash_b)
+        }
+    })
+}
+
+fn compare_casts_by_following_timeline(
+    a: &proto::Message,
+    b: &proto::Message,
+    reverse: bool,
+) -> std::cmp::Ordering {
+    compare_timeline_points(
+        a.data.as_ref().map(|d| d.timestamp).unwrap_or(0),
+        &a.hash,
+        b.data.as_ref().map(|d| d.timestamp).unwrap_or(0),
+        &b.hash,
+        reverse,
+    )
+}
+
+fn cast_is_before_timeline_boundary(
+    msg: &Message,
+    boundary: &CastsByFollowingBoundary,
+    reverse: bool,
+) -> bool {
+    compare_timeline_points(
+        msg.data.as_ref().map(|d| d.timestamp).unwrap_or(0),
+        &msg.hash,
+        boundary.timestamp,
+        &boundary.hash,
+        reverse,
+    ) == std::cmp::Ordering::Less
+}
+
+/// Removes cast entries already passed by `buffer_idx` so dead prefix does not accumulate.
+fn compact_consumed_fid_cast_prefix(state: &mut FidMergeState) {
+    if state.buffer_idx == 0 {
+        return;
+    }
+    if state.buffer_idx >= state.buffer.len() {
+        state.buffer.clear();
+    } else {
+        state.buffer.drain(..state.buffer_idx);
+    }
+    state.buffer_idx = 0;
+}
+
+/// Merges two timeline-ordered cast lists. `incoming` is sorted in place; `existing` must
+/// already be sorted.
+fn merge_timeline_sorted_cast_batches(
+    existing: Vec<Message>,
+    mut incoming: Vec<Message>,
+    reverse: bool,
+) -> Vec<Message> {
+    if incoming.is_empty() {
+        return existing;
+    }
+    incoming.sort_by(|a, b| compare_casts_by_following_timeline(a, b, reverse));
+    if existing.is_empty() {
+        return incoming;
+    }
+
+    let mut merged = Vec::with_capacity(existing.len() + incoming.len());
+    let (mut left_idx, mut right_idx) = (0, 0);
+    while left_idx < existing.len() && right_idx < incoming.len() {
+        if compare_casts_by_following_timeline(&existing[left_idx], &incoming[right_idx], reverse)
+            != std::cmp::Ordering::Greater
+        {
+            merged.push(existing[left_idx].clone());
+            left_idx += 1;
+        } else {
+            merged.push(incoming[right_idx].clone());
+            right_idx += 1;
+        }
+    }
+    merged.extend(existing[left_idx..].iter().cloned());
+    merged.extend(incoming[right_idx..].iter().cloned());
+    merged
+}
+
+fn fetch_fid_cast_batch(
+    state: &mut FidMergeState,
+    cast_store: &Store<CastStoreDef>,
+    start_ts: Option<u32>,
+    stop_ts: Option<u32>,
+    reverse: bool,
+    batch_size: usize,
+) -> Result<(), HubError> {
+    if state.exhausted {
+        return Ok(());
+    }
+    // `ensure_fid_cast_available` only fetches once the cursor has consumed the buffer.
+    compact_consumed_fid_cast_prefix(state);
+
+    let page = CastStore::get_cast_adds_by_fid_page(
+        cast_store,
+        state.fid,
+        start_ts,
+        stop_ts,
+        &PageOptions {
+            page_size: Some(batch_size),
+            page_token: state.db_page_token.clone(),
+            reverse,
+        },
+    )?;
+    state.db_page_token = page.next_page_token.clone();
+    if page.next_page_token.is_none() {
+        state.exhausted = true;
+    }
+    state.buffer = merge_timeline_sorted_cast_batches(
+        std::mem::take(&mut state.buffer),
+        page.messages,
+        reverse,
+    );
+    Ok(())
+}
+
+fn ensure_fid_cast_available(
+    state: &mut FidMergeState,
+    cast_store: &Store<CastStoreDef>,
+    start_ts: Option<u32>,
+    stop_ts: Option<u32>,
+    reverse: bool,
+    batch_size: usize,
+) -> Result<(), HubError> {
+    while state.buffer_idx >= state.buffer.len() && !state.exhausted {
+        fetch_fid_cast_batch(state, cast_store, start_ts, stop_ts, reverse, batch_size)?;
+    }
+    Ok(())
+}
+
+fn link_target_fid(message: &proto::Message) -> Option<u64> {
+    message.data.as_ref().and_then(|data| {
+        if let Some(message_data::Body::LinkBody(link_body)) = &data.body {
+            if let Some(link_body::Target::TargetFid(target_fid)) = link_body.target {
+                return Some(target_fid);
+            }
+        }
+        None
+    })
+}
+
+fn collect_following_fids(
+    link_store: &Store<LinkStore>,
+    user_fid: u64,
+    following_limit: usize,
+) -> Result<Vec<u64>, HubError> {
+    let mut following_fids = Vec::new();
+    let mut page_token = None;
+
+    loop {
+        if following_fids.len() >= following_limit {
+            break;
+        }
+
+        let remaining = following_limit - following_fids.len();
+        let page = LinkStore::get_link_adds_by_fid(
+            link_store,
+            user_fid,
+            LINK_TYPE_FOLLOW.to_string(),
+            &PageOptions {
+                page_size: Some(PAGE_SIZE_MAX.min(remaining)),
+                page_token: page_token.clone(),
+                reverse: false,
+            },
+        )?;
+
+        for message in page.messages {
+            if let Some(target_fid) = link_target_fid(&message) {
+                following_fids.push(target_fid);
+                if following_fids.len() >= following_limit {
+                    break;
+                }
+            }
+        }
+
+        page_token = page.next_page_token;
+        if page_token.is_none() || following_fids.len() >= following_limit {
+            break;
+        }
+    }
+
+    Ok(following_fids)
+}
 
 // Time budget for recovering from a `MissingFname` validation failure on UserDataAdd
 // Username messages.
@@ -111,6 +354,23 @@ fn signer_store_error_to_status(err: HubError) -> Status {
         Status::invalid_argument(err.to_string())
     } else {
         Status::internal(format!("Store error: {:?}", err))
+    }
+}
+
+fn status_to_hub_error(status: Status) -> HubError {
+    HubError::unavailable(status.message())
+}
+
+fn hub_error_to_status(err: HubError) -> Status {
+    match err.code.as_str() {
+        "unavailable" => Status::unavailable(err.message),
+        "bad_request.invalid_param"
+        | "bad_request.validation_failure"
+        | "bad_request.decode_error"
+        | "bad_request.duplicate"
+        | "bad_request.rate_limited" => Status::invalid_argument(err.to_string()),
+        "not_found" => Status::not_found(err.message),
+        _ => Status::internal(err.to_string()),
     }
 }
 
@@ -351,6 +611,10 @@ pub struct MyHubService {
     // the background fname connector has polled the corresponding transfer. None
     // disables on-demand recovery (e.g. when fnames are configured off).
     fname_lookup: Option<Arc<dyn FnameTransferLookup>>,
+    /// When false, `GetCastsByFollowing` returns unavailable. Defaults to enabled.
+    casts_by_following_enabled: bool,
+    /// Hard cap on followed FIDs scanned per request.
+    following_limit: usize,
 }
 
 /// Opaque cursor for notifications pagination.
@@ -397,6 +661,8 @@ impl MyHubService {
         version: String,
         peer_id: String,
         fname_lookup: Option<Arc<dyn FnameTransferLookup>>,
+        casts_by_following_enabled: bool,
+        following_limit: usize,
     ) -> Self {
         let mut allowed_users = HashMap::new();
         for auth in rpc_auth.split(",") {
@@ -434,8 +700,184 @@ impl MyHubService {
             peer_id,
             id_registry_cache,
             fname_lookup,
+            casts_by_following_enabled,
+            following_limit,
         };
         service
+    }
+
+    pub(crate) fn get_casts_by_following_messages(
+        &self,
+        user_fid: u64,
+        start_ts: Option<u32>,
+        stop_ts: Option<u32>,
+        reverse: bool,
+        page_size: usize,
+        page_token: Option<CastsByFollowingPageToken>,
+    ) -> Result<(Vec<Message>, Option<Vec<u8>>), HubError> {
+        let page_size = validate_casts_by_following_page_size(page_size)?;
+        let user_stores = self.get_stores_for(user_fid).map_err(status_to_hub_error)?;
+        let mut following_fids =
+            collect_following_fids(&user_stores.link_store, user_fid, self.following_limit)?;
+
+        if following_fids.is_empty() {
+            return Ok((vec![], None));
+        }
+
+        following_fids.sort_unstable();
+        following_fids.dedup();
+
+        let saved_token = page_token.unwrap_or_default();
+        let timeline_boundary = saved_token.boundary;
+
+        let mut fid_states: HashMap<u64, FidMergeState> = HashMap::new();
+        for &fid in &following_fids {
+            let shard_id = self.message_router.route_fid(fid, self.num_shards);
+            let cursor = saved_token
+                .fid_cursors
+                .get(&fid)
+                .cloned()
+                .unwrap_or_default();
+
+            let mut buffer = Vec::new();
+            if let Ok(stores) = self.get_stores_for_shard(shard_id) {
+                for pending in &cursor.pending {
+                    if let Ok(Some(msg)) = CastStore::get_cast_add(
+                        &stores.cast_store,
+                        pending.fid,
+                        pending.hash.clone(),
+                    ) {
+                        buffer.push(msg);
+                    }
+                }
+            }
+            buffer.sort_by(|a, b| compare_casts_by_following_timeline(a, b, reverse));
+
+            let exhausted = saved_token.fid_cursors.contains_key(&fid)
+                && cursor.db_page_token.is_none()
+                && cursor.pending.is_empty();
+            fid_states.insert(
+                fid,
+                FidMergeState {
+                    fid,
+                    shard_id,
+                    buffer,
+                    buffer_idx: 0,
+                    db_page_token: cursor.db_page_token,
+                    exhausted,
+                },
+            );
+        }
+
+        let mut results: Vec<Message> = Vec::with_capacity(page_size);
+        while results.len() < page_size {
+            for &fid in &following_fids {
+                let state = fid_states.get_mut(&fid).expect("fid_states complete");
+                let stores = self
+                    .get_stores_for_shard(state.shard_id)
+                    .map_err(status_to_hub_error)?;
+                ensure_fid_cast_available(
+                    state,
+                    &stores.cast_store,
+                    start_ts,
+                    stop_ts,
+                    reverse,
+                    page_size,
+                )?;
+
+                while state.buffer_idx < state.buffer.len() {
+                    let candidate = &state.buffer[state.buffer_idx];
+                    if timeline_boundary
+                        .as_ref()
+                        .map(|boundary| {
+                            cast_is_before_timeline_boundary(candidate, boundary, reverse)
+                        })
+                        .unwrap_or(true)
+                    {
+                        break;
+                    }
+                    state.buffer_idx += 1;
+                    compact_consumed_fid_cast_prefix(state);
+                }
+            }
+
+            let mut best_fid: Option<u64> = None;
+            let mut best_head: Option<Message> = None;
+            for &fid in &following_fids {
+                let state = fid_states.get(&fid).expect("fid_states complete");
+                if state.buffer_idx >= state.buffer.len() {
+                    continue;
+                }
+                let head = state.buffer[state.buffer_idx].clone();
+                let replace_best = match &best_head {
+                    None => true,
+                    Some(current_best) => {
+                        compare_casts_by_following_timeline(&head, current_best, reverse)
+                            == std::cmp::Ordering::Less
+                    }
+                };
+                if replace_best {
+                    best_fid = Some(fid);
+                    best_head = Some(head);
+                }
+            }
+
+            let Some(fid) = best_fid else {
+                break;
+            };
+
+            let state = fid_states.get_mut(&fid).expect("best fid present");
+            results.push(state.buffer[state.buffer_idx].clone());
+            state.buffer_idx += 1;
+            compact_consumed_fid_cast_prefix(state);
+        }
+
+        if results.len() < page_size {
+            return Ok((results, None));
+        }
+
+        let boundary = results.last().map(|msg| CastsByFollowingBoundary {
+            timestamp: msg.data.as_ref().map(|d| d.timestamp).unwrap_or(0),
+            hash: msg.hash.clone(),
+        });
+
+        let mut has_more = false;
+        let mut fid_cursors = HashMap::new();
+        for &fid in &following_fids {
+            let state = fid_states.get(&fid).expect("fid_states complete");
+            let pending: Vec<PendingFollowingCast> = state.buffer[state.buffer_idx..]
+                .iter()
+                .map(|msg| PendingFollowingCast {
+                    fid,
+                    timestamp: msg.data.as_ref().map(|d| d.timestamp).unwrap_or(0),
+                    hash: msg.hash.clone(),
+                })
+                .collect();
+            if !state.exhausted || !pending.is_empty() {
+                has_more = true;
+                fid_cursors.insert(
+                    fid,
+                    FidFollowingCursor {
+                        db_page_token: state.db_page_token.clone(),
+                        pending,
+                    },
+                );
+            }
+        }
+
+        let next_page_token = if has_more {
+            Some(
+                serde_json::to_vec(&CastsByFollowingPageToken {
+                    fid_cursors,
+                    boundary,
+                })
+                .map_err(|e| HubError::internal_db_error(&e.to_string()))?,
+            )
+        } else {
+            None
+        };
+
+        Ok((results, next_page_token))
     }
 
     async fn submit_message_internal(
@@ -705,9 +1147,10 @@ impl MyHubService {
     fn get_stores_for_shard(&self, shard_id: u32) -> Result<&Stores, Status> {
         match self.shard_stores.get(&shard_id) {
             Some(store) => Ok(store),
-            None => Err(Status::invalid_argument(
-                "no shard store for fid".to_string(),
-            )),
+            None => Err(Status::unavailable(format!(
+                "shard {} is not served by this node",
+                shard_id
+            ))),
         }
     }
 
@@ -2160,6 +2603,55 @@ impl HubService for MyHubService {
         Ok(Response::new(response))
     }
 
+    async fn get_casts_by_following(
+        &self,
+        request: Request<CastsByFollowingRequest>,
+    ) -> Result<Response<MessagesResponse>, Status> {
+        if !self.casts_by_following_enabled {
+            return Err(Status::failed_precondition(
+                "GetCastsByFollowing is disabled on this node".to_string(),
+            ));
+        }
+
+        let req = request.into_inner();
+        let user_fid = match req.fid {
+            Some(fid) => fid,
+            None => {
+                return Err(Status::invalid_argument(
+                    "fid must be specified".to_string(),
+                ))
+            }
+        };
+        let (start_ts, stop_ts) = req.timestamps();
+        let reverse = req.reverse.unwrap_or(true);
+        let page_size = validate_casts_by_following_page_size(
+            req.page_size
+                .map(|s| s as usize)
+                .unwrap_or(DEFAULT_CASTS_BY_FOLLOWING_PAGE_SIZE),
+        )
+        .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+        let page_token = if let Some(token_bytes) = req.page_token {
+            Some(
+                serde_json::from_slice::<CastsByFollowingPageToken>(&token_bytes)
+                    .map_err(|e| Status::invalid_argument(format!("Invalid page token: {}", e)))?,
+            )
+        } else {
+            None
+        };
+
+        let (messages, next_page_token) = self
+            .get_casts_by_following_messages(
+                user_fid, start_ts, stop_ts, reverse, page_size, page_token,
+            )
+            .map_err(hub_error_to_status)?;
+
+        Ok(Response::new(MessagesResponse {
+            messages,
+            next_page_token,
+        }))
+    }
+
     async fn get_casts_by_mention(
         &self,
         request: Request<FidRequest>,
@@ -3533,5 +4025,103 @@ impl crate::api::HubQueryHandler for MyHubService {
         all_fids.dedup();
         all_fids.truncate(limit);
         Ok((all_fids, None))
+    }
+
+    async fn get_casts_by_following(
+        &self,
+        fid: u64,
+        page_size: usize,
+        page_token: Option<Vec<u8>>,
+        reverse: bool,
+        start_timestamp: Option<u32>,
+        stop_timestamp: Option<u32>,
+    ) -> Result<(Vec<Message>, Option<Vec<u8>>), String> {
+        if !self.casts_by_following_enabled {
+            return Err("GetCastsByFollowing is disabled on this node".to_string());
+        }
+
+        let page_token = if let Some(token_bytes) = page_token {
+            Some(
+                serde_json::from_slice::<CastsByFollowingPageToken>(&token_bytes)
+                    .map_err(|e| format!("Invalid page token: {}", e))?,
+            )
+        } else {
+            None
+        };
+
+        self.get_casts_by_following_messages(
+            fid,
+            start_timestamp,
+            stop_timestamp,
+            reverse,
+            page_size,
+            page_token,
+        )
+        .map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod casts_by_following_buffer_tests {
+    use super::*;
+    use crate::utils::factory::messages_factory;
+
+    fn cast_at(fid: u64, ts: u32) -> Message {
+        messages_factory::casts::create_cast_add(fid, &format!("cast-{ts}"), Some(ts), None)
+    }
+
+    fn fid_state(buffer: Vec<Message>, buffer_idx: usize) -> FidMergeState {
+        FidMergeState {
+            fid: 1,
+            shard_id: 1,
+            buffer,
+            buffer_idx,
+            db_page_token: None,
+            exhausted: false,
+        }
+    }
+
+    fn timestamps(messages: &[Message]) -> Vec<u32> {
+        messages
+            .iter()
+            .map(|m| m.data.as_ref().map(|d| d.timestamp).unwrap_or(0))
+            .collect()
+    }
+
+    #[test]
+    fn compact_drops_consumed_prefix() {
+        let mut state = fid_state(vec![cast_at(1, 100), cast_at(1, 200), cast_at(1, 300)], 2);
+        compact_consumed_fid_cast_prefix(&mut state);
+        assert_eq!(state.buffer_idx, 0);
+        assert_eq!(state.buffer.len(), 1);
+        assert_eq!(state.buffer[0].data.as_ref().unwrap().timestamp, 300);
+    }
+
+    #[test]
+    fn compact_clears_fully_consumed_buffer() {
+        let mut state = fid_state(vec![cast_at(1, 100), cast_at(1, 200)], 2);
+        compact_consumed_fid_cast_prefix(&mut state);
+        assert!(state.buffer.is_empty());
+        assert_eq!(state.buffer_idx, 0);
+    }
+
+    #[test]
+    fn merge_timeline_sorted_cast_batches_newest_first() {
+        let merged = merge_timeline_sorted_cast_batches(
+            vec![cast_at(1, 300), cast_at(1, 100)],
+            vec![cast_at(1, 200)],
+            true,
+        );
+        assert_eq!(timestamps(&merged), vec![300, 200, 100]);
+    }
+
+    #[test]
+    fn merge_timeline_sorted_cast_batches_oldest_first() {
+        let merged = merge_timeline_sorted_cast_batches(
+            vec![cast_at(1, 100), cast_at(1, 300)],
+            vec![cast_at(1, 200)],
+            false,
+        );
+        assert_eq!(timestamps(&merged), vec![100, 200, 300]);
     }
 }

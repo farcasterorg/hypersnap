@@ -24,7 +24,9 @@ mod tests {
     };
     use crate::proto::{FidRequest, SubscribeRequest};
     use crate::storage::db::{RocksDB, RocksDbTransactionBatch};
-    use crate::storage::store::account::{HubEventIdGenerator, HubEventStorageExt, SEQUENCE_BITS};
+    use crate::storage::store::account::{
+        HubEventIdGenerator, HubEventStorageExt, MIN_CASTS_BY_FOLLOWING_LIMIT, SEQUENCE_BITS,
+    };
     use crate::storage::store::block_engine::BlockEngine;
     use crate::storage::store::block_engine_test_helpers::{BlockEngineOptions, Validity};
     use crate::storage::store::engine::{Senders, ShardEngine};
@@ -180,8 +182,61 @@ mod tests {
         service.submit_bulk_messages(request).await
     }
 
+    struct MakeServerOpts {
+        rpc_auth: Option<String>,
+        following_limit: Option<usize>,
+        unlimited_store_limits: bool,
+    }
+
+    impl Default for MakeServerOpts {
+        fn default() -> Self {
+            Self {
+                rpc_auth: None,
+                following_limit: None,
+                unlimited_store_limits: false,
+            }
+        }
+    }
+
     async fn make_server(
         rpc_auth: Option<String>,
+    ) -> (
+        HashMap<u32, Stores>,
+        HashMap<u32, Senders>,
+        [ShardEngine; 2],
+        BlockEngine,
+        MyHubService,
+        broadcast::Sender<ShardChunk>,
+        broadcast::Sender<Block>,
+    ) {
+        make_server_with_opts(MakeServerOpts {
+            rpc_auth,
+            ..Default::default()
+        })
+        .await
+    }
+
+    async fn make_server_for_casts_by_following(
+        following_limit: Option<usize>,
+    ) -> (
+        HashMap<u32, Stores>,
+        HashMap<u32, Senders>,
+        [ShardEngine; 2],
+        BlockEngine,
+        MyHubService,
+        broadcast::Sender<ShardChunk>,
+        broadcast::Sender<Block>,
+    ) {
+        make_server_with_opts(MakeServerOpts {
+            following_limit,
+            unlimited_store_limits: true,
+            ..Default::default()
+        })
+        .await
+    }
+
+    async fn make_server_with_opts(
+        opts: MakeServerOpts,
     ) -> (
         HashMap<u32, Stores>,
         HashMap<u32, Senders>,
@@ -198,7 +253,11 @@ mod tests {
             true,
         );
 
-        let limits = test_helper::limits::test_store_limits();
+        let limits = if opts.unlimited_store_limits {
+            test_helper::limits::unlimited_store_limits()
+        } else {
+            test_helper::limits::test_store_limits()
+        };
         let (engine1, _) = test_helper::new_engine_with_options(test_helper::EngineOptions {
             limits: Some(limits.clone()),
             messages_request_tx: Some(msgs_request_tx.clone()),
@@ -237,7 +296,9 @@ mod tests {
         let senders = HashMap::from([(1, shard1_senders), (2, shard2_senders)]);
         let num_shards = senders.len() as u32;
 
-        let auth = rpc_auth.unwrap_or_else(|| format!("{}:{}", USER_NAME, PASSWORD));
+        let auth = opts
+            .rpc_auth
+            .unwrap_or_else(|| format!("{}:{}", USER_NAME, PASSWORD));
 
         let message_router = Box::new(routing::EvenOddRouterForTest {});
         assert_eq!(message_router.route_fid(SHARD1_FID, 2), 1);
@@ -300,6 +361,9 @@ mod tests {
                 "0.1.2".to_string(),
                 "asddef".to_string(),
                 None,
+                true,
+                opts.following_limit
+                    .unwrap_or_else(crate::api::config::default_casts_by_following_following_limit),
             ),
             shard_decision_tx,
             block_decision_tx,
@@ -516,8 +580,8 @@ mod tests {
         // Validate the response
         assert!(response.is_err());
         let status = response.unwrap_err();
-        assert_eq!(status.code(), tonic::Code::InvalidArgument);
-        assert_eq!(status.message(), "no shard store for fid");
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(status.message(), "shard 999 is not served by this node");
     }
 
     #[tokio::test]
@@ -543,8 +607,8 @@ mod tests {
 
         assert!(response.is_err());
         let status = response.unwrap_err();
-        assert_eq!(status.code(), tonic::Code::InvalidArgument);
-        assert_eq!(status.message(), "no shard store for fid");
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(status.message(), "shard 0 is not served by this node");
     }
 
     #[tokio::test]
@@ -1479,6 +1543,526 @@ mod tests {
             .await
             .unwrap();
         test_helper::assert_contains_all_messages(&response, &[&reply_1, &reply_3_another_shard]);
+    }
+
+    #[tokio::test]
+    async fn test_get_casts_by_following_returns_followed_casts_in_time_range() {
+        const VIEWER_FID: u64 = SHARD1_FID;
+        const FOLLOWED_SAME_SHARD: u64 = 123;
+        const FOLLOWED_OTHER_SHARD: u64 = SHARD2_FID;
+
+        let (
+            _stores,
+            _senders,
+            [mut engine1, mut engine2],
+            _block_engine,
+            service,
+            _shard_decision_tx,
+            _block_decision_tx,
+        ) = make_server_for_casts_by_following(None).await;
+
+        for fid in [VIEWER_FID, FOLLOWED_SAME_SHARD] {
+            test_helper::register_user(
+                fid,
+                test_helper::default_signer(),
+                test_helper::default_custody_address(),
+                &mut engine1,
+            )
+            .await;
+        }
+        test_helper::register_user(
+            FOLLOWED_OTHER_SHARD,
+            test_helper::default_signer(),
+            test_helper::default_custody_address(),
+            &mut engine2,
+        )
+        .await;
+
+        let follow_same_shard = messages_factory::links::create_link_add(
+            VIEWER_FID,
+            "follow",
+            FOLLOWED_SAME_SHARD,
+            None,
+            None,
+        );
+        let follow_other_shard = messages_factory::links::create_link_add(
+            VIEWER_FID,
+            "follow",
+            FOLLOWED_OTHER_SHARD,
+            None,
+            None,
+        );
+        test_helper::commit_message(&mut engine1, &follow_same_shard).await;
+        test_helper::commit_message(&mut engine1, &follow_other_shard).await;
+
+        let cast_same_shard = messages_factory::casts::create_cast_add(
+            FOLLOWED_SAME_SHARD,
+            "cast from same shard",
+            Some(1100),
+            None,
+        );
+        let cast_other_shard = messages_factory::casts::create_cast_add(
+            FOLLOWED_OTHER_SHARD,
+            "cast from other shard",
+            Some(1200),
+            None,
+        );
+        let cast_viewer =
+            messages_factory::casts::create_cast_add(VIEWER_FID, "viewer cast", Some(1300), None);
+        let cast_out_of_range = messages_factory::casts::create_cast_add(
+            FOLLOWED_OTHER_SHARD,
+            "out of range",
+            Some(2000),
+            None,
+        );
+
+        test_helper::commit_message(&mut engine1, &cast_same_shard).await;
+        test_helper::commit_message(&mut engine2, &cast_other_shard).await;
+        test_helper::commit_message(&mut engine1, &cast_viewer).await;
+        test_helper::commit_message(&mut engine2, &cast_out_of_range).await;
+
+        let response = service
+            .get_casts_by_following(Request::new(proto::CastsByFollowingRequest {
+                fid: Some(VIEWER_FID),
+                page_size: None,
+                page_token: None,
+                reverse: None,
+                start_timestamp: Some(1000),
+                stop_timestamp: Some(1500),
+            }))
+            .await
+            .unwrap();
+
+        test_helper::assert_contains_all_messages(
+            &response,
+            &[&cast_other_shard, &cast_same_shard],
+        );
+        assert!(
+            !response
+                .get_ref()
+                .messages
+                .iter()
+                .any(|m| m.hash == cast_viewer.hash),
+            "viewer's own casts should not be included"
+        );
+        assert!(
+            !response
+                .get_ref()
+                .messages
+                .iter()
+                .any(|m| m.hash == cast_out_of_range.hash),
+            "casts outside the timestamp range should not be included"
+        );
+
+        let timestamps: Vec<u32> = response
+            .get_ref()
+            .messages
+            .iter()
+            .filter_map(|m| m.data.as_ref().map(|d| d.timestamp))
+            .collect();
+        assert_eq!(timestamps, vec![1200, 1100]);
+
+        let page_one = service
+            .get_casts_by_following(Request::new(proto::CastsByFollowingRequest {
+                fid: Some(VIEWER_FID),
+                page_size: Some(MIN_CASTS_BY_FOLLOWING_LIMIT as u32),
+                page_token: None,
+                reverse: None,
+                start_timestamp: Some(1000),
+                stop_timestamp: Some(1500),
+            }))
+            .await
+            .unwrap();
+        test_helper::assert_contains_all_messages(
+            &page_one,
+            &[&cast_other_shard, &cast_same_shard],
+        );
+        assert!(page_one.get_ref().next_page_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_casts_by_following_stable_pagination_with_equal_timestamps() {
+        const VIEWER_FID: u64 = SHARD1_FID;
+        const FOLLOWED_SAME_SHARD: u64 = 123;
+        const FOLLOWED_OTHER_SHARD: u64 = SHARD2_FID;
+        const SAME_TS: u32 = 1400;
+
+        let (
+            _stores,
+            _senders,
+            [mut engine1, mut engine2],
+            _block_engine,
+            service,
+            _shard_decision_tx,
+            _block_decision_tx,
+        ) = make_server_for_casts_by_following(None).await;
+
+        for fid in [VIEWER_FID, FOLLOWED_SAME_SHARD] {
+            test_helper::register_user(
+                fid,
+                test_helper::default_signer(),
+                test_helper::default_custody_address(),
+                &mut engine1,
+            )
+            .await;
+        }
+        test_helper::register_user(
+            FOLLOWED_OTHER_SHARD,
+            test_helper::default_signer(),
+            test_helper::default_custody_address(),
+            &mut engine2,
+        )
+        .await;
+
+        for target in [FOLLOWED_SAME_SHARD, FOLLOWED_OTHER_SHARD] {
+            let follow =
+                messages_factory::links::create_link_add(VIEWER_FID, "follow", target, None, None);
+            test_helper::commit_message(&mut engine1, &follow).await;
+        }
+
+        let cast_same_shard = messages_factory::casts::create_cast_add(
+            FOLLOWED_SAME_SHARD,
+            "same ts same shard",
+            Some(SAME_TS),
+            None,
+        );
+        let cast_other_shard = messages_factory::casts::create_cast_add(
+            FOLLOWED_OTHER_SHARD,
+            "same ts other shard",
+            Some(SAME_TS),
+            None,
+        );
+        test_helper::commit_message(&mut engine1, &cast_same_shard).await;
+        test_helper::commit_message(&mut engine2, &cast_other_shard).await;
+
+        let (newer_first, older_second) =
+            if cast_same_shard.hash.cmp(&cast_other_shard.hash) == std::cmp::Ordering::Greater {
+                (&cast_same_shard, &cast_other_shard)
+            } else {
+                (&cast_other_shard, &cast_same_shard)
+            };
+
+        let mut hashes = Vec::new();
+        for _ in 0..5 {
+            let response = service
+                .get_casts_by_following(Request::new(proto::CastsByFollowingRequest {
+                    fid: Some(VIEWER_FID),
+                    page_size: Some(MIN_CASTS_BY_FOLLOWING_LIMIT as u32),
+                    page_token: None,
+                    reverse: None,
+                    start_timestamp: Some(1000),
+                    stop_timestamp: Some(1500),
+                }))
+                .await
+                .unwrap();
+            assert_eq!(response.get_ref().messages.len(), 2);
+            let page_hashes: Vec<_> = response
+                .get_ref()
+                .messages
+                .iter()
+                .map(|m| m.hash.clone())
+                .collect();
+            hashes.push(page_hashes);
+        }
+
+        for page_hashes in &hashes {
+            assert_eq!(page_hashes[0], newer_first.hash);
+            assert_eq!(page_hashes[1], older_second.hash);
+        }
+        assert!(
+            hashes.windows(2).all(|w| w[0] == w[1]),
+            "ordering should be stable across repeated calls"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_casts_by_following_messages_newest_first() {
+        const VIEWER_FID: u64 = SHARD1_FID;
+        const FOLLOWED_SAME_SHARD: u64 = 123;
+        const FOLLOWED_OTHER_SHARD: u64 = SHARD2_FID;
+
+        let (
+            _stores,
+            _senders,
+            [mut engine1, mut engine2],
+            _block_engine,
+            service,
+            _shard_decision_tx,
+            _block_decision_tx,
+        ) = make_server_for_casts_by_following(None).await;
+
+        for fid in [VIEWER_FID, FOLLOWED_SAME_SHARD] {
+            test_helper::register_user(
+                fid,
+                test_helper::default_signer(),
+                test_helper::default_custody_address(),
+                &mut engine1,
+            )
+            .await;
+        }
+        test_helper::register_user(
+            FOLLOWED_OTHER_SHARD,
+            test_helper::default_signer(),
+            test_helper::default_custody_address(),
+            &mut engine2,
+        )
+        .await;
+
+        for target in [FOLLOWED_SAME_SHARD, FOLLOWED_OTHER_SHARD] {
+            let follow =
+                messages_factory::links::create_link_add(VIEWER_FID, "follow", target, None, None);
+            test_helper::commit_message(&mut engine1, &follow).await;
+        }
+
+        let cast_same = messages_factory::casts::create_cast_add(
+            FOLLOWED_SAME_SHARD,
+            "same shard",
+            Some(1100),
+            None,
+        );
+        let cast_other = messages_factory::casts::create_cast_add(
+            FOLLOWED_OTHER_SHARD,
+            "other shard",
+            Some(1200),
+            None,
+        );
+        test_helper::commit_message(&mut engine1, &cast_same).await;
+        test_helper::commit_message(&mut engine2, &cast_other).await;
+
+        let (messages, _) = service
+            .get_casts_by_following_messages(
+                VIEWER_FID,
+                Some(1000),
+                Some(1500),
+                true,
+                MIN_CASTS_BY_FOLLOWING_LIMIT,
+                None,
+            )
+            .unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].hash, cast_other.hash);
+        assert_eq!(messages[1].hash, cast_same.hash);
+
+        let grpc_page = service
+            .get_casts_by_following(Request::new(proto::CastsByFollowingRequest {
+                fid: Some(VIEWER_FID),
+                page_size: Some(MIN_CASTS_BY_FOLLOWING_LIMIT as u32),
+                page_token: None,
+                reverse: None,
+                start_timestamp: Some(1000),
+                stop_timestamp: Some(1500),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(grpc_page.get_ref().messages.len(), 2);
+        assert_eq!(grpc_page.get_ref().messages[0].hash, cast_other.hash);
+    }
+
+    #[tokio::test]
+    async fn test_get_casts_by_following_pages_past_first_per_fid_batch() {
+        const VIEWER_FID: u64 = SHARD1_FID;
+        const FOLLOWED_FID: u64 = 123;
+
+        let (
+            _stores,
+            _senders,
+            [mut engine1, _engine2],
+            _block_engine,
+            service,
+            _shard_decision_tx,
+            _block_decision_tx,
+        ) = make_server_for_casts_by_following(None).await;
+
+        for fid in [VIEWER_FID, FOLLOWED_FID] {
+            test_helper::register_user(
+                fid,
+                test_helper::default_signer(),
+                test_helper::default_custody_address(),
+                &mut engine1,
+            )
+            .await;
+        }
+
+        let follow = messages_factory::links::create_link_add(
+            VIEWER_FID,
+            "follow",
+            FOLLOWED_FID,
+            None,
+            None,
+        );
+        test_helper::commit_message(&mut engine1, &follow).await;
+
+        let mut casts = Vec::new();
+        for i in 0..12 {
+            let ts = 1100 + i * 10;
+            let cast = messages_factory::casts::create_cast_add(
+                FOLLOWED_FID,
+                &format!("cast-{ts}"),
+                Some(ts),
+                None,
+            );
+            test_helper::commit_message(&mut engine1, &cast).await;
+            casts.push(cast);
+        }
+        casts.reverse();
+
+        let page_one = service
+            .get_casts_by_following(Request::new(proto::CastsByFollowingRequest {
+                fid: Some(VIEWER_FID),
+                page_size: Some(MIN_CASTS_BY_FOLLOWING_LIMIT as u32),
+                page_token: None,
+                reverse: None,
+                start_timestamp: Some(1000),
+                stop_timestamp: Some(1500),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            page_one.get_ref().messages.len(),
+            MIN_CASTS_BY_FOLLOWING_LIMIT
+        );
+        for (msg, expected) in page_one
+            .get_ref()
+            .messages
+            .iter()
+            .zip(casts.iter().take(MIN_CASTS_BY_FOLLOWING_LIMIT))
+        {
+            assert_eq!(msg.hash, expected.hash);
+        }
+
+        assert!(
+            page_one.get_ref().next_page_token.is_some(),
+            "more than one page of casts should yield a continuation token"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_casts_by_following_rejects_page_size_below_min() {
+        let (
+            _stores,
+            _senders,
+            [_engine1, _engine2],
+            _block_engine,
+            service,
+            _shard_decision_tx,
+            _block_decision_tx,
+        ) = make_server_for_casts_by_following(None).await;
+
+        let err = service
+            .get_casts_by_following(Request::new(proto::CastsByFollowingRequest {
+                fid: Some(SHARD1_FID),
+                page_size: Some(9),
+                page_token: None,
+                reverse: None,
+                start_timestamp: None,
+                stop_timestamp: None,
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn test_get_casts_by_following_respects_following_limit() {
+        const VIEWER_FID: u64 = SHARD1_FID;
+        const FOLLOWED_OLDEST: u64 = 123;
+        const FOLLOWED_MIDDLE: u64 = 125;
+        const FOLLOWED_NEWEST: u64 = 127;
+
+        let (
+            _stores,
+            _senders,
+            [mut engine1, _engine2],
+            _block_engine,
+            service,
+            _shard_decision_tx,
+            _block_decision_tx,
+        ) = make_server_for_casts_by_following(Some(2)).await;
+
+        for fid in [
+            VIEWER_FID,
+            FOLLOWED_OLDEST,
+            FOLLOWED_MIDDLE,
+            FOLLOWED_NEWEST,
+        ] {
+            test_helper::register_user(
+                fid,
+                test_helper::default_signer(),
+                test_helper::default_custody_address(),
+                &mut engine1,
+            )
+            .await;
+        }
+
+        for target in [FOLLOWED_OLDEST, FOLLOWED_MIDDLE, FOLLOWED_NEWEST] {
+            let follow =
+                messages_factory::links::create_link_add(VIEWER_FID, "follow", target, None, None);
+            test_helper::commit_message(&mut engine1, &follow).await;
+        }
+
+        let cast_oldest =
+            messages_factory::casts::create_cast_add(FOLLOWED_OLDEST, "oldest", Some(1100), None);
+        let cast_middle =
+            messages_factory::casts::create_cast_add(FOLLOWED_MIDDLE, "middle", Some(1200), None);
+        let cast_newest =
+            messages_factory::casts::create_cast_add(FOLLOWED_NEWEST, "newest", Some(1300), None);
+        test_helper::commit_message(&mut engine1, &cast_oldest).await;
+        test_helper::commit_message(&mut engine1, &cast_middle).await;
+        test_helper::commit_message(&mut engine1, &cast_newest).await;
+
+        let response = service
+            .get_casts_by_following(Request::new(proto::CastsByFollowingRequest {
+                fid: Some(VIEWER_FID),
+                page_size: Some(MIN_CASTS_BY_FOLLOWING_LIMIT as u32),
+                page_token: None,
+                reverse: None,
+                start_timestamp: Some(1000),
+                stop_timestamp: Some(1500),
+            }))
+            .await
+            .unwrap();
+
+        let returned_fids: Vec<u64> = response
+            .get_ref()
+            .messages
+            .iter()
+            .map(|m| m.fid())
+            .collect();
+        assert_eq!(returned_fids.len(), 2);
+        assert!(
+            !returned_fids.contains(&FOLLOWED_OLDEST),
+            "the oldest follow should fall outside following_limit"
+        );
+        assert!(returned_fids.contains(&FOLLOWED_MIDDLE));
+        assert!(returned_fids.contains(&FOLLOWED_NEWEST));
+    }
+
+    #[tokio::test]
+    async fn test_get_casts_by_following_rejects_page_size_above_max() {
+        let (
+            _stores,
+            _senders,
+            [_engine1, _engine2],
+            _block_engine,
+            service,
+            _shard_decision_tx,
+            _block_decision_tx,
+        ) = make_server_for_casts_by_following(None).await;
+
+        let err = service
+            .get_casts_by_following(Request::new(proto::CastsByFollowingRequest {
+                fid: Some(SHARD1_FID),
+                page_size: Some(1001),
+                page_token: None,
+                reverse: None,
+                start_timestamp: None,
+                stop_timestamp: None,
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
     #[tokio::test]
