@@ -347,7 +347,21 @@ where
         for message in received {
             // Index for the counterparty.
             let counterparty = message.parties.sender;
-            let current_kept = kept.get(&counterparty).unwrap();
+            // F108 fix: `parties.sender` is an attacker-controlled
+            // wire byte. Without these guards a peer can drive
+            // `kept.get(&attacker_byte).unwrap()` into a panic by
+            // submitting a Phase1Send naming a non-committee party,
+            // crashing the signing actor. Convert the bad-routing
+            // case to a proper `Abort` from this party.
+            let current_kept = match kept.get(&counterparty) {
+                Some(k) => k,
+                None => {
+                    return Err(Abort::new(
+                        self.party_index,
+                        &format!("Phase2: unknown counterparty {counterparty}"),
+                    ))
+                }
+            };
 
             // We continue the multiplication protocol to get the values
             // c^u and c^v from the paper. We are now the sender.
@@ -363,11 +377,16 @@ where
             ]
             .concat();
 
-            let mul_result = self.mul_senders.get(&counterparty).unwrap().run(
-                &mul_sid,
-                &input,
-                &message.mul_transmit,
-            );
+            let mul_sender = match self.mul_senders.get(&counterparty) {
+                Some(s) => s,
+                None => {
+                    return Err(Abort::new(
+                        self.party_index,
+                        &format!("Phase2: no mul_sender for counterparty {counterparty}"),
+                    ))
+                }
+            };
+            let mul_result = mul_sender.run(&mul_sid, &input, &message.mul_transmit);
 
             let c_u: C::Scalar;
             let c_v: C::Scalar;
@@ -483,7 +502,17 @@ where
         for message in received {
             // Index for the counterparty.
             let counterparty = message.parties.sender;
-            let current_kept = kept.get(&counterparty).unwrap();
+            // F108 fix: validate counterparty before unwrap (same
+            // shape as Phase2 — see comment above).
+            let current_kept = match kept.get(&counterparty) {
+                Some(k) => k,
+                None => {
+                    return Err(Abort::new(
+                        self.party_index,
+                        &format!("Phase3: unknown counterparty {counterparty}"),
+                    ))
+                }
+            };
 
             // Checking the committed value.
             let verification = verify_commitment_point::<C>(
@@ -512,11 +541,17 @@ where
             ]
             .concat();
 
-            let mul_result = self.mul_receivers.get(&counterparty).unwrap().run_phase2(
-                &mul_sid,
-                &current_kept.mul_keep,
-                &message.mul_transmit,
-            );
+            let mul_receiver = match self.mul_receivers.get(&counterparty) {
+                Some(r) => r,
+                None => {
+                    return Err(Abort::new(
+                        self.party_index,
+                        &format!("Phase3: no mul_receiver for counterparty {counterparty}"),
+                    ))
+                }
+            };
+            let mul_result =
+                mul_receiver.run_phase2(&mul_sid, &current_kept.mul_keep, &message.mul_transmit);
 
             let d_u: C::Scalar;
             let d_v: C::Scalar;

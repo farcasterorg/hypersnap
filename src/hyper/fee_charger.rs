@@ -114,7 +114,7 @@ impl FeeCharger {
                 })
                 .unwrap_or("");
             self.fingerprint_store
-                .uniqueness_score(text, data.timestamp as u64)
+                .uniqueness_score(text, data.timestamp as u64, batch)
                 .map_err(|e| FeeChargeError::Fingerprint(e.to_string()))?
         } else {
             1.0
@@ -129,10 +129,22 @@ impl FeeCharger {
         Ok(fee)
     }
 
-    /// After a CastAdd has been successfully merged, insert its
-    /// fingerprint so subsequent casts in the rolling window see this
-    /// content as a near-dup. No-op for non-cast types.
-    pub fn record_fingerprint_if_cast(&self, msg: &proto::Message) -> Result<(), FeeChargeError> {
+    /// After a CastAdd has been successfully merged, stage the
+    /// fingerprint write on the merge `batch` so it commits
+    /// atomically. No-op for non-cast types.
+    ///
+    /// CRITICAL: this must go on the batch, not direct-write. A
+    /// direct `db.put` here breaks deterministic state replay —
+    /// validators replaying the proposer's block would see the
+    /// proposer's fingerprint in the store (since it's already on
+    /// disk) and compute a different `uniqueness_score` than the
+    /// proposer did at replay time, producing a different effective
+    /// fee and a `HashMismatch` against the proposed state root.
+    pub fn record_fingerprint_if_cast(
+        &self,
+        msg: &proto::Message,
+        batch: &mut RocksDbTransactionBatch,
+    ) -> Result<(), FeeChargeError> {
         let data = match msg.data.as_ref() {
             Some(d) => d,
             None => return Ok(()),
@@ -156,8 +168,7 @@ impl FeeCharger {
             return Ok(());
         }
         self.fingerprint_store
-            .insert(data.fid, text, data.timestamp as u64)
-            .map_err(|e| FeeChargeError::Fingerprint(e.to_string()))?;
+            .stage_insert(data.fid, text, data.timestamp as u64, batch);
         Ok(())
     }
 }

@@ -57,6 +57,14 @@ use std::collections::BTreeMap;
 pub enum DklsError {
     #[error("dkls23 protocol abort: party {party} — {reason}")]
     Abort { party: u8, reason: String },
+    /// F045: DKLS23 occasionally produces `recovery_id ∈ {2, 3}`
+    /// (`R.x ≥ curve order`), which is not Ethereum-compatible. The
+    /// protocol-prescribed remedy is to re-run the signing ceremony
+    /// with a fresh nonce. Distinct from `Abort` so supervisor /
+    /// caller code can branch on it and trigger the re-run rather
+    /// than treating it as a permanent failure.
+    #[error("dkls23 produced non-Ethereum recovery_id={recovery_id} (R.x ≥ curve order); retry ceremony with fresh nonce")]
+    RecoveryIdOutOfRange { recovery_id: u8 },
     #[error("threshold {threshold} > share count {share_count}")]
     BadParameters { threshold: u8, share_count: u8 },
     #[error(

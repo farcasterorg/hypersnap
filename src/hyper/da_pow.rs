@@ -142,7 +142,14 @@ pub fn validate_da_response(
             max: CHALLENGES_PER_EPOCH - 1,
         });
     }
-    if body.served_key.len() != 32 {
+    // F135 fix: accept natural-length served keys (must be at least
+    // the challenge-prefix size). The prior `== 32` gate forced the
+    // driver to zero-pad, but the apply-path trie stores natural-
+    // length keys; pinning to 32 made every honest response miss.
+    // Upper bound caps wire abuse without constraining honest sizes.
+    const MAX_SERVED_KEY_LEN: usize = 256;
+    if body.served_key.len() < CHALLENGE_PREFIX_BYTES || body.served_key.len() > MAX_SERVED_KEY_LEN
+    {
         return Err(DaPowValidationError::BadServedKey {
             got: body.served_key.len(),
         });

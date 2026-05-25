@@ -37,11 +37,30 @@ pub struct HyperRuntimeFileConfig {
     pub mempool_capacity: usize,
     #[serde(default)]
     pub score_weights: ScoreWeightsConfig,
-    /// Optional path to a KZG ceremony trusted-setup text file. If `None`, the
-    /// runtime is constructed with a randomly-sampled SRS — fine for testing
-    /// but unsafe for production.
+    /// Optional path to a KZG ceremony trusted-setup text file. If `None`,
+    /// the runtime requires `allow_random_kzg_srs = true` to fall back to
+    /// a randomly-sampled SRS (devnet/test only — the τ scalar lives in
+    /// process memory and is toxic waste).
     #[serde(default)]
     pub kzg_setup_path: Option<String>,
+    /// F116: ceremony files come in two basis variants:
+    /// monomial (`g_i = g^(τ^i)`) and Lagrange (`g_i = g^(L_i(τ))`).
+    /// The canonical EIP-4844 ceremony file is Lagrange. `build_srs`
+    /// constructs a monomial SRS, so a Lagrange file used unconditionally
+    /// would silently re-interpret the points and break every KZG
+    /// opening verification. Operators must declare which basis their
+    /// file uses; there is no default. Loading a Lagrange file requires
+    /// pre-converting to monomial offline (group-level inverse-FFT).
+    #[serde(default)]
+    pub kzg_basis: Option<KzgBasis>,
+    /// Opt-in to the random-τ SRS fallback. Required when
+    /// `kzg_setup_path` is unset; otherwise `build_srs` returns
+    /// `ConfigError::MissingKzgSetup` rather than silently constructing
+    /// an unsafe SRS. Defaults to `false` so a misconfigured production
+    /// node fails to start instead of running on a forgeable verkle
+    /// commitment.
+    #[serde(default)]
+    pub allow_random_kzg_srs: bool,
     /// SRS max degree when loading from a ceremony file. Defaults to the
     /// verkle domain size (256).
     #[serde(default = "default_srs_max_degree")]
@@ -186,6 +205,11 @@ pub struct RecoveryWatcherFileConfig {
     pub poll_interval_secs: u64,
     #[serde(default = "default_recovery_block_batch")]
     pub block_batch: u64,
+    /// L1 confirmations to wait before treating a Recover event as
+    /// final. F097: without this the watcher could record a Recover
+    /// from a block that later reorgs out.
+    #[serde(default = "default_recovery_finality_confirmations")]
+    pub finality_confirmations: u64,
 }
 
 fn default_recovery_start_block() -> u64 {
@@ -198,6 +222,10 @@ fn default_recovery_poll_secs() -> u64 {
 
 fn default_recovery_block_batch() -> u64 {
     8_000
+}
+
+fn default_recovery_finality_confirmations() -> u64 {
+    64
 }
 
 /// Genesis state declared in TOML. The DKLS23 group address is
@@ -281,6 +309,28 @@ pub enum ConfigError {
         "transport secret file at {0:?} does not exist and auto_generate_transport_secret = false"
     )]
     MissingTransportSecret(String),
+    #[error(
+        "kzg_setup_path is unset and allow_random_kzg_srs = false. \
+         Random SRS leaves toxic-waste τ in process memory and is test-only. \
+         Set kzg_setup_path to a trusted-setup ceremony file or, for \
+         devnets only, explicitly set allow_random_kzg_srs = true."
+    )]
+    MissingKzgSetup,
+    #[error(
+        "kzg_setup_path is set but kzg_basis is missing. The canonical \
+         EIP-4844 ceremony file is Lagrange-basis; this runtime's KZG \
+         constructor consumes monomial-basis G1 points. Set kzg_basis = \
+         \"monomial\" or \"lagrange\" explicitly so we can fail loudly if \
+         a Lagrange file is loaded without conversion."
+    )]
+    MissingKzgBasis,
+    #[error(
+        "kzg_setup_path points at a Lagrange-basis file. Loading Lagrange \
+         directly produces an SRS that fails every KZG opening; convert to \
+         monomial offline (group-level inverse FFT) and re-point \
+         kzg_setup_path at the converted file."
+    )]
+    LagrangeKzgSetupNotSupported,
     #[error("bridge burn watcher misconfigured: {0}")]
     BridgeBurnWatcher(String),
     #[error("failed to read local DKLS share file at {path:?}: {source}")]
@@ -303,6 +353,16 @@ pub enum ConfigError {
         "local_dkls_share_party_index ({configured}) does not match share file's party_index ({on_disk})"
     )]
     DklsShareIndexMismatch { configured: u64, on_disk: u64 },
+}
+
+/// F116: explicit basis declaration for a `kzg_setup_path` ceremony
+/// file. There is no default — operators must declare. See
+/// `HyperRuntimeFileConfig::kzg_basis`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KzgBasis {
+    Monomial,
+    Lagrange,
 }
 
 impl BridgeBurnWatcherFileConfig {
@@ -405,11 +465,31 @@ impl HyperRuntimeFileConfig {
     pub fn build_srs(&self) -> Result<Arc<KzgSrs>, ConfigError> {
         match &self.kzg_setup_path {
             Some(path) => {
+                // F116 fix: require operator to declare the basis.
+                // Loading a Lagrange-basis file (the canonical
+                // EIP-4844 format) through `into_srs_monomial` would
+                // silently re-interpret `g^L_i(τ)` as `g^(τ^i)`,
+                // breaking every KZG opening verification on
+                // honest verkle-inclusion proofs.
+                let basis = self.kzg_basis.ok_or(ConfigError::MissingKzgBasis)?;
+                match basis {
+                    KzgBasis::Monomial => {}
+                    KzgBasis::Lagrange => return Err(ConfigError::LagrangeKzgSetupNotSupported),
+                }
                 let text = std::fs::read_to_string(Path::new(path))?;
                 let parsed = parse_trusted_setup_text(&text)?;
                 Ok(Arc::new(parsed.into_srs_monomial(self.srs_max_degree)?))
             }
             None => {
+                // F048 fix: refuse the silent random-τ fallback in
+                // production. The verkle SRS is the trust anchor for
+                // every state commitment; a random τ in process
+                // memory is toxic waste that could forge proofs.
+                // Operators who actually want this (devnet, smoke
+                // test) must opt in explicitly.
+                if !self.allow_random_kzg_srs {
+                    return Err(ConfigError::MissingKzgSetup);
+                }
                 let mut rng = rand::rngs::OsRng;
                 Ok(Arc::new(KzgSrs::random_unsafe(
                     &mut rng,
@@ -695,6 +775,14 @@ bootstrap_validators = [
             mempool_capacity: 100,
             score_weights: ScoreWeightsConfig::default(),
             kzg_setup_path: None,
+            // F116: tests use random-τ SRS, so kzg_basis is N/A —
+            // None defers the declaration to operators using a
+            // real ceremony file.
+            kzg_basis: None,
+            // Devnet/test fixtures opt into the random-τ SRS
+            // explicitly. Production deployments must set
+            // `kzg_setup_path` to a real ceremony file.
+            allow_random_kzg_srs: true,
             srs_max_degree: 256,
             genesis_path,
             recovery_watcher: RecoveryWatcherFileConfig::default(),

@@ -231,6 +231,12 @@ impl HyperHttpHandler {
             .map(parse_hex)
             .transpose()?
             .unwrap_or_default();
+        let libp2p_peer_id = input
+            .libp2p_peer_id
+            .as_deref()
+            .map(parse_hex)
+            .transpose()?
+            .unwrap_or_default();
         let event = proto::HyperValidatorEventBody {
             event_type: event_type as i32,
             validator_key,
@@ -246,6 +252,7 @@ impl HyperHttpHandler {
             fid,
             custody_signature,
             validator_address,
+            libp2p_peer_id,
         };
         let msg = crate::hyper::router::HyperRouter::outbound_validator_register(event);
         self.inbound
@@ -717,7 +724,7 @@ impl HyperHttpHandler {
         // it lets a relayer build claim calldata without
         // re-implementing the encoder.
         let leaf_hex = state.as_ref().map(|s| {
-            let leaf = crate::hyper::token_lock::encode_token_lock_leaf(s);
+            let leaf = crate::hyper::lock_tree::encode_token_lock_leaf(s);
             format!("0x{}", hex::encode(leaf.as_slice()))
         });
         let response = TokenLockResponse {
@@ -1147,6 +1154,12 @@ struct ValidatorEventInput {
     /// custody address authorizing this validator slot. Required for
     /// register events.
     custody_signature: Option<String>,
+    /// F018: libp2p PeerId bytes (hex). Bound into the signed
+    /// registration payload so a malicious peer cannot rewrite this
+    /// field at relay time. Required for register events to enable
+    /// the per-epoch peer-id ↔ committee-party-index registry that
+    /// gates DKLS gossip ingress.
+    libp2p_peer_id: Option<String>,
 }
 
 #[derive(Serialize)]

@@ -202,6 +202,35 @@ pub enum OpenedDklsMessage {
 /// Decode an incoming DKLS DKG frame. Reads the discriminator,
 /// either bincode-deserializes the plaintext or attempts decryption
 /// with the local transport secret.
+///
+/// F018 partial mitigation: the inner `sender: u8` byte is
+/// encryptor-supplied and not bound to the libp2p
+/// `propagation_source` peer-id of the gossip frame. This codec
+/// cross-checks inner-vs-outer `sender`/`receiver` within the
+/// encrypted frame (`HeaderMismatch` below), but a remote peer
+/// can still broadcast a *plaintext* round message claiming
+/// `sender = Q` for any party `Q`. Defenses currently in place:
+///
+/// 1. F114: the ceremony codec
+///    (`hypersnap-crypto::dkls_ceremony::submit`) cross-checks
+///    inner `parties.sender`/`parties.receiver` against the
+///    outer wire `sender`/`receiver` and drops mismatches.
+/// 2. F107: `step5` unconditionally verifies every inbound
+///    `ProofCommitment` regardless of claimed index.
+/// 3. F108: signing-side `kept.get(&counterparty)` and
+///    `mul_senders.get(&counterparty)` validate before unwrap,
+///    converting bad routing to an `Abort` instead of a panic.
+/// 4. F021: autodiscovery `ContactInfo` is bound to the
+///    libp2p sender's peer-id.
+///
+/// The complete fix is a per-epoch
+/// `(libp2p_peer_id → committee_party_index)` registry built from
+/// `ContactInfo`, consulted at gossip ingress to enforce
+/// "inner.sender == registry.lookup(propagation_source)". That
+/// registry is not yet wired; remaining residual risk is
+/// liveness-only (forged round messages cause peer-side aborts
+/// per DKLS23's `sign_id` binding, not state corruption). Consumers
+/// treat the returned `sender` as untrusted hint, not authority.
 pub fn open_dkls_round_message(
     bytes: &[u8],
     epoch: u64,

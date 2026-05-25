@@ -38,14 +38,18 @@ impl Codec<SignedConsensusMsg<SnapchainValidatorContext>> for SnapchainCodec {
         let message = ConsensusMessage::decode(bytes)?;
         match message.consensus_message {
             Some(consensus_message::ConsensusMessage::Vote(vote)) => {
+                let vote_msg = Vote::try_from_proto(vote)
+                    .map_err(|e| SnapchainCodecError::InvalidField(e.into()))?;
                 Ok(SignedConsensusMsg::Vote(SignedVote {
-                    message: Vote::from_proto(vote),
+                    message: vote_msg,
                     signature: Signature(message.signature),
                 }))
             }
             Some(consensus_message::ConsensusMessage::Proposal(proposal)) => {
+                let prop_msg = Proposal::try_from_proto(proposal)
+                    .map_err(|e| SnapchainCodecError::InvalidField(e.into()))?;
                 Ok(SignedConsensusMsg::Proposal(SignedProposal {
-                    message: Proposal::from_proto(proposal),
+                    message: prop_msg,
                     signature: Signature(message.signature),
                 }))
             }
@@ -229,7 +233,9 @@ impl Codec<sync::Response<SnapchainValidatorContext>> for SnapchainCodec {
                         "Missing commits in ValueResponse".to_string(),
                     )
                 })?;
-                let commit_certificate = commits.to_commit_certificate();
+                let commit_certificate = commits
+                    .try_to_commit_certificate()
+                    .map_err(|e| SnapchainCodecError::InvalidField(e.into()))?;
                 Ok(sync::Response::ValueResponse(sync::ValueResponse {
                     height: value.height.ok_or_else(|| {
                         SnapchainCodecError::InvalidField(
@@ -247,11 +253,15 @@ impl Codec<sync::Response<SnapchainValidatorContext>> for SnapchainCodec {
                     .votes
                     .into_iter()
                     .zip(vote_set.signatures)
-                    .map(|(vote, signature)| SignedVote {
-                        message: Vote::from_proto(vote),
-                        signature: Signature(signature),
+                    .map(|(vote, signature)| {
+                        Vote::try_from_proto(vote)
+                            .map(|m| SignedVote {
+                                message: m,
+                                signature: Signature(signature),
+                            })
+                            .map_err(|e| SnapchainCodecError::InvalidField(e.into()))
                     })
-                    .collect();
+                    .collect::<Result<Vec<_>, _>>()?;
                 Ok(sync::Response::VoteSetResponse(sync::VoteSetResponse {
                     height: vote_set.height.ok_or_else(|| {
                         SnapchainCodecError::InvalidField(

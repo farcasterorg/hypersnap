@@ -62,11 +62,12 @@ pub enum TransferValidationError {
 /// `memo` is included in the payload — that way the signer
 /// commits to the payload it produced (UX shows the memo to the
 /// user before signing).
-pub fn token_transfer_signing_payload(body: &proto::TokenTransferBody) -> Vec<u8> {
-    const DST: &[u8] = b"hypersnap-token-transfer-v1\x00";
+pub fn token_transfer_signing_payload(body: &proto::TokenTransferBody, chain_id: u64) -> Vec<u8> {
+    const DST: &[u8] = b"hypersnap-token-transfer-v1";
     let mut buf =
-        Vec::with_capacity(DST.len() + 8 * 4 + 2 + body.signer_pubkey.len() + 2 + body.memo.len());
+        Vec::with_capacity(DST.len() + 8 * 5 + 2 + body.signer_pubkey.len() + 2 + body.memo.len());
     buf.extend_from_slice(DST);
+    buf.extend_from_slice(&chain_id.to_be_bytes());
     buf.extend_from_slice(&body.sender_fid.to_be_bytes());
     buf.extend_from_slice(&body.recipient_fid.to_be_bytes());
     buf.extend_from_slice(&body.amount.to_be_bytes());
@@ -82,8 +83,12 @@ pub fn token_transfer_signing_payload(body: &proto::TokenTransferBody) -> Vec<u8
 /// Does NOT touch the runtime state — apply paths handle nonce /
 /// balance checks separately. Pure-function so it's safe to call
 /// from gossip ingress before the runtime sees the message.
+///
+/// `chain_id` is bound into the signed payload so a captured body
+/// cannot replay on a sibling hypersnap deployment.
 pub fn validate_token_transfer(
     body: &proto::TokenTransferBody,
+    chain_id: u64,
 ) -> Result<(), TransferValidationError> {
     if body.sender_fid == 0 {
         return Err(TransferValidationError::BadSenderFid);
@@ -114,7 +119,7 @@ pub fn validate_token_transfer(
         .map_err(|_| TransferValidationError::InvalidSignerPubkey)?;
     let sig_bytes: [u8; 64] = body.signature.as_slice().try_into().expect("len 64");
     let sig = Signature::from_bytes(&sig_bytes);
-    let payload = token_transfer_signing_payload(body);
+    let payload = token_transfer_signing_payload(body, chain_id);
     pk.verify(&payload, &sig)
         .map_err(|_| TransferValidationError::SignatureVerifyFailed)?;
     Ok(())
@@ -124,6 +129,8 @@ pub fn validate_token_transfer(
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+
+    const TEST_CHAIN_ID: u64 = 10;
 
     fn make_signed_transfer(
         sender_fid: u64,
@@ -142,7 +149,7 @@ mod tests {
             signature: Vec::new(),
             memo: Vec::new(),
         };
-        let payload = token_transfer_signing_payload(&body);
+        let payload = token_transfer_signing_payload(&body, TEST_CHAIN_ID);
         body.signature = sk.sign(&payload).to_bytes().to_vec();
         (body, sk)
     }
@@ -150,14 +157,14 @@ mod tests {
     #[test]
     fn valid_signed_transfer_validates() {
         let (body, _) = make_signed_transfer(1, 2, 100, 1);
-        validate_token_transfer(&body).unwrap();
+        validate_token_transfer(&body, TEST_CHAIN_ID).unwrap();
     }
 
     #[test]
     fn rejects_zero_amount() {
         let (body, _) = make_signed_transfer(1, 2, 0, 1);
         assert_eq!(
-            validate_token_transfer(&body),
+            validate_token_transfer(&body, TEST_CHAIN_ID),
             Err(TransferValidationError::ZeroAmount)
         );
     }
@@ -166,7 +173,7 @@ mod tests {
     fn rejects_zero_sender_fid() {
         let (body, _) = make_signed_transfer(0, 2, 100, 1);
         assert_eq!(
-            validate_token_transfer(&body),
+            validate_token_transfer(&body, TEST_CHAIN_ID),
             Err(TransferValidationError::BadSenderFid)
         );
     }
@@ -175,7 +182,7 @@ mod tests {
     fn rejects_zero_recipient_fid() {
         let (body, _) = make_signed_transfer(1, 0, 100, 1);
         assert_eq!(
-            validate_token_transfer(&body),
+            validate_token_transfer(&body, TEST_CHAIN_ID),
             Err(TransferValidationError::BadRecipientFid)
         );
     }
@@ -186,10 +193,10 @@ mod tests {
         body.memo = vec![0u8; 257];
         // Re-sign so signature is valid against the new payload —
         // we want to test the size gate, not the sig path.
-        let payload = token_transfer_signing_payload(&body);
+        let payload = token_transfer_signing_payload(&body, TEST_CHAIN_ID);
         body.signature = sk.sign(&payload).to_bytes().to_vec();
         assert_eq!(
-            validate_token_transfer(&body),
+            validate_token_transfer(&body, TEST_CHAIN_ID),
             Err(TransferValidationError::MemoTooLong { got: 257 })
         );
     }
@@ -199,7 +206,7 @@ mod tests {
         let (mut body, _) = make_signed_transfer(1, 2, 100, 1);
         body.signer_pubkey = vec![0u8; 33];
         assert_eq!(
-            validate_token_transfer(&body),
+            validate_token_transfer(&body, TEST_CHAIN_ID),
             Err(TransferValidationError::BadSignerPubkey { got: 33 })
         );
     }
@@ -209,7 +216,7 @@ mod tests {
         let (mut body, _) = make_signed_transfer(1, 2, 100, 1);
         body.signature = vec![0u8; 63];
         assert_eq!(
-            validate_token_transfer(&body),
+            validate_token_transfer(&body, TEST_CHAIN_ID),
             Err(TransferValidationError::BadSignatureLen { got: 63 })
         );
     }
@@ -222,7 +229,7 @@ mod tests {
         let other = SigningKey::from_bytes(&[9u8; 32]);
         body.signer_pubkey = other.verifying_key().to_bytes().to_vec();
         assert_eq!(
-            validate_token_transfer(&body),
+            validate_token_transfer(&body, TEST_CHAIN_ID),
             Err(TransferValidationError::SignatureVerifyFailed)
         );
     }
@@ -234,7 +241,7 @@ mod tests {
         let (mut body, _) = make_signed_transfer(1, 2, 100, 1);
         body.amount = 999;
         assert_eq!(
-            validate_token_transfer(&body),
+            validate_token_transfer(&body, TEST_CHAIN_ID),
             Err(TransferValidationError::SignatureVerifyFailed)
         );
     }
@@ -244,7 +251,7 @@ mod tests {
         let (mut body, _) = make_signed_transfer(1, 2, 100, 1);
         body.recipient_fid = 99;
         assert_eq!(
-            validate_token_transfer(&body),
+            validate_token_transfer(&body, TEST_CHAIN_ID),
             Err(TransferValidationError::SignatureVerifyFailed)
         );
     }
@@ -254,7 +261,18 @@ mod tests {
         let (mut body, _) = make_signed_transfer(1, 2, 100, 1);
         body.nonce = 99;
         assert_eq!(
-            validate_token_transfer(&body),
+            validate_token_transfer(&body, TEST_CHAIN_ID),
+            Err(TransferValidationError::SignatureVerifyFailed)
+        );
+    }
+
+    /// A body signed for one chain must not verify on a sibling
+    /// chain.
+    #[test]
+    fn cross_chain_replay_rejected() {
+        let (body, _) = make_signed_transfer(1, 2, 100, 1);
+        assert_eq!(
+            validate_token_transfer(&body, TEST_CHAIN_ID + 1),
             Err(TransferValidationError::SignatureVerifyFailed)
         );
     }

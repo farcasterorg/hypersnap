@@ -185,6 +185,15 @@ pub async fn run(
             time::sleep(cfg.poll_interval).await;
             continue;
         }
+        // F094 fix: persist the high-watermark after a successful
+        // scan range so restart-resume doesn't re-scan from the
+        // configured `start_block` once observed burns drain.
+        if let Err(e) = store.advance_watermark(cfg.source_chain_id, stop) {
+            warn!(
+                "bridge burn watcher (chain {}): advance_watermark({}) failed: {}",
+                cfg.source_chain_id, stop, e
+            );
+        }
         next_block = stop.saturating_add(1);
     }
 }

@@ -133,6 +133,10 @@ pub trait TrustScoreResolver: Send + Sync {
 pub fn validator_event_signing_payload(event: &proto::HyperValidatorEventBody) -> Vec<u8> {
     // DST bumped from v3 → v4 in Phase 6.2c when the legacy BLS
     // `bls_public_key` field was removed entirely from the proto.
+    // F018: `libp2p_peer_id` added to the canonical payload so the
+    // validator's Ed25519 signature binds it to the (fid,
+    // validator_key) pair — a registered peer-id cannot then be
+    // unilaterally rewritten by a relay attacker.
     const DST: &[u8] = b"hypersnap-validator-event-v4";
     let mut buf = Vec::with_capacity(
         DST.len()
@@ -145,7 +149,9 @@ pub fn validator_event_signing_payload(event: &proto::HyperValidatorEventBody) -
             + event.operator_address.len()
             + 8
             + 2
-            + event.validator_address.len(),
+            + event.validator_address.len()
+            + 2
+            + event.libp2p_peer_id.len(),
     );
     buf.extend_from_slice(DST);
     buf.extend_from_slice(&event.event_type.to_be_bytes());
@@ -158,6 +164,8 @@ pub fn validator_event_signing_payload(event: &proto::HyperValidatorEventBody) -
     buf.extend_from_slice(&event.fid.to_be_bytes());
     buf.extend_from_slice(&(event.validator_address.len() as u16).to_be_bytes());
     buf.extend_from_slice(&event.validator_address);
+    buf.extend_from_slice(&(event.libp2p_peer_id.len() as u16).to_be_bytes());
+    buf.extend_from_slice(&event.libp2p_peer_id);
     buf
 }
 
@@ -732,6 +740,77 @@ impl ValidatorRegistry {
         }
 
         Ok(active)
+    }
+
+    /// F018: parallel to `compute_active_set` but returning each
+    /// active validator's `libp2p_peer_id`. Used by the gossip
+    /// ingress to cross-check inner DKLS `sender` byte against the
+    /// libp2p `propagation_source` for the frame.
+    ///
+    /// Bootstrap entries are excluded — peer-id binding for
+    /// bootstrap validators is a separate config concern; the gossip
+    /// ingress treats absent registry entries as "permissive" (drop
+    /// the bound but accept the frame) so genesis still works. After
+    /// the first scheduled validator registration with a non-empty
+    /// `libp2p_peer_id` lands, the cross-check kicks in for that
+    /// party.
+    pub fn compute_active_peer_ids(
+        &self,
+        epoch: u64,
+    ) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, RegistryError> {
+        let mut peer_ids: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+
+        let cutoff = match epoch.checked_sub(EPOCH_BUFFER + 1) {
+            Some(c) => c,
+            None => return Ok(peer_ids),
+        };
+
+        let prefix = vec![RootPrefix::HyperValidatorEvent as u8];
+        let mut events: Vec<(u64, proto::HyperValidatorEventBody)> = Vec::new();
+        let mut decode_err: Option<prost::DecodeError> = None;
+        self.db
+            .for_each_iterator_by_prefix(
+                Some(prefix),
+                None,
+                &PageOptions::default(),
+                |key, value| {
+                    if key.len() < 1 + 32 + 8 {
+                        return Ok(false);
+                    }
+                    let mut be = [0u8; 8];
+                    be.copy_from_slice(&key[1 + 32..1 + 32 + 8]);
+                    let event_epoch = u64::from_be_bytes(be);
+                    if event_epoch > cutoff {
+                        return Ok(false);
+                    }
+                    match proto::HyperValidatorEventBody::decode(value) {
+                        Ok(e) => events.push((event_epoch, e)),
+                        Err(e) => {
+                            decode_err = Some(e);
+                            return Ok(true);
+                        }
+                    }
+                    Ok(false)
+                },
+            )
+            .map_err(HubError::from)?;
+        if let Some(e) = decode_err {
+            return Err(RegistryError::Decode(e));
+        }
+
+        events.sort_by_key(|(ep, e)| (*ep, e.validator_key.clone()));
+
+        for (_ep, e) in events {
+            if e.event_type == proto::HyperValidatorEventType::Register as i32 {
+                if !e.libp2p_peer_id.is_empty() {
+                    peer_ids.insert(e.validator_key.clone(), e.libp2p_peer_id.clone());
+                }
+            } else if e.event_type == proto::HyperValidatorEventType::Deregister as i32 {
+                peer_ids.remove(&e.validator_key);
+            }
+        }
+
+        Ok(peer_ids)
     }
 
     /// Like `compute_active_set`, but additionally excludes validators

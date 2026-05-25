@@ -133,75 +133,6 @@ pub enum LockError {
         "EVM spend authority must be 20-byte address or 33-byte compressed secp256k1 (got {0})"
     )]
     EvmSpendPubkeyLength(usize),
-    #[error("lock signature must be exactly 112 bytes (got {0})")]
-    BadSignatureLength(usize),
-    #[error("invalid lock signature (R or s not canonical)")]
-    BadSignature,
-    #[error("locker pubkey must be exactly 56 bytes compressed Decaf448 (got {0})")]
-    BadLockerPubkey(usize),
-    #[error("lock signature does not verify under locker pubkey")]
-    InvalidLockSignature,
-}
-
-/// Canonical signing payload for a lock event. The locker signs these bytes
-/// to authorize the burn → bridge mint mapping. Domain-separated so it
-/// cannot collide with any other Schnorr-signed payload in the protocol.
-pub fn lock_signing_payload(event: &proto::HyperLockEvent) -> Vec<u8> {
-    const DST: &[u8] = b"hypersnap-lock-event-v1";
-    let mut buf = Vec::with_capacity(
-        DST.len()
-            + 8
-            + 8
-            + 2
-            + event.dest_address.len()
-            + 2
-            + event.spend_pubkey.len()
-            + 32
-            + 8
-            + 8,
-    );
-    buf.extend_from_slice(DST);
-    buf.extend_from_slice(&event.amount.to_be_bytes());
-    buf.extend_from_slice(&event.dest_chain_id.to_be_bytes());
-    buf.extend_from_slice(&(event.dest_address.len() as u16).to_be_bytes());
-    buf.extend_from_slice(&event.dest_address);
-    buf.extend_from_slice(&(event.spend_pubkey.len() as u16).to_be_bytes());
-    buf.extend_from_slice(&event.spend_pubkey);
-    buf.extend_from_slice(&event.lock_id);
-    buf.extend_from_slice(&event.lock_height.to_be_bytes());
-    buf.extend_from_slice(&event.lock_timestamp.to_be_bytes());
-    buf
-}
-
-/// Verify the lock event's Schnorr signature against `locker_pubkey`. The
-/// locker pubkey is the spend pubkey of the burned note (or a one-time pubkey
-/// derived during the burn). The caller is responsible for confirming the
-/// pubkey matches whatever notes the locker claims to burn.
-pub fn verify_lock_signature(
-    event: &proto::HyperLockEvent,
-    locker_pubkey_bytes: &[u8],
-) -> Result<(), LockError> {
-    use hypersnap_crypto::tokens::{point_from_compressed_bytes, schnorr_verify, SchnorrSignature};
-
-    if locker_pubkey_bytes.len() != 56 {
-        return Err(LockError::BadLockerPubkey(locker_pubkey_bytes.len()));
-    }
-    let mut pk_arr = [0u8; 56];
-    pk_arr.copy_from_slice(locker_pubkey_bytes);
-    let locker_pubkey =
-        point_from_compressed_bytes(&pk_arr).ok_or(LockError::BadLockerPubkey(56))?;
-
-    if event.lock_signature.len() != 112 {
-        return Err(LockError::BadSignatureLength(event.lock_signature.len()));
-    }
-    let sig = SchnorrSignature::from_bytes(&event.lock_signature).ok_or(LockError::BadSignature)?;
-
-    let payload = lock_signing_payload(event);
-    if schnorr_verify(&locker_pubkey, &payload, &sig) {
-        Ok(())
-    } else {
-        Err(LockError::InvalidLockSignature)
-    }
 }
 
 /// Validate the structural invariants of a lock event. Cryptographic
@@ -253,15 +184,19 @@ fn is_evm_chain(chain_id: u64) -> bool {
     )
 }
 
-/// Insert a validated lock event into the verkle tree. The verkle key is the
-/// 32-byte `lock_id`; the value is the canonical leaf encoding.
+/// Insert a validated lock event into the verkle tree. The verkle key
+/// is the `lock_id` prefixed with `KEY_DOMAIN_LOCK = 0x01` (see F117).
+/// Without the discriminator a 32-byte lock_id can become a strict
+/// path-prefix of a 33-byte nullifier or note-commitment key and
+/// panic the recursive insert in `verkle::insert_recursive`.
 pub fn insert_lock_into_tree(
     tree: &mut hypersnap_crypto::verkle::VerkleTree,
     event: &proto::HyperLockEvent,
 ) -> Result<(), LockError> {
     validate_lock_event(event)?;
     let leaf = encode_lock_leaf(event);
-    tree.insert(&event.lock_id, leaf);
+    let key = crate::hyper::builder::lock_verkle_key(&event.lock_id);
+    tree.insert(&key, leaf);
     Ok(())
 }
 
@@ -296,128 +231,6 @@ mod tests {
     fn validate_evm_event_accepts_correct_lengths() {
         let e = sample_evm_event();
         assert!(validate_lock_event(&e).is_ok());
-    }
-
-    #[test]
-    fn lock_signing_payload_is_deterministic() {
-        let e = sample_evm_event();
-        let p1 = lock_signing_payload(&e);
-        let p2 = lock_signing_payload(&e);
-        assert_eq!(p1, p2);
-
-        // Any field change → different payload.
-        let mut e2 = e.clone();
-        e2.amount += 1;
-        assert_ne!(lock_signing_payload(&e), lock_signing_payload(&e2));
-
-        let mut e3 = e.clone();
-        e3.dest_chain_id = 999;
-        assert_ne!(lock_signing_payload(&e), lock_signing_payload(&e3));
-
-        let mut e4 = e.clone();
-        e4.lock_id[0] ^= 0xff;
-        assert_ne!(lock_signing_payload(&e), lock_signing_payload(&e4));
-    }
-
-    #[test]
-    fn schnorr_signed_lock_verifies() {
-        use hypersnap_crypto::bulletproofs::curve_adapter::Scalar;
-        use hypersnap_crypto::tokens::{
-            point_to_compressed_bytes, schnorr_sign, PedersenCommitment as PC,
-        };
-        use rand::rngs::OsRng;
-
-        let mut rng = OsRng;
-        let locker_secret = Scalar::random(&mut rng);
-        // The locker's pubkey is locker_secret · B (using the Pedersen value
-        // generator, the same one used for Schnorr signatures).
-        let pc = hypersnap_crypto::bulletproofs::PedersenGens::default();
-        let locker_pubkey = hypersnap_crypto::bulletproofs::curve_adapter::Point::multiscalar_mul(
-            &[locker_secret],
-            &[pc.B],
-        );
-
-        let mut e = sample_evm_event();
-        let payload = lock_signing_payload(&e);
-        let sig = schnorr_sign(&locker_secret, &payload, &mut rng);
-        e.lock_signature = sig.to_bytes().to_vec();
-
-        let pk_bytes = point_to_compressed_bytes(&locker_pubkey);
-        verify_lock_signature(&e, &pk_bytes).unwrap();
-    }
-
-    #[test]
-    fn schnorr_lock_rejects_wrong_locker() {
-        use hypersnap_crypto::bulletproofs::curve_adapter::Scalar;
-        use hypersnap_crypto::tokens::{point_to_compressed_bytes, schnorr_sign};
-        use rand::rngs::OsRng;
-
-        let mut rng = OsRng;
-        let locker_secret = Scalar::random(&mut rng);
-        let other_secret = Scalar::random(&mut rng);
-        let pc = hypersnap_crypto::bulletproofs::PedersenGens::default();
-        let other_pubkey = hypersnap_crypto::bulletproofs::curve_adapter::Point::multiscalar_mul(
-            &[other_secret],
-            &[pc.B],
-        );
-
-        let mut e = sample_evm_event();
-        let payload = lock_signing_payload(&e);
-        let sig = schnorr_sign(&locker_secret, &payload, &mut rng);
-        e.lock_signature = sig.to_bytes().to_vec();
-
-        let other_pk_bytes = point_to_compressed_bytes(&other_pubkey);
-        assert!(matches!(
-            verify_lock_signature(&e, &other_pk_bytes),
-            Err(LockError::InvalidLockSignature)
-        ));
-    }
-
-    #[test]
-    fn schnorr_lock_rejects_tampered_amount() {
-        use hypersnap_crypto::bulletproofs::curve_adapter::Scalar;
-        use hypersnap_crypto::tokens::{point_to_compressed_bytes, schnorr_sign};
-        use rand::rngs::OsRng;
-
-        let mut rng = OsRng;
-        let locker_secret = Scalar::random(&mut rng);
-        let pc = hypersnap_crypto::bulletproofs::PedersenGens::default();
-        let locker_pubkey = hypersnap_crypto::bulletproofs::curve_adapter::Point::multiscalar_mul(
-            &[locker_secret],
-            &[pc.B],
-        );
-
-        let mut e = sample_evm_event();
-        let payload = lock_signing_payload(&e);
-        let sig = schnorr_sign(&locker_secret, &payload, &mut rng);
-        e.lock_signature = sig.to_bytes().to_vec();
-        // Tamper with amount AFTER signing.
-        e.amount += 1_000_000;
-
-        let pk_bytes = point_to_compressed_bytes(&locker_pubkey);
-        assert!(matches!(
-            verify_lock_signature(&e, &pk_bytes),
-            Err(LockError::InvalidLockSignature)
-        ));
-    }
-
-    #[test]
-    fn lock_signature_rejects_wrong_pubkey_length() {
-        let e = sample_evm_event();
-        assert!(matches!(
-            verify_lock_signature(&e, &[0u8; 32]),
-            Err(LockError::BadLockerPubkey(32))
-        ));
-    }
-
-    #[test]
-    fn lock_signature_rejects_wrong_signature_length() {
-        let mut e = sample_evm_event();
-        e.lock_signature = vec![0u8; 64];
-        assert!(matches!(
-            verify_lock_signature(&e, &[0u8; 56]),
-            Err(LockError::BadLockerPubkey(_)) | Err(LockError::BadSignatureLength(_))
-        ));
     }
 
     #[test]
@@ -473,7 +286,8 @@ mod tests {
         let mut tree = make_tree();
         let e = sample_evm_event();
         insert_lock_into_tree(&mut tree, &e).unwrap();
-        let stored = tree.get(&e.lock_id).expect("lock must be retrievable");
+        let key = crate::hyper::builder::lock_verkle_key(&e.lock_id);
+        let stored = tree.get(&key).expect("lock must be retrievable");
         assert_eq!(stored, encode_lock_leaf(&e));
     }
 
@@ -534,13 +348,14 @@ mod tests {
         }
 
         let root = tree.root_commitment().unwrap();
+        let lock_key = crate::hyper::builder::lock_verkle_key(&event.lock_id);
         let proof = tree
-            .prove_inclusion(&event.lock_id)
+            .prove_inclusion(&lock_key)
             .unwrap()
             .expect("lock must produce a valid inclusion proof");
 
         // L1-equivalent verification.
-        assert!(verify_inclusion(&root, &event.lock_id, &proof, &srs));
+        assert!(verify_inclusion(&root, &lock_key, &proof, &srs));
 
         // Decode the leaf and confirm round-trip.
         let decoded = decode_lock_leaf(&proof.value).expect("leaf must decode");
@@ -550,7 +365,7 @@ mod tests {
         assert_eq!(decoded.spend_pubkey, event.spend_pubkey);
 
         // Negative case: a wrong lock_id must produce a different (non-matching) proof.
-        let wrong_key = vec![0xff; 32];
+        let wrong_key = crate::hyper::builder::lock_verkle_key(&vec![0xff; 32]);
         let wrong_proof = tree.prove_inclusion(&wrong_key).unwrap();
         assert!(wrong_proof.is_none(), "unknown lock_id has no proof");
     }
@@ -569,7 +384,33 @@ mod tests {
         insert_lock_into_tree(&mut tree, &e1).unwrap();
         insert_lock_into_tree(&mut tree, &e2).unwrap();
 
-        assert_eq!(tree.get(&e1.lock_id).unwrap()[0..8], 100u64.to_be_bytes());
-        assert_eq!(tree.get(&e2.lock_id).unwrap()[0..8], 200u64.to_be_bytes());
+        let k1 = crate::hyper::builder::lock_verkle_key(&e1.lock_id);
+        let k2 = crate::hyper::builder::lock_verkle_key(&e2.lock_id);
+        assert_eq!(tree.get(&k1).unwrap()[0..8], 100u64.to_be_bytes());
+        assert_eq!(tree.get(&k2).unwrap()[0..8], 200u64.to_be_bytes());
+    }
+
+    /// F117: an attacker-chosen `lock_id` whose first byte equals the
+    /// nullifier discriminator (0x02) used to be insertable into the
+    /// same path-space, panicking the next nullifier insert. After
+    /// the fix, lock keys are always 33 bytes with a leading 0x01,
+    /// so no lock_id can be a prefix of a nullifier key.
+    #[test]
+    fn lock_with_attacker_chosen_nullifier_prefix_does_not_panic() {
+        let mut tree = make_tree();
+        let mut e = sample_evm_event();
+        // Pick a lock_id that, before the fix, would have been a
+        // strict 32-byte prefix of the 33-byte key
+        // `[0x02, n_0, ..., n_31]` produced by `nullifier_verkle_key`.
+        e.lock_id = vec![0x02u8; 32];
+        insert_lock_into_tree(&mut tree, &e).unwrap();
+
+        // Now drop a nullifier whose 32 inner bytes are identical to
+        // the lock_id. With the fix, the lock landed at the 0x01
+        // domain, so no path conflict — this insert must succeed.
+        let nullifier = [0x02u8; 32];
+        let nkey = crate::hyper::builder::nullifier_verkle_key_public(&nullifier);
+        tree.insert(&nkey, b"sentinel".to_vec());
+        assert!(tree.get(&nkey).is_some());
     }
 }

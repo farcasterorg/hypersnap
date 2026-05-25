@@ -3852,14 +3852,28 @@ impl ApiHttpHandler {
 
     // === Batch Endpoints ===
 
+    /// F154: cap the per-request fids array. Each FID in the list
+    /// fans out into an O(N) RocksDB pagination loop in the
+    /// downstream batch handlers, so an attacker submitting 100k
+    /// FIDs in a 1 MiB body pins a consensus-shared RocksDB and
+    /// multi-GB heap for multiple minutes per call.
+    const MAX_BATCH_FIDS: usize = 1024;
     fn parse_batch_fids(body: &[u8]) -> Result<Vec<u64>, String> {
         #[derive(serde::Deserialize)]
         struct BatchRequest {
             fids: Vec<u64>,
         }
-        serde_json::from_slice::<BatchRequest>(body)
+        let fids = serde_json::from_slice::<BatchRequest>(body)
             .map(|r| r.fids)
-            .map_err(|e| format!("Invalid JSON body: {}", e))
+            .map_err(|e| format!("Invalid JSON body: {}", e))?;
+        if fids.len() > Self::MAX_BATCH_FIDS {
+            return Err(format!(
+                "fids array length {} exceeds maximum {}",
+                fids.len(),
+                Self::MAX_BATCH_FIDS
+            ));
+        }
+        Ok(fids)
     }
 
     async fn handle_batch_following_batch(
@@ -3961,6 +3975,12 @@ impl ApiHttpHandler {
         for fid in fids {
             let mut entries = Vec::new();
             let mut page_token: Option<Vec<u8>> = None;
+            // F154: cap the per-FID pagination depth. Without this,
+            // a single FID with millions of casts pins the call
+            // for minutes; combined with MAX_BATCH_FIDS this
+            // bounds heap + CPU per request.
+            const MAX_PAGES_PER_FID: usize = 20;
+            let mut pages_drained = 0usize;
             loop {
                 match hub
                     .get_casts_by_fid(fid, 500, page_token.clone(), false)
@@ -3991,6 +4011,10 @@ impl ApiHttpHandler {
                                     }
                                 }
                             }
+                        }
+                        pages_drained += 1;
+                        if pages_drained >= MAX_PAGES_PER_FID {
+                            break;
                         }
                         match next_token {
                             Some(t) if !t.is_empty() => page_token = Some(t),
@@ -4030,6 +4054,10 @@ impl ApiHttpHandler {
         for fid in fids {
             let mut entries = Vec::new();
             let mut page_token: Option<Vec<u8>> = None;
+            // F154: cap per-FID pagination depth (see sibling
+            // handler's comment).
+            const MAX_PAGES_PER_FID: usize = 20;
+            let mut pages_drained = 0usize;
             loop {
                 match hub
                     .get_casts_by_fid(fid, 500, page_token.clone(), false)
@@ -4079,6 +4107,10 @@ impl ApiHttpHandler {
                                 "embeds": embeds,
                                 "timestamp": data.timestamp,
                             }));
+                        }
+                        pages_drained += 1;
+                        if pages_drained >= MAX_PAGES_PER_FID {
+                            break;
                         }
                         match next_token {
                             Some(t) if !t.is_empty() => page_token = Some(t),

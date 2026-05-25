@@ -73,13 +73,16 @@ where
         chain_id,
     );
     let served = lookup(&prefix)?;
-    // Pad short keys to the on-wire 32-byte width.
-    let mut served_key = [0u8; 32];
-    let copy_len = served.len().min(32);
-    served_key[..copy_len].copy_from_slice(&served[..copy_len]);
-    if served_key[..CHALLENGE_PREFIX_BYTES] != prefix[..] {
+    // F135 fix: serve the natural-length trie key, not a 32-byte
+    // zero-padded version. The apply-path lookup runs an exact-byte
+    // `contains_key` against the trie, which stores natural-length
+    // keys; zero-padding to 32 bytes never matches. The bottom
+    // `CHALLENGE_PREFIX_BYTES` (16) must still match the derived
+    // prefix; the rest is whatever the trie stores beyond the prefix.
+    if served.len() < CHALLENGE_PREFIX_BYTES || served[..CHALLENGE_PREFIX_BYTES] != prefix[..] {
         return None;
     }
+    let served_key: Vec<u8> = served;
 
     let pk = signer_sk.verifying_key();
     let mut body = proto::DaChallengeResponseBody {
@@ -87,7 +90,7 @@ where
         validator_pubkey: validator_pubkey.to_vec(),
         epoch,
         challenge_index,
-        served_key: served_key.to_vec(),
+        served_key,
         signer_pubkey: pk.to_bytes().to_vec(),
         signature: Vec::new(),
     };

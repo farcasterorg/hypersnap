@@ -91,6 +91,16 @@ pub enum RuntimeRetroVestError {
     RetroStore(String),
     #[error("reward: {0}")]
     Reward(String),
+    /// F012: the planned tranche set would exceed an emission cap.
+    /// Reject wholesale rather than partial-apply.
+    #[error(
+        "retro tranche would exceed epoch budget cap (planned={planned}, cap={cap}, market={market})"
+    )]
+    BudgetExceeded {
+        planned: u128,
+        cap: u128,
+        market: i32,
+    },
 }
 
 /// FIP-proof-of-work-tokenization §10.5: default number of on-protocol
@@ -447,6 +457,36 @@ impl HyperRuntime {
         self.db.clone()
     }
 
+    /// F027 fix: single active-key gate every signed-by-FID apply
+    /// path must pass through. The previous shape inlined the
+    /// `OnchainEventStore::new` + `StoreEventHandler::new_no_persist`
+    /// + empty `RocksDbTransactionBatch` + `get_active_key` + `is_none`
+    /// branch into 13 separate `apply_*` handlers, each with the same
+    /// Phase-1b documentation comment. Drift between sites is now
+    /// impossible — call this once.
+    ///
+    /// Returns `Ok(())` if `signer_pubkey` is an authorized signer
+    /// for `fid` at the current on-chain event height, else
+    /// `RewardError::SignerNotAuthorized`.
+    pub(crate) fn require_active_signer(
+        &self,
+        fid: u64,
+        signer_pubkey: &[u8],
+    ) -> Result<(), RewardError> {
+        use crate::storage::store::account::{
+            get_active_key, OnchainEventStore, StoreEventHandler,
+        };
+        let handler = StoreEventHandler::new_no_persist();
+        let onchain = OnchainEventStore::new(self.db.clone(), handler);
+        let txn = crate::storage::db::RocksDbTransactionBatch::new();
+        let active = get_active_key(&onchain, &self.db, &txn, fid, signer_pubkey)
+            .map_err(|e| RewardError::Custom(format!("active-key lookup: {}", e)))?;
+        if active.is_none() {
+            return Err(RewardError::SignerNotAuthorized { fid });
+        }
+        Ok(())
+    }
+
     /// Build the deterministic FID universe at the snapchain anchor
     /// block. Currently uses the OnchainEventStore's `get_fids` to
     /// enumerate all known FIDs. A future optimization could filter to
@@ -603,14 +643,20 @@ impl HyperRuntime {
         crate::hyper::sig_verify::verify_trust_snapshot_signature(&payload, update, &expected)
             .map_err(|_| RuntimeRewardError::Reward(RewardError::InvalidSignature))?;
 
-        // Persist entries to the trust store. Entries are sorted by
-        // fid in canonical encoding; we just iterate.
-        for entry in &update.entries {
-            let score = f64::from_bits(entry.score_bits);
-            self.trust_store
-                .set(entry.fid, score)
-                .map_err(|e| RuntimeRewardError::Reward(RewardError::Custom(e.to_string())))?;
-        }
+        // F014: replace the entire store atomically — FIDs present
+        // in the new snapshot are set; FIDs absent are deleted. The
+        // prior PUT-only `set_many` left stale FIDs in the store
+        // indefinitely, feeding the validator-trust gate, soft-evict
+        // filter, and the fee discount path with arbitrarily stale
+        // data.
+        let entries: Vec<(u64, f64)> = update
+            .entries
+            .iter()
+            .map(|e| (e.fid, f64::from_bits(e.score_bits)))
+            .collect();
+        self.trust_store
+            .replace_with(&entries)
+            .map_err(|e| RuntimeRewardError::Reward(RewardError::Custom(e.to_string())))?;
         self.last_trust_snapshot_epoch = Some(update.epoch);
         Ok(update.entries.len())
     }
@@ -641,7 +687,7 @@ impl HyperRuntime {
         use crate::storage::store::account::{
             get_active_key, OnchainEventStore, StoreEventHandler,
         };
-        crate::hyper::token_transfer::validate_token_transfer(body)
+        crate::hyper::token_transfer::validate_token_transfer(body, self.protocol_chain_id)
             .map_err(|e| RewardError::Custom(format!("transfer validation: {}", e)))?;
 
         // Phase 1b: signer must be active for sender FID. We
@@ -682,7 +728,7 @@ impl HyperRuntime {
         use crate::storage::store::account::{
             get_active_key, OnchainEventStore, StoreEventHandler,
         };
-        crate::hyper::fee_deposit::validate_fee_deposit(body)
+        crate::hyper::fee_deposit::validate_fee_deposit(body, self.protocol_chain_id)
             .map_err(|e| RewardError::Custom(format!("fee deposit validation: {}", e)))?;
 
         let handler = StoreEventHandler::new_no_persist();
@@ -706,24 +752,19 @@ impl HyperRuntime {
             .apply_fee_deposit(body.sender_fid, body.amount, body.nonce)
     }
 
-    /// Apply a transparent token lock. Gates: structural + Ed25519
-    /// sig (`validate_token_lock`), signer-set auth
-    /// (`get_active_key`), then `reward_store::apply_lock` (nonce,
-    /// balance, lock_id uniqueness, leaf-bytes persistence).
-    ///
-    /// Bridge claimability flows from the `reward_store`-resident
-    /// `TokenLockState` set into `build_lock_merkle_tree` (keccak
-    /// merkle, OZ-compatible) → threshold-signed root → posted to
-    /// `HypersnapBridge.claim`. No verkle insert is needed for the
-    /// bridge; the verkle state commitment is consulted only for
-    /// internal queries.
-    pub fn apply_token_lock(&mut self, body: &proto::TokenLockBody) -> Result<(), RewardError> {
+    /// Shield: move atoms from the transparent FID balance into the
+    /// confidential note store. Required so users can acquire
+    /// confidential notes — the ConfidentialLockBody bridge path
+    /// can only spend notes, not transparent balance.
+    pub fn apply_shield(&mut self, body: &proto::ShieldBody) -> Result<(), RewardError> {
         use crate::storage::store::account::{
             get_active_key, OnchainEventStore, StoreEventHandler,
         };
-        crate::hyper::token_lock::validate_token_lock(body)
-            .map_err(|e| RewardError::Custom(format!("lock validation: {}", e)))?;
+        let (commitment, one_time_pubkey) =
+            crate::hyper::shield::validate_shield(body, self.protocol_chain_id)
+                .map_err(|e| RewardError::Custom(format!("shield: {}", e)))?;
 
+        // Signer must be authorized for sender_fid.
         let handler = StoreEventHandler::new_no_persist();
         let onchain = OnchainEventStore::new(self.db.clone(), handler);
         let txn = crate::storage::db::RocksDbTransactionBatch::new();
@@ -741,9 +782,117 @@ impl HyperRuntime {
             });
         }
 
-        let state = crate::hyper::token_lock::state_from_body(body);
+        // Debit balance, bump nonce. Reuses apply_transfer's path
+        // by routing through self-transfer (recipient == sender) at
+        // amount=0 — but that would double the nonce and not move
+        // atoms. Implement the debit directly.
+        let current_nonce = self.reward_store.nonce_of(body.sender_fid)?;
+        let expected = current_nonce.saturating_add(1);
+        if body.nonce != expected {
+            return Err(RewardError::NonceMismatch {
+                fid: body.sender_fid,
+                expected,
+                got: body.nonce,
+            });
+        }
+        let sender_bal = self.reward_store.balance_of(body.sender_fid)?;
+        if sender_bal < body.amount {
+            return Err(RewardError::InsufficientBalance {
+                fid: body.sender_fid,
+                available: sender_bal,
+                needed: body.amount,
+            });
+        }
+        // Atomic batch: debit + nonce bump. Note insertion uses the
+        // NoteStoreMut write path which is not batch-aware (write-
+        // through; failure mode is the same as other primitives).
+        let new_bal = sender_bal - body.amount;
+        let mut batch = self.db.txn();
+        batch.put(
+            {
+                let mut k = Vec::with_capacity(9);
+                k.push(crate::storage::constants::RootPrefix::HyperRewardBalance as u8);
+                k.extend_from_slice(&body.sender_fid.to_be_bytes());
+                k
+            },
+            new_bal.to_be_bytes().to_vec(),
+        );
+        batch.put(
+            {
+                let mut k = Vec::with_capacity(9);
+                k.push(crate::storage::constants::RootPrefix::HyperTokenNonce as u8);
+                k.extend_from_slice(&body.sender_fid.to_be_bytes());
+                k
+            },
+            body.nonce.to_be_bytes().to_vec(),
+        );
+        self.db
+            .commit(batch)
+            .map_err(crate::core::error::HubError::from)?;
+
+        // Mint the note.
+        use hypersnap_crypto::tokens::NoteStoreMut;
+        self.note_store.record_note(commitment, one_time_pubkey);
+        Ok(())
+    }
+
+    /// Confidential bridge lock. Spends a confidential note and
+    /// emits a `TokenLockState` for the bridge merkle tree. The
+    /// `lock_id` is deterministically derived from the spent
+    /// nullifier so no two locks can collide.
+    pub fn apply_confidential_lock(
+        &mut self,
+        body: &proto::ConfidentialLockBody,
+    ) -> Result<(), RewardError> {
+        let lock_id = crate::hyper::confidential_lock::validate_against_store(
+            body,
+            self.protocol_chain_id,
+            &self.note_store,
+        )
+        .map_err(|e| RewardError::Custom(format!("confidential lock: {}", e)))?;
+
+        // The lock_id is derived from the spent nullifier, which is
+        // unique per note; collision at this point is a 2^-256 event
+        // and would indicate a serious crypto-level break. Still,
+        // reject defensively.
+        if self
+            .reward_store
+            .lock_state(0, &lock_id)
+            .map_err(|e| RewardError::Custom(format!("lock_state lookup: {}", e)))?
+            .is_some()
+        {
+            return Err(RewardError::LockIdCollision {
+                fid: 0,
+                lock_id_hex: hex::encode(lock_id),
+            });
+        }
+
+        // Build the TokenLockState the bridge merkle tree consumes.
+        // `sender_fid = 0` is the sentinel for non-FID-keyed locks
+        // (already used by the EIP-712 escrow-bridge path).
+        let lock_state = proto::TokenLockState {
+            sender_fid: 0,
+            amount: body.amount,
+            destination_chain_id: body.destination_chain_id,
+            destination_address: body.destination_address.clone(),
+            lock_id: lock_id.to_vec(),
+        };
+
+        // Atomic: mark nullifier spent + record the lock state.
+        use hypersnap_crypto::tokens::{NoteStoreMut, Nullifier};
+        let mut batch = self.db.txn();
         self.reward_store
-            .apply_lock(body.sender_fid, body.amount, body.nonce, &state)
+            .put_lock_state(0, &lock_state, &mut batch)?;
+        self.db
+            .commit(batch)
+            .map_err(crate::core::error::HubError::from)?;
+
+        // Mark spent via the note store (uses its own write path —
+        // the NoteStoreMut trait is not batch-aware).
+        let mut null_bytes = [0u8; 32];
+        null_bytes.copy_from_slice(&body.input.as_ref().expect("validated above").nullifier);
+        self.note_store.mark_spent(Nullifier(null_bytes));
+        Ok(())
     }
 
     /// FIP §13.5 outbound bridge: build the canonical merkle tree
@@ -788,6 +937,18 @@ impl HyperRuntime {
         let (tree, _indexed) = self
             .build_lock_merkle_tree()
             .map_err(RuntimeRewardError::Reward)?;
+        // F062: refuse to produce a signed empty-root update. The
+        // L1 contract advances `latestRoot` to whatever value the
+        // owner signs; advancing to bytes32(0) freezes every prior
+        // unclaimed leaf because the tree containing them no longer
+        // matches `latestRoot`. The contract also rejects the zero
+        // root on the receiving side, but the producer side should
+        // not even build/sign one — sit out empty epochs.
+        if tree.root == alloy_primitives::B256::ZERO {
+            return Err(RuntimeRewardError::Reward(RewardError::Custom(
+                "refusing to sign empty merkle root (no locks to post)".to_string(),
+            )));
+        }
         let payload = hypersnap_crypto::bridge_payload::merkle_root_update_signing_payload(
             block_number,
             tree.root,
@@ -823,6 +984,17 @@ impl HyperRuntime {
                 "merkle root must be 32 bytes (got {})",
                 update.root.len()
             ))));
+        }
+        // F062: reject the zero root. Even a legitimately
+        // threshold-signed empty-epoch update would otherwise advance
+        // the local "latest signed root" pointer to B256::ZERO,
+        // detaching every previously-claimable leaf from the visible
+        // root. The producer side already refuses to sign these; this
+        // is the defense-in-depth check on the import path.
+        if update.root.iter().all(|b| *b == 0) {
+            return Err(RuntimeRewardError::Reward(RewardError::Custom(
+                "merkle root update has zero root".to_string(),
+            )));
         }
         // Reject older block_number against the locally-stored
         // latest. Mirrors the contract's `StaleBlock` semantic so
@@ -1042,6 +1214,55 @@ impl HyperRuntime {
         Some(hypersnap_crypto::transport_encrypt::TransportPublicKey::from_bytes(bytes))
     }
 
+    /// F018: resolve `(epoch, party_index) → libp2p_peer_id`. The
+    /// gossip ingress consults this map to cross-check the inner
+    /// DKLS `sender` byte against the libp2p `propagation_source` of
+    /// the frame.
+    ///
+    /// Returns `None` when no registered libp2p_peer_id exists for
+    /// the party at this epoch — callers must treat that as
+    /// "registry-unknown" and decide policy (drop or accept). Default
+    /// `peer_id_to_party_index_for_epoch` returns the full map for
+    /// reverse lookup.
+    pub fn peer_id_for_party(&self, epoch: u64, party_index: u8) -> Option<Vec<u8>> {
+        if party_index == 0 {
+            return None;
+        }
+        let peer_ids = self
+            .validator_registry
+            .compute_active_peer_ids(epoch)
+            .ok()?;
+        // Same canonical ordering: BTreeMap iterates by validator_key
+        // and DKLS committees number parties 1..=N over that order.
+        let target = (party_index as usize).checked_sub(1)?;
+        let (_, peer_id) = peer_ids.iter().nth(target)?;
+        Some(peer_id.clone())
+    }
+
+    /// F018: build the per-epoch reverse map
+    /// `libp2p_peer_id → committee_party_index (1-based)`. Used at
+    /// the gossip ingress as the authority for "this frame's
+    /// `propagation_source` is committee party X".
+    pub fn peer_id_to_party_index_for_epoch(
+        &self,
+        epoch: u64,
+    ) -> std::collections::BTreeMap<Vec<u8>, u8> {
+        let peer_ids = self
+            .validator_registry
+            .compute_active_peer_ids(epoch)
+            .unwrap_or_default();
+        let mut map = std::collections::BTreeMap::new();
+        for (idx, (_, peer_id)) in peer_ids.iter().enumerate() {
+            // Party indices are 1-based; the BTreeMap iter is in
+            // sorted-by-validator_key order, matching the DKLS
+            // committee enumeration.
+            if let Ok(party_index) = u8::try_from(idx + 1) {
+                map.insert(peer_id.clone(), party_index);
+            }
+        }
+        map
+    }
+
     /// FIP §13.6 importer-side: verify a signed inbound-burn
     /// message against the epoch's group address, check the
     /// `(source_chain_id, burn_id)` triple hasn't been processed,
@@ -1084,8 +1305,30 @@ impl HyperRuntime {
             )));
         }
 
-        // Replay-key check before sig verification (cheaper) — already-
-        // processed burns short-circuit without spending a recover op.
+        // F096: verify the threshold signature BEFORE the nullifier
+        // short-circuit. Otherwise an attacker could send a forged
+        // (unsigned) inbound_burn carrying an already-processed
+        // (source_chain_id, burn_id), and the apply path would
+        // return Ok(false) — a value the router's gossip-relay path
+        // treats as "successfully handled" and one-hop-rebroadcasts.
+        // Verifying first means forged messages are dropped at
+        // sig-verify, not silently propagated.
+        let dkls_addr = self
+            .dkls_group_address_for_epoch(burn.epoch)
+            .ok_or(RuntimeRewardError::UnknownEpoch(burn.epoch))?;
+        let payload =
+            crate::hyper::inbound_burn::inbound_burn_signing_payload(burn, self.protocol_chain_id);
+        let expected = crate::hyper::sig_verify::ExpectedGroupKey::ecdsa_only(&dkls_addr);
+        crate::hyper::sig_verify::verify_hyperblock_signature(
+            &payload,
+            &burn.ecdsa_signature,
+            &[],
+            &expected,
+        )
+        .map_err(|_| RuntimeRewardError::Reward(RewardError::InvalidSignature))?;
+
+        // Now that the signature is known good, short-circuit on
+        // already-processed nullifier.
         let key = Self::inbound_burn_key(burn.source_chain_id, &burn.burn_id);
         if self
             .db
@@ -1096,19 +1339,6 @@ impl HyperRuntime {
         {
             return Ok(false);
         }
-
-        let dkls_addr = self
-            .dkls_group_address_for_epoch(burn.epoch)
-            .ok_or(RuntimeRewardError::UnknownEpoch(burn.epoch))?;
-        let payload = crate::hyper::inbound_burn::inbound_burn_signing_payload(burn);
-        let expected = crate::hyper::sig_verify::ExpectedGroupKey::ecdsa_only(&dkls_addr);
-        crate::hyper::sig_verify::verify_hyperblock_signature(
-            &payload,
-            &burn.ecdsa_signature,
-            &[],
-            &expected,
-        )
-        .map_err(|_| RuntimeRewardError::Reward(RewardError::InvalidSignature))?;
 
         // Credit the recipient FID's balance. Goes through the same
         // RewardStore as forward emission + retro vesting.
@@ -1193,7 +1423,10 @@ impl HyperRuntime {
             source_tx_hash: observed.source_tx_hash.clone(),
             ecdsa_signature: Vec::new(),
         };
-        let payload = crate::hyper::inbound_burn::inbound_burn_signing_payload(&unsigned);
+        let payload = crate::hyper::inbound_burn::inbound_burn_signing_payload(
+            &unsigned,
+            self.protocol_chain_id,
+        );
         let digest = alloy_primitives::keccak256(&payload);
         let sig = hypersnap_crypto::dkls_sign::run_local_dkls_sign(&share.party, digest).map_err(
             |e| {
@@ -1619,14 +1852,7 @@ impl HyperRuntime {
             .map_err(|e| RewardError::Custom(format!("stake validation: {}", e)))?;
 
         // Signer-set check (same shape as TokenTransfer).
-        let handler = StoreEventHandler::new_no_persist();
-        let onchain = OnchainEventStore::new(self.db.clone(), handler);
-        let txn = crate::storage::db::RocksDbTransactionBatch::new();
-        let active = get_active_key(&onchain, &self.db, &txn, body.fid, &body.signer_pubkey)
-            .map_err(|e| RewardError::Custom(format!("active-key lookup: {}", e)))?;
-        if active.is_none() {
-            return Err(RewardError::SignerNotAuthorized { fid: body.fid });
-        }
+        self.require_active_signer(body.fid, &body.signer_pubkey)?;
 
         // Nonce check (shared with TokenTransfer).
         let current_nonce = self.reward_store.nonce_of(body.fid)?;
@@ -2189,25 +2415,20 @@ impl HyperRuntime {
         validate_app_usage_receipt(body, self.protocol_chain_id)
             .map_err(|e| RewardError::Custom(format!("app receipt validation: {}", e)))?;
 
-        // Signer-set check for the user. The user — not the app —
-        // must have an authorized signer matching
-        // `user_signer_pubkey`.
-        let handler = StoreEventHandler::new_no_persist();
-        let onchain = OnchainEventStore::new(self.db.clone(), handler);
-        let txn = crate::storage::db::RocksDbTransactionBatch::new();
-        let active = get_active_key(
-            &onchain,
-            &self.db,
-            &txn,
-            body.user_fid,
-            &body.user_signer_pubkey,
-        )
-        .map_err(|e| RewardError::Custom(format!("active-key lookup: {}", e)))?;
-        if active.is_none() {
-            return Err(RewardError::SignerNotAuthorized { fid: body.user_fid });
-        }
+        // Signer-set check for the user — not the app.
+        self.require_active_signer(body.user_fid, &body.user_signer_pubkey)?;
 
         let epoch = self.epoch_resolver.current_epoch();
+        // The receipt's signed `epoch` field must match the apply-time
+        // epoch. Without this check a single signed receipt would
+        // replay every future epoch — the storage key would land in
+        // a fresh slot each time and inflate the app owner's §7 score.
+        if body.epoch != epoch {
+            return Err(RewardError::Custom(format!(
+                "app receipt epoch mismatch: body claims {}, current_epoch = {}",
+                body.epoch, epoch
+            )));
+        }
         let count = self.app_receipt_count(epoch, body.app_owner_fid, body.user_fid)?;
         if count >= Self::MAX_RECEIPTS_PER_APP_PER_EPOCH {
             return Err(RewardError::Custom(format!(
@@ -2358,8 +2579,14 @@ impl HyperRuntime {
         let handler = StoreEventHandler::new_no_persist();
         let onchain = OnchainEventStore::new(self.db.clone(), handler);
         let custody = StoreBackedCustodyResolver::new(onchain);
-        verify_account_association(proof, body.fid, &body.domain, &custody)
-            .map_err(|e| RewardError::Custom(format!("miniapp register proof: {}", e)))?;
+        verify_account_association(
+            proof,
+            body.fid,
+            &body.domain,
+            self.protocol_chain_id,
+            &custody,
+        )
+        .map_err(|e| RewardError::Custom(format!("miniapp register proof: {}", e)))?;
 
         let miniapp_id = miniapp_id_from_domain(&body.domain);
 
@@ -3446,6 +3673,19 @@ impl HyperRuntime {
                 .map_err(|e| RoutingError::FeeDeposit(e.to_string()))?;
             return Ok(());
         }
+        // Confidential bridge lock. Spends a confidential note;
+        // produces a `TokenLockState` with deterministic lock_id.
+        if let Some(proto::hyper_message::Body::ConfidentialLock(ref lock)) = msg.body {
+            self.apply_confidential_lock(lock)
+                .map_err(|e| RoutingError::ConfidentialLock(e.to_string()))?;
+            return Ok(());
+        }
+        // Shield: transparent FID balance → confidential note.
+        if let Some(proto::hyper_message::Body::Shield(ref shield)) = msg.body {
+            self.apply_shield(shield)
+                .map_err(|e| RoutingError::Shield(e.to_string()))?;
+            return Ok(());
+        }
         // Confidential `Transfer`: strong validation against the
         // runtime's note store (per-input owner-pubkey lookup +
         // Schnorr verify + nullifier-not-spent) plus Pedersen
@@ -3478,12 +3718,6 @@ impl HyperRuntime {
             self.mempool
                 .submit_transfer(tx_proto.clone())
                 .map_err(|e| RoutingError::Transfer(format!("{}", e)))?;
-            return Ok(());
-        }
-        // TokenLock: same intercept pattern as TokenTransfer.
-        if let Some(proto::hyper_message::Body::TokenLock(ref lock)) = msg.body {
-            self.apply_token_lock(lock)
-                .map_err(|e| RoutingError::TokenLock(e.to_string()))?;
             return Ok(());
         }
         // FIP §13.5/§13.4 signed merkle-root update.
@@ -4071,12 +4305,25 @@ impl HyperRuntime {
             .retro_store
             .iter_all()
             .map_err(|e| RuntimeRetroVestError::RetroStore(e.to_string()))?;
-        let mut credited = 0usize;
         let market = proto::WorkMarket::Retroactive as i32;
-        for mut rec in records {
-            // Idempotency: skip outright if this epoch+fid already
-            // got a tranche. The retro record's `remaining_atoms`
-            // was already decremented on the original pass.
+
+        // F012: pre-compute the planned credit total and reject
+        // wholesale if it would exceed the per-market or global
+        // emission cap. Mirrors the wholesale-rejection pattern in
+        // `apply_reward_issuance` (`max_reward_per_epoch_per_market`
+        // and `max_reward_per_epoch`).
+        //
+        // Each entry's planned credit is recomputed deterministically
+        // (the live records carry `remaining_atoms`; the per-tranche
+        // formula is the same we use below). Idempotency: skip
+        // (already-issued, epoch+fid+market) just like the apply loop.
+        struct Plan {
+            fid: u64,
+            tranche: u64,
+        }
+        let mut plan: Vec<Plan> = Vec::new();
+        let mut planned_total: u128 = 0;
+        for rec in &records {
             if self
                 .reward_store
                 .was_issued(epoch, rec.fid, market)
@@ -4087,9 +4334,6 @@ impl HyperRuntime {
             if rec.remaining_atoms == 0 {
                 continue;
             }
-            // On the final epoch, pay out the entire remaining
-            // balance — sweeps any rounding residual that would
-            // otherwise strand atoms in the store.
             let tranche = if remaining_tranches == 1 {
                 rec.remaining_atoms
             } else {
@@ -4098,13 +4342,76 @@ impl HyperRuntime {
             if tranche == 0 {
                 continue;
             }
-            self.reward_store
-                .credit_if_unissued(epoch, rec.fid, market, tranche)
+            planned_total = planned_total.saturating_add(tranche as u128);
+            plan.push(Plan {
+                fid: rec.fid,
+                tranche,
+            });
+        }
+        if let Some(cap) = self.max_reward_per_epoch_per_market.get(&market).copied() {
+            let already_in_market = self
+                .reward_store
+                .issued_total_for_epoch_market(epoch, market)
                 .map_err(|e| RuntimeRetroVestError::Reward(e.to_string()))?;
+            if already_in_market.saturating_add(planned_total) > cap {
+                return Err(RuntimeRetroVestError::BudgetExceeded {
+                    planned: already_in_market.saturating_add(planned_total),
+                    cap,
+                    market,
+                });
+            }
+        }
+        if let Some(global_cap) = self.max_reward_per_epoch {
+            let already_global = self
+                .reward_store
+                .issued_total_for_epoch(epoch)
+                .map_err(|e| RuntimeRetroVestError::Reward(e.to_string()))?;
+            if already_global.saturating_add(planned_total) > global_cap {
+                return Err(RuntimeRetroVestError::BudgetExceeded {
+                    planned: already_global.saturating_add(planned_total),
+                    cap: global_cap,
+                    market,
+                });
+            }
+        }
+
+        // Caps cleared — apply the plan. F015 fix: each per-FID
+        // tranche commits its balance + issued-marker + retro_store
+        // decrement in a single atomic batch. The prior code wrote
+        // the credit and the retro_store.put separately, so a crash
+        // between them left the balance credited but
+        // `remaining_atoms` un-decremented, inflating every
+        // subsequent tranche.
+        let planned_fids: std::collections::BTreeSet<u64> = plan.iter().map(|p| p.fid).collect();
+        let mut credited = 0usize;
+        for mut rec in records {
+            if !planned_fids.contains(&rec.fid) {
+                continue;
+            }
+            let tranche = if remaining_tranches == 1 {
+                rec.remaining_atoms
+            } else {
+                rec.remaining_atoms / remaining_tranches
+            };
+            let mut batch = self.db.txn();
+            let staged = self
+                .reward_store
+                .stage_credit_if_unissued(epoch, rec.fid, market, tranche, &mut batch)
+                .map_err(|e| RuntimeRetroVestError::Reward(e.to_string()))?;
+            if !staged {
+                // Already-issued: should not happen given the
+                // pre-plan filter, but treat as a no-op rather than
+                // double-applying.
+                continue;
+            }
             rec.remaining_atoms = rec.remaining_atoms.saturating_sub(tranche);
             self.retro_store
-                .put(&rec)
+                .stage_put(&rec, &mut batch)
                 .map_err(|e| RuntimeRetroVestError::RetroStore(e.to_string()))?;
+            self.db
+                .commit(batch)
+                .map_err(crate::core::error::HubError::from)
+                .map_err(|e| RuntimeRetroVestError::Reward(e.to_string()))?;
             credited += 1;
         }
         Ok(credited)
@@ -4135,7 +4442,9 @@ impl HyperRuntime {
         // off-mempool. Each transfer must verify against the
         // current note store + carry a balance-closing blinding
         // delta.
-        use crate::hyper::transfer_codec::{extract_blinding_diff, tx_from_proto};
+        use crate::hyper::transfer_codec::{
+            extract_blinding_diff, extract_output_pubkeys, tx_from_proto,
+        };
         for (i, tx_proto) in transfers_in_block.iter().enumerate() {
             let typed = tx_from_proto(tx_proto).map_err(|e| {
                 crate::hyper::importer::ImportError::TransferValidation(format!(
@@ -4146,6 +4455,22 @@ impl HyperRuntime {
             let blinding_diff = extract_blinding_diff(tx_proto).map_err(|e| {
                 crate::hyper::importer::ImportError::TransferValidation(format!(
                     "transfer[{}] blinding-diff codec: {}",
+                    i, e
+                ))
+            })?;
+            // F137 fix: pre-decode `one_time_pubkey`s here so a
+            // malformed entry rejects the block instead of being
+            // silently skipped by the post-apply note-store sync. A
+            // proposer that includes a transfer whose
+            // `extract_output_pubkeys` fails would otherwise land
+            // the commitment in the verkle tree (via the apply
+            // path) but skip the note_store insert, permanently
+            // stranding the output: the recipient can never spend
+            // it because owner-pubkey resolution misses, while the
+            // commitment shows up under the verkle root forever.
+            let _output_pubkeys = extract_output_pubkeys(tx_proto).map_err(|e| {
+                crate::hyper::importer::ImportError::TransferValidation(format!(
+                    "transfer[{}] output_pubkey codec: {}",
                     i, e
                 ))
             })?;
@@ -4212,6 +4537,15 @@ impl HyperRuntime {
             block.signature.epoch,
             &block.envelope.metadata.missed_proposals,
         );
+
+        // F004: advance the epoch resolver from the imported block's
+        // snapchain anchor. Previously this was only advanced at
+        // `apply_cutover`, which left downstream consumers
+        // (unstake maturation, DA-PoW response acceptance, router
+        // current_epoch, proposer-context refresh) reading a stale
+        // epoch for the entire post-cutover lifetime.
+        self.epoch_resolver
+            .observe_anchor(block.envelope.metadata.snapchain_anchor_block);
 
         Ok(crate::hyper::chain::hyper_block_hash(block))
     }
@@ -4453,15 +4787,21 @@ impl HyperRuntime {
                 snapchain_anchor_timestamp,
             )
             .map_err(RuntimeProduceError::Builder)?;
-        // The "current epoch" at production time is the one the
-        // DKLS signer is keyed on — fall back to the most-recently
-        // installed if multiple are present.
-        let (epoch, group_address) = self
+        // F028 fix (audit finding F026): bind block production to the
+        // epoch_resolver's current_epoch, not `dkls_signers.iter().next_back()`.
+        // The latter picks the max-installed epoch, which leaks pre-staged
+        // future-epoch material into current production and lets a proposer
+        // double-sign the same canonical_block_id with two distinct
+        // `signature.epoch` tags — bypassing the `DifferentEpochs` slashing
+        // guard. Bind to current_epoch and require the share to exist for
+        // exactly that epoch.
+        let current_epoch = self.epoch_resolver.current_epoch();
+        let group_address = self
             .dkls_signers
-            .iter()
-            .next_back()
-            .map(|(e, s)| (*e, s.group_address))
+            .get(&current_epoch)
+            .map(|s| s.group_address)
             .ok_or(RuntimeProduceError::NoDklsShare)?;
+        let epoch = current_epoch;
 
         let block = crate::hyper::HyperBlock {
             envelope,
@@ -4540,10 +4880,15 @@ impl HyperRuntime {
 
         // Single-party committee: just our own party_index. The
         // canonical signing payload is what the verifier will keccak;
-        // dispatch path runs that hash internally.
-        let payload = block.envelope.metadata.signing_payload(epoch);
-        let digest = alloy_primitives::keccak256(&payload);
+        // dispatch path runs that hash internally. F153: bind the
+        // committee (here just our own index) into the payload.
         let committee = vec![share.party.party_index];
+        let committee_u64: Vec<u64> = committee.iter().map(|&i| i as u64).collect();
+        let payload = block
+            .envelope
+            .metadata
+            .signing_payload(epoch, &committee_u64);
+        let digest = alloy_primitives::keccak256(&payload);
         let signature = hypersnap_crypto::dkls_sign::run_local_dkls_sign(&share.party, digest)
             .map_err(RuntimeProduceError::DklsSign)?;
         Self::attach_dkls_signature(&mut block, &committee, &signature);
@@ -5109,7 +5454,7 @@ mod tests {
         let payload = block
             .envelope
             .metadata
-            .signing_payload(block.signature.epoch);
+            .signing_payload(block.signature.epoch, &block.signature.signer_indices);
         let group_addr = dkg.group_address;
         let expected = crate::hyper::sig_verify::ExpectedGroupKey::ecdsa_only(&group_addr);
         crate::hyper::sig_verify::verify_hyperblock_signature(
@@ -5142,7 +5487,12 @@ mod tests {
     fn produce_unsigned_block_dkls_carries_group_address_and_empty_sig() {
         let (mut rt, _dir) = make_runtime();
         let dkg = hypersnap_crypto::dkls_threshold::run_honest_dkg(2, 3, [0xcc; 32]).unwrap();
-        rt.install_local_dkls_share(5, 1, dkg.parties[0].clone(), dkg.group_address);
+        // F026 fix: share must be installed for the resolver's current
+        // epoch — production now binds to epoch_resolver.current_epoch()
+        // instead of the max-installed share, so installing at an
+        // arbitrary future epoch no longer matches.
+        let current = rt.epoch_resolver.current_epoch();
+        rt.install_local_dkls_share(current, 1, dkg.parties[0].clone(), dkg.group_address);
 
         let (block, _locks, _transfers) = rt
             .produce_unsigned_block_dkls(7, vec![0u8; 32], 0, 0, vec![], 0)
@@ -5152,14 +5502,14 @@ mod tests {
             block.signature.group_address.as_slice(),
             dkg.group_address.as_slice()
         );
-        assert_eq!(block.signature.epoch, 5);
+        assert_eq!(block.signature.epoch, current);
 
         // attach_dkls_signature fills in the sig.
         let digest = alloy_primitives::keccak256(
             block
                 .envelope
                 .metadata
-                .signing_payload(block.signature.epoch),
+                .signing_payload(block.signature.epoch, &[1u64, 2]),
         );
         let sig =
             hypersnap_crypto::dkls_threshold::run_honest_sign(&dkg, &digest, &[1, 2]).unwrap();
@@ -5639,7 +5989,10 @@ mod tests {
             signature: Vec::new(),
             memo: b"first transfer".to_vec(),
         };
-        let payload = crate::hyper::token_transfer::token_transfer_signing_payload(&body);
+        let payload = crate::hyper::token_transfer::token_transfer_signing_payload(
+            &body,
+            crate::hyper::DEFAULT_PROTOCOL_CHAIN_ID,
+        );
         body.signature = sk.sign(&payload).to_bytes().to_vec();
 
         let msg = proto::HyperMessage {
@@ -5723,7 +6076,10 @@ mod tests {
             signature: Vec::new(),
             memo: Vec::new(),
         };
-        let payload = crate::hyper::token_transfer::token_transfer_signing_payload(&body);
+        let payload = crate::hyper::token_transfer::token_transfer_signing_payload(
+            &body,
+            crate::hyper::DEFAULT_PROTOCOL_CHAIN_ID,
+        );
         body.signature = sk.sign(&payload).to_bytes().to_vec();
         let msg = proto::HyperMessage {
             message_type: proto::HyperMessageType::TokenTransfer as i32,
@@ -5742,164 +6098,6 @@ mod tests {
         // Pre-state-mutation gate: balance + nonce untouched.
         assert_eq!(rt.reward_store.balance_of(1).unwrap(), 5_000);
         assert_eq!(rt.reward_store.balance_of(2).unwrap(), 0);
-        assert_eq!(rt.reward_store.nonce_of(1).unwrap(), 0);
-    }
-
-    /// FIP §13.5 end-to-end: a signed `TokenLockBody` arriving via
-    /// `submit_message` validates, authorizes the signer, mutates
-    /// balance + nonce + persists the canonical lock leaf at the
-    /// (fid, lock_id) key. Replay (same nonce + same lock_id) is
-    /// rejected.
-    #[test]
-    fn token_lock_through_submit_message_round_trips() {
-        use ed25519_dalek::{Signer, SigningKey};
-        let (mut rt, _dir) = make_runtime();
-        rt.reward_store
-            .credit_if_unissued(0, 1, proto::WorkMarket::Growth as i32, 5_000)
-            .unwrap();
-
-        let sk = SigningKey::from_bytes(&[3u8; 32]);
-        seed_onchain_signer(&rt, 1, sk.clone());
-
-        let pk = sk.verifying_key();
-        let lock_id = [0xccu8; 32];
-        let mut body = proto::TokenLockBody {
-            sender_fid: 1,
-            amount: 1_000,
-            nonce: 1,
-            destination_chain_id: 10,
-            destination_address: vec![0xab; 20],
-            lock_id: lock_id.to_vec(),
-            signer_pubkey: pk.to_bytes().to_vec(),
-            signature: Vec::new(),
-        };
-        let payload = crate::hyper::token_lock::token_lock_signing_payload(&body);
-        body.signature = sk.sign(&payload).to_bytes().to_vec();
-
-        let msg = proto::HyperMessage {
-            message_type: proto::HyperMessageType::TokenLock as i32,
-            body: Some(proto::hyper_message::Body::TokenLock(body.clone())),
-        };
-        rt.submit_message(msg).unwrap();
-        assert_eq!(rt.reward_store.balance_of(1).unwrap(), 4_000);
-        assert_eq!(rt.reward_store.nonce_of(1).unwrap(), 1);
-        // Lock state persisted at (fid=1, lock_id). The leaf hash
-        // recomputed from the state matches the canonical bridge
-        // encoder, byte-for-byte with what the on-chain contract
-        // would compute from `(lock_id, dest_chain, recipient,
-        // amount)`.
-        let stored = rt.reward_store.lock_state(1, &lock_id).unwrap().unwrap();
-        assert_eq!(stored.amount, 1_000);
-        assert_eq!(stored.destination_chain_id, 10);
-        assert_eq!(stored.destination_address.len(), 20);
-        let recomputed_leaf = crate::hyper::token_lock::encode_token_lock_leaf(&stored);
-        let expected_leaf = hypersnap_crypto::bridge_payload::lock_leaf_evm(
-            alloy_primitives::B256::from_slice(&lock_id),
-            10,
-            alloy_primitives::Address::from_slice(&stored.destination_address),
-            alloy_primitives::U256::from(1_000u64),
-        );
-        assert_eq!(recomputed_leaf, expected_leaf);
-
-        // Replay: same body, same nonce, same lock_id. The nonce
-        // gate fires first.
-        let replay = proto::HyperMessage {
-            message_type: proto::HyperMessageType::TokenLock as i32,
-            body: Some(proto::hyper_message::Body::TokenLock(body)),
-        };
-        let err = rt.submit_message(replay).unwrap_err();
-        assert!(matches!(
-            err,
-            crate::hyper::router::RoutingError::TokenLock(_)
-        ));
-        // State unchanged after replay.
-        assert_eq!(rt.reward_store.balance_of(1).unwrap(), 4_000);
-        assert_eq!(rt.reward_store.nonce_of(1).unwrap(), 1);
-    }
-
-    /// Two distinct lock_ids on the same FID + balance work as
-    /// expected; the lock store carries both leaves independently.
-    #[test]
-    fn two_token_locks_with_distinct_lock_ids_coexist() {
-        use ed25519_dalek::{Signer, SigningKey};
-        let (mut rt, _dir) = make_runtime();
-        rt.reward_store
-            .credit_if_unissued(0, 1, proto::WorkMarket::Growth as i32, 5_000)
-            .unwrap();
-        let sk = SigningKey::from_bytes(&[3u8; 32]);
-        seed_onchain_signer(&rt, 1, sk.clone());
-        let pk = sk.verifying_key();
-
-        for (i, lock_id) in [[0xaau8; 32], [0xbbu8; 32]].iter().enumerate() {
-            let nonce = (i + 1) as u64;
-            let mut body = proto::TokenLockBody {
-                sender_fid: 1,
-                amount: 100 * nonce,
-                nonce,
-                destination_chain_id: 10,
-                destination_address: vec![0xab; 20],
-                lock_id: lock_id.to_vec(),
-                signer_pubkey: pk.to_bytes().to_vec(),
-                signature: Vec::new(),
-            };
-            let payload = crate::hyper::token_lock::token_lock_signing_payload(&body);
-            body.signature = sk.sign(&payload).to_bytes().to_vec();
-            rt.submit_message(proto::HyperMessage {
-                message_type: proto::HyperMessageType::TokenLock as i32,
-                body: Some(proto::hyper_message::Body::TokenLock(body)),
-            })
-            .unwrap();
-        }
-        assert_eq!(rt.reward_store.balance_of(1).unwrap(), 5_000 - 100 - 200);
-        assert_eq!(rt.reward_store.nonce_of(1).unwrap(), 2);
-        assert!(rt
-            .reward_store
-            .lock_state(1, &[0xaau8; 32])
-            .unwrap()
-            .is_some());
-        assert!(rt
-            .reward_store
-            .lock_state(1, &[0xbbu8; 32])
-            .unwrap()
-            .is_some());
-    }
-
-    /// A lock signed by an unauthorized key (no SignerAdd for
-    /// sender_fid) is rejected before any state mutation.
-    #[test]
-    fn token_lock_rejects_unauthorized_signer() {
-        use ed25519_dalek::{Signer, SigningKey};
-        let (mut rt, _dir) = make_runtime();
-        rt.reward_store
-            .credit_if_unissued(0, 1, proto::WorkMarket::Growth as i32, 5_000)
-            .unwrap();
-        // No SignerAdd seeded.
-        let sk = SigningKey::from_bytes(&[3u8; 32]);
-        let pk = sk.verifying_key();
-        let mut body = proto::TokenLockBody {
-            sender_fid: 1,
-            amount: 100,
-            nonce: 1,
-            destination_chain_id: 10,
-            destination_address: vec![0xab; 20],
-            lock_id: vec![0xcc; 32],
-            signer_pubkey: pk.to_bytes().to_vec(),
-            signature: Vec::new(),
-        };
-        let payload = crate::hyper::token_lock::token_lock_signing_payload(&body);
-        body.signature = sk.sign(&payload).to_bytes().to_vec();
-        let msg = proto::HyperMessage {
-            message_type: proto::HyperMessageType::TokenLock as i32,
-            body: Some(proto::hyper_message::Body::TokenLock(body)),
-        };
-        let err = rt.submit_message(msg).unwrap_err();
-        match err {
-            crate::hyper::router::RoutingError::TokenLock(s) => {
-                assert!(s.contains("not active"));
-            }
-            other => panic!("expected TokenLock error, got {other:?}"),
-        }
-        assert_eq!(rt.reward_store.balance_of(1).unwrap(), 5_000);
         assert_eq!(rt.reward_store.nonce_of(1).unwrap(), 0);
     }
 
@@ -5927,7 +6125,10 @@ mod tests {
             signature: Vec::new(),
             memo: Vec::new(),
         };
-        let payload = crate::hyper::token_transfer::token_transfer_signing_payload(&body);
+        let payload = crate::hyper::token_transfer::token_transfer_signing_payload(
+            &body,
+            crate::hyper::DEFAULT_PROTOCOL_CHAIN_ID,
+        );
         body.signature = sk.sign(&payload).to_bytes().to_vec();
         let msg = proto::HyperMessage {
             message_type: proto::HyperMessageType::TokenTransfer as i32,
@@ -5959,31 +6160,24 @@ mod tests {
         let dkg = hypersnap_crypto::dkls_threshold::run_honest_dkg(1, 1, [0xab; 32]).expect("dkg");
         rt.install_local_dkls_share(0, 1, dkg.parties[0].clone(), dkg.group_address);
 
-        // Seed a single transparent lock so the tree has content.
-        let sk = SigningKey::from_bytes(&[3u8; 32]);
-        seed_onchain_signer(&rt, 1, sk.clone());
-        rt.reward_store
-            .credit_if_unissued(0, 1, proto::WorkMarket::Growth as i32, 5_000)
-            .unwrap();
-        let pk = sk.verifying_key();
+        // Seed a single lock state directly so the bridge tree has
+        // content. The transparent FID-keyed lock body is gone; the
+        // tree only cares that a `TokenLockState` row exists.
         let lock_id = [0xccu8; 32];
-        let mut body = proto::TokenLockBody {
-            sender_fid: 1,
-            amount: 1_000,
-            nonce: 1,
-            destination_chain_id: 10,
-            destination_address: vec![0xab; 20],
-            lock_id: lock_id.to_vec(),
-            signer_pubkey: pk.to_bytes().to_vec(),
-            signature: Vec::new(),
-        };
-        let payload = crate::hyper::token_lock::token_lock_signing_payload(&body);
-        body.signature = sk.sign(&payload).to_bytes().to_vec();
-        rt.submit_message(proto::HyperMessage {
-            message_type: proto::HyperMessageType::TokenLock as i32,
-            body: Some(proto::hyper_message::Body::TokenLock(body)),
-        })
-        .unwrap();
+        {
+            let lock_state = proto::TokenLockState {
+                sender_fid: 1,
+                amount: 1_000,
+                destination_chain_id: 10,
+                destination_address: vec![0xab; 20],
+                lock_id: lock_id.to_vec(),
+            };
+            let mut txn = crate::storage::db::RocksDbTransactionBatch::new();
+            rt.reward_store
+                .put_lock_state(1, &lock_state, &mut txn)
+                .unwrap();
+            rt.db.commit(txn).unwrap();
+        }
 
         // Produce + apply the signed root update at block 42.
         let block_number = 42u64;
@@ -6024,6 +6218,23 @@ mod tests {
         let dkg = hypersnap_crypto::dkls_threshold::run_honest_dkg(1, 1, [0xab; 32]).expect("dkg");
         rt.install_local_dkls_share(0, 1, dkg.parties[0].clone(), dkg.group_address);
 
+        // Seed a lock so the tree has a non-empty root (F062: the
+        // producer side refuses to sign empty roots).
+        {
+            let lock_state = proto::TokenLockState {
+                sender_fid: 0,
+                amount: 1_000,
+                destination_chain_id: 10,
+                destination_address: vec![0xab; 20],
+                lock_id: vec![0x99; 32],
+            };
+            let mut txn = crate::storage::db::RocksDbTransactionBatch::new();
+            rt.reward_store
+                .put_lock_state(0, &lock_state, &mut txn)
+                .unwrap();
+            rt.db.commit(txn).unwrap();
+        }
+
         let u1 = rt.produce_signed_lock_merkle_root_local(0, 10).unwrap();
         assert!(rt.apply_lock_merkle_root_update(&u1).unwrap());
         // Same block_number (or older): no-op.
@@ -6056,7 +6267,8 @@ mod tests {
         // out-of-band via `run_honest_sign`.
         rt.install_dkls_group_address(0, dkg.group_address);
 
-        // Build a non-empty tree: seed one transparent lock.
+        // Build a non-empty tree: seed one lock directly via the
+        // store, bypassing the (deprecated) signed-body apply path.
         let lock_state = proto::TokenLockState {
             sender_fid: 1,
             amount: 1_000,
@@ -6064,16 +6276,13 @@ mod tests {
             destination_address: vec![0xab; 20],
             lock_id: vec![0xcc; 32],
         };
-        rt.reward_store
-            .apply_lock(1, 1_000, 1, &lock_state)
-            .unwrap_err(); // nonce check fails (no balance/nonce setup) — irrelevant; just prepopulate via direct put
-                           // Direct-put bypasses balance checks for test setup.
-        let mut buf = Vec::new();
-        prost::Message::encode(&lock_state, &mut buf).unwrap();
-        let mut key = vec![crate::storage::constants::RootPrefix::HyperTokenLocked as u8];
-        key.extend_from_slice(&1u64.to_be_bytes());
-        key.extend_from_slice(&lock_state.lock_id);
-        rt.db.put(&key, &buf).unwrap();
+        {
+            let mut txn = crate::storage::db::RocksDbTransactionBatch::new();
+            rt.reward_store
+                .put_lock_state(1, &lock_state, &mut txn)
+                .unwrap();
+            rt.db.commit(txn).unwrap();
+        }
 
         // Build the canonical merkle root from current state.
         let (tree, _) = rt.build_lock_merkle_tree().unwrap();
@@ -6117,6 +6326,22 @@ mod tests {
         let (mut rt, _dir) = make_runtime();
         let dkg = hypersnap_crypto::dkls_threshold::run_honest_dkg(1, 1, [0xab; 32]).expect("dkg");
         rt.install_local_dkls_share(0, 1, dkg.parties[0].clone(), dkg.group_address);
+
+        // Seed a lock so the tree has a non-empty root.
+        {
+            let lock_state = proto::TokenLockState {
+                sender_fid: 0,
+                amount: 1_000,
+                destination_chain_id: 10,
+                destination_address: vec![0xab; 20],
+                lock_id: vec![0x99; 32],
+            };
+            let mut txn = crate::storage::db::RocksDbTransactionBatch::new();
+            rt.reward_store
+                .put_lock_state(0, &lock_state, &mut txn)
+                .unwrap();
+            rt.db.commit(txn).unwrap();
+        }
 
         let mut update = rt.produce_signed_lock_merkle_root_local(0, 7).unwrap();
         // Flip the root after signing.
@@ -6260,7 +6485,10 @@ mod tests {
             source_tx_hash: vec![0xcd; 32],
             ecdsa_signature: Vec::new(),
         };
-        let payload = crate::hyper::inbound_burn::inbound_burn_signing_payload(&burn);
+        let payload = crate::hyper::inbound_burn::inbound_burn_signing_payload(
+            &burn,
+            crate::hyper::DEFAULT_PROTOCOL_CHAIN_ID,
+        );
         let digest = alloy_primitives::keccak256(&payload);
         let sig =
             hypersnap_crypto::dkls_sign::run_local_dkls_sign(&dkg.parties[0], digest).unwrap();
@@ -6308,7 +6536,10 @@ mod tests {
             source_tx_hash: vec![0x01; 32],
             ecdsa_signature: Vec::new(),
         };
-        let payload_a = crate::hyper::inbound_burn::inbound_burn_signing_payload(&burn_a);
+        let payload_a = crate::hyper::inbound_burn::inbound_burn_signing_payload(
+            &burn_a,
+            crate::hyper::DEFAULT_PROTOCOL_CHAIN_ID,
+        );
         burn_a.ecdsa_signature = hypersnap_crypto::dkls_sign::run_local_dkls_sign(
             &dkg.parties[0],
             alloy_primitives::keccak256(&payload_a),
@@ -6320,7 +6551,10 @@ mod tests {
         burn_b.source_chain_id = 8453;
         burn_b.amount = 200;
         burn_b.ecdsa_signature = Vec::new();
-        let payload_b = crate::hyper::inbound_burn::inbound_burn_signing_payload(&burn_b);
+        let payload_b = crate::hyper::inbound_burn::inbound_burn_signing_payload(
+            &burn_b,
+            crate::hyper::DEFAULT_PROTOCOL_CHAIN_ID,
+        );
         burn_b.ecdsa_signature = hypersnap_crypto::dkls_sign::run_local_dkls_sign(
             &dkg.parties[0],
             alloy_primitives::keccak256(&payload_b),
@@ -6352,7 +6586,10 @@ mod tests {
             source_tx_hash: vec![0xcd; 32],
             ecdsa_signature: Vec::new(),
         };
-        let payload = crate::hyper::inbound_burn::inbound_burn_signing_payload(&burn);
+        let payload = crate::hyper::inbound_burn::inbound_burn_signing_payload(
+            &burn,
+            crate::hyper::DEFAULT_PROTOCOL_CHAIN_ID,
+        );
         burn.ecdsa_signature = hypersnap_crypto::dkls_sign::run_local_dkls_sign(
             &dkg.parties[0],
             alloy_primitives::keccak256(&payload),
@@ -6386,7 +6623,10 @@ mod tests {
             source_tx_hash: vec![0xcd; 32],
             ecdsa_signature: Vec::new(),
         };
-        let payload = crate::hyper::inbound_burn::inbound_burn_signing_payload(&burn);
+        let payload = crate::hyper::inbound_burn::inbound_burn_signing_payload(
+            &burn,
+            crate::hyper::DEFAULT_PROTOCOL_CHAIN_ID,
+        );
         let digest = alloy_primitives::keccak256(&payload);
         let sig =
             hypersnap_crypto::dkls_threshold::run_honest_sign(&dkg, &digest, &[1, 2]).unwrap();
@@ -6475,6 +6715,7 @@ mod tests {
             fid: 7,
             custody_signature: vec![],
             validator_address: vec![0xab; 20],
+            libp2p_peer_id: vec![],
         };
         body.signature = sk
             .sign(&validator_event_signing_payload(&body))
@@ -6524,6 +6765,7 @@ mod tests {
             fid: 7,
             custody_signature: vec![],
             validator_address: vec![0xab; 20],
+            libp2p_peer_id: vec![],
         };
         body.signature = sk
             .sign(&validator_event_signing_payload(&body))
@@ -6559,6 +6801,7 @@ mod tests {
             fid: 7,
             custody_signature: vec![],
             validator_address: vec![],
+            libp2p_peer_id: vec![],
         };
         body.signature = sk
             .sign(&validator_event_signing_payload(&body))
@@ -6631,6 +6874,7 @@ mod tests {
             fid: 7,
             custody_signature: vec![],
             validator_address: vec![0xab; 20],
+            libp2p_peer_id: vec![],
         };
         body.signature = sk
             .sign(&validator_event_signing_payload(&body))
@@ -8220,6 +8464,17 @@ mod tests {
         nonce: u64,
         sk: &ed25519_dalek::SigningKey,
     ) -> proto::AppUsageReceiptBody {
+        sign_app_receipt_for_epoch(user_fid, app_owner_fid, action, nonce, 0, sk)
+    }
+
+    fn sign_app_receipt_for_epoch(
+        user_fid: u64,
+        app_owner_fid: u64,
+        action: &str,
+        nonce: u64,
+        epoch: u64,
+        sk: &ed25519_dalek::SigningKey,
+    ) -> proto::AppUsageReceiptBody {
         use crate::hyper::app_usage_receipt::app_receipt_signing_payload;
         use ed25519_dalek::Signer;
         let pk = sk.verifying_key();
@@ -8232,6 +8487,7 @@ mod tests {
             nonce,
             user_signer_pubkey: pk.to_bytes().to_vec(),
             user_signature: Vec::new(),
+            epoch,
         };
         body.user_signature = sk
             .sign(&app_receipt_signing_payload(
@@ -8271,6 +8527,27 @@ mod tests {
         assert!(format!("{}", err).contains("duplicate receipt nonce"));
         let epoch = rt.epoch_resolver.current_epoch();
         assert_eq!(rt.app_receipt_count(epoch, 42, 7).unwrap(), 1);
+    }
+
+    /// A receipt signed for a non-current epoch is rejected at apply
+    /// time. Without this binding the same signed receipt could be
+    /// replayed every future epoch to inflate the app owner's §7
+    /// score.
+    #[test]
+    fn app_receipt_rejects_epoch_mismatch() {
+        use ed25519_dalek::SigningKey;
+        let (mut rt, _dir) = make_runtime();
+        let sk = SigningKey::from_bytes(&[3u8; 32]);
+        seed_onchain_signer(&rt, 7, sk.clone());
+        let current = rt.epoch_resolver.current_epoch();
+        let stale = sign_app_receipt_for_epoch(7, 42, "open", 1, current + 1, &sk);
+        let err = rt.apply_app_usage_receipt(&stale).unwrap_err();
+        assert!(
+            format!("{}", err).contains("epoch mismatch"),
+            "expected epoch-mismatch rejection, got: {}",
+            err
+        );
+        assert_eq!(rt.app_receipt_count(current, 42, 7).unwrap(), 0);
     }
 
     /// Distinct nonces from the same user against the same app
@@ -8414,7 +8691,11 @@ mod tests {
             fid,
             hex::encode(addr.as_slice())
         );
-        let payload_json = format!(r#"{{"domain":"{}"}}"#, domain);
+        let payload_json = format!(
+            r#"{{"domain":"{}","chain_id":{}}}"#,
+            domain,
+            crate::hyper::DEFAULT_PROTOCOL_CHAIN_ID
+        );
         let header_b64 = URL_SAFE_NO_PAD.encode(header_json.as_bytes());
         let payload_b64 = URL_SAFE_NO_PAD.encode(payload_json.as_bytes());
         let signing_input = format!("{}.{}", header_b64, payload_b64);

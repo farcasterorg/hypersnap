@@ -154,6 +154,22 @@ pub fn get_current_header(db: &RocksDB) -> Result<Option<proto::ShardHeader>, Sh
 
 pub fn put_shard_chunk(db: &RocksDB, shard_chunk: &ShardChunk) -> Result<(), ShardStorageError> {
     let mut txn = db.txn();
+    stage_shard_chunk(db, &mut txn, shard_chunk)?;
+    db.commit(txn)?;
+    Ok(())
+}
+
+/// Stage the shard-chunk + timestamp-index writes onto a caller-owned
+/// batch. F033 fix: lets the engine merge the chunk write with the
+/// state-mutation batch so trie + chunk + header land in a single
+/// atomic commit. A crash between previously-separate commits could
+/// leave the trie at height H with the header still at H-1 — on
+/// restart the chains diverge and pollute S3 snapshots.
+pub fn stage_shard_chunk(
+    db: &RocksDB,
+    txn: &mut crate::storage::db::RocksDbTransactionBatch,
+    shard_chunk: &ShardChunk,
+) -> Result<(), ShardStorageError> {
     let header = shard_chunk
         .header
         .as_ref()
@@ -170,8 +186,6 @@ pub fn put_shard_chunk(db: &RocksDB, shard_chunk: &ShardChunk) -> Result<(), Sha
     if db.get(&timestamp_index_key)? == None {
         txn.put(timestamp_index_key, primary_key);
     }
-
-    db.commit(txn)?;
     Ok(())
 }
 
@@ -200,6 +214,15 @@ impl ShardStore {
 
     pub fn put_shard_chunk(&self, shard_chunk: &ShardChunk) -> Result<(), ShardStorageError> {
         put_shard_chunk(&self.db, shard_chunk)
+    }
+
+    /// Batch-aware variant — see [`stage_shard_chunk`].
+    pub fn stage_shard_chunk(
+        &self,
+        txn: &mut crate::storage::db::RocksDbTransactionBatch,
+        shard_chunk: &ShardChunk,
+    ) -> Result<(), ShardStorageError> {
+        stage_shard_chunk(&self.db, txn, shard_chunk)
     }
 
     pub fn get_first_shard_chunk(&self) -> Result<Option<ShardChunk>, ShardStorageError> {

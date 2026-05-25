@@ -27,6 +27,13 @@ use thiserror::Error;
 const PREFIX: u8 = 0xE5;
 const SUB_PRIMARY: u8 = 0x01;
 const SUB_URL_INDEX: u8 = 0x02;
+/// F158: per-envelope replay marker. Key shape:
+/// `<prefix> 0x03 <fid:8 BE> <payload_hash:32>`
+/// Value: the `app_id` that first consumed this envelope (variable
+/// length, length-prefixed). Same envelope re-played against any
+/// other `app_id` for the same `fid` is rejected; a benign retry
+/// against the same `app_id` is idempotent.
+const SUB_ENVELOPE_REPLAY: u8 = 0x03;
 
 /// Maximum length we accept for an `app_id`. Keeps key sizes bounded.
 ///
@@ -45,6 +52,10 @@ pub enum NotificationStoreError {
     Serde(String),
     #[error("app_id too long (max {MAX_APP_ID_LEN} bytes)")]
     AppIdTooLong,
+    /// F158: same JFS envelope replayed across distinct app_ids
+    /// for the same fid.
+    #[error("envelope already consumed for app_id {first:?}; cannot replay for {attempted:?}")]
+    CrossAppReplay { first: String, attempted: String },
 }
 
 pub struct NotificationStore {
@@ -238,6 +249,52 @@ impl NotificationStore {
             .map_err(|e| NotificationStoreError::Storage(e.to_string()))?;
         Ok(fids)
     }
+
+    /// F158: claim a (fid, payload_hash) for `app_id` and reject
+    /// cross-app replay.
+    ///
+    /// - If `(fid, payload_hash)` has no prior entry, record this
+    ///   `app_id` as the first consumer and return `Ok(())`.
+    /// - If a prior entry exists and matches `app_id`, treat as
+    ///   idempotent retry and return `Ok(())`.
+    /// - If a prior entry exists for a DIFFERENT `app_id`, return
+    ///   `Err(CrossAppReplay)`.
+    ///
+    /// The signed JFS envelope contains no `app_id` binding (the
+    /// upstream mini-app wire spec ships without one), so this
+    /// store-side nullifier is the only thing preventing a captured
+    /// envelope from being replayed against an attacker-owned
+    /// `app_id` on the same hypersnap deployment.
+    pub fn claim_envelope(
+        &self,
+        app_id: &str,
+        fid: u64,
+        payload_hash: &[u8; 32],
+    ) -> Result<(), NotificationStoreError> {
+        validate_app_id(app_id)?;
+        let key = make_envelope_replay_key(fid, payload_hash);
+        if let Some(prev) = self
+            .db
+            .get(&key)
+            .map_err(|e| NotificationStoreError::Storage(e.to_string()))?
+        {
+            // Length-prefixed app_id bytes (we wrote them ourselves
+            // last time, so the round-trip is deterministic).
+            let stored = std::str::from_utf8(&prev).unwrap_or("");
+            if stored == app_id {
+                return Ok(());
+            }
+            return Err(NotificationStoreError::CrossAppReplay {
+                first: stored.to_string(),
+                attempted: app_id.to_string(),
+            });
+        }
+        let mut txn = RocksDbTransactionBatch::new();
+        txn.put(key, app_id.as_bytes().to_vec());
+        self.db
+            .commit(txn)
+            .map_err(|e| NotificationStoreError::Storage(e.to_string()))
+    }
 }
 
 fn validate_app_id(app_id: &str) -> Result<(), NotificationStoreError> {
@@ -282,6 +339,17 @@ fn make_url_index_prefix(app_id: &str, url: &str) -> Vec<u8> {
 fn make_url_index_key(app_id: &str, url: &str, fid: u64) -> Vec<u8> {
     let mut key = make_url_index_prefix(app_id, url);
     key.extend_from_slice(&fid.to_be_bytes());
+    key
+}
+
+/// F158: replay-marker key. `(fid, blake3(payload_bytes))` →
+/// app_id-bytes.
+fn make_envelope_replay_key(fid: u64, payload_hash: &[u8; 32]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(2 + 8 + 32);
+    key.push(PREFIX);
+    key.push(SUB_ENVELOPE_REPLAY);
+    key.extend_from_slice(&fid.to_be_bytes());
+    key.extend_from_slice(payload_hash);
     key
 }
 

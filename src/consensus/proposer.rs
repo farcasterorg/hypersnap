@@ -207,8 +207,23 @@ impl Proposer for ShardProposer {
         if let Some(proto::full_proposal::ProposedValue::Shard(chunk)) =
             full_proposal.proposed_value.clone()
         {
-            let header = chunk.header.as_ref().unwrap();
-            let height = header.height.unwrap();
+            // F002: peer-controlled proto — both `chunk.header` and
+            // `header.height` are `Option`; reject malformed proposals
+            // instead of panicking.
+            let header = match chunk.header.as_ref() {
+                Some(h) => h,
+                None => {
+                    warn!("Received shard proposal with missing header");
+                    return Validity::Invalid;
+                }
+            };
+            let height = match header.height {
+                Some(h) => h,
+                None => {
+                    warn!("Received shard proposal with missing header height");
+                    return Validity::Invalid;
+                }
+            };
             self.proposed_chunks
                 .add_proposed_value(full_proposal.clone());
             let timestamp = FarcasterTime::new(header.timestamp);
@@ -579,8 +594,22 @@ impl Proposer for BlockProposer {
         if let Some(proto::full_proposal::ProposedValue::Block(block)) =
             &full_proposal.proposed_value
         {
-            let header = block.header.as_ref().unwrap();
-            let height = header.height.unwrap();
+            // F002: peer-controlled proto — guard against missing
+            // header / height instead of panicking.
+            let header = match block.header.as_ref() {
+                Some(h) => h,
+                None => {
+                    error!("Received block proposal with missing header");
+                    return Validity::Invalid;
+                }
+            };
+            let height = match header.height {
+                Some(h) => h,
+                None => {
+                    error!("Received block proposal with missing header height");
+                    return Validity::Invalid;
+                }
+            };
 
             if height != self.get_confirmed_height().increment() {
                 warn!(
@@ -607,19 +636,17 @@ impl Proposer for BlockProposer {
                 );
                 return Validity::Invalid;
             }
-            if header.height.is_none() {
-                error!("Received block with missing height");
-                return Validity::Invalid;
-            }
             if header.shard_witnesses_hash.is_empty() {
                 error!("Received block with missing shard witnesses hash");
                 return Validity::Invalid;
             }
-            if block.shard_witness.is_none() {
-                error!("Received block with missing shard witnesses");
-                return Validity::Invalid;
-            }
-            let witness = block.shard_witness.as_ref().unwrap();
+            let witness = match block.shard_witness.as_ref() {
+                Some(w) => w,
+                None => {
+                    error!("Received block with missing shard witnesses");
+                    return Validity::Invalid;
+                }
+            };
             if witness.shard_chunk_witnesses.len() != self.num_shards as usize {
                 error!(
                     "Received block with wrong number of shard witnesses: {}",

@@ -8,7 +8,7 @@ use crate::proto::{full_proposal, Commits, FullProposal, ShardHash};
 use crate::storage::store::node_local_state::LocalStateStore;
 use crate::utils::statsd_wrapper::StatsdClientWrapper;
 use informalsystems_malachitebft_core_consensus::ProposedValue;
-use informalsystems_malachitebft_core_types::{Round, ValidatorSet};
+use informalsystems_malachitebft_core_types::{Round, ValidatorSet, Validity};
 use libp2p::identity::ed25519::PublicKey;
 use std::cmp::PartialEq;
 use std::time::Duration;
@@ -280,13 +280,38 @@ impl ShardValidator {
     ) -> ProposedValue<SnapchainValidatorContext> {
         let value = full_proposal.shard_hash();
         self.proposal_source = proposal_source;
-        if self.shard_id.shard_id() != full_proposal.shard_id().unwrap() {
+        // F002: `FullProposal::shard_id()` returns `Err` when the
+        // proposal's `height` field is `None` (a peer-reachable
+        // condition). Reject the proposal as Invalid instead of
+        // panicking on the unwrap.
+        let proposal_shard = match full_proposal.shard_id() {
+            Ok(s) => s,
+            Err(_) => {
+                warn!("Received proposal with missing height/shard_id; dropping");
+                return ProposedValue {
+                    height: full_proposal.height(),
+                    round: full_proposal.round(),
+                    valid_round: Round::Nil,
+                    proposer: full_proposal.proposer_address(),
+                    value,
+                    validity: Validity::Invalid,
+                };
+            }
+        };
+        if self.shard_id.shard_id() != proposal_shard {
             warn!(
-                "Received proposal for shard {} on shard {}",
-                full_proposal.shard_id().unwrap(),
+                "Received proposal for shard {} on shard {}; dropping",
+                proposal_shard,
                 self.shard_id.shard_id()
             );
-            panic!("Received proposal for wrong shard");
+            return ProposedValue {
+                height: full_proposal.height(),
+                round: full_proposal.round(),
+                valid_round: Round::Nil,
+                proposer: full_proposal.proposer_address(),
+                value,
+                validity: Validity::Invalid,
+            };
         }
         let validity = if let Some(block_proposer) = &mut self.block_proposer {
             block_proposer.add_proposed_value(full_proposal)

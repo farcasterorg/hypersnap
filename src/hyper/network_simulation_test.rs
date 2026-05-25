@@ -127,7 +127,7 @@ mod tests {
         let mut block_wire_bytes: Option<Vec<u8>> = None;
         let mut produced_block = None;
         for out in proposer_outs {
-            if let HyperActorOutbound::BroadcastBlock(block) = &out {
+            if let HyperActorOutbound::BroadcastBlock { block, .. } = &out {
                 produced_block = Some(block.clone());
             }
             if let Some((topic, wire)) = outbound_to_wire(out) {
@@ -140,22 +140,12 @@ mod tests {
         let block_wire_bytes =
             block_wire_bytes.expect("block should have been wrapped to wire frame");
 
-        // Step 5: Importer's gossip side decodes and runs the actor.
-        // (The importer also needs the locks list in the InboundBlock event,
-        // which the wire frame currently carries empty — this test
-        // therefore manually attaches them via a synthesized event. Once
-        // the producing path includes them in BroadcastBlock outbounds,
-        // this step becomes pure wire decode.)
+        // Step 5: Importer's gossip side decodes the wire frame; locks +
+        // transfers ride with the block (F138 fix) and arrive on the
+        // `InboundBlock` event directly — no manual re-injection.
         let decoded_block_wire =
             proto::HyperWireMessage::decode(block_wire_bytes.as_slice()).unwrap();
-        let importer_event = match wire_to_event(decoded_block_wire).unwrap() {
-            HyperActorEvent::InboundBlock { block, .. } => HyperActorEvent::InboundBlock {
-                block,
-                locks: vec![lock.clone()],
-                transfers: vec![],
-            },
-            other => panic!("expected InboundBlock, got {:?}", other),
-        };
+        let importer_event = wire_to_event(decoded_block_wire).unwrap();
 
         let importer_outs = HyperActor::drive_events(importer_rt, vec![importer_event]).await;
         let err_count = importer_outs
@@ -200,7 +190,7 @@ mod tests {
         let block = tokio::time::timeout(Duration::from_secs(120), async {
             loop {
                 match handles.outbound.recv().await {
-                    Some(HyperActorOutbound::BroadcastBlock(b)) => return Some(b),
+                    Some(HyperActorOutbound::BroadcastBlock { block, .. }) => return Some(block),
                     Some(HyperActorOutbound::EventError(e)) => {
                         panic!("actor error: {}", e);
                     }
@@ -287,7 +277,7 @@ mod tests {
             let payload = block
                 .envelope
                 .metadata
-                .signing_payload(block.signature.epoch);
+                .signing_payload(block.signature.epoch, &block.signature.signer_indices);
             let digest = keccak256(&payload);
             let sig = hypersnap_crypto::dkls_sign::run_local_dkls_sign(&dkg.parties[0], digest)
                 .expect("local sign");

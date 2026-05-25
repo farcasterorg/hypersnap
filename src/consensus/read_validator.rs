@@ -47,6 +47,11 @@ impl ReadValidator {
     }
 
     async fn commit_decided_value(&mut self, value: &DecidedValue, height: Height) {
+        // F005: peer-controlled `DecidedValue.value` oneof. Drop with
+        // an error log instead of panicking when the variant doesn't
+        // match the engine (e.g. forward-incompat protocol drift, an
+        // unknown tag decoded by prost as `None`, or a HyperBlock
+        // arriving on a non-hyper engine).
         match &mut self.engine {
             Engine::ShardEngine(shard_engine) => match &value.value {
                 Some(proto::decided_value::Value::Shard(shard_chunk)) => {
@@ -56,9 +61,14 @@ impl ReadValidator {
                         hash = hex::encode(&shard_chunk.hash),
                         "Processed decided shard chunk"
                     );
+                    self.last_height = height;
                 }
-                _ => {
-                    panic!("Invalid decided value")
+                other => {
+                    error!(
+                        %height,
+                        variant = ?other.as_ref().map(|v| std::mem::discriminant(v)),
+                        "Dropping DecidedValue: expected a ShardChunk for ShardEngine"
+                    );
                 }
             },
             Engine::BlockEngine(block_engine) => match &value.value {
@@ -69,13 +79,17 @@ impl ReadValidator {
                         hash = hex::encode(&block.hash),
                         "Processed decided block"
                     );
+                    self.last_height = height;
                 }
-                _ => {
-                    panic!("Invalid decided value")
+                other => {
+                    error!(
+                        %height,
+                        variant = ?other.as_ref().map(|v| std::mem::discriminant(v)),
+                        "Dropping DecidedValue: expected a Block for BlockEngine"
+                    );
                 }
             },
         };
-        self.last_height = height;
     }
 
     async fn process_buffered_blocks(&mut self) -> u64 {
@@ -94,14 +108,18 @@ impl ReadValidator {
         num_blocks_processed
     }
 
-    fn get_decided_value_height(value: &proto::DecidedValue) -> Height {
-        match value.value.as_ref().unwrap() {
+    /// F005: returns `None` when the peer-controlled oneof is empty
+    /// (unknown future variant decoded by prost) or when a nested
+    /// `Option` (`header`, `header.height`) is missing. Callers must
+    /// drop the message in that case, not unwrap.
+    fn get_decided_value_height(value: &proto::DecidedValue) -> Option<Height> {
+        match value.value.as_ref()? {
             proto::decided_value::Value::Shard(shard_chunk) => {
-                shard_chunk.header.as_ref().unwrap().height.unwrap()
+                shard_chunk.header.as_ref().and_then(|h| h.height)
             }
 
             proto::decided_value::Value::Block(block) => {
-                block.header.as_ref().unwrap().height.unwrap()
+                block.header.as_ref().and_then(|h| h.height)
             }
 
             proto::decided_value::Value::HyperBlock(hb) => {
@@ -114,21 +132,31 @@ impl ReadValidator {
                     .and_then(|e| e.metadata.as_ref())
                     .map(|m| m.canonical_block_id)
                     .unwrap_or(0);
-                Height {
+                Some(Height {
                     shard_index: 0,
                     block_number: canonical,
-                }
+                })
             }
         }
     }
 
     fn verify_signatures(&self, value: &proto::DecidedValue) -> bool {
-        let commits = match value.value.as_ref().unwrap() {
-            proto::decided_value::Value::Shard(shard_chunk) => {
-                shard_chunk.commits.as_ref().unwrap()
-            }
+        // F005: `value.value` is peer-controlled; missing-or-unknown
+        // variants are dropped rather than panicked on.
+        let inner = match value.value.as_ref() {
+            Some(v) => v,
+            None => return false,
+        };
+        let commits = match inner {
+            proto::decided_value::Value::Shard(shard_chunk) => match shard_chunk.commits.as_ref() {
+                Some(c) => c,
+                None => return false,
+            },
 
-            proto::decided_value::Value::Block(block) => block.commits.as_ref().unwrap(),
+            proto::decided_value::Value::Block(block) => match block.commits.as_ref() {
+                Some(c) => c,
+                None => return false,
+            },
 
             proto::decided_value::Value::HyperBlock(_) => {
                 // Hyperblocks carry threshold BLS signatures, not Ed25519
@@ -145,16 +173,25 @@ impl ReadValidator {
     pub fn validate_protocol_version(&self, value: &DecidedValue) -> bool {
         match &value.value {
             Some(proto::decided_value::Value::Block(block)) => {
-                let header = block.header.as_ref().unwrap();
-                let network = FarcasterNetwork::try_from(header.chain_id).unwrap();
+                // F005: peer-controlled — `header`, `chain_id`, and
+                // nested `height` are all guarded.
+                let header = match block.header.as_ref() {
+                    Some(h) => h,
+                    None => return false,
+                };
+                let network = match FarcasterNetwork::try_from(header.chain_id) {
+                    Ok(n) => n,
+                    Err(_) => return false,
+                };
                 let timestamp = FarcasterTime::new(header.timestamp);
                 let expected_version =
                     EngineVersion::version_for(&timestamp, network).protocol_version();
 
                 if header.version != expected_version {
+                    let block_number = header.height.map(|h| h.block_number).unwrap_or(0);
                     let error_message = format!(
                         "Invalid protocol version in decided block at height {}: expected {}, got {}. Does your node need an upgrade?",
-                        header.height.unwrap().block_number,
+                        block_number,
                         expected_version, header.version
                     );
                     error!(%self.last_height, error_message);
@@ -167,14 +204,27 @@ impl ReadValidator {
                 }
             }
             _ => {
-                // no-op. Only blocks have protocol version
+                // no-op. Only blocks have protocol version. Unknown
+                // (None) variants are dropped earlier in process_decided_value.
             }
         }
         true
     }
 
     pub async fn process_decided_value(&mut self, value: DecidedValue) -> u64 {
-        let height = Self::get_decided_value_height(&value);
+        // F005: peer-controlled `value.value` may be `None` for
+        // unknown future oneof variants. Drop the message rather than
+        // panic on `.unwrap()`.
+        let height = match Self::get_decided_value_height(&value) {
+            Some(h) => h,
+            None => {
+                warn!(
+                    last_height = %self.last_height,
+                    "Dropping decided value: missing or unknown oneof variant (possible forward-protocol drift)"
+                );
+                return 0;
+            }
+        };
         let verified = self.verify_signatures(&value);
         if !verified {
             error!(%height, last_height = %self.last_height, "Dropping decided block because its signatures are invalid");

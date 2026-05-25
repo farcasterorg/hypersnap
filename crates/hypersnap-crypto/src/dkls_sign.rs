@@ -208,6 +208,21 @@ impl DklsSignCoordinator {
         })
     }
 
+    /// F045: rebuild this coordinator from scratch with the same
+    /// `(party, committee, digest)`. Used after a Phase-4 result with
+    /// `recovery_id ∈ {2, 3}` so the next attempt regenerates the
+    /// per-ceremony nonce (`instance_key`) inside `sign_phase1` and
+    /// (with overwhelming probability) lands a recovery_id in `{0, 1}`.
+    /// Caller must re-invoke `start()` after `restart()`.
+    pub fn restart(&mut self) -> Result<(), DklsError> {
+        let party = self.party.clone();
+        let signing_committee = self.signing_committee.clone();
+        let digest = self.digest;
+        let fresh = Self::new(party, signing_committee, digest)?;
+        *self = fresh;
+        Ok(())
+    }
+
     pub fn party_index(&self) -> u8 {
         self.party.party_index
     }
@@ -377,12 +392,10 @@ impl DklsSignCoordinator {
                 reason: abort.description,
             })?;
         if recovery_id > 1 {
-            return Err(DklsError::Abort {
-                party: 0,
-                reason: format!(
-                    "DKLS23 produced recovery_id={recovery_id} (R.x ≥ curve order); not Ethereum-compatible"
-                ),
-            });
+            // F045: distinct error variant so the supervisor can
+            // detect this and re-run the ceremony with fresh
+            // entropy rather than treating it as a permanent abort.
+            return Err(DklsError::RecoveryIdOutOfRange { recovery_id });
         }
         let r = decode_be32_hex(&x_coord)?;
         let s = decode_be32_hex(&s_hex)?;
@@ -416,6 +429,34 @@ fn decode_be32_hex(s: &str) -> Result<B256, DklsError> {
 /// 1-of-1 issuance/snapshot signing) where the entire ceremony
 /// completes synchronously without network round-trips.
 pub fn run_local_dkls_sign(
+    party: &Party<Secp256k1>,
+    digest: B256,
+) -> Result<EcdsaSignature, DklsError> {
+    // F045: a DKLS sign occasionally produces `recovery_id ∈ {2, 3}`
+    // (`R.x ≥ curve order`), which is not Ethereum-compatible. The
+    // protocol-prescribed remedy is to re-run the ceremony with
+    // fresh entropy — each `DklsSignCoordinator::new` call regenerates
+    // the per-ceremony nonce inside `sign_phase1`, so a clean retry
+    // gets us a different `R` and (with overwhelming probability) a
+    // recovery_id in {0, 1}. The probability per attempt is ~2⁻¹²⁸,
+    // so any retry budget > 0 is overwhelmingly enough; we cap at
+    // small N as defense-in-depth against a (cryptographically
+    // impossible) infinite loop.
+    const RECOVERY_ID_RETRY_BUDGET: u32 = 4;
+    let mut attempts_left = RECOVERY_ID_RETRY_BUDGET;
+    loop {
+        match run_local_dkls_sign_once(party, digest) {
+            Ok(sig) => return Ok(sig),
+            Err(DklsError::RecoveryIdOutOfRange { .. }) if attempts_left > 0 => {
+                attempts_left -= 1;
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn run_local_dkls_sign_once(
     party: &Party<Secp256k1>,
     digest: B256,
 ) -> Result<EcdsaSignature, DklsError> {

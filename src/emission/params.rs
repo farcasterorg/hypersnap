@@ -17,23 +17,32 @@ pub const RETRO_POOL_ATOMS: u128 = 200_000_000 * 1_000_000;
 
 /// Mutuality function applied to engagement counts before normalization.
 /// Wrapped in `ln(1 + x)` after applying the inner reduction.
+///
+/// F010 alignment: the in-protocol scoring path
+/// (`crates/proof-of-quality/src/scoring.rs`) uses a hardcoded
+/// harmonic mean, so `Harmonic` is the only mode that matches the
+/// consensus output. The other modes are retained for the
+/// `compute_emissions` CLI binary and offline experimentation only —
+/// the production consensus path never reads them. `Harmonic` is the
+/// default so a misconfigured CLI run still matches consensus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MutualityMode {
     /// `min(a, b)` — penalises one-sided engagement aggressively.
     Min,
     /// `sqrt(a · b)` — geometric mean.
     Geom,
-    /// `2ab/(a+b)` — harmonic mean.
+    /// `2ab/(a+b)` — harmonic mean (FIP-default, matches consensus).
     Harmonic,
     /// `(a + b) / 2`.
     Avg,
-    /// `a + b` — favors total volume; FIP-default.
+    /// `a + b` — favors total volume. **Not the consensus mode** —
+    /// retained for offline experiments only.
     Sum,
 }
 
 impl Default for MutualityMode {
     fn default() -> Self {
-        Self::Sum
+        Self::Harmonic
     }
 }
 
@@ -63,7 +72,9 @@ pub struct EmissionParams {
     pub epoch_tranche_atoms: u64,
     /// EigenTrust seed cutoff. Defaults to `SEED_MAX_FID`.
     pub seed_max_fid: u64,
-    /// Mutuality reduction function. Defaults to `MutualityMode::Sum`.
+    /// Mutuality reduction function. Defaults to
+    /// `MutualityMode::Harmonic` (matches the in-protocol scoring
+    /// path; F010 alignment).
     pub mutuality_mode: MutualityMode,
     /// Minimum total emission a single FID can receive in atoms. Floors small
     /// allocations to avoid dust.
@@ -80,7 +91,7 @@ impl Default for EmissionParams {
         Self {
             epoch_tranche_atoms: 0,
             seed_max_fid: SEED_MAX_FID,
-            mutuality_mode: MutualityMode::Sum,
+            mutuality_mode: MutualityMode::Harmonic,
             min_per_recipient_atoms: 1, // 0.000001 HYPER floor
             crediter_trust_floor: 0.05,
             min_active_days: 7,
@@ -128,7 +139,10 @@ mod tests {
     fn default_params_match_fip() {
         let p = EmissionParams::default();
         assert_eq!(p.seed_max_fid, 50_000);
-        assert_eq!(p.mutuality_mode, MutualityMode::Sum);
+        // F010 alignment: default is Harmonic to match the
+        // in-protocol scoring path. The Sum constant is retained
+        // for offline experiments.
+        assert_eq!(p.mutuality_mode, MutualityMode::Harmonic);
     }
 
     #[test]

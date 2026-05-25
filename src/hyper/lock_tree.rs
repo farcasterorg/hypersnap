@@ -1,36 +1,49 @@
 //! FIP-proof-of-work-tokenization §13.5 outbound-bridge merkle
-//! tree builder.
+//! tree builder + canonical leaf encoder.
 //!
 //! Validators collect every persisted `TokenLockState` from the
 //! `RewardStore` (across all FIDs), encode each as the canonical
-//! EVM bridge leaf via
-//! [`crate::hyper::token_lock::encode_token_lock_leaf`], sort the
-//! leaves ascending, and build a sorted-pair keccak256 merkle tree
-//! via [`hypersnap_crypto::merkle::Tree`]. The resulting root is
+//! EVM bridge leaf via [`encode_token_lock_leaf`], sort the leaves
+//! ascending, and build a sorted-pair keccak256 merkle tree via
+//! [`hypersnap_crypto::merkle::Tree`]. The resulting root is
 //! threshold-signed by the validator set and posted to
 //! `HypersnapBridge.claim` as the new `latestRoot`.
 //!
 //! ## Canonical leaf ordering
 //!
-//! Leaves are sorted ascending by leaf hash before tree
-//! construction. This is the same ordering the offline bridge
-//! ceremony tool uses (`crates/hypersnap-bridge-ceremony`) and the
-//! contract-side test helper (`MerkleHelper.sortAscending`). Same
-//! lock-set in → same root out, byte-exact, regardless of
-//! iteration order in the underlying store.
+//! Leaves are sorted ascending by leaf hash before tree construction.
+//! Same ordering as the offline bridge ceremony tool
+//! (`crates/hypersnap-bridge-ceremony`) and the contract-side test
+//! helper (`MerkleHelper.sortAscending`). Same lock-set in → same
+//! root out, byte-exact, regardless of iteration order in the
+//! underlying store.
 //!
 //! ## Per-claim proof
 //!
 //! [`build_proof_for`] returns `(leaf_hash, sibling_path)` for a
-//! specific `lock_id` against the same canonical tree. The
-//! claimant submits this proof to `HypersnapBridge.claim` along
-//! with the (lock_id, recipient, amount, chain_id) used to
-//! recompute the leaf on-chain.
+//! specific `lock_id` against the same canonical tree. The claimant
+//! submits this proof to `HypersnapBridge.claim` along with the
+//! (lock_id, recipient, amount, chain_id) used to recompute the leaf
+//! on-chain.
 
-use crate::hyper::token_lock::encode_token_lock_leaf;
 use crate::proto;
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256, U256};
 use hypersnap_crypto::merkle::Tree;
+
+/// Compute the EVM-family merkle leaf hash for a lock. Byte-exact
+/// with what `HypersnapBridge.claim` recomputes from
+/// `(lock_id, destinationChainId, recipient, amount)`.
+pub fn encode_token_lock_leaf(state: &proto::TokenLockState) -> B256 {
+    let lock_id = B256::from_slice(&state.lock_id);
+    let recipient = Address::from_slice(&state.destination_address);
+    let amount = U256::from(state.amount);
+    hypersnap_crypto::bridge_payload::lock_leaf_evm(
+        lock_id,
+        state.destination_chain_id,
+        recipient,
+        amount,
+    )
+}
 
 /// A single lock with its canonical leaf hash. Returned by
 /// [`build_lock_tree`] alongside the constructed tree so callers

@@ -62,6 +62,57 @@ impl TrustScoreStore {
         }
         Ok(())
     }
+
+    /// Delete the trust score record for a single FID. F014 fix.
+    pub fn delete(&self, fid: u64) -> Result<(), HubError> {
+        let key = make_key(fid);
+        self.db.del(&key).map_err(HubError::from)
+    }
+
+    /// Bulk-replace: install every FID listed in `entries` and
+    /// delete every FID currently in the store that is not in
+    /// `entries`. This is the snapshot-apply semantic the audit
+    /// finding F014 calls for — `set_many` alone is PUT-only and
+    /// leaves stale FIDs in the store indefinitely, feeding the
+    /// validator-trust gate, soft-evict filter, and the fee
+    /// discount path with arbitrarily stale data.
+    pub fn replace_with(&self, entries: &[(u64, f64)]) -> Result<(), HubError> {
+        use crate::storage::db::PageOptions;
+        use std::collections::BTreeSet;
+        let new_fids: BTreeSet<u64> = entries.iter().map(|(f, _)| *f).collect();
+
+        // Walk the existing store and collect FIDs that aren't in
+        // the new set.
+        let prefix = vec![RootPrefix::HyperTrustScore as u8];
+        let mut to_delete: Vec<u64> = Vec::new();
+        self.db.for_each_iterator_by_prefix(
+            Some(prefix.clone()),
+            None,
+            &PageOptions::default(),
+            |key, _value| {
+                if key.len() == 9 {
+                    let mut fid_bytes = [0u8; 8];
+                    fid_bytes.copy_from_slice(&key[1..9]);
+                    let fid = u64::from_be_bytes(fid_bytes);
+                    if !new_fids.contains(&fid) {
+                        to_delete.push(fid);
+                    }
+                }
+                Ok(false)
+            },
+        )?;
+
+        // Apply: deletes + sets in a single batch.
+        let mut batch = self.db.txn();
+        for fid in to_delete {
+            batch.delete(make_key(fid).to_vec());
+        }
+        for &(fid, score) in entries {
+            batch.put(make_key(fid).to_vec(), score.to_be_bytes().to_vec());
+        }
+        self.db.commit(batch).map_err(HubError::from)?;
+        Ok(())
+    }
 }
 
 /// `TrustScoreResolver` adapter for the validator registry. Reads the

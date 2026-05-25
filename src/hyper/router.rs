@@ -40,8 +40,10 @@ pub enum RoutingError {
     FeeDeposit(String),
     #[error("confidential transfer rejected: {0}")]
     Transfer(String),
-    #[error("token lock rejected: {0}")]
-    TokenLock(String),
+    #[error("confidential lock rejected: {0}")]
+    ConfidentialLock(String),
+    #[error("shield (transparent\u{2192}confidential) rejected: {0}")]
+    Shield(String),
     #[error("lock merkle root update rejected: {0}")]
     LockMerkleRootUpdate(String),
     #[error("owner rotation rejected: {0}")]
@@ -191,14 +193,6 @@ impl HyperRouter {
                     proto::HyperMessageType::TokenTransfer as i32,
                 ))
             }
-            proto::hyper_message::Body::TokenLock(_) => {
-                // Transparent FID-keyed token locks (FIP §13.5) need
-                // the runtime's balance + lock stores. Same intercept
-                // pattern as TokenTransfer.
-                Err(RoutingError::UnsupportedMessageType(
-                    proto::HyperMessageType::TokenLock as i32,
-                ))
-            }
             proto::hyper_message::Body::LockMerkleRootUpdate(_) => {
                 // FIP §13.5/§13.4 signed merkle-root update —
                 // verifies + persists in the runtime, not the
@@ -299,6 +293,18 @@ impl HyperRouter {
                 // (needs RewardStore + signer-set check).
                 RoutingError::UnsupportedMessageType(proto::HyperMessageType::FeeDeposit as i32),
             ),
+            proto::hyper_message::Body::ConfidentialLock(_) => Err(
+                // Confidential bridge lock — runtime intercepts (needs
+                // NoteStore + Pedersen balance closure check).
+                RoutingError::UnsupportedMessageType(
+                    proto::HyperMessageType::ConfidentialLock as i32,
+                ),
+            ),
+            proto::hyper_message::Body::Shield(_) => Err(
+                // Shield (transparent → confidential) — runtime intercepts
+                // (debits RewardStore balance, mints note in NoteStore).
+                RoutingError::UnsupportedMessageType(proto::HyperMessageType::Shield as i32),
+            ),
         }
     }
 
@@ -309,6 +315,16 @@ impl HyperRouter {
         }
     }
 
+    /// F149 — REQUIRED: callers building `tx` for a production
+    /// publish MUST have signed every `TransferInput.spend_signature`
+    /// against `TransferTx::signing_payload_with_envelope(...)` —
+    /// which covers the per-output `one_time_pubkey` and the
+    /// `blinding_diff_scalar`. The bare `signing_payload()` is
+    /// permissive enough that a gossip-relay attacker can rewrite
+    /// the recipient's stealth pubkey on a captured transfer and
+    /// burn the output. There are no production callers today;
+    /// when wiring one in, see `tx_to_proto_full` for the matching
+    /// wire encoder.
     pub fn outbound_transfer(tx: proto::HyperTransferTx) -> proto::HyperMessage {
         proto::HyperMessage {
             message_type: proto::HyperMessageType::Transfer as i32,

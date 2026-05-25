@@ -147,6 +147,35 @@ impl BlockProductionScheduler {
         )
     }
 
+    /// F024 fix: gating decision + anchor snapshot in a single lock
+    /// acquisition. Splitting these lets a `refresh_proposer_context`
+    /// tick between the two reads change which validator is gating
+    /// the decision vs. which anchor the produced block commits to —
+    /// surfacing as a block whose `anchor_hash` differs from the
+    /// hash the gating decision was made against.
+    async fn should_propose_and_snapshot(&self, height: u64) -> Option<(u64, Vec<u8>, u64)> {
+        let ctx = self.proposer_ctx.lock().await;
+        let gating_disabled = ctx.anchor_block_hash.is_empty()
+            || ctx.validators.is_empty()
+            || ctx.local_key.is_empty();
+        let should = gating_disabled
+            || is_proposer(
+                &ctx.local_key,
+                &ctx.validators,
+                &ctx.anchor_block_hash,
+                height,
+                0,
+            );
+        if !should {
+            return None;
+        }
+        Some((
+            ctx.anchor_block,
+            ctx.anchor_block_hash.clone(),
+            ctx.anchor_block_timestamp,
+        ))
+    }
+
     /// Drive the scheduler. Returns when the inbound channel closes.
     pub async fn run(self) {
         let mut ticker = time::interval(self.block_time);
@@ -158,20 +187,14 @@ impl BlockProductionScheduler {
             ticker.tick().await;
             let snapshot = self.head.lock().await.clone();
             let next = snapshot.next_height();
-            if !self.should_propose(next).await {
-                debug!("scheduler: not proposer for height {}, skipping", next);
-                continue;
-            }
-            // Snapshot the anchor info under the same lock so the
-            // produced block is consistent with the gating decision.
-            let (anchor_block, anchor_hash, anchor_ts) = {
-                let ctx = self.proposer_ctx.lock().await;
-                (
-                    ctx.anchor_block,
-                    ctx.anchor_block_hash.clone(),
-                    ctx.anchor_block_timestamp,
-                )
-            };
+            let (anchor_block, anchor_hash, anchor_ts) =
+                match self.should_propose_and_snapshot(next).await {
+                    Some(snap) => snap,
+                    None => {
+                        debug!("scheduler: not proposer for height {}, skipping", next);
+                        continue;
+                    }
+                };
             let event = HyperActorEvent::ProduceBlockDkls {
                 height: next,
                 parent_hash: snapshot.parent_hash.clone(),
@@ -196,7 +219,7 @@ impl BlockProductionScheduler {
         mut outbound: mpsc::Receiver<HyperActorOutbound>,
     ) {
         while let Some(item) = outbound.recv().await {
-            if let HyperActorOutbound::BroadcastBlock(block) = item {
+            if let HyperActorOutbound::BroadcastBlock { block, .. } = item {
                 let h = block.envelope.metadata.canonical_block_id;
                 let hash = hyper_block_hash(&block);
                 let mut g = head.lock().await;
@@ -520,9 +543,13 @@ mod tests {
         };
         let expected_hash = hyper_block_hash(&block);
 
-        tx.send(HyperActorOutbound::BroadcastBlock(block))
-            .await
-            .unwrap();
+        tx.send(HyperActorOutbound::BroadcastBlock {
+            block,
+            locks: vec![],
+            transfers: vec![],
+        })
+        .await
+        .unwrap();
         drop(tx);
 
         BlockProductionScheduler::track_outbounds(head.clone(), rx).await;

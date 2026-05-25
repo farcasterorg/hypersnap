@@ -406,15 +406,22 @@ impl InnerProductProof {
 
         let pos = 2 * lg_n * 56;
 
-        // Create scalars from byte slices
+        // F121 fix: decode `a` and `b` with `from_canonical_bytes`,
+        // not `from_bytes_mod_order`. Non-canonical decoding accepts
+        // multiple distinct byte payloads for the same scalar, so a
+        // single logical IPA proof has 2^k≥9 distinct wire forms —
+        // each one re-flooded on gossip with a fresh content-hashed
+        // libp2p `message_id`. Canonical decode matches upstream
+        // dalek and this crate's own RangeProof/LinearProof/R1CS
+        // parsers; reject non-canonical bytes here as malformed.
         let mut a_bytes = [0u8; 56];
         a_bytes.copy_from_slice(&slice[pos..pos + 56]);
-        let a = Scalar::from_bytes_mod_order(a_bytes);
+        let a = Scalar::from_canonical_bytes(a_bytes).ok_or(ProofError::FormatError)?;
 
         let pos = pos + 56;
         let mut b_bytes = [0u8; 56];
         b_bytes.copy_from_slice(&slice[pos..pos + 56]);
-        let b = Scalar::from_bytes_mod_order(b_bytes);
+        let b = Scalar::from_canonical_bytes(b_bytes).ok_or(ProofError::FormatError)?;
 
         Ok(InnerProductProof { L_vec, R_vec, a, b })
     }

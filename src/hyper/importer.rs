@@ -246,7 +246,7 @@ pub fn import_hyper_block(
     let payload = block
         .envelope
         .metadata
-        .signing_payload(block.signature.epoch);
+        .signing_payload(block.signature.epoch, &block.signature.signer_indices);
     let expected =
         crate::hyper::sig_verify::ExpectedGroupKey::ecdsa_only(expected_dkls_group_address);
     crate::hyper::sig_verify::verify_hyperblock_signature(

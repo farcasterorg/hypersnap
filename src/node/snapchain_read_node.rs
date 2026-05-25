@@ -187,28 +187,55 @@ impl SnapchainReadNode {
         }
     }
     pub fn dispatch_decided_value(&self, decided_value: proto::DecidedValue) {
-        let shard_id = match decided_value.value.as_ref().unwrap() {
-            proto::decided_value::Value::Shard(shard_chunk) => {
-                shard_chunk
-                    .header
-                    .as_ref()
-                    .unwrap()
-                    .height
-                    .unwrap()
-                    .shard_index
+        // F005: gossip-delivered `DecidedValue` is peer-controlled.
+        // Drop frames with missing / unknown oneof variants and
+        // missing nested headers rather than panicking on `.unwrap()`.
+        let shard_id = match decided_value.value.as_ref() {
+            Some(proto::decided_value::Value::Shard(shard_chunk)) => {
+                match shard_chunk.header.as_ref().and_then(|h| h.height) {
+                    Some(h) => h.shard_index,
+                    None => {
+                        tracing::warn!(
+                            "Dropping DecidedValue: shard chunk has missing header/height"
+                        );
+                        return;
+                    }
+                }
             }
-            proto::decided_value::Value::Block(block) => {
-                block.header.as_ref().unwrap().height.unwrap().shard_index
+            Some(proto::decided_value::Value::Block(block)) => {
+                match block.header.as_ref().and_then(|h| h.height) {
+                    Some(h) => h.shard_index,
+                    None => {
+                        tracing::warn!("Dropping DecidedValue: block has missing header/height");
+                        return;
+                    }
+                }
             }
-            proto::decided_value::Value::HyperBlock(_) => {
+            Some(proto::decided_value::Value::HyperBlock(_)) => {
                 // Hyperblocks have their own dispatch path. This should not be
                 // reached via the snapchain DecidedValue pipeline.
                 tracing::warn!("HyperBlock DecidedValue received via snapchain dispatch; dropping");
                 return;
             }
+            None => {
+                // Unknown future oneof variant decoded by prost as None.
+                // Forward-protocol drift: log + drop instead of crashing.
+                tracing::warn!(
+                    "Dropping DecidedValue: unknown oneof variant (forward-protocol drift?)"
+                );
+                return;
+            }
         };
-        let actors = self.consensus_actors.get(&shard_id).unwrap();
-        actors.cast_decided_value(decided_value).unwrap();
+        let actors = match self.consensus_actors.get(&shard_id) {
+            Some(a) => a,
+            None => {
+                tracing::warn!(shard_id, "Dropping DecidedValue: no actor for shard");
+                return;
+            }
+        };
+        if let Err(e) = actors.cast_decided_value(decided_value) {
+            tracing::error!(shard_id, error = %e, "Failed to cast DecidedValue to actor");
+        }
     }
 
     pub fn dispatch_network_event(&self, shard: MalachiteEventShard, event: MalachiteNetworkEvent) {

@@ -154,10 +154,10 @@ pub enum RootPrefix {
     HyperRetroactiveScore = 58,
     /// FIP-proof-of-work-tokenization §13.1 transparent token-transfer
     /// nonce store. Key: `[59][fid BE u64]`, value: u64 BE — the
-    /// FID's current nonce. The next valid `TokenTransferBody` /
-    /// `TokenLockBody` for this FID must carry `nonce == current + 1`.
-    /// FIDs that have never transacted have no entry; the nonce is
-    /// treated as 0.
+    /// FID's current nonce. Shared by `TokenTransferBody`,
+    /// `FeeDepositBody`, and `ShieldBody`: the next valid body for
+    /// this FID must carry `nonce == current + 1`. FIDs that have
+    /// never transacted have no entry; the nonce is treated as 0.
     HyperTokenNonce = 59,
     /// FIP-proof-of-work-tokenization §13.5 transparent token-lock
     /// state. Key: `[60][fid BE u64][lock_id 32B]`, value: encoded
@@ -332,6 +332,25 @@ pub enum RootPrefix {
     /// Key: `[86][fid BE u64]`, value: BE u64 atoms.
     HyperFeeBalance = 86,
 
+    /// Audit findings F094/F095: persisted high-watermark for the
+    /// inbound bridge-burn watcher, keyed by source_chain_id. The
+    /// prior cursor was derived from the drainable
+    /// `BridgeBurnStore` queue, which produces None on restart once
+    /// burns are processed — restarting the watcher from
+    /// `start_block` and re-scanning L1 from zero. This separate
+    /// watermark is updated as the watcher confirms ranges and is
+    /// never cleared by queue drains.
+    /// Key: `[91][source_chain_id BE u32]` → value: `[block BE u64]`.
+    HyperBridgeBurnWatermark = 91,
+    /// Audit finding F011: cross-epoch consecutive-missed-proposal
+    /// counter. The per-epoch `ValidatorScoreRecord.consecutive_misses`
+    /// resets at every epoch boundary (its storage key includes the
+    /// epoch), so `should_auto_deregister` never trips. This prefix
+    /// stores a single u64 keyed only on validator_key that survives
+    /// epoch transitions; it's reset by `record_successful_proposal`
+    /// and consulted by `should_auto_deregister`.
+    /// Key: `[90][validator_key 32B]` → value: BE u64.
+    HyperValidatorConsecutiveMisses = 90,
     /// FIP-proof-of-quality §3 / r9k content fingerprint window. Rolling
     /// 30-day SimHash store used by the live uniqueness scorer.
     /// Key: `[87][simhash_high u64 BE][ts BE u64][fid BE u64]`

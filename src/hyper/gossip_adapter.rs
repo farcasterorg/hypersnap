@@ -54,6 +54,18 @@ pub enum AdapterError {
 /// topic. (We still expose the topic constants via `topic_for_outbound` for
 /// the publish direction.)
 pub fn wire_to_event(wire: proto::HyperWireMessage) -> Result<HyperActorEvent, AdapterError> {
+    wire_to_event_with_source(wire, None)
+}
+
+/// F018: variant of [`wire_to_event`] that threads the libp2p
+/// `propagation_source` peer-id into the resulting event. Production
+/// gossip ingress must use this and pass the real peer-id; tests
+/// and locally-synthesized events use the `wire_to_event`
+/// convenience which sets `None`.
+pub fn wire_to_event_with_source(
+    wire: proto::HyperWireMessage,
+    propagation_source: Option<Vec<u8>>,
+) -> Result<HyperActorEvent, AdapterError> {
     match wire.body.ok_or(AdapterError::MissingBody)? {
         proto::hyper_wire_message::Body::Block(b) => {
             let block_proto = b.block.ok_or(AdapterError::MissingBlock)?;
@@ -72,10 +84,12 @@ pub fn wire_to_event(wire: proto::HyperWireMessage) -> Result<HyperActorEvent, A
             WIRE_ROUND_DKLS => Ok(HyperActorEvent::InboundDkls {
                 target_epoch: d.target_epoch,
                 encoded: d.encoded,
+                propagation_source,
             }),
             WIRE_ROUND_DKLS_SIGN => Ok(HyperActorEvent::InboundDklsSign {
                 epoch: d.target_epoch,
                 encoded: d.encoded,
+                propagation_source,
             }),
             n => Err(AdapterError::InvalidDkgRound(n)),
         },
@@ -96,18 +110,17 @@ pub fn outbound_to_wire(
     out: HyperActorOutbound,
 ) -> Option<(&'static str, proto::HyperWireMessage)> {
     match out {
-        HyperActorOutbound::BroadcastBlock(block) => {
+        HyperActorOutbound::BroadcastBlock {
+            block,
+            locks,
+            transfers,
+        } => {
             let wire = proto::HyperWireMessage {
                 body: Some(proto::hyper_wire_message::Body::Block(
                     proto::HyperWireBlock {
                         block: Some(encode_hyper_block(block)),
-                        // Currently we attach the messages on the producing
-                        // side; the actor owns them at that point. This
-                        // adapter doesn't have access to them since the
-                        // actor doesn't publish them in the outbound today.
-                        // Wire them in by changing the actor outbound.
-                        locks: vec![],
-                        transfers: vec![],
+                        locks,
+                        transfers,
                     },
                 )),
             };
@@ -170,60 +183,30 @@ pub fn wrap_outbound_message(msg: proto::HyperMessage) -> (&'static str, proto::
     )
 }
 
+/// Round-trip decode of a wire `HyperBlock`. Uses the
+/// `From<proto::HyperBlockMetadata>` impl so every field the proposer
+/// signs (anchor block / hash / timestamp, missed proposals, range
+/// metadata) is preserved — see F138.
 fn decode_hyper_block(block: proto::HyperBlock) -> Result<HyperBlock, AdapterError> {
     let envelope = block.envelope.ok_or(AdapterError::MissingEnvelope)?;
-    let metadata = envelope.metadata.ok_or(AdapterError::MissingMetadata)?;
-    let signature = block.signature.ok_or(AdapterError::MissingSignature)?;
+    let metadata_proto = envelope.metadata.ok_or(AdapterError::MissingMetadata)?;
+    let signature_proto = block.signature.ok_or(AdapterError::MissingSignature)?;
     Ok(HyperBlock {
         envelope: crate::hyper::HyperEnvelope {
-            metadata: crate::hyper::HyperBlockMetadata {
-                canonical_block_id: metadata.canonical_block_id,
-                parent_hash: metadata.parent_hash,
-                hyper_state_root: metadata.hyper_state_root,
-                extra_rules_version: metadata.extra_rules_version,
-                retained_message_count: metadata.retained_message_count,
-                missed_proposals: vec![],
-                snapchain_anchor_block: 0,
-                snapchain_anchor_hash: vec![],
-                snapchain_range_start_block: 0,
-                snapchain_range_root: vec![],
-                snapchain_anchor_timestamp: 0,
-            },
+            metadata: metadata_proto.into(),
             payload: envelope.payload,
         },
-        signature: crate::hyper::HyperBlockSignature {
-            epoch: signature.epoch,
-            signer_indices: signature.signer_indices,
-            group_address: signature.group_address,
-            ecdsa_signature: signature.ecdsa_signature,
-        },
+        signature: signature_proto.into(),
     })
 }
 
 fn encode_hyper_block(block: HyperBlock) -> proto::HyperBlock {
     proto::HyperBlock {
         envelope: Some(proto::HyperEnvelope {
-            metadata: Some(proto::HyperBlockMetadata {
-                canonical_block_id: block.envelope.metadata.canonical_block_id,
-                parent_hash: block.envelope.metadata.parent_hash,
-                hyper_state_root: block.envelope.metadata.hyper_state_root,
-                extra_rules_version: block.envelope.metadata.extra_rules_version,
-                retained_message_count: block.envelope.metadata.retained_message_count,
-                missed_proposals: vec![],
-                snapchain_anchor_block: 0,
-                snapchain_anchor_hash: vec![],
-                snapchain_range_start_block: 0,
-                snapchain_range_root: vec![],
-                snapchain_anchor_timestamp: 0,
-            }),
+            metadata: Some(block.envelope.metadata.into()),
             payload: block.envelope.payload,
         }),
-        signature: Some(proto::HyperBlockSignature {
-            epoch: block.signature.epoch,
-            signer_indices: block.signature.signer_indices,
-            group_address: block.signature.group_address,
-            ecdsa_signature: block.signature.ecdsa_signature,
-        }),
+        signature: Some(block.signature.into()),
     }
 }
 
@@ -295,7 +278,11 @@ mod tests {
     #[test]
     fn block_round_trip_through_wire() {
         let block = sample_block();
-        let outbound = HyperActorOutbound::BroadcastBlock(block.clone());
+        let outbound = HyperActorOutbound::BroadcastBlock {
+            block: block.clone(),
+            locks: vec![],
+            transfers: vec![],
+        };
         let (topic, wire) = outbound_to_wire(outbound).unwrap();
         assert_eq!(topic, TOPIC_HYPER_BLOCKS);
 
@@ -355,6 +342,7 @@ mod tests {
             HyperActorEvent::InboundDkls {
                 target_epoch,
                 encoded: round_tripped,
+                ..
             } => {
                 assert_eq!(target_epoch, 42);
                 assert_eq!(round_tripped, encoded);
@@ -400,6 +388,7 @@ mod tests {
             HyperActorEvent::InboundDklsSign {
                 epoch,
                 encoded: round_tripped,
+                ..
             } => {
                 assert_eq!(epoch, 5);
                 assert_eq!(round_tripped, encoded);

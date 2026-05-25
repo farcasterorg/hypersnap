@@ -68,6 +68,13 @@ pub enum AccountAssociationError {
         payload_domain: String,
         message_domain: String,
     },
+    #[error(
+        "payload.chain_id {payload_chain_id} does not match expected chain_id {expected_chain_id}"
+    )]
+    ChainIdMismatch {
+        payload_chain_id: u64,
+        expected_chain_id: u64,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -81,6 +88,11 @@ struct AssociationHeader {
 #[derive(Debug, Deserialize)]
 struct AssociationPayload {
     domain: String,
+    /// Hypersnap deployment this proof is bound to. Required: the
+    /// JFS-signed bytes must carry an explicit chain_id so the proof
+    /// cannot be replayed on a sibling hypersnap deployment that
+    /// mirrors the same L1 IdRegistry/KeyRegistry events.
+    chain_id: u64,
 }
 
 fn parse_address(hex_str: &str) -> Result<Address, AccountAssociationError> {
@@ -116,7 +128,8 @@ pub struct VerifiedAssociation {
 }
 
 /// Verify a Farcaster account-association proof against an expected
-/// `(fid, domain)` and the on-chain custody address for `fid`.
+/// `(fid, domain, chain_id)` and the on-chain custody address for
+/// `fid`.
 ///
 /// Returns `Ok(VerifiedAssociation)` only if every check passes:
 /// 1. header + payload JSON parse cleanly
@@ -127,10 +140,14 @@ pub struct VerifiedAssociation {
 /// 5. `header.key` equals the on-chain custody address for `header.fid`
 /// 6. `header.fid == expected_fid`
 /// 7. `payload.domain == expected_domain`
+/// 8. `payload.chain_id == expected_chain_id` (closes cross-chain
+///    replay — the signed JSON payload must explicitly name the
+///    hypersnap deployment it authorizes the registration for)
 pub fn verify_account_association(
     proof: &proto::AccountAssociationProof,
     expected_fid: u64,
     expected_domain: &str,
+    expected_chain_id: u64,
     custody: &dyn CustodyResolver,
 ) -> Result<VerifiedAssociation, AccountAssociationError> {
     if proof.header.is_empty() {
@@ -212,6 +229,12 @@ pub fn verify_account_association(
             message_domain: expected_domain.to_string(),
         });
     }
+    if payload.chain_id != expected_chain_id {
+        return Err(AccountAssociationError::ChainIdMismatch {
+            payload_chain_id: payload.chain_id,
+            expected_chain_id,
+        });
+    }
 
     Ok(VerifiedAssociation {
         fid: header.fid,
@@ -234,10 +257,21 @@ mod tests {
         }
     }
 
+    const TEST_CHAIN_ID: u64 = 10;
+
     fn make_proof(
         signer: &PrivateKeySigner,
         fid: u64,
         domain: &str,
+    ) -> proto::AccountAssociationProof {
+        make_proof_for_chain(signer, fid, domain, TEST_CHAIN_ID)
+    }
+
+    fn make_proof_for_chain(
+        signer: &PrivateKeySigner,
+        fid: u64,
+        domain: &str,
+        chain_id: u64,
     ) -> proto::AccountAssociationProof {
         let addr = signer.address();
         let header_json = format!(
@@ -245,7 +279,7 @@ mod tests {
             fid,
             hex::encode(addr.as_slice())
         );
-        let payload_json = format!(r#"{{"domain":"{}"}}"#, domain);
+        let payload_json = format!(r#"{{"domain":"{}","chain_id":{}}}"#, domain, chain_id);
         let header_b64 = URL_SAFE_NO_PAD.encode(header_json.as_bytes());
         let payload_b64 = URL_SAFE_NO_PAD.encode(payload_json.as_bytes());
         let signing_input = format!("{}.{}", header_b64, payload_b64);
@@ -264,7 +298,8 @@ mod tests {
         let addr_bytes: [u8; 20] = signer.address().into();
         let custody = FixedCustody(vec![(42, addr_bytes)]);
         let proof = make_proof(&signer, 42, "example.com");
-        let v = verify_account_association(&proof, 42, "example.com", &custody).unwrap();
+        let v =
+            verify_account_association(&proof, 42, "example.com", TEST_CHAIN_ID, &custody).unwrap();
         assert_eq!(v.fid, 42);
         assert_eq!(v.custody_address, addr_bytes);
         assert_eq!(v.domain, "example.com");
@@ -280,7 +315,8 @@ mod tests {
         // Attacker signs a proof claiming fid 42; the header.key in
         // the proof is the attacker's address.
         let proof = make_proof(&attacker, 42, "example.com");
-        let err = verify_account_association(&proof, 42, "example.com", &custody).unwrap_err();
+        let err = verify_account_association(&proof, 42, "example.com", TEST_CHAIN_ID, &custody)
+            .unwrap_err();
         // Recovered = attacker; header.key = attacker; recovered ==
         // key passes — but on-chain custody is the real signer, so
         // the CustodyMismatch fires.
@@ -296,14 +332,36 @@ mod tests {
         let addr_bytes: [u8; 20] = signer.address().into();
         let custody = FixedCustody(vec![(42, addr_bytes)]);
         let mut proof = make_proof(&signer, 42, "example.com");
-        // Swap domain in the payload bytes (without re-signing).
-        proof.payload = r#"{"domain":"evil.com"}"#.as_bytes().to_vec();
-        let err = verify_account_association(&proof, 42, "example.com", &custody).unwrap_err();
+        // Swap domain in the payload bytes (still well-formed JSON,
+        // includes the now-required chain_id).
+        proof.payload = format!(r#"{{"domain":"evil.com","chain_id":{}}}"#, TEST_CHAIN_ID)
+            .as_bytes()
+            .to_vec();
+        let err = verify_account_association(&proof, 42, "example.com", TEST_CHAIN_ID, &custody)
+            .unwrap_err();
         // The signature was over the original payload bytes — the
         // recovered address will not match header.key.
         assert!(matches!(
             err,
             AccountAssociationError::RecoveredMismatch { .. }
+        ));
+    }
+
+    /// F101 regression: a proof signed for one chain must not verify
+    /// on a sibling chain.
+    #[test]
+    fn cross_chain_replay_rejected() {
+        let signer = PrivateKeySigner::from_bytes(&[7u8; 32].into()).unwrap();
+        let addr_bytes: [u8; 20] = signer.address().into();
+        let custody = FixedCustody(vec![(42, addr_bytes)]);
+        let proof = make_proof_for_chain(&signer, 42, "example.com", 10);
+        let err = verify_account_association(&proof, 42, "example.com", 11, &custody).unwrap_err();
+        assert!(matches!(
+            err,
+            AccountAssociationError::ChainIdMismatch {
+                payload_chain_id: 10,
+                expected_chain_id: 11
+            }
         ));
     }
 
@@ -314,7 +372,8 @@ mod tests {
         let custody = FixedCustody(vec![(42, addr_bytes)]);
         let proof = make_proof(&signer, 42, "example.com");
         // Verifier expects FID 99 — header says 42.
-        let err = verify_account_association(&proof, 99, "example.com", &custody).unwrap_err();
+        let err = verify_account_association(&proof, 99, "example.com", TEST_CHAIN_ID, &custody)
+            .unwrap_err();
         assert!(matches!(
             err,
             AccountAssociationError::FidMismatch {
@@ -330,7 +389,8 @@ mod tests {
         let addr_bytes: [u8; 20] = signer.address().into();
         let custody = FixedCustody(vec![(42, addr_bytes)]);
         let proof = make_proof(&signer, 42, "example.com");
-        let err = verify_account_association(&proof, 42, "other.com", &custody).unwrap_err();
+        let err = verify_account_association(&proof, 42, "other.com", TEST_CHAIN_ID, &custody)
+            .unwrap_err();
         assert!(matches!(
             err,
             AccountAssociationError::DomainMismatch { .. }
@@ -342,7 +402,8 @@ mod tests {
         let signer = PrivateKeySigner::from_bytes(&[7u8; 32].into()).unwrap();
         let custody = FixedCustody(vec![]); // no entries
         let proof = make_proof(&signer, 42, "example.com");
-        let err = verify_account_association(&proof, 42, "example.com", &custody).unwrap_err();
+        let err = verify_account_association(&proof, 42, "example.com", TEST_CHAIN_ID, &custody)
+            .unwrap_err();
         assert!(matches!(
             err,
             AccountAssociationError::UnknownFid { fid: 42 }
@@ -361,7 +422,8 @@ mod tests {
             hex::encode(addr_bytes)
         );
         proof.header = header_json.into_bytes();
-        let err = verify_account_association(&proof, 42, "example.com", &custody).unwrap_err();
+        let err = verify_account_association(&proof, 42, "example.com", TEST_CHAIN_ID, &custody)
+            .unwrap_err();
         assert!(matches!(err, AccountAssociationError::UnsupportedType(_)));
     }
 }

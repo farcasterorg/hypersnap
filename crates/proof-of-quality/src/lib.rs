@@ -257,14 +257,27 @@ impl Default for ScoringParams {
             new_user_share_exponent: 0.5,
             new_user_share_smoothing: 0.001,
             growth_exponent: 0.5,
-            crediter_trust_threshold: 0.0,
+            // F009 fix: ship a non-zero floor so noise-floor accounts
+            // (typical sybil-ring members, whose EigenTrust mass is
+            // ~10^-3 against the top-N anchor) don't contribute to
+            // anyone else's Growth credit. The threshold is well
+            // below the typical real-user score (>0.1 after age-
+            // adjustment), so legitimate engagement is unaffected.
+            crediter_trust_threshold: 0.05,
             market_budgets: budgets,
             eligibility: EligibilityParams::default(),
             app_pow_receipt_weight: 0.5,
             app_pow_add_weight: 5.0,
             app_pow_max_per_epoch_atoms: 0,
             da_pow_challenges_per_epoch: 100,
-            vouch_boost_min_vouchee_trust: 0.0,
+            // F013 fix: ship with a meaningful floor instead of 0.0.
+            // Below this trust score the vouch-stake multiplier
+            // (1 + stake_factor) stays at 1.0 regardless of staked
+            // atoms, so a high-trust voucher cannot amplify a fresh
+            // sybil's growth share. 0.3 is below the typical
+            // mid-tier user's trust score but well above the noise
+            // floor where new accounts land.
+            vouch_boost_min_vouchee_trust: 0.3,
         }
     }
 }

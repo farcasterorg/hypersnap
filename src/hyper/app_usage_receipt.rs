@@ -86,6 +86,11 @@ pub fn app_receipt_signing_payload(body: &proto::AppUsageReceiptBody, chain_id: 
     buf.extend_from_slice(&body.app_owner_fid.to_be_bytes());
     buf.extend_from_slice(&body.timestamp.to_be_bytes());
     buf.extend_from_slice(&body.nonce.to_be_bytes());
+    // Epoch the receipt is valid for. Binding this into the signed
+    // payload + checking it at apply time closes cross-epoch replay:
+    // the same body cannot be re-submitted every future epoch to
+    // inflate the app owner's §7 score.
+    buf.extend_from_slice(&body.epoch.to_be_bytes());
     buf.extend_from_slice(&(action_bytes.len() as u16).to_be_bytes());
     buf.extend_from_slice(action_bytes);
     buf.extend_from_slice(&body.user_signer_pubkey);
@@ -170,6 +175,7 @@ mod tests {
             nonce,
             user_signer_pubkey: pk.to_bytes().to_vec(),
             user_signature: Vec::new(),
+            epoch: 0,
         };
         body.user_signature = sk
             .sign(&app_receipt_signing_payload(
@@ -301,15 +307,17 @@ mod tests {
     fn signing_payload_length_is_fixed_modulo_action_type() {
         let sk = SigningKey::from_bytes(&[1u8; 32]);
         let body = make_signed(7, 42, "open", 1, &sk);
-        // v2: DST(32) + chain_id(8) + 16 + 8 + 8 + 8 + 8 + 2 + 4 + 32 = 126
+        // DST(32) + chain_id(8) + miniapp_id(16) + user_fid(8) + app_owner_fid(8)
+        // + timestamp(8) + nonce(8) + epoch(8) + action_len(2) + action(4) + opk(32) = 134
         assert_eq!(
             app_receipt_signing_payload(&body, crate::hyper::DEFAULT_PROTOCOL_CHAIN_ID).len(),
-            126
+            134
         );
         let body2 = make_signed(7, 42, "swapping", 1, &sk);
+        // 134 + (8 - 4) = 138
         assert_eq!(
             app_receipt_signing_payload(&body2, crate::hyper::DEFAULT_PROTOCOL_CHAIN_ID).len(),
-            130
+            138
         );
     }
 }

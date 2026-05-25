@@ -1,6 +1,6 @@
 use base64::prelude::*;
 use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::header::HeaderValue;
 use hyper::{body::Bytes, Method};
 use hyper::{HeaderMap, Request, Response, StatusCode};
@@ -24,6 +24,25 @@ use crate::proto::{
     reaction_request, reactions_by_target_request, GetConnectedPeersRequest, Protocol,
 };
 use crate::storage::store::account::message_decode;
+
+/// Maximum request body size accepted at the HTTP ingress layer.
+/// Buffering caps prevent an anonymous public-internet POST of a
+/// multi-GB body from OOM-killing the node. Set to 4 MiB — well
+/// above any legitimate single-message or bulk-submit payload while
+/// remaining well below process memory pressure.
+const MAX_HTTP_BODY_BYTES: usize = 4 * 1024 * 1024;
+
+/// Read a request body with a transport-level cap. Wraps the body
+/// in `Limited` so the read errors out as soon as the cap is
+/// exceeded — no more buffering past the limit.
+async fn read_limited_body(body: hyper::body::Incoming) -> Result<Bytes, String> {
+    let limited = Limited::new(body, MAX_HTTP_BODY_BYTES);
+    let collected = limited
+        .collect()
+        .await
+        .map_err(|e| format!("body too large or read error: {e}"))?;
+    Ok(collected.to_bytes())
+}
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Config {
@@ -3345,12 +3364,15 @@ where
             if hyper_handler.can_handle(req.method(), path) {
                 let method = req.method().clone();
                 let path = path.to_string();
-                let body = req
-                    .into_body()
-                    .collect()
-                    .await
-                    .map(|c| c.to_bytes())
-                    .unwrap_or_else(|_| Bytes::new());
+                let body = match read_limited_body(req.into_body()).await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return Ok(Response::builder()
+                            .status(StatusCode::PAYLOAD_TOO_LARGE)
+                            .body(http_body_util::Full::new(Bytes::from(e)).boxed())
+                            .unwrap());
+                    }
+                };
                 let mut response = hyper_handler.handle(&method, &path, body).await;
                 response.headers_mut().append(
                     "Access-Control-Allow-Origin",
@@ -3764,14 +3786,14 @@ where
     ) -> Result<proto::SubmitBulkMessagesRequest, Response<Bytes>> {
         use prost::Message;
 
-        let body_bytes = req.collect().await.map_err(|e| {
+        let body_bytes = read_limited_body(req.into_body()).await.map_err(|e| {
             Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Bytes::from(format!("Internal server error: {}", e)))
+                .status(StatusCode::PAYLOAD_TOO_LARGE)
+                .body(Bytes::from(e))
                 .unwrap()
         })?;
 
-        proto::SubmitBulkMessagesRequest::decode(body_bytes.to_bytes()).map_err(|e| {
+        proto::SubmitBulkMessagesRequest::decode(body_bytes).map_err(|e| {
             Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .body(Bytes::from(format!("Invalid protobuf data: {}", e)))
@@ -3784,18 +3806,17 @@ where
         req: Request<hyper::body::Incoming>,
     ) -> Result<proto::Message, Response<Bytes>> {
         // For POST/PUT requests, parse body
-        let body_bytes = req.collect().await;
-        if body_bytes.is_err() {
-            return Err(Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Bytes::from(format!(
-                    "Internal server error: {}",
-                    body_bytes.unwrap_err().to_string()
-                )))
-                .unwrap());
-        }
+        let body_bytes = match read_limited_body(req.into_body()).await {
+            Ok(b) => b,
+            Err(e) => {
+                return Err(Response::builder()
+                    .status(StatusCode::PAYLOAD_TOO_LARGE)
+                    .body(Bytes::from(e))
+                    .unwrap());
+            }
+        };
 
-        match message_decode(&body_bytes.unwrap().to_bytes().slice(..)) {
+        match message_decode(&body_bytes.slice(..)) {
             Ok(parsed) => Ok(parsed),
             Err(e) => Err(Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -3819,13 +3840,19 @@ where
             });
         }
 
-        // For POST/PUT requests, parse body
-        let body_bytes = req.collect().await;
+        // For POST/PUT requests, parse body. F030 fix: cap the
+        // body via `http_body_util::Limited` so we reject an
+        // unbounded payload BEFORE buffering the whole thing in
+        // memory. Without this, an anonymous POST of a 10 GB body
+        // OOMs the node before any application-level checks run.
+        const MAX_HTTP_BODY_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
+        let limited = Limited::new(req, MAX_HTTP_BODY_BYTES);
+        let body_bytes = limited.collect().await;
         if body_bytes.is_err() {
             return Err(Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .status(StatusCode::PAYLOAD_TOO_LARGE)
                 .body(Bytes::from(format!(
-                    "Internal server error: {}",
+                    "Body exceeds {MAX_HTTP_BODY_BYTES} bytes or read failed: {}",
                     body_bytes.unwrap_err().to_string()
                 )))
                 .unwrap());

@@ -197,12 +197,47 @@ impl RewardStore {
             .balance_of(fid)?
             .checked_add(amount)
             .ok_or(RewardError::BalanceOverflow { fid })?;
-        self.db
-            .put(&Self::balance_key(fid), &new_balance.to_be_bytes())
-            .map_err(HubError::from)?;
-        self.db
-            .put(&Self::issued_key(epoch, fid, market), &amount.to_be_bytes())
-            .map_err(HubError::from)?;
+        // F015 fix: write balance + issued-marker atomically. The
+        // prior two-put sequence could land balance-but-not-issued
+        // on a crash, letting a re-run double-credit the FID (the
+        // second pass would see `!was_issued` and apply on top of the
+        // already-updated balance).
+        let mut batch = self.db.txn();
+        batch.put(Self::balance_key(fid), new_balance.to_be_bytes().to_vec());
+        batch.put(
+            Self::issued_key(epoch, fid, market),
+            amount.to_be_bytes().to_vec(),
+        );
+        self.db.commit(batch).map_err(HubError::from)?;
+        Ok(true)
+    }
+
+    /// Batch-aware variant of `credit_if_unissued` (F015 follow-up).
+    /// Stages the balance + issued-marker writes on `batch` so the
+    /// caller can combine them with sibling writes (e.g.
+    /// `RetroStore::stage_put`) into a single atomic commit.
+    /// Returns `true` if the credit was staged, `false` if the triple
+    /// was already issued.
+    pub fn stage_credit_if_unissued(
+        &self,
+        epoch: u64,
+        fid: u64,
+        market: i32,
+        amount: u64,
+        batch: &mut crate::storage::db::RocksDbTransactionBatch,
+    ) -> Result<bool, RewardError> {
+        if self.was_issued(epoch, fid, market)? {
+            return Ok(false);
+        }
+        let new_balance = self
+            .balance_of(fid)?
+            .checked_add(amount)
+            .ok_or(RewardError::BalanceOverflow { fid })?;
+        batch.put(Self::balance_key(fid), new_balance.to_be_bytes().to_vec());
+        batch.put(
+            Self::issued_key(epoch, fid, market),
+            amount.to_be_bytes().to_vec(),
+        );
         Ok(true)
     }
 
@@ -245,7 +280,7 @@ impl RewardStore {
     /// lock. Returns `None` if no such lock exists. The leaf hash
     /// the bridge contract verifies is recomputed deterministically
     /// from the state via
-    /// [`crate::hyper::token_lock::encode_token_lock_leaf`].
+    /// [`crate::hyper::lock_tree::encode_token_lock_leaf`].
     pub fn lock_state(
         &self,
         fid: u64,
@@ -266,27 +301,19 @@ impl RewardStore {
         }
     }
 
-    /// FIP §13.5 transparent token lock. Validates `nonce`,
-    /// available balance, and `lock_id` uniqueness, then atomically
-    /// (single RocksDB write batch) decrements sender, bumps nonce,
-    /// and persists the canonical `TokenLockState` at
-    /// `RootPrefix::HyperTokenLocked || fid || lock_id`.
-    ///
-    /// Replay protection: per-FID monotonic nonce. `lock_id`
-    /// collision is also explicitly rejected — the bridge contract
-    /// uses `lock_id` as its replay nullifier, so any duplicate is
-    /// a bug or replay attempt regardless of nonce state.
-    ///
-    /// The on-chain merkle leaf is recomputed deterministically
-    /// from the stored `TokenLockState` via the canonical
-    /// `bridge_payload::lock_leaf_evm` encoder shared with the
-    /// contract — there's no need to persist the leaf hash here.
-    pub fn apply_lock(
+    /// Persist a `TokenLockState` row. Used by the confidential
+    /// bridge primitive (`apply_confidential_lock`) and by the escrow
+    /// bridge path (`apply_token_escrow_bridge`). The transparent
+    /// FID-keyed lock body that previously called this is gone —
+    /// bridge locks now consume a confidential note rather than
+    /// debit a FID balance, so this helper takes no FID/nonce/balance
+    /// arguments: the caller is responsible for whatever state
+    /// mutation (nullifier insert, escrow drain) accompanies the lock.
+    pub fn put_lock_state(
         &self,
-        sender_fid: u64,
-        amount: u64,
-        nonce: u64,
+        owner_fid: u64,
         state: &proto::TokenLockState,
+        batch: &mut crate::storage::db::RocksDbTransactionBatch,
     ) -> Result<(), RewardError> {
         use prost::Message;
         if state.lock_id.len() != 32 {
@@ -294,43 +321,17 @@ impl RewardStore {
                 got: state.lock_id.len(),
             });
         }
-        let current_nonce = self.nonce_of(sender_fid)?;
-        let expected = current_nonce.saturating_add(1);
-        if nonce != expected {
-            return Err(RewardError::NonceMismatch {
-                fid: sender_fid,
-                expected,
-                got: nonce,
-            });
-        }
-        if self.lock_state(sender_fid, &state.lock_id)?.is_some() {
+        if self.lock_state(owner_fid, &state.lock_id)?.is_some() {
             return Err(RewardError::LockIdCollision {
-                fid: sender_fid,
+                fid: owner_fid,
                 lock_id_hex: hex::encode(&state.lock_id),
             });
         }
-        let sender_bal = self.balance_of(sender_fid)?;
-        if sender_bal < amount {
-            return Err(RewardError::InsufficientBalance {
-                fid: sender_fid,
-                available: sender_bal,
-                needed: amount,
-            });
-        }
-        let new_sender = sender_bal - amount;
         let mut state_bytes = Vec::with_capacity(state.encoded_len());
         state
             .encode(&mut state_bytes)
             .map_err(|e| RewardError::Custom(format!("encode lock state: {e}")))?;
-
-        let mut batch = self.db.txn();
-        batch.put(
-            Self::balance_key(sender_fid),
-            new_sender.to_be_bytes().to_vec(),
-        );
-        batch.put(Self::nonce_key(sender_fid), nonce.to_be_bytes().to_vec());
-        batch.put(Self::lock_key(sender_fid, &state.lock_id), state_bytes);
-        self.db.commit(batch).map_err(HubError::from)?;
+        batch.put(Self::lock_key(owner_fid, &state.lock_id), state_bytes);
         Ok(())
     }
 
@@ -573,6 +574,66 @@ impl RewardStore {
     /// Returns `InsufficientBalance` without staging anything if the
     /// sender's fee balance is below `total`. Caller is responsible for
     /// committing `batch`.
+    /// F132 fix: read the pending batch first, then fall back to the
+    /// on-disk value. A bare `db.get` here would miss a previous
+    /// `stage_charge_message_fee` call within the same shard chunk —
+    /// successive same-FID fees would all see the pre-batch balance
+    /// and overwrite each other's batch entries, silently making every
+    /// fee after the first one free and breaking the `debited =
+    /// burned + proposer_share` conservation invariant.
+    fn fee_balance_through_batch(
+        &self,
+        fid: u64,
+        batch: &crate::storage::db::RocksDbTransactionBatch,
+    ) -> Result<u64, RewardError> {
+        let key = Self::fee_balance_key(fid);
+        match batch.batch.get(key.as_slice()) {
+            Some(Some(b)) if b.len() == 8 => {
+                let mut be = [0u8; 8];
+                be.copy_from_slice(b);
+                return Ok(u64::from_be_bytes(be));
+            }
+            Some(Some(_)) => return Ok(0), // staged garbage; treat as zero
+            Some(None) => return Ok(0),    // staged delete
+            None => {}
+        }
+        self.fee_balance_of(fid)
+    }
+
+    fn total_fee_burned_through_batch(
+        &self,
+        batch: &crate::storage::db::RocksDbTransactionBatch,
+    ) -> Result<u128, RewardError> {
+        let key = Self::total_burned_key();
+        match batch.batch.get(key.as_slice()) {
+            Some(Some(b)) if b.len() == 16 => {
+                let mut be = [0u8; 16];
+                be.copy_from_slice(b);
+                return Ok(u128::from_be_bytes(be));
+            }
+            Some(_) => return Ok(0),
+            None => {}
+        }
+        self.total_fee_burned()
+    }
+
+    fn proposer_fee_pot_through_batch(
+        &self,
+        batch: &crate::storage::db::RocksDbTransactionBatch,
+    ) -> Result<u64, RewardError> {
+        let key = Self::proposer_pot_key();
+        match batch.batch.get(key.as_slice()) {
+            Some(Some(b)) if b.len() == 8 => {
+                let mut be = [0u8; 8];
+                be.copy_from_slice(b);
+                return Ok(u64::from_be_bytes(be));
+            }
+            Some(_) => return Ok(0),
+            None => {}
+        }
+        self.proposer_fee_pot()
+    }
+
     pub fn stage_charge_message_fee(
         &self,
         sender_fid: u64,
@@ -582,7 +643,7 @@ impl RewardStore {
         if total == 0 {
             return Ok(());
         }
-        let cur = self.fee_balance_of(sender_fid)?;
+        let cur = self.fee_balance_through_batch(sender_fid, batch)?;
         if cur < total {
             return Err(RewardError::InsufficientBalance {
                 fid: sender_fid,
@@ -594,11 +655,11 @@ impl RewardStore {
         let (burn, proposer_share) = proof_of_quality::fees::split_burn_proposer(total);
 
         let new_burned = self
-            .total_fee_burned()?
+            .total_fee_burned_through_batch(batch)?
             .checked_add(burn as u128)
             .ok_or(RewardError::BalanceOverflow { fid: 0 })?;
         let new_pot = self
-            .proposer_fee_pot()?
+            .proposer_fee_pot_through_batch(batch)?
             .checked_add(proposer_share)
             .ok_or(RewardError::BalanceOverflow { fid: 0 })?;
 
@@ -919,141 +980,36 @@ mod tests {
         assert_eq!(store.nonce_of(1).unwrap(), 3);
     }
 
-    fn lock_state(fid: u64, amount: u64, lock_id: [u8; 32]) -> proto::TokenLockState {
-        proto::TokenLockState {
-            sender_fid: fid,
-            amount,
-            destination_chain_id: 10,
-            destination_address: vec![0xab; 20],
-            lock_id: lock_id.to_vec(),
-        }
-    }
-
+    /// F132: two same-FID fee charges in one batch each subtract from
+    /// the latest in-batch balance (not the pre-batch disk balance),
+    /// and the burn/proposer-pot accumulators are incremented for
+    /// EVERY charge — not just the last one.
     #[test]
-    fn apply_lock_decrements_balance_and_persists_state() {
+    fn stage_charge_message_fee_composes_within_batch() {
         let (store, _dir) = make_store();
-        store
-            .credit_if_unissued(0, 1, proto::WorkMarket::Growth as i32, 1_000)
-            .unwrap();
-        let lock_id = [0xaau8; 32];
-        let state = lock_state(1, 250, lock_id);
-        store.apply_lock(1, 250, 1, &state).unwrap();
-        assert_eq!(store.balance_of(1).unwrap(), 750);
-        assert_eq!(store.nonce_of(1).unwrap(), 1);
-        let stored = store.lock_state(1, &lock_id).unwrap().unwrap();
-        assert_eq!(stored.amount, 250);
-        assert_eq!(stored.destination_chain_id, 10);
-        assert_eq!(stored.destination_address, vec![0xab; 20]);
-        assert_eq!(stored.lock_id, lock_id.to_vec());
-    }
+        // Seed the FID's fee balance via a direct put.
+        let mut seed = crate::storage::db::RocksDbTransactionBatch::new();
+        seed.put(
+            RewardStore::fee_balance_key(42).to_vec(),
+            1_000u64.to_be_bytes().to_vec(),
+        );
+        store.db.commit(seed).unwrap();
+        assert_eq!(store.fee_balance_of(42).unwrap(), 1_000);
 
-    #[test]
-    fn apply_lock_rejects_collision_on_lock_id() {
-        let (store, _dir) = make_store();
-        store
-            .credit_if_unissued(0, 1, proto::WorkMarket::Growth as i32, 1_000)
-            .unwrap();
-        let lock_id = [0xaau8; 32];
-        store
-            .apply_lock(1, 100, 1, &lock_state(1, 100, lock_id))
-            .unwrap();
-        // Second lock with the same lock_id: rejected even with a
-        // valid next nonce.
-        let r = store.apply_lock(1, 100, 2, &lock_state(1, 100, lock_id));
-        assert!(matches!(
-            r,
-            Err(RewardError::LockIdCollision { fid: 1, .. })
-        ));
-        // First lock untouched.
-        assert!(store.lock_state(1, &lock_id).unwrap().is_some());
-        // Nonce did not advance on collision.
-        assert_eq!(store.nonce_of(1).unwrap(), 1);
-    }
+        // Two same-FID charges in the same batch.
+        let mut batch = crate::storage::db::RocksDbTransactionBatch::new();
+        store.stage_charge_message_fee(42, 100, &mut batch).unwrap();
+        store.stage_charge_message_fee(42, 250, &mut batch).unwrap();
+        store.db.commit(batch).unwrap();
 
-    #[test]
-    fn apply_lock_rejects_bad_nonce() {
-        let (store, _dir) = make_store();
-        store
-            .credit_if_unissued(0, 1, proto::WorkMarket::Growth as i32, 1_000)
-            .unwrap();
-        let lock_id = [0xaau8; 32];
-        let r = store.apply_lock(1, 100, 5, &lock_state(1, 100, lock_id)); // expected 1
-        assert!(matches!(r, Err(RewardError::NonceMismatch { .. })));
-    }
+        // Both charges debited: 1000 - 100 - 250 = 650 (pre-fix would
+        // see only the last 250 → 750).
+        assert_eq!(store.fee_balance_of(42).unwrap(), 650);
 
-    #[test]
-    fn apply_lock_rejects_insufficient_balance() {
-        let (store, _dir) = make_store();
-        store
-            .credit_if_unissued(0, 1, proto::WorkMarket::Growth as i32, 50)
-            .unwrap();
-        let lock_id = [0xaau8; 32];
-        let r = store.apply_lock(1, 100, 1, &lock_state(1, 100, lock_id));
-        assert!(matches!(
-            r,
-            Err(RewardError::InsufficientBalance {
-                fid: 1,
-                available: 50,
-                needed: 100
-            })
-        ));
-    }
+        // Burn accumulator covers both: 60% of (100+250) = 210.
+        assert_eq!(store.total_fee_burned().unwrap(), 210);
 
-    #[test]
-    fn apply_lock_rejects_bad_lock_id_length() {
-        let (store, _dir) = make_store();
-        store
-            .credit_if_unissued(0, 1, proto::WorkMarket::Growth as i32, 1_000)
-            .unwrap();
-        let mut bad = lock_state(1, 100, [0u8; 32]);
-        bad.lock_id = vec![0xaa; 16]; // wrong length
-        let r = store.apply_lock(1, 100, 1, &bad);
-        assert!(matches!(r, Err(RewardError::BadLockIdLen { got: 16 })));
-    }
-
-    /// Distinct lock_ids on the same FID coexist; balance and
-    /// nonce advance with each lock.
-    #[test]
-    fn distinct_lock_ids_coexist_on_same_fid() {
-        let (store, _dir) = make_store();
-        store
-            .credit_if_unissued(0, 1, proto::WorkMarket::Growth as i32, 1_000)
-            .unwrap();
-        let lid_a = [0xaau8; 32];
-        let lid_b = [0xbbu8; 32];
-        store
-            .apply_lock(1, 100, 1, &lock_state(1, 100, lid_a))
-            .unwrap();
-        store
-            .apply_lock(1, 200, 2, &lock_state(1, 200, lid_b))
-            .unwrap();
-        assert_eq!(store.balance_of(1).unwrap(), 700);
-        assert_eq!(store.nonce_of(1).unwrap(), 2);
-        assert!(store.lock_state(1, &lid_a).unwrap().is_some());
-        assert!(store.lock_state(1, &lid_b).unwrap().is_some());
-    }
-
-    /// Same lock_id on distinct FIDs is allowed — the storage key
-    /// includes both. The bridge contract treats lock_id as
-    /// globally unique, but enforcement of that is up to the user
-    /// generating the IDs.
-    #[test]
-    fn same_lock_id_on_distinct_fids_is_allowed() {
-        let (store, _dir) = make_store();
-        store
-            .credit_if_unissued(0, 1, proto::WorkMarket::Growth as i32, 1_000)
-            .unwrap();
-        store
-            .credit_if_unissued(0, 2, proto::WorkMarket::Growth as i32, 1_000)
-            .unwrap();
-        let lock_id = [0xaau8; 32];
-        store
-            .apply_lock(1, 100, 1, &lock_state(1, 100, lock_id))
-            .unwrap();
-        store
-            .apply_lock(2, 200, 1, &lock_state(2, 200, lock_id))
-            .unwrap();
-        assert!(store.lock_state(1, &lock_id).unwrap().is_some());
-        assert!(store.lock_state(2, &lock_id).unwrap().is_some());
+        // Proposer pot covers both: 40% of (100+250) = 140.
+        assert_eq!(store.proposer_fee_pot().unwrap(), 140);
     }
 }

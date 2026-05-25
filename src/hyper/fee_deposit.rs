@@ -33,16 +33,22 @@ pub enum FeeDepositValidationError {
 /// Canonical signing payload for `FeeDepositBody`.
 ///
 /// ```text
-/// DST                                       (28 bytes)
+/// DST                                       (24 bytes)
+/// chain_id         (BE u64)                  ( 8 bytes)
 /// sender_fid       (BE u64)                  ( 8 bytes)
 /// amount           (BE u64)                  ( 8 bytes)
 /// nonce            (BE u64)                  ( 8 bytes)
 /// signer_pubkey_len (BE u16) + signer_pubkey
 /// ```
-pub fn fee_deposit_signing_payload(body: &proto::FeeDepositBody) -> Vec<u8> {
-    const DST: &[u8] = b"hypersnap-fee-deposit-v1\x00\x00\x00\x00";
-    let mut buf = Vec::with_capacity(DST.len() + 8 * 3 + 2 + body.signer_pubkey.len());
+///
+/// `chain_id` is bound into the signed payload so the same body
+/// cannot replay on a sibling hypersnap deployment that shares the
+/// FID's L1 active-key set.
+pub fn fee_deposit_signing_payload(body: &proto::FeeDepositBody, chain_id: u64) -> Vec<u8> {
+    const DST: &[u8] = b"hypersnap-fee-deposit-v1";
+    let mut buf = Vec::with_capacity(DST.len() + 8 * 4 + 2 + body.signer_pubkey.len());
     buf.extend_from_slice(DST);
+    buf.extend_from_slice(&chain_id.to_be_bytes());
     buf.extend_from_slice(&body.sender_fid.to_be_bytes());
     buf.extend_from_slice(&body.amount.to_be_bytes());
     buf.extend_from_slice(&body.nonce.to_be_bytes());
@@ -51,7 +57,10 @@ pub fn fee_deposit_signing_payload(body: &proto::FeeDepositBody) -> Vec<u8> {
     buf
 }
 
-pub fn validate_fee_deposit(body: &proto::FeeDepositBody) -> Result<(), FeeDepositValidationError> {
+pub fn validate_fee_deposit(
+    body: &proto::FeeDepositBody,
+    chain_id: u64,
+) -> Result<(), FeeDepositValidationError> {
     if body.sender_fid == 0 {
         return Err(FeeDepositValidationError::BadSenderFid);
     }
@@ -73,7 +82,7 @@ pub fn validate_fee_deposit(body: &proto::FeeDepositBody) -> Result<(), FeeDepos
         .map_err(|_| FeeDepositValidationError::InvalidSignerPubkey)?;
     let sig_bytes: [u8; 64] = body.signature.as_slice().try_into().expect("len 64");
     let sig = Signature::from_bytes(&sig_bytes);
-    let payload = fee_deposit_signing_payload(body);
+    let payload = fee_deposit_signing_payload(body, chain_id);
     pk.verify(&payload, &sig)
         .map_err(|_| FeeDepositValidationError::SignatureVerifyFailed)?;
     Ok(())
@@ -84,7 +93,18 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
 
+    const TEST_CHAIN_ID: u64 = 10;
+
     fn signed_body(sender_fid: u64, amount: u64, nonce: u64) -> proto::FeeDepositBody {
+        signed_body_for_chain(sender_fid, amount, nonce, TEST_CHAIN_ID)
+    }
+
+    fn signed_body_for_chain(
+        sender_fid: u64,
+        amount: u64,
+        nonce: u64,
+        chain_id: u64,
+    ) -> proto::FeeDepositBody {
         let sk = SigningKey::from_bytes(&[3u8; 32]);
         let pk = sk.verifying_key();
         let mut body = proto::FeeDepositBody {
@@ -94,7 +114,7 @@ mod tests {
             signer_pubkey: pk.to_bytes().to_vec(),
             signature: Vec::new(),
         };
-        let payload = fee_deposit_signing_payload(&body);
+        let payload = fee_deposit_signing_payload(&body, chain_id);
         body.signature = sk.sign(&payload).to_bytes().to_vec();
         body
     }
@@ -102,14 +122,14 @@ mod tests {
     #[test]
     fn valid_signed_deposit_validates() {
         let body = signed_body(7, 1_000, 1);
-        validate_fee_deposit(&body).unwrap();
+        validate_fee_deposit(&body, TEST_CHAIN_ID).unwrap();
     }
 
     #[test]
     fn rejects_zero_amount() {
         let body = signed_body(7, 0, 1);
         assert_eq!(
-            validate_fee_deposit(&body),
+            validate_fee_deposit(&body, TEST_CHAIN_ID),
             Err(FeeDepositValidationError::ZeroAmount)
         );
     }
@@ -118,7 +138,7 @@ mod tests {
     fn rejects_zero_sender_fid() {
         let body = signed_body(0, 100, 1);
         assert_eq!(
-            validate_fee_deposit(&body),
+            validate_fee_deposit(&body, TEST_CHAIN_ID),
             Err(FeeDepositValidationError::BadSenderFid)
         );
     }
@@ -128,7 +148,7 @@ mod tests {
         let mut body = signed_body(7, 1_000, 1);
         body.nonce = 99;
         assert_eq!(
-            validate_fee_deposit(&body),
+            validate_fee_deposit(&body, TEST_CHAIN_ID),
             Err(FeeDepositValidationError::SignatureVerifyFailed)
         );
     }
@@ -138,7 +158,18 @@ mod tests {
         let mut body = signed_body(7, 1_000, 1);
         body.amount = 2_000;
         assert_eq!(
-            validate_fee_deposit(&body),
+            validate_fee_deposit(&body, TEST_CHAIN_ID),
+            Err(FeeDepositValidationError::SignatureVerifyFailed)
+        );
+    }
+
+    /// A body signed for one chain must not verify on a sibling
+    /// chain.
+    #[test]
+    fn cross_chain_replay_rejected() {
+        let body = signed_body_for_chain(7, 1_000, 1, 10);
+        assert_eq!(
+            validate_fee_deposit(&body, 11),
             Err(FeeDepositValidationError::SignatureVerifyFailed)
         );
     }

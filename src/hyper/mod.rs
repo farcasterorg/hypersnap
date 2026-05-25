@@ -117,6 +117,7 @@ pub mod bridge_burn_store;
 pub mod bridge_burn_watcher;
 pub mod builder;
 pub mod chain;
+pub mod confidential_lock;
 pub mod config;
 pub mod custody_escrow;
 pub mod da_pow;
@@ -157,12 +158,12 @@ pub mod router;
 pub mod runtime;
 pub mod scheduler;
 pub mod scoring_driver;
+pub mod shield;
 pub mod sig_verify;
 pub mod slashing;
 pub mod slashing_store;
 pub mod token_escrow_bridge;
 pub mod token_escrow_claim;
-pub mod token_lock;
 pub mod token_stake;
 pub mod token_transfer;
 pub mod topics;
@@ -391,11 +392,16 @@ pub struct HyperBlock {
 impl HyperBlockMetadata {
     /// Canonical byte sequence threshold-signed by the validator set.
     /// Domain-separated so the signature cannot collide with anything else
-    /// signed under the same group key. Commits to: epoch, block height,
-    /// parent hash, hyper state root, missed-proposal entries, and the
-    /// snapchain anchor (block number + hash).
-    pub fn signing_payload(&self, epoch: u64) -> Vec<u8> {
-        const DST: &[u8] = b"hypersnap-hyperblock-v1:";
+    /// signed under the same group key. Commits to **every** field that
+    /// the canonical block hash mixes in (see [`crate::hyper::chain::hyper_block_hash`]),
+    /// so a single threshold signature authenticates exactly one block
+    /// hash. Audit finding F028: prior v1 layout omitted
+    /// `extra_rules_version` and `retained_message_count`, which the block
+    /// hash includes — that left one signature authenticating many
+    /// distinct block hashes and enabled forgeable conflicting-blocks
+    /// slashing evidence. v2 closes the gap.
+    pub fn signing_payload(&self, epoch: u64, signer_indices: &[u64]) -> Vec<u8> {
+        const DST: &[u8] = b"hypersnap-hyperblock-v2:";
         let mut buf = Vec::new();
         buf.extend_from_slice(DST);
         buf.extend_from_slice(&epoch.to_be_bytes());
@@ -404,6 +410,12 @@ impl HyperBlockMetadata {
         buf.extend_from_slice(&self.parent_hash);
         buf.extend_from_slice(&(self.hyper_state_root.len() as u32).to_be_bytes());
         buf.extend_from_slice(&self.hyper_state_root);
+        // F028 fix: bind the two block-hash-mixed fields the v1 layout
+        // omitted. Without these, a proposer could vary either field and
+        // present multiple distinct block hashes that satisfy the same
+        // threshold signature.
+        buf.extend_from_slice(&self.extra_rules_version.to_be_bytes());
+        buf.extend_from_slice(&self.retained_message_count.to_be_bytes());
         // Missed-proposal commitment: u32 count, then for each entry
         // u32 key_len, key_bytes, i64 round (BE).
         buf.extend_from_slice(&(self.missed_proposals.len() as u32).to_be_bytes());
@@ -424,6 +436,18 @@ impl HyperBlockMetadata {
         // Anchor block timestamp — committed so importers and the
         // scoring auto-trigger see a byte-deterministic `now_unix`.
         buf.extend_from_slice(&self.snapchain_anchor_timestamp.to_be_bytes());
+        // F153 fix: bind the committee that signed. Without this,
+        // a captured conflicting-block evidence message can be
+        // malleated to slash attacker-chosen validators at the
+        // next epoch boundary, because `signer_indices` lives on
+        // the signature struct and isn't covered by the threshold
+        // signature. Sort + encode for canonicality.
+        let mut sorted_indices = signer_indices.to_vec();
+        sorted_indices.sort_unstable();
+        buf.extend_from_slice(&(sorted_indices.len() as u32).to_be_bytes());
+        for idx in sorted_indices {
+            buf.extend_from_slice(&idx.to_be_bytes());
+        }
         buf
     }
 }
@@ -745,19 +769,32 @@ mod tests {
             snapchain_range_root: vec![],
             snapchain_anchor_timestamp: 0,
         };
-        let p1 = metadata.signing_payload(5);
-        let p2 = metadata.signing_payload(5);
+        let indices = vec![1u64, 2, 3];
+        let p1 = metadata.signing_payload(5, &indices);
+        let p2 = metadata.signing_payload(5, &indices);
         assert_eq!(p1, p2);
 
         // Different epoch must produce different bytes.
-        let p3 = metadata.signing_payload(6);
+        let p3 = metadata.signing_payload(6, &indices);
         assert_ne!(p1, p3);
 
         // Different state root must produce different bytes.
         let mut metadata2 = metadata.clone();
         metadata2.hyper_state_root = vec![0xaa, 0xbb, 0xcd];
-        let p4 = metadata2.signing_payload(5);
+        let p4 = metadata2.signing_payload(5, &indices);
         assert_ne!(p1, p4);
+
+        // F153: different signer_indices must produce different
+        // bytes — without this, an attacker can malleate the index
+        // set on a captured signature to slash arbitrary validators.
+        let other_indices = vec![1u64, 2, 4];
+        let p5 = metadata.signing_payload(5, &other_indices);
+        assert_ne!(p1, p5);
+
+        // Sort-invariance: producer ordering doesn't matter.
+        let permuted = vec![3u64, 1, 2];
+        let p6 = metadata.signing_payload(5, &permuted);
+        assert_eq!(p1, p6);
     }
 
     #[test]
@@ -810,22 +847,38 @@ mod tests {
             ),
             snapchain_anchor_timestamp: 1_700_000_000,
         };
-        let baseline = m.signing_payload(0);
+        let indices: &[u64] = &[1, 2, 3];
+        let baseline = m.signing_payload(0, indices);
 
         // Same range, different start block → different payload.
         let mut m_b = m.clone();
         m_b.snapchain_range_start_block = 90;
-        assert_ne!(baseline, m_b.signing_payload(0));
+        assert_ne!(baseline, m_b.signing_payload(0, indices));
 
         // Tampered range root → different payload.
         let mut m_root = m.clone();
         m_root.snapchain_range_root = vec![0xff; 32];
-        assert_ne!(baseline, m_root.signing_payload(0));
+        assert_ne!(baseline, m_root.signing_payload(0, indices));
 
         // Tampered anchor timestamp → different payload.
         let mut m_ts = m.clone();
         m_ts.snapchain_anchor_timestamp = m.snapchain_anchor_timestamp.wrapping_add(1);
-        assert_ne!(baseline, m_ts.signing_payload(0));
+        assert_ne!(baseline, m_ts.signing_payload(0, indices));
+
+        // F028 regression: extra_rules_version is mixed into the block
+        // hash, must also be bound in the signing payload.
+        let mut m_rules = m.clone();
+        m_rules.extra_rules_version = m.extra_rules_version.wrapping_add(1);
+        assert_ne!(baseline, m_rules.signing_payload(0, indices));
+
+        // F028 regression: retained_message_count is mixed into the block
+        // hash, must also be bound in the signing payload.
+        let mut m_count = m.clone();
+        m_count.retained_message_count = m.retained_message_count.wrapping_add(1);
+        assert_ne!(baseline, m_count.signing_payload(0, indices));
+
+        // Silence the unused-mut warning when no further mutations.
+        let _ = &m;
     }
 }
 

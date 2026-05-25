@@ -42,6 +42,18 @@ use tracing::{debug, error, info, warn};
 const DEFAULT_GOSSIP_HOST: &str = "127.0.0.1";
 const MAX_GOSSIP_MESSAGE_SIZE: usize = 1024 * 1024 * 10; // 10 mb
 
+// F019: per-variant tighter ceilings applied inside
+// `map_gossip_bytes_to_system_message`. The global 10 MB cap above is
+// libp2p's transport-level guard; these are the application-level
+// caps that match the natural max size of each topic. Anything
+// larger is a Sybil-flood / amplification vector and is dropped at
+// ingress.
+const MAX_HYPER_WIRE_BYTES: usize = 512 * 1024; // 512 KB — DKLS round msgs + evidence frames
+const MAX_MEMPOOL_MESSAGE_BYTES: usize = 256 * 1024;
+const MAX_CONTACT_INFO_BYTES: usize = 4 * 1024;
+const MAX_STATUS_BYTES: usize = 4 * 1024;
+const MAX_CONSENSUS_BYTES: usize = 64 * 1024;
+
 const CONSENSUS_TOPIC: &str = "consensus";
 const MEMPOOL_TOPIC: &str = "mempool";
 const DECIDED_VALUES: &str = "decided-values";
@@ -295,6 +307,23 @@ impl SnapchainGossip {
                     gossipsub::MessageAuthenticity::Signed(key.clone()),
                     gossipsub_config,
                 )?;
+
+                // F017 fix: enable libp2p gossipsub peer scoring with
+                // the default thresholds. Without this a Sybil-poisoned
+                // mesh has no eviction path; misbehaving peers (slow,
+                // duplicate-flooding, invalid-message-rate) keep their
+                // mesh slots indefinitely. The defaults conservative
+                // enough to use without per-topic tuning while still
+                // exercising the scoring + greylist machinery.
+                let peer_score_params = gossipsub::PeerScoreParams::default();
+                let peer_score_thresholds = gossipsub::PeerScoreThresholds::default();
+                if let Err(e) = gossipsub.with_peer_score(peer_score_params, peer_score_thresholds)
+                {
+                    warn!(
+                        error = %e,
+                        "gossipsub: with_peer_score failed; mesh runs with no scoring"
+                    );
+                }
 
                 for peer_id in config.direct_peers() {
                     info!(peer_id = peer_id.to_string(), "Adding direct peer");
@@ -744,7 +773,13 @@ impl SnapchainGossip {
     }
 
     pub fn handle_contact_info(&mut self, contact_info: ContactInfo, peer_id: PeerId) {
-        // TODO(aditi): We might want to persist peers and reconnect to them on restart
+        // F021: peer-controlled body. Two hardening rules:
+        //   1. The inner `peer_id` byte-string must parse — log + drop
+        //      on failure instead of `.unwrap()` panicking.
+        //   2. The libp2p `peer_id` of the sender must match the inner
+        //      `peer_id` claim. Without this binding any connected
+        //      peer can flood-dial a read node with attacker
+        //      multiaddrs (eclipse).
         if contact_info.body.is_none() {
             warn!("Received empty contact info from peer: {}", peer_id);
             return;
@@ -756,7 +791,29 @@ impl SnapchainGossip {
             "Received contact info from peer"
         );
 
-        let contact_peer_id = PeerId::from_bytes(&contact_info_body.peer_id).unwrap();
+        let contact_peer_id = match PeerId::from_bytes(&contact_info_body.peer_id) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(
+                    peer_id = peer_id.to_string(),
+                    error = %e,
+                    "Dropping contact info: inner peer_id failed to parse"
+                );
+                return;
+            }
+        };
+
+        // The inner peer_id must match the libp2p sender — otherwise
+        // any peer could announce attacker-controlled multiaddrs on
+        // behalf of arbitrary other peer_ids.
+        if contact_peer_id != peer_id {
+            warn!(
+                sender = peer_id.to_string(),
+                claimed = contact_peer_id.to_string(),
+                "Dropping contact info: inner peer_id does not match libp2p sender"
+            );
+            return;
+        }
 
         self.peers
             .insert(contact_peer_id, contact_info_body.clone());
@@ -808,6 +865,17 @@ impl SnapchainGossip {
         match proto::GossipMessage::decode(gossip_message.as_slice()) {
             Ok(gossip_message) => match gossip_message.gossip_message {
                 Some(gossip_message::GossipMessage::ContactInfoMessage(contact_info)) => {
+                    // F019: cap per-variant bytes far below the
+                    // transport-level 10 MB ceiling.
+                    if contact_info.encoded_len() > MAX_CONTACT_INFO_BYTES {
+                        warn!(
+                            peer_id = peer_id.to_string(),
+                            len = contact_info.encoded_len(),
+                            cap = MAX_CONTACT_INFO_BYTES,
+                            "Dropping oversized ContactInfo"
+                        );
+                        return None;
+                    }
                     self.handle_contact_info(contact_info, peer_id);
                     None
                 }
@@ -846,6 +914,15 @@ impl SnapchainGossip {
                     Some(SystemMessage::MalachiteNetwork(shard, event))
                 }
                 Some(proto::gossip_message::GossipMessage::Consensus(signed_consensus_msg)) => {
+                    if signed_consensus_msg.encoded_len() > MAX_CONSENSUS_BYTES {
+                        warn!(
+                            peer_id = peer_id.to_string(),
+                            len = signed_consensus_msg.encoded_len(),
+                            cap = MAX_CONSENSUS_BYTES,
+                            "Dropping oversized Consensus message"
+                        );
+                        return None;
+                    }
                     let malachite_peer_id = MalachitePeerId::from_libp2p(&peer_id);
                     let bytes = Bytes::from(signed_consensus_msg.encode_to_vec());
                     let event = MalachiteNetworkEvent::Message(
@@ -862,6 +939,15 @@ impl SnapchainGossip {
                     Some(SystemMessage::MalachiteNetwork(shard, event))
                 }
                 Some(proto::gossip_message::GossipMessage::Status(status)) => {
+                    if status.encoded_len() > MAX_STATUS_BYTES {
+                        warn!(
+                            peer_id = peer_id.to_string(),
+                            len = status.encoded_len(),
+                            cap = MAX_STATUS_BYTES,
+                            "Dropping oversized Status message"
+                        );
+                        return None;
+                    }
                     let encoded = status.encode_to_vec();
                     let Some(height) = status.height else {
                         warn!(
@@ -887,8 +973,24 @@ impl SnapchainGossip {
                     None
                 }
                 Some(proto::gossip_message::GossipMessage::HyperWire(wire)) => {
+                    if wire.encoded_len() > MAX_HYPER_WIRE_BYTES {
+                        warn!(
+                            peer_id = peer_id.to_string(),
+                            len = wire.encoded_len(),
+                            cap = MAX_HYPER_WIRE_BYTES,
+                            "Dropping oversized HyperWire message"
+                        );
+                        return None;
+                    }
                     if let Some(tx) = self.hyper_actor_tx.as_ref() {
-                        match crate::hyper::gossip_adapter::wire_to_event(wire) {
+                        // F018: pass libp2p propagation_source through
+                        // so the actor can cross-check DKLS inner
+                        // `sender` against the per-epoch
+                        // (committee_party_index → peer_id) registry.
+                        match crate::hyper::gossip_adapter::wire_to_event_with_source(
+                            wire,
+                            Some(peer_id.to_bytes()),
+                        ) {
                             Ok(event) => {
                                 if let Err(e) = tx.try_send(event) {
                                     warn!(
@@ -911,6 +1013,15 @@ impl SnapchainGossip {
                     None
                 }
                 Some(proto::gossip_message::GossipMessage::MempoolMessage(message)) => {
+                    if message.encoded_len() > MAX_MEMPOOL_MESSAGE_BYTES {
+                        warn!(
+                            peer_id = peer_id.to_string(),
+                            len = message.encoded_len(),
+                            cap = MAX_MEMPOOL_MESSAGE_BYTES,
+                            "Dropping oversized MempoolMessage"
+                        );
+                        return None;
+                    }
                     if let Some(mempool_message_proto) = message.mempool_message {
                         let mempool_message = match mempool_message_proto {
                             proto::mempool_message::MempoolMessage::UserMessage(message) => {

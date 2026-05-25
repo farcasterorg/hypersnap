@@ -362,6 +362,19 @@ impl DklsCeremonyCoordinator {
                 if receiver != self.party_index {
                     return Ok(());
                 }
+                // F114 fix: cross-check the inner `parties.sender`
+                // and `parties.receiver` against the outer wire
+                // identity. The inner bytes are attacker-controlled;
+                // without this guard a peer can deliver a message
+                // whose inner `parties.receiver != self.party_index`
+                // (triggering a blame-the-victim abort downstream in
+                // `dkg::phase4`) or whose inner `parties.sender`
+                // names a third party (corrupting blame attribution
+                // and ZeroShare derivation). Drop silently — the
+                // honest counterparty will retransmit.
+                if zero_init.parties.sender != sender || zero_init.parties.receiver != receiver {
+                    return Ok(());
+                }
                 self.zero_received_2to4.insert(sender, zero_init);
             }
             DklsRoundMessage::Phase3BipBroadcast {
@@ -378,6 +391,10 @@ impl DklsCeremonyCoordinator {
                 if receiver != self.party_index {
                     return Ok(());
                 }
+                // F114 fix: same inner-vs-outer cross-check as Phase 2.
+                if zero_init.parties.sender != sender || zero_init.parties.receiver != receiver {
+                    return Ok(());
+                }
                 self.zero_received_3to4.insert(sender, zero_init);
             }
             DklsRoundMessage::Phase3MulSend {
@@ -386,6 +403,10 @@ impl DklsCeremonyCoordinator {
                 mul_init,
             } => {
                 if receiver != self.party_index {
+                    return Ok(());
+                }
+                // F114 fix: same cross-check pattern for MulSend.
+                if mul_init.parties.sender != sender || mul_init.parties.receiver != receiver {
                     return Ok(());
                 }
                 self.mul_received_3to4.insert(sender, mul_init);

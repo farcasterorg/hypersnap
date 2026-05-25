@@ -34,7 +34,7 @@ pub async fn run_outbound_pump<F>(
 {
     while let Some(item) = outbound.recv().await {
         match &item {
-            HyperActorOutbound::BroadcastBlock(_)
+            HyperActorOutbound::BroadcastBlock { .. }
             | HyperActorOutbound::BroadcastDkls { .. }
             | HyperActorOutbound::BroadcastDklsSign { .. }
             | HyperActorOutbound::BroadcastMessage(_)
@@ -145,7 +145,11 @@ mod tests {
         let (gossip_tx, mut gossip_rx) = mpsc::channel::<GossipEvent<SnapchainValidatorContext>>(4);
 
         out_tx
-            .send(HyperActorOutbound::BroadcastBlock(dummy_block()))
+            .send(HyperActorOutbound::BroadcastBlock {
+                block: dummy_block(),
+                locks: vec![],
+                transfers: vec![],
+            })
             .await
             .unwrap();
         drop(out_tx);

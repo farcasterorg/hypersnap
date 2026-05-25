@@ -126,6 +126,13 @@ where
     /// inside the struct.
     #[must_use]
     pub fn verify(&self, point: &C::AffinePoint, point_rand_commitment: &C::AffinePoint) -> bool {
+        // F119: the wire-supplied `self.challenge` is a `Vec<u8>` and
+        // serde will deserialize any length; `U256::from_be_slice`
+        // hard-`assert!`s on length and would panic the verifier
+        // thread on adversarial input. Reject lengths != T/8 here.
+        if self.challenge.len() != (T / 8) as usize {
+            return false;
+        }
         let generator: C::AffinePoint = crate::generator::<C>();
 
         // For convenience, we are using a challenge in bytes.

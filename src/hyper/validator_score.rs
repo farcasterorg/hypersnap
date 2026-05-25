@@ -76,6 +76,44 @@ impl ValidatorScoreTracker {
         k
     }
 
+    /// Cross-epoch consecutive-misses key (F011 fix). The per-epoch
+    /// `ValidatorScoreRecord.consecutive_misses` field is still
+    /// maintained for telemetry but is *not* what
+    /// `should_auto_deregister` reads — that consults this counter
+    /// instead, which is keyed only on `validator_key` and therefore
+    /// survives epoch boundaries.
+    fn consecutive_misses_key(validator_key: &[u8]) -> Vec<u8> {
+        let mut k = Vec::with_capacity(1 + validator_key.len());
+        k.push(RootPrefix::HyperValidatorConsecutiveMisses as u8);
+        k.extend_from_slice(validator_key);
+        k
+    }
+
+    fn read_consecutive_misses(&self, validator_key: &[u8]) -> Result<u64, ScoreError> {
+        match self
+            .db
+            .get(&Self::consecutive_misses_key(validator_key))
+            .map_err(HubError::from)?
+        {
+            Some(bytes) if bytes.len() == 8 => {
+                let mut be = [0u8; 8];
+                be.copy_from_slice(&bytes);
+                Ok(u64::from_be_bytes(be))
+            }
+            _ => Ok(0),
+        }
+    }
+
+    fn write_consecutive_misses(&self, validator_key: &[u8], v: u64) -> Result<(), ScoreError> {
+        self.db
+            .put(
+                &Self::consecutive_misses_key(validator_key),
+                &v.to_be_bytes(),
+            )
+            .map_err(HubError::from)?;
+        Ok(())
+    }
+
     fn fetch(
         &self,
         epoch: u64,
@@ -128,9 +166,14 @@ impl ValidatorScoreTracker {
         Self::validate_key(validator_key)?;
         let mut record = self.fetch(epoch, validator_key)?;
         record.successful_proposals += 1;
-        record.consecutive_misses = 0; // reset on success
+        // Per-epoch telemetry counter; the auto-deregister gate uses
+        // the cross-epoch counter below.
+        record.consecutive_misses = 0;
         self.recompute_score(&mut record);
-        self.persist(&record)
+        self.persist(&record)?;
+        // F011 fix: reset the cross-epoch consecutive-misses counter
+        // on every successful proposal.
+        self.write_consecutive_misses(validator_key, 0)
     }
 
     pub fn record_missed_proposal(
@@ -143,7 +186,13 @@ impl ValidatorScoreTracker {
         record.missed_proposals += 1;
         record.consecutive_misses += 1;
         self.recompute_score(&mut record);
-        self.persist(&record)
+        self.persist(&record)?;
+        // F011 fix: bump the cross-epoch counter that
+        // `should_auto_deregister` actually consults.
+        let next = self
+            .read_consecutive_misses(validator_key)?
+            .saturating_add(1);
+        self.write_consecutive_misses(validator_key, next)
     }
 
     pub fn record_invalid_proposal(
@@ -179,18 +228,23 @@ impl ValidatorScoreTracker {
         self.fetch(epoch, validator_key)
     }
 
-    /// Returns true if the validator's `consecutive_misses` counter has
-    /// crossed `AUTO_DEREGISTER_CONSECUTIVE_MISSES`. The caller is expected
-    /// to construct and submit a deregistration event for this validator
+    /// Returns true if the validator has missed
+    /// `AUTO_DEREGISTER_CONSECUTIVE_MISSES` proposals consecutively
+    /// (across epochs — F011 fix). The caller is expected to
+    /// construct and submit a deregistration event for this validator
     /// at the next epoch boundary.
+    ///
+    /// The `epoch` parameter is accepted for API symmetry with the
+    /// other helpers but is unused — the counter is cross-epoch by
+    /// design.
     pub fn should_auto_deregister(
         &self,
-        epoch: u64,
+        _epoch: u64,
         validator_key: &[u8],
     ) -> Result<bool, ScoreError> {
         Self::validate_key(validator_key)?;
-        let record = self.fetch(epoch, validator_key)?;
-        Ok(record.consecutive_misses >= AUTO_DEREGISTER_CONSECUTIVE_MISSES)
+        let cm = self.read_consecutive_misses(validator_key)?;
+        Ok(cm >= AUTO_DEREGISTER_CONSECUTIVE_MISSES)
     }
 }
 
@@ -316,6 +370,30 @@ mod tests {
         // One more miss → at threshold.
         t.record_missed_proposal(1, &vk(1)).unwrap();
         assert!(t.should_auto_deregister(1, &vk(1)).unwrap());
+    }
+
+    /// F011 regression: misses are counted across epoch boundaries.
+    /// Pre-fix, the per-epoch `consecutive_misses` counter reset at
+    /// every new epoch, so a validator missing up to
+    /// `AUTO_DEREGISTER_CONSECUTIVE_MISSES - 1` proposals per epoch
+    /// indefinitely never tripped the gate.
+    #[test]
+    fn auto_deregister_aggregates_across_epochs() {
+        let (t, _dir) = make_tracker();
+        let half = AUTO_DEREGISTER_CONSECUTIVE_MISSES / 2;
+        // First epoch: half the threshold.
+        for _ in 0..half {
+            t.record_missed_proposal(1, &vk(1)).unwrap();
+        }
+        // Below threshold so far, even after the per-epoch counter
+        // would have "reset" in the buggy implementation.
+        assert!(!t.should_auto_deregister(2, &vk(1)).unwrap());
+        // Second epoch: the other half (plus the rest).
+        for _ in 0..(AUTO_DEREGISTER_CONSECUTIVE_MISSES - half) {
+            t.record_missed_proposal(2, &vk(1)).unwrap();
+        }
+        // Cross-epoch total = threshold → should trigger.
+        assert!(t.should_auto_deregister(2, &vk(1)).unwrap());
     }
 
     #[test]

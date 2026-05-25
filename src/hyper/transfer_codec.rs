@@ -104,6 +104,19 @@ pub fn tx_to_proto(t: &TransferTx) -> proto::HyperTransferTx {
 /// extras are dropped and the missing ones are encoded as empty
 /// (which the strong-validation decoder rejects). Callers should
 /// produce one pubkey per output.
+///
+/// F149 — REQUIRED for any production producer: the spend signatures
+/// on `t.inputs` MUST be computed against
+/// `TransferTx::signing_payload_with_envelope(output_pubkeys_bytes,
+/// blinding_diff_bytes)`, NOT the bare `signing_payload()`. The
+/// envelope-binding variant covers `one_time_pubkey` and
+/// `blinding_diff_scalar` — without it, a gossip-relay attacker can
+/// rewrite the recipient's stealth pubkey on a captured transfer,
+/// win the mempool dedup race (keyed on the first-input nullifier),
+/// and durably record the attacker's pubkey for the recipient's
+/// stealth output — locking the legitimate recipient out of those
+/// atoms. Bare `signing_payload()` is preserved for round-trip test
+/// fixtures only.
 pub fn tx_to_proto_full(
     t: &TransferTx,
     blinding_diff: &Scalar,

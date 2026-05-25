@@ -76,8 +76,11 @@ impl FingerprintStore {
     }
 
     /// Persist a fingerprint for `(fid, text)` at timestamp `ts_secs`.
-    /// `ts_secs` is the block timestamp — using the block clock (not
-    /// wall-clock) keeps the store deterministic across validators.
+    /// Direct disk write — only safe outside a `merge_message` flow
+    /// (e.g. test fixtures). Production code must use `stage_insert`
+    /// so the write composes with the engine's `RocksDbTransactionBatch`
+    /// (F133).
+    #[cfg(test)]
     pub fn insert(&self, fid: u64, text: &str, ts_secs: u64) -> Result<u128, FingerprintError> {
         let fp = fingerprint(text);
         let high = (fp >> 64) as u64;
@@ -87,10 +90,44 @@ impl FingerprintStore {
         Ok(fp)
     }
 
-    /// Score the candidate text against the rolling window. As a side
-    /// effect, evicts fingerprints older than `now_secs -
-    /// FINGERPRINT_WINDOW_SECS` from the inspected bucket.
-    pub fn uniqueness_score(&self, text: &str, now_secs: u64) -> Result<f64, FingerprintError> {
+    /// Batch-aware insert. Stages the fingerprint write on `batch`
+    /// so it commits atomically with the surrounding merge — critical
+    /// for deterministic state replay, because a direct `db.put`
+    /// would let the proposer's fingerprint become visible to
+    /// validators replaying the same proposal, perturbing their
+    /// `uniqueness_score` and producing a different effective fee +
+    /// state root (state-validation `HashMismatch`).
+    pub fn stage_insert(
+        &self,
+        fid: u64,
+        text: &str,
+        ts_secs: u64,
+        batch: &mut crate::storage::db::RocksDbTransactionBatch,
+    ) -> u128 {
+        let fp = fingerprint(text);
+        let high = (fp >> 64) as u64;
+        let key = Self::full_key(high, ts_secs, fid);
+        let val = fp.to_le_bytes();
+        batch.put(key.to_vec(), val.to_vec());
+        fp
+    }
+
+    /// Score the candidate text against the rolling window. Stale
+    /// fingerprints (`ts < now_secs - FINGERPRINT_WINDOW_SECS`) in
+    /// the inspected bucket are staged for eviction on the caller's
+    /// `batch` — see F133. This is critical for deterministic state
+    /// replay: a direct `self.db.commit` here would leak eviction
+    /// side-effects out of the engine's `RocksDbTransactionBatch`
+    /// (the simulate path discards the batch but live disk would
+    /// retain the deletes, perturbing peer validators' fingerprint
+    /// state and the `uniqueness_score` they compute against the
+    /// next CastAdd → fee divergence → state-root fork).
+    pub fn uniqueness_score(
+        &self,
+        text: &str,
+        now_secs: u64,
+        batch: &mut crate::storage::db::RocksDbTransactionBatch,
+    ) -> Result<f64, FingerprintError> {
         let candidate = fingerprint(text);
         let high = (candidate >> 64) as u64;
         let prefix = Self::bucket_prefix(high);
@@ -132,12 +169,8 @@ impl FingerprintStore {
             )
             .map_err(HubError::from)?;
 
-        if !to_evict.is_empty() {
-            let mut batch = self.db.txn();
-            for k in to_evict {
-                batch.delete(k);
-            }
-            self.db.commit(batch).map_err(HubError::from)?;
+        for k in to_evict {
+            batch.delete(k);
         }
 
         Ok(uniqueness_score_from_neighbor_count(near_dup_count))
@@ -161,7 +194,10 @@ mod tests {
     #[test]
     fn novel_text_scores_one() {
         let (store, _d) = make_store();
-        let score = store.uniqueness_score("first cast ever", 1_000).unwrap();
+        let mut batch = crate::storage::db::RocksDbTransactionBatch::new();
+        let score = store
+            .uniqueness_score("first cast ever", 1_000, &mut batch)
+            .unwrap();
         assert_eq!(score, 1.0);
     }
 
@@ -172,7 +208,8 @@ mod tests {
         for fid in 1..=8u64 {
             store.insert(fid, text, 1_000).unwrap();
         }
-        let score = store.uniqueness_score(text, 1_000).unwrap();
+        let mut batch = crate::storage::db::RocksDbTransactionBatch::new();
+        let score = store.uniqueness_score(text, 1_000, &mut batch).unwrap();
         assert!(
             score < 1.0,
             "duplicate should drive score below 1.0, got {score}"
@@ -186,11 +223,14 @@ mod tests {
         store.insert(1, text, 1_000).unwrap();
         // Far past the 30-day window
         let now = 1_000 + FINGERPRINT_WINDOW_SECS + 1;
-        let score = store.uniqueness_score(text, now).unwrap();
+        let mut batch = crate::storage::db::RocksDbTransactionBatch::new();
+        let score = store.uniqueness_score(text, now, &mut batch).unwrap();
         assert_eq!(score, 1.0, "ancient entries must not count");
-        // A second read after eviction should still see no entries (no
-        // re-insert in this test, so the bucket is now empty).
-        let score = store.uniqueness_score(text, now).unwrap();
+        // Eviction was staged on `batch` (F133 fix), so committing
+        // here mirrors what the engine's outer commit would do.
+        store.db.commit(batch).unwrap();
+        let mut batch2 = crate::storage::db::RocksDbTransactionBatch::new();
+        let score = store.uniqueness_score(text, now, &mut batch2).unwrap();
         assert_eq!(score, 1.0);
     }
 }

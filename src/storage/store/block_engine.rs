@@ -952,11 +952,16 @@ impl BlockEngine {
                     panic!("State change commit failed: {}", err);
                 }
                 Ok(()) => {
-                    self.db.commit(txn).unwrap();
-                    let result = self.stores.block_store.put_block(block);
-                    if result.is_err() {
-                        error!("Failed to store block: {:?}", result.err());
+                    // F033: stage the block header write on the same
+                    // batch as the state mutations so both commit
+                    // atomically. A crash between previously-separate
+                    // commits could leave the trie at height H and
+                    // the header at H-1, diverging the chain on
+                    // restart.
+                    if let Err(e) = self.stores.block_store.stage_block(&mut txn, block) {
+                        error!("Failed to stage block write: {}", e);
                     }
+                    self.db.commit(txn).unwrap();
                     self.stores.trie.reload(&self.db).unwrap();
                     self.metrics
                         .publish_transaction_counts(&block.transactions, ProposalSource::Commit);

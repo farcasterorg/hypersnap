@@ -55,6 +55,16 @@ pub struct DklsSupervisorInputs {
     pub start_lead_blocks: u64,
 }
 
+/// Number of ticks the supervisor waits after dispatching a `StartDkls`
+/// before retrying. If the share for `next_epoch` is still not
+/// installed by then, the ceremony is assumed to have aborted (peer
+/// fault, partition, internal driver error) and the supervisor
+/// re-dispatches (F040 fix). The dispatched ceremony either completes
+/// — flipping `has_dkls_share_for_epoch(target) -> true` and freezing
+/// the retry — or stays stuck, in which case re-dispatch is the only
+/// recovery short of operator intervention.
+pub const DKLS_RETRY_AFTER_TICKS: u32 = 12;
+
 /// Run the supervisor loop until the actor inbound closes.
 pub async fn run(
     inputs: DklsSupervisorInputs,
@@ -65,7 +75,14 @@ pub async fn run(
     ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
     ticker.tick().await;
 
-    let mut last_started_for_epoch: Option<u64> = None;
+    /// Local view of the ceremony state for the most recently
+    /// targeted next-epoch DKG. `None` means no ceremony has been
+    /// dispatched for that epoch (or we just retried after a timeout).
+    struct Dispatched {
+        epoch: u64,
+        ticks_since: u32,
+    }
+    let mut dispatched: Option<Dispatched> = None;
 
     loop {
         ticker.tick().await;
@@ -76,9 +93,41 @@ pub async fn run(
         let next_epoch_start = next_epoch * EPOCH_LENGTH;
         let blocks_until_next = next_epoch_start.saturating_sub(anchor);
 
-        if blocks_until_next <= inputs.start_lead_blocks
-            && last_started_for_epoch != Some(next_epoch)
-        {
+        // F040: if a prior dispatch's share is now installed, freeze
+        // the retry counter. If it isn't installed and we've waited
+        // long enough, clear `dispatched` so the start-lead-blocks
+        // condition can fire again.
+        if let Some(d) = dispatched.as_mut() {
+            // Successful install? Freeze.
+            let installed = client
+                .has_dkls_share_for_epoch(d.epoch)
+                .await
+                .unwrap_or(false);
+            if installed {
+                // Stay in the "dispatched" state but bump ticks_since
+                // so subsequent failures (e.g. share dropped on a
+                // restart) keep behaving sensibly. The
+                // `last_started_for_epoch != Some(next_epoch)` gate
+                // below uses `d.epoch == next_epoch` directly.
+            } else {
+                d.ticks_since = d.ticks_since.saturating_add(1);
+                if d.ticks_since >= DKLS_RETRY_AFTER_TICKS {
+                    warn!(
+                        target_epoch = d.epoch,
+                        ticks = d.ticks_since,
+                        "DKLS ceremony share never installed; clearing dispatched marker for retry"
+                    );
+                    dispatched = None;
+                }
+            }
+        }
+
+        let already_dispatched_for_next = dispatched
+            .as_ref()
+            .map(|d| d.epoch == next_epoch)
+            .unwrap_or(false);
+
+        if blocks_until_next <= inputs.start_lead_blocks && !already_dispatched_for_next {
             match build_driver(&inputs, &client, next_epoch).await {
                 Ok(driver) => {
                     info!(
@@ -95,7 +144,10 @@ pub async fn run(
                     {
                         break;
                     }
-                    last_started_for_epoch = Some(next_epoch);
+                    dispatched = Some(Dispatched {
+                        epoch: next_epoch,
+                        ticks_since: 0,
+                    });
                 }
                 Err(e) => {
                     warn!(target_epoch = next_epoch, "skip StartDkls: {}", e);

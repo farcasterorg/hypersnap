@@ -50,7 +50,7 @@ fn note_commitment_verkle_key(commitment_bytes: &[u8]) -> Vec<u8> {
     k
 }
 
-fn lock_verkle_key(lock_id: &[u8]) -> Vec<u8> {
+pub fn lock_verkle_key(lock_id: &[u8]) -> Vec<u8> {
     let mut k = Vec::with_capacity(33);
     k.push(KEY_DOMAIN_LOCK);
     k.extend_from_slice(lock_id);
@@ -380,11 +380,12 @@ mod tests {
         // Each lock's lock_id should produce a valid inclusion proof.
         let root = tree.root_commitment().unwrap();
         for lock in &locks {
+            let key = lock_verkle_key(&lock.lock_id);
             let proof = tree
-                .prove_inclusion(&lock.lock_id)
+                .prove_inclusion(&key)
                 .unwrap()
                 .expect("must have inclusion proof");
-            assert!(verify_inclusion(&root, &lock.lock_id, &proof, &srs));
+            assert!(verify_inclusion(&root, &key, &proof, &srs));
         }
     }
 
@@ -567,10 +568,11 @@ mod tests {
         )
         .unwrap();
 
-        // Lock is at lock_id (32B path).
-        assert!(tree.get(&[0xa1; 32]).is_some());
+        // Lock is at 33B path with KEY_DOMAIN_LOCK (F117).
+        let lock_key = lock_verkle_key(&[0xa1; 32]);
+        assert!(tree.get(&lock_key).is_some());
 
-        // Nullifier at 33B path with discriminator.
+        // Nullifier at 33B path with KEY_DOMAIN_NULLIFIER.
         let nf_key = nullifier_verkle_key(&nullifier.0);
         assert_eq!(tree.get(&nf_key), Some(&[1u8][..]));
     }

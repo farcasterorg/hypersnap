@@ -120,7 +120,11 @@ enum HyperMessageType {
   // wire shape is unambiguous: body oneof picks confidential vs.
   // transparent rail by message_type.
   HYPER_MESSAGE_TYPE_TOKEN_TRANSFER = 140;
-  HYPER_MESSAGE_TYPE_TOKEN_LOCK = 141;
+  // Confidential bridge lock — consumes a confidential note (commitment +
+  // nullifier) and emits a `TokenLockState` for the bridge merkle tree.
+  // `lock_id` is deterministically derived from the spent nullifier, so
+  // no two locks can collide and the wire message carries no FID.
+  HYPER_MESSAGE_TYPE_CONFIDENTIAL_LOCK = 141;
   HYPER_MESSAGE_TYPE_LOCK_MERKLE_ROOT_UPDATE = 142;
   HYPER_MESSAGE_TYPE_OWNER_ROTATION = 143;
   HYPER_MESSAGE_TYPE_INBOUND_BURN = 144;
@@ -155,6 +159,10 @@ enum HyperMessageType {
   // RewardStore balance into a separate fee-balance ledger used to
   // pay the trust×uniqueness-discounted message fee at merge time.
   HYPER_MESSAGE_TYPE_FEE_DEPOSIT = 154;
+  // Shield: move atoms from the transparent FID balance into the
+  // confidential note store. Required so users can acquire the
+  // confidential notes that `ConfidentialLockBody` spends.
+  HYPER_MESSAGE_TYPE_SHIELD = 155;
   // FIP-native-miniapp-index: miniapp registry + user collections.
   // 120-129 reserved by the FIP for this family.
   HYPER_MESSAGE_TYPE_MINIAPP_REGISTER = 120;
@@ -194,6 +202,59 @@ message HyperTransferOutput {
   // `validate_against_store` lookups recover the right verification
   // key. REQUIRED — empty rejects.
   bytes one_time_pubkey = 3;
+}
+
+// Confidential bridge lock. Spends a confidential note and emits a
+// `TokenLockState` for the bridge merkle tree. The lock_id is
+// deterministically derived at apply time from the spent nullifier
+// (`keccak256("hypersnap-conf-lock-v1:" || nullifier)`), so it is
+// never carried on the wire and two locks cannot collide.
+message ConfidentialLockBody {
+  // Note being burned. The runtime checks the nullifier against the
+  // NoteStore (unspent) and verifies `spend_signature` against the
+  // one-time-pubkey recorded alongside the commitment.
+  HyperTransferInput input = 1;
+
+  // Bridge parameters — these land in the L1 merkle leaf.
+  uint64 amount = 2;
+  uint32 destination_chain_id = 3;
+  bytes  destination_address = 4;  // EVM: 20 bytes
+
+  // 56-byte Decaf448 scalar: blinding-factor difference
+  // `r_in - r_amount` proving the input note's commitment opens to
+  // exactly `amount` atoms (plus an optional fee in `fee_atoms`).
+  bytes  blinding_diff_scalar = 5;
+
+  // Bulletproofs range proof for `amount`. Proves `amount` fits in
+  // the protocol's range without revealing further structure.
+  bytes  range_proof = 6;
+
+  // Optional explicit bridge fee (in atoms). Folded into the
+  // Pedersen balance closure check.
+  uint64 fee_atoms = 7;
+}
+
+// Shield: transparent FID balance → confidential note.
+//
+// Debits `amount` atoms from `sender_fid`'s `RewardStore` balance and
+// records a fresh note (`commitment`, `one_time_pubkey`, `range_proof`)
+// in the NoteStore that the recipient can later spend via a
+// `HyperTransferTx` or burn into a `ConfidentialLockBody` for bridging.
+//
+// Self-shield is the common case (sender_fid mints a note keyed on
+// its own viewing key), but the wire schema does not constrain the
+// note's owner — anyone can mint a note to anyone else's view-pubkey
+// because the on-chain debit is signed by the sender.
+message ShieldBody {
+  uint64 sender_fid = 1;
+  uint64 amount = 2;
+  uint64 nonce = 3;
+  // 32-byte Ed25519 signer pubkey (must be authorized for sender_fid).
+  bytes  signer_pubkey = 4;
+  // 64-byte Ed25519 signature over the canonical signing payload.
+  bytes  signature = 5;
+  // New note materialising on the confidential side.
+  HyperTransferOutput output = 6;
 }
 
 message HyperTransferTx {
@@ -342,6 +403,16 @@ message HyperValidatorEventBody {
   // DKLS23-derived group key. Required for register; ignored for
   // deregister.
   bytes validator_address = 10;
+
+  // F018: libp2p PeerId bytes for this validator's gossip identity.
+  // Bound into the registration via `signature` (the Ed25519 over
+  // the canonical signing payload covers this field). The DKLS
+  // gossip ingress consults the per-epoch
+  // `(committee_party_index → libp2p_peer_id)` registry built from
+  // these entries to enforce
+  // `inner.sender == registry.lookup(propagation_source)`. Required
+  // for register; ignored for deregister.
+  bytes libp2p_peer_id = 11;
 }
 
 // FIP-proof-of-work-tokenization §13.1: transparent FID-keyed
@@ -383,56 +454,6 @@ message TokenTransferBody {
   bytes memo = 7;
 }
 
-// FIP-proof-of-work-tokenization §13.5 outbound bridge: transparent
-// FID-keyed lock that decrements the sender's balance and records a
-// `TokenLockState` keyed by `(sender_fid, lock_id)`. Validators
-// snapshot the unclaimed-lock set per epoch, build a sorted-pair
-// keccak256 merkle tree (matching OZ `MerkleProof.verifyCalldata`)
-// over the leaf hashes (computed via
-// `hypersnap_crypto::bridge_payload::lock_leaf_evm`), threshold-
-// sign the resulting root, and post it to the EVM bridge. A user
-// or relayer then submits a single-leaf merkle proof to
-// `HypersnapBridge.claim`, which mints wrapped tokens to
-// `destination_address`.
-//
-// Replay protection: the per-FID monotonic `nonce` (same store as
-// `TokenTransferBody`). `lock_id` is the *external* identifier the
-// bridge contract uses to detect double-claims; it is independent
-// of the nonce and must be globally unique per lock (collision is
-// rejected at apply time).
-//
-// Phase 2a is EVM-only — `destination_address` must be exactly 20
-// bytes and `destination_chain_id` is u32-fitting (matches the
-// contract's `bytes4(destinationChainId)`). Multi-network support
-// (Solana / Quilibrium / etc.) lands when those bridges land.
-message TokenLockBody {
-  // FID initiating the lock. The signer must be authorized for
-  // this FID (signer-set check, same gate as TokenTransferBody).
-  uint64 sender_fid = 1;
-  // Atoms to lock. Decrements the sender's available balance.
-  // Stored as u64 (the protocol's atom unit); zero-extended to
-  // u256 when encoding the merkle leaf for the bridge contract.
-  uint64 amount = 2;
-  // Per-FID monotonic nonce, shared with `TokenTransferBody` —
-  // both ops advance the same counter.
-  uint64 nonce = 3;
-  // EIP-155 chain ID of the destination chain (1=Ethereum,
-  // 10=Optimism, 8453=Base, etc.). The bridge contract on chain X
-  // only honors locks whose `destination_chain_id == X`. u32 to
-  // exactly match `bytes4(uint32(destinationChainId))` in the
-  // contract's leaf-hash preimage.
-  uint32 destination_chain_id = 4;
-  // EVM destination address: exactly 20 bytes. The bridge
-  // contract mints to this address.
-  bytes destination_address = 5;
-  // Globally unique lock identifier (32 bytes). The bridge
-  // contract uses this as its replay nullifier.
-  bytes lock_id = 6;
-  // Ed25519 public key of the signer (32 bytes).
-  bytes signer_pubkey = 7;
-  // Ed25519 signature (64 bytes) over the canonical signing payload.
-  bytes signature = 8;
-}
 
 // FIP-proof-of-work-tokenization §13.9 FID custody escrow:
 // claim from escrow into a destination FID, signed by the old
@@ -629,8 +650,7 @@ message AppUsageReceiptBody {
   // to 64 bytes UTF-8; longer rejects.
   string action_type = 4;
   // Farcaster timestamp (seconds since FARCASTER_EPOCH).
-  // Informational — the storage epoch is the runtime's
-  // current_epoch() at apply time, not derived from this.
+  // Informational — the storage epoch is `epoch` below.
   uint64 timestamp = 5;
   // Per-(user, app, epoch) replay/dedup nonce. Distinct nonces
   // for distinct receipts within an epoch; reuse rejects on
@@ -646,6 +666,13 @@ message AppUsageReceiptBody {
   // app cannot rewrite user_fid, action_type, etc. after the
   // user signs.
   bytes user_signature = 8;
+  // Epoch the receipt is valid for. Signed by the user (part of
+  // the canonical payload) and checked against the runtime's
+  // current_epoch() at apply time. Receipts whose `epoch` does
+  // not match the apply-time epoch are rejected — closes the
+  // cross-epoch replay vector where a single signed receipt could
+  // be re-submitted every future epoch to inflate §7 score.
+  uint64 epoch = 9;
 }
 
 // FIP-proof-of-work-tokenization §5 DA-PoW challenge response.
@@ -1055,7 +1082,7 @@ message HyperMessage {
     HyperRewardIssuance reward_issuance = 5;
     HyperTrustSnapshotUpdate trust_snapshot_update = 6;
     TokenTransferBody token_transfer = 7;
-    TokenLockBody token_lock = 8;
+    ConfidentialLockBody confidential_lock = 8;
     HyperLockMerkleRootUpdate lock_merkle_root_update = 9;
     HyperOwnerRotation owner_rotation = 10;
     HyperInboundBurn inbound_burn = 11;
@@ -1073,6 +1100,7 @@ message HyperMessage {
     DaChallengeResponseBody da_challenge_response = 23;
     DaEpochSeedBody da_epoch_seed = 24;
     FeeDepositBody fee_deposit = 25;
+    ShieldBody shield = 26;
   }
 }
 

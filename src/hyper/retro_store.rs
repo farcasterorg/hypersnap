@@ -147,6 +147,21 @@ impl RetroStore {
         Ok(())
     }
 
+    /// Stage the per-record write on a caller-owned batch (F015
+    /// fix). Used by the retro-vesting apply path so the
+    /// balance + issued-marker + remaining-atoms decrement all
+    /// commit atomically.
+    pub fn stage_put(
+        &self,
+        record: &proto::HyperRetroactiveRecord,
+        batch: &mut crate::storage::db::RocksDbTransactionBatch,
+    ) -> Result<(), RetroStoreError> {
+        let mut buf = Vec::with_capacity(record.encoded_len());
+        record.encode(&mut buf).map_err(RetroStoreError::Encode)?;
+        batch.put(Self::key_for(record.fid), buf);
+        Ok(())
+    }
+
     /// Bulk-seed the store from an iterator of records. Convenient
     /// for the operator CSV path. Each row writes via `put` —
     /// duplicates within the input overwrite, so the last entry for a

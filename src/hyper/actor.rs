@@ -91,7 +91,17 @@ pub enum HyperActorEvent {
     /// [`crate::hyper::dkls_wire_codec`]. If the message is sealed
     /// to a different party, the actor application-layer-filters
     /// it (`NotForUs`) without attempting decryption.
-    InboundDkls { target_epoch: u64, encoded: Vec<u8> },
+    InboundDkls {
+        target_epoch: u64,
+        encoded: Vec<u8>,
+        /// F018: libp2p `propagation_source` for the frame. `None`
+        /// at locally-synthesized events (tests, scheduler-direct
+        /// paths). The actor cross-checks this against the
+        /// per-epoch `peer_id → committee_party_index` registry to
+        /// reject frames whose inner DKLS `sender` byte doesn't
+        /// match the libp2p sender.
+        propagation_source: Option<Vec<u8>>,
+    },
     /// Begin a DKLS23 ceremony. Driver carries the per-epoch
     /// parameters + this node's party index, assembled out-of-band by
     /// `dkls_supervisor`.
@@ -102,7 +112,12 @@ pub enum HyperActorEvent {
     AdvanceDkls,
     /// Inbound DKLS23 *signing* round message from gossip. Same
     /// codec-wrapped `encoded` shape as `InboundDkls`.
-    InboundDklsSign { epoch: u64, encoded: Vec<u8> },
+    InboundDklsSign {
+        epoch: u64,
+        encoded: Vec<u8>,
+        /// F018: see `InboundDkls::propagation_source`.
+        propagation_source: Option<Vec<u8>>,
+    },
     /// Begin a DKLS23 signing ceremony. The actor takes ownership of
     /// the driver; subsequent `InboundDklsSign` and `AdvanceDklsSign`
     /// events feed it. On completion, the actor surfaces the
@@ -242,6 +257,14 @@ pub enum HyperActorQuery {
     SlashedValidators {
         epoch: u64,
         reply: oneshot::Sender<Result<std::collections::BTreeSet<Vec<u8>>, String>>,
+    },
+    /// Whether the local node has a DKLS share installed for `epoch`.
+    /// Used by the supervisor to detect ceremony aborts: if a
+    /// previously-dispatched DKG didn't install a share, the
+    /// supervisor re-dispatches after a timeout (F040 fix).
+    HasDklsShareForEpoch {
+        epoch: u64,
+        reply: oneshot::Sender<bool>,
     },
     /// Validator's registry event history up to `max_epoch`.
     ValidatorEvents {
@@ -432,6 +455,10 @@ impl std::fmt::Debug for HyperActorQuery {
                 .debug_struct("SlashedValidators")
                 .field("epoch", epoch)
                 .finish(),
+            Self::HasDklsShareForEpoch { epoch, .. } => f
+                .debug_struct("HasDklsShareForEpoch")
+                .field("epoch", epoch)
+                .finish(),
             Self::ValidatorEvents { max_epoch, .. } => f
                 .debug_struct("ValidatorEvents")
                 .field("max_epoch", max_epoch)
@@ -555,8 +582,17 @@ impl std::fmt::Debug for HyperActorEvent {
 /// otherwise act on.
 #[derive(Debug)]
 pub enum HyperActorOutbound {
-    /// A signed block ready for `TOPIC_HYPER_BLOCKS`.
-    BroadcastBlock(HyperBlock),
+    /// A signed block ready for `TOPIC_HYPER_BLOCKS`, along with the
+    /// `locks` and `transfers` the importer needs to re-apply state.
+    /// Both must travel together — `import_block` recomputes the
+    /// state root over the concatenation of `block.envelope.payload`
+    /// + `locks` + `transfers`, and `signing_payload` covers the
+    /// anchor metadata that `decode_hyper_block` must round-trip.
+    BroadcastBlock {
+        block: HyperBlock,
+        locks: Vec<proto::HyperLockEvent>,
+        transfers: Vec<proto::HyperTransferTx>,
+    },
     /// A locally-originated hyper message (lock/transfer/validator
     /// event/reward issuance) that should be gossiped on
     /// `TOPIC_HYPER_MESSAGES`. Emitted after a successful
@@ -793,6 +829,17 @@ impl HyperActorClient {
             .await
     }
 
+    /// Whether the local node has a DKLS share installed for `epoch`.
+    /// Used by the supervisor to detect aborted DKG ceremonies and
+    /// trigger a retry.
+    pub async fn has_dkls_share_for_epoch(
+        &self,
+        epoch: u64,
+    ) -> Result<bool, HyperActorClientError> {
+        self.ask(move |reply| HyperActorQuery::HasDklsShareForEpoch { epoch, reply })
+            .await
+    }
+
     pub async fn validator_events(
         &self,
         validator_key: Vec<u8>,
@@ -938,6 +985,12 @@ pub struct HyperActor {
     runtime: HyperRuntime,
     /// At most one DKLS23 DKG ceremony is in flight at a time.
     active_dkls: Option<ActiveDkls>,
+    /// F023(a) fix: round messages that arrive before `StartDkls`
+    /// is dispatched are buffered here, keyed by `target_epoch`,
+    /// and drained on the matching `StartDkls`. Prevents stalls
+    /// where a fast peer's round-1 message reaches our gossip
+    /// before the supervisor decides to fire StartDkls.
+    pending_dkls_inbound: std::collections::BTreeMap<u64, Vec<Vec<u8>>>,
     /// At most one DKLS23 signing ceremony at a time. Block
     /// production gates on prior completion. May relax to a small
     /// queue if signing rate becomes a bottleneck.
@@ -972,6 +1025,13 @@ pub struct HyperActor {
 }
 
 const RECENT_EVIDENCE_CAP: usize = 256;
+
+/// Per-epoch ceiling for the pre-StartDkls inbound buffer (F023). One
+/// active set is at most `MAX_SHARE_COUNT_DKLS = 32` parties; each
+/// produces up to a handful of round-1 + round-2 messages, so ~256
+/// envelopes is enough headroom for any honest committee while
+/// keeping a Sybil flood bounded.
+const PENDING_DKLS_INBOUND_CAP_PER_EPOCH: usize = 256;
 
 struct ActiveDkls {
     driver: crate::hyper::dkls_driver::DklsDriver,
@@ -1048,6 +1108,7 @@ impl HyperActor {
         let actor = HyperActor {
             runtime,
             active_dkls: None,
+            pending_dkls_inbound: std::collections::BTreeMap::new(),
             active_dkls_sign: None,
             pending_dkls_blocks: std::collections::BTreeMap::new(),
             pending_dkls_messages: std::collections::BTreeMap::new(),
@@ -1082,6 +1143,7 @@ impl HyperActor {
         let actor = HyperActor {
             runtime,
             active_dkls: None,
+            pending_dkls_inbound: std::collections::BTreeMap::new(),
             active_dkls_sign: None,
             pending_dkls_blocks: std::collections::BTreeMap::new(),
             pending_dkls_messages: std::collections::BTreeMap::new(),
@@ -1099,12 +1161,23 @@ impl HyperActor {
         }
         in_tx.send(HyperActorEvent::Shutdown).await.unwrap();
         drop(in_tx);
+        // Drain outbound concurrently so a dispatch path that emits
+        // more than `cap` messages does not deadlock on `send().await`.
+        // Without this, an event like `EvaluateEpochDkls` that sends
+        // (issuances + trust snapshot + lock-root + inbound-burn) can
+        // saturate the bounded channel and wedge the actor mid-run.
+        let collector = tokio::spawn(async move {
+            let mut out = Vec::new();
+            while let Some(item) = out_rx.recv().await {
+                out.push(item);
+            }
+            out
+        });
         actor.run().await;
-        let mut out = Vec::new();
-        while let Ok(item) = out_rx.try_recv() {
-            out.push(item);
-        }
-        out
+        // Dropping the actor's `outbound` (held inside `actor`) closes
+        // the channel, which unblocks the collector. `run()` consumes
+        // the actor by value, so the drop already happened above.
+        collector.await.unwrap_or_default()
     }
 
     async fn run(mut self) {
@@ -1237,13 +1310,40 @@ impl HyperActor {
             HyperActorEvent::InboundDkls {
                 target_epoch,
                 encoded,
+                propagation_source,
             } => {
-                let dkls = self
+                // F023(a) fix: if the ceremony for `target_epoch`
+                // hasn't been started yet, buffer the round message
+                // rather than dropping it. Drained on `StartDkls`.
+                let is_active = self
                     .active_dkls
-                    .as_mut()
+                    .as_ref()
+                    .map(|d| d.driver.target_epoch() == target_epoch)
+                    .unwrap_or(false);
+                if !is_active {
+                    let buf = self.pending_dkls_inbound.entry(target_epoch).or_default();
+                    if buf.len() < PENDING_DKLS_INBOUND_CAP_PER_EPOCH {
+                        buf.push(encoded);
+                    } else {
+                        tracing::warn!(
+                            target_epoch,
+                            cap = PENDING_DKLS_INBOUND_CAP_PER_EPOCH,
+                            "pre-StartDkls buffer full; dropping round message"
+                        );
+                    }
+                    return Ok(());
+                }
+                // Resolve local_party + open the codec frame first so
+                // the F018 check below can borrow `self.runtime`
+                // immutably without conflicting with the mutable
+                // `active_dkls` borrow we take to submit the message.
+                let local_party = self
+                    .active_dkls
+                    .as_ref()
                     .filter(|d| d.driver.target_epoch() == target_epoch)
-                    .ok_or(HyperActorError::NoActiveDkg(target_epoch))?;
-                let local_party = dkls.driver.party_index();
+                    .ok_or(HyperActorError::NoActiveDkg(target_epoch))?
+                    .driver
+                    .party_index();
                 let opened = crate::hyper::dkls_wire_codec::open_dkls_round_message(
                     &encoded,
                     target_epoch,
@@ -1254,6 +1354,23 @@ impl HyperActor {
                 use crate::hyper::dkls_wire_codec::OpenedDklsMessage;
                 match opened {
                     OpenedDklsMessage::ForUs(message) | OpenedDklsMessage::Broadcast(message) => {
+                        // F018: cross-check the inner sender against
+                        // the libp2p peer-id registry for this epoch.
+                        // The codec's inner/outer check binds within
+                        // an encrypted frame; this binds the encryptor
+                        // identity to a real peer-id.
+                        if !self.check_dkls_sender_against_propagation_source(
+                            target_epoch,
+                            message.sender(),
+                            propagation_source.as_deref(),
+                        ) {
+                            return Ok(());
+                        }
+                        let dkls = self
+                            .active_dkls
+                            .as_mut()
+                            .filter(|d| d.driver.target_epoch() == target_epoch)
+                            .ok_or(HyperActorError::NoActiveDkg(target_epoch))?;
                         dkls.driver.submit(message)?;
                     }
                     OpenedDklsMessage::NotForUs { .. } => {
@@ -1268,8 +1385,75 @@ impl HyperActor {
             }
             HyperActorEvent::StartDkls { driver } => {
                 let mut driver = *driver;
+                // F023(c) fix: refuse to silently overwrite an
+                // active ceremony. A second StartDkls for the same
+                // epoch is a configuration / scheduler bug; a
+                // different epoch reaching us mid-ceremony means
+                // the supervisor advanced past us — log and ignore
+                // rather than nuking in-flight state.
+                if let Some(active) = self.active_dkls.as_ref() {
+                    if active.driver.target_epoch() == driver.target_epoch() {
+                        tracing::warn!(
+                            target_epoch = driver.target_epoch(),
+                            "StartDkls for already-active ceremony — keeping the existing driver"
+                        );
+                        return Ok(());
+                    } else {
+                        tracing::warn!(
+                            active_epoch = active.driver.target_epoch(),
+                            new_epoch = driver.target_epoch(),
+                            "StartDkls for a different epoch while another ceremony is active; \
+                             replacing — supervisor likely advanced past stale state"
+                        );
+                    }
+                }
+                let target = driver.target_epoch();
                 driver.start()?;
                 self.flush_dkls_outbound(&mut driver).await;
+                // F023(a) fix: drain any pre-start buffer for this
+                // epoch. Round messages that arrived before
+                // StartDkls would otherwise be lost; the prior
+                // dropping behaviour caused a ceremony to stall if
+                // a fast peer's round-1 message hit our actor
+                // before the supervisor dispatched StartDkls.
+                if let Some(buffered) = self.pending_dkls_inbound.remove(&target) {
+                    for encoded in buffered {
+                        let local_party = driver.party_index();
+                        match crate::hyper::dkls_wire_codec::open_dkls_round_message(
+                            &encoded,
+                            target,
+                            &self.runtime.local_transport_secret,
+                            local_party,
+                        ) {
+                            Ok(opened) => {
+                                use crate::hyper::dkls_wire_codec::OpenedDklsMessage;
+                                match opened {
+                                    OpenedDklsMessage::ForUs(m)
+                                    | OpenedDklsMessage::Broadcast(m) => {
+                                        if let Err(e) = driver.submit(m) {
+                                            tracing::warn!(
+                                                target_epoch = target,
+                                                error = %e,
+                                                "buffered DKLS round message rejected by driver"
+                                            );
+                                        }
+                                    }
+                                    OpenedDklsMessage::NotForUs { .. } => {}
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    target_epoch = target,
+                                    error = %e,
+                                    "buffered DKLS round message failed codec; dropping"
+                                );
+                            }
+                        }
+                    }
+                    // Drain any outbound that the buffered submissions
+                    // produced.
+                    self.flush_dkls_outbound(&mut driver).await;
+                }
                 self.active_dkls = Some(ActiveDkls { driver });
                 Ok(())
             }
@@ -1293,13 +1477,17 @@ impl HyperActor {
                 }
                 Ok(())
             }
-            HyperActorEvent::InboundDklsSign { epoch, encoded } => {
-                let driver = self
+            HyperActorEvent::InboundDklsSign {
+                epoch,
+                encoded,
+                propagation_source,
+            } => {
+                let local_party = self
                     .active_dkls_sign
-                    .as_mut()
+                    .as_ref()
                     .filter(|d| d.epoch() == epoch)
-                    .ok_or(HyperActorError::NoActiveDkg(epoch))?;
-                let local_party = driver.party_index();
+                    .ok_or(HyperActorError::NoActiveDkg(epoch))?
+                    .party_index();
                 let opened = crate::hyper::dkls_wire_codec::open_dkls_sign_round_message(
                     &encoded,
                     epoch,
@@ -1312,6 +1500,21 @@ impl HyperActor {
                     OpenedDklsSignMessage::ForUs(m) | OpenedDklsSignMessage::Broadcast(m) => m,
                     OpenedDklsSignMessage::NotForUs { .. } => return Ok(()),
                 };
+                // F018: cross-check the inner sign-round sender's
+                // claimed party_index against the libp2p
+                // propagation_source. Same shape as the DKG path.
+                if !self.check_dkls_sender_against_propagation_source(
+                    epoch,
+                    message.sender(),
+                    propagation_source.as_deref(),
+                ) {
+                    return Ok(());
+                }
+                let driver = self
+                    .active_dkls_sign
+                    .as_mut()
+                    .filter(|d| d.epoch() == epoch)
+                    .ok_or(HyperActorError::NoActiveDkg(epoch))?;
                 driver.submit(message)?;
                 Ok(())
             }
@@ -1326,7 +1529,10 @@ impl HyperActor {
                 let Some(mut driver) = self.active_dkls_sign.take() else {
                     return Ok(());
                 };
-                driver.try_advance()?;
+                // F045: catches `RecoveryIdOutOfRange` and restarts
+                // the ceremony with fresh entropy before propagating.
+                self.try_advance_dkls_sign_with_recovery_retry(&mut driver)
+                    .await?;
                 self.flush_dkls_sign_outbound(&mut driver).await;
                 if driver.is_completed() {
                     let signature = driver
@@ -1483,6 +1689,10 @@ impl HyperActor {
                     .slashed_validators_for_epoch(epoch, &active)
                     .map_err(|e| e.to_string());
                 let _ = reply.send(r);
+            }
+            HyperActorQuery::HasDklsShareForEpoch { epoch, reply } => {
+                let has = self.runtime.dkls_share_for_epoch(epoch).is_some();
+                let _ = reply.send(has);
             }
             HyperActorQuery::ValidatorEvents {
                 validator_key,
@@ -1720,7 +1930,6 @@ impl HyperActor {
             Some(Body::RewardIssuance(_)) => "reward_issuance",
             Some(Body::TrustSnapshotUpdate(_)) => "trust_snapshot_update",
             Some(Body::TokenTransfer(_)) => "token_transfer",
-            Some(Body::TokenLock(_)) => "token_lock",
             Some(Body::LockMerkleRootUpdate(_)) => "lock_merkle_root_update",
             Some(Body::OwnerRotation(_)) => "owner_rotation",
             Some(Body::InboundBurn(_)) => "inbound_burn",
@@ -1738,6 +1947,8 @@ impl HyperActor {
             Some(Body::DaChallengeResponse(_)) => "da_challenge_response",
             Some(Body::DaEpochSeed(_)) => "da_epoch_seed",
             Some(Body::FeeDeposit(_)) => "fee_deposit",
+            Some(Body::ConfidentialLock(_)) => "confidential_lock",
+            Some(Body::Shield(_)) => "shield",
             None => "none",
         };
         self.metric_count_tagged("hyper.message.inbound", 1, "kind", kind);
@@ -2185,6 +2396,57 @@ impl HyperActor {
         self.metric_count("hyper.da.responses_submitted", submitted as i64);
     }
 
+    /// F018: cross-check the inner DKLS sender claim against the
+    /// libp2p `propagation_source` for this frame.
+    ///
+    /// Returns `true` (accept) when any of these hold:
+    ///   - `propagation_source` is `None` — locally-synthesized event,
+    ///     no remote peer to authenticate against;
+    ///   - the runtime has no peer-id registered for `claimed_sender`
+    ///     in this epoch — pre-rollout permissive mode so the chain
+    ///     keeps working until every active validator has registered
+    ///     a `libp2p_peer_id`;
+    ///   - the registered peer-id for `claimed_sender` equals the
+    ///     `propagation_source`.
+    ///
+    /// Returns `false` (drop with a warning) when a peer-id IS
+    /// registered for `claimed_sender` AND the source disagrees —
+    /// that is the F018 forgery attempt the registry exists to
+    /// catch. The frame is dropped silently with a log line; the
+    /// honest peer's next retransmit will succeed.
+    fn check_dkls_sender_against_propagation_source(
+        &self,
+        epoch: u64,
+        claimed_sender: u8,
+        propagation_source: Option<&[u8]>,
+    ) -> bool {
+        let source = match propagation_source {
+            Some(s) => s,
+            None => return true,
+        };
+        let registered = match self.runtime.peer_id_for_party(epoch, claimed_sender) {
+            Some(p) => p,
+            None => {
+                // Permissive: no registered peer-id for this party
+                // in this epoch. Validator registry rollout is
+                // gradual; treat as unverified rather than reject.
+                return true;
+            }
+        };
+        if registered == source {
+            true
+        } else {
+            tracing::warn!(
+                epoch,
+                claimed_sender,
+                registered_peer = hex::encode(&registered),
+                actual_peer = hex::encode(source),
+                "F018: DKLS frame's inner sender does not match libp2p propagation_source; dropping"
+            );
+            false
+        }
+    }
+
     async fn flush_dkls_outbound(&self, driver: &mut crate::hyper::dkls_driver::DklsDriver) {
         let target_epoch = driver.target_epoch();
         for msg in driver.drain_outbound() {
@@ -2225,6 +2487,50 @@ impl HyperActor {
                     encoded,
                 })
                 .await;
+        }
+    }
+
+    /// F045: drive `try_advance` and recover from
+    /// `RecoveryIdOutOfRange` by restarting the ceremony with fresh
+    /// entropy. The driver tracks its own retry budget, so all this
+    /// helper does is detect the recoverable variant, call `restart`,
+    /// flush the new phase-1 outbound, and loop. Any other DKLS
+    /// error (or budget exhaustion) propagates to the caller.
+    async fn try_advance_dkls_sign_with_recovery_retry(
+        &self,
+        driver: &mut crate::hyper::dkls_sign_driver::DklsSignDriver,
+    ) -> Result<(), HyperActorError> {
+        loop {
+            match driver.try_advance() {
+                Ok(()) => return Ok(()),
+                Err(crate::hyper::dkls_sign_driver::DklsSignDriverError::Dkls(
+                    hypersnap_crypto::dkls_threshold::DklsError::RecoveryIdOutOfRange {
+                        recovery_id,
+                    },
+                )) => {
+                    let restarted = driver.try_restart_for_recovery_id()?;
+                    if !restarted {
+                        return Err(HyperActorError::DklsSign(
+                            crate::hyper::dkls_sign_driver::DklsSignDriverError::Dkls(
+                                hypersnap_crypto::dkls_threshold::DklsError::RecoveryIdOutOfRange {
+                                    recovery_id,
+                                },
+                            ),
+                        ));
+                    }
+                    tracing::warn!(
+                        epoch = driver.epoch(),
+                        recovery_id,
+                        "DKLS sign emitted non-Ethereum recovery_id; restarted ceremony with fresh entropy"
+                    );
+                    // Drain the new phase-1 outbound so peers see the
+                    // restart on the wire. Continue the loop to call
+                    // `try_advance` against the fresh coordinator.
+                    self.flush_dkls_sign_outbound(driver).await;
+                    continue;
+                }
+                Err(e) => return Err(HyperActorError::DklsSign(e)),
+            }
         }
     }
 
@@ -2278,18 +2584,13 @@ impl HyperActor {
     ) -> Result<(), HyperActorError> {
         let (block, locks, transfers) = self.runtime.produce_unsigned_block_dkls(
             height,
-            parent_hash,
+            parent_hash.clone(),
             extra_rules_version,
             snapchain_anchor_block,
             snapchain_anchor_hash,
             snapchain_anchor_timestamp,
         )?;
         let epoch = block.signature.epoch;
-        let payload = block.envelope.metadata.signing_payload(epoch);
-        let digest = alloy_primitives::keccak256(&payload);
-
-        // Resolve our local share to learn (party_index, threshold,
-        // share_count).
         let Some(share) = self.runtime.dkls_share_for_epoch(epoch) else {
             // No local share — we can't sign; treat as no-op.
             return Ok(());
@@ -2299,9 +2600,18 @@ impl HyperActor {
         let local_party_index = share.party.party_index;
         let party = share.party.clone();
 
+        // F036 fix: committee selection uses a non-grindable seed,
+        // not the full signing_payload digest. The signing payload
+        // mixes in proposer-controlled fields (mempool ordering,
+        // missed_proposals, anchor block/hash/timestamp) — letting
+        // the proposer grind the committee. The block-production
+        // seed is built from `(epoch, height, parent_hash)` only,
+        // each of which is pinned by consensus before composition.
+        let committee_seed =
+            crate::hyper::dkls_committee::committee_seed_for_block(epoch, height, &parent_hash);
         let committee = crate::hyper::dkls_committee::select_signing_committee(
             epoch,
-            &digest,
+            &committee_seed,
             share_count,
             threshold,
         )
@@ -2312,6 +2622,20 @@ impl HyperActor {
             // independently.
             return Ok(());
         }
+
+        // F153: bind the committee into the signing payload. The
+        // committee was selected deterministically above from
+        // `(epoch, height, parent_hash)` — every honest validator
+        // computes the same set, so the same payload, so the same
+        // digest. An attacker who malleates `signer_indices` on a
+        // captured signature breaks the digest match and the
+        // signature no longer verifies.
+        let committee_indices: Vec<u64> = committee.iter().map(|&i| i as u64).collect();
+        let payload = block
+            .envelope
+            .metadata
+            .signing_payload(epoch, &committee_indices);
+        let digest = alloy_primitives::keccak256(&payload);
 
         let coordinator =
             hypersnap_crypto::dkls_sign::DklsSignCoordinator::new(party, committee.clone(), digest)
@@ -2335,9 +2659,11 @@ impl HyperActor {
         );
         // Single-party committees finish phase 1 → 2 → 3 → 4
         // entirely from drain+self-route; advance immediately so the
-        // 1-of-1 case completes within a single tick.
+        // 1-of-1 case completes within a single tick. F045: retry
+        // through the same recovery-id-aware helper.
         if driver.coordinator.signing_committee().len() == 1 {
-            driver.try_advance()?;
+            self.try_advance_dkls_sign_with_recovery_retry(&mut driver)
+                .await?;
         }
         if driver.is_completed() {
             // Already finalized — short-circuit straight to the
@@ -2381,6 +2707,8 @@ impl HyperActor {
             let anchor_block = block.envelope.metadata.snapchain_anchor_block;
             let anchor_ts = block.envelope.metadata.snapchain_anchor_timestamp;
             let send_block = block.clone();
+            let send_locks = pending.locks.clone();
+            let send_transfers = pending.transfers.clone();
             if let Err(e) = self
                 .runtime
                 .import_block(&block, &pending.locks, &pending.transfers)
@@ -2393,7 +2721,11 @@ impl HyperActor {
                 self.metric_count("hyper.blocks.produced", 1);
                 let _ = self
                     .outbound
-                    .send(HyperActorOutbound::BroadcastBlock(send_block))
+                    .send(HyperActorOutbound::BroadcastBlock {
+                        block: send_block,
+                        locks: send_locks,
+                        transfers: send_transfers,
+                    })
                     .await;
                 self.maybe_trigger_scoring(anchor_block, anchor_ts).await;
             }
@@ -2808,7 +3140,10 @@ impl HyperActor {
                 source_tx_hash: obs.source_tx_hash.clone(),
                 ecdsa_signature: Vec::new(),
             };
-            let payload = crate::hyper::inbound_burn::inbound_burn_signing_payload(&unsigned);
+            let payload = crate::hyper::inbound_burn::inbound_burn_signing_payload(
+                &unsigned,
+                self.runtime.protocol_chain_id,
+            );
             let digest = alloy_primitives::keccak256(&payload);
             let committee = crate::hyper::dkls_committee::select_signing_committee(
                 epoch,
@@ -3077,7 +3412,7 @@ mod tests {
         assert!(
             outbound
                 .iter()
-                .all(|o| !matches!(o, HyperActorOutbound::BroadcastBlock(_))),
+                .all(|o| !matches!(o, HyperActorOutbound::BroadcastBlock { .. })),
             "should not have produced a block on a mere inbound message"
         );
     }
@@ -3107,7 +3442,7 @@ mod tests {
 
         let block_count = outbound
             .iter()
-            .filter(|o| matches!(o, HyperActorOutbound::BroadcastBlock(_)))
+            .filter(|o| matches!(o, HyperActorOutbound::BroadcastBlock { .. }))
             .count();
         assert_eq!(block_count, 1, "expected exactly one BroadcastBlock");
 
@@ -3147,7 +3482,7 @@ mod tests {
         let blocks: Vec<&HyperBlock> = outbound
             .iter()
             .filter_map(|o| match o {
-                HyperActorOutbound::BroadcastBlock(b) => Some(b),
+                HyperActorOutbound::BroadcastBlock { block, .. } => Some(block),
                 _ => None,
             })
             .collect();
@@ -3170,7 +3505,7 @@ mod tests {
         let payload = block
             .envelope
             .metadata
-            .signing_payload(block.signature.epoch);
+            .signing_payload(block.signature.epoch, &block.signature.signer_indices);
         let group_addr = dkg.group_address;
         let expected = crate::hyper::sig_verify::ExpectedGroupKey::ecdsa_only(&group_addr);
         crate::hyper::sig_verify::verify_hyperblock_signature(
@@ -3491,7 +3826,7 @@ mod tests {
         // matters is that no malformed BroadcastBlock landed.
         let block_count = outbound
             .iter()
-            .filter(|o| matches!(o, HyperActorOutbound::BroadcastBlock(_)))
+            .filter(|o| matches!(o, HyperActorOutbound::BroadcastBlock { .. }))
             .count();
         assert_eq!(block_count, 0);
     }
@@ -3543,25 +3878,25 @@ mod tests {
             .reward_store
             .credit_if_unissued(0, 1, proto::WorkMarket::Growth as i32, 5_000)
             .unwrap();
-        let pk = sk.verifying_key();
-        let mut body = proto::TokenLockBody {
-            sender_fid: 1,
-            amount: 1_000,
-            nonce: 1,
-            destination_chain_id: 10,
-            destination_address: vec![0xab; 20],
-            lock_id: vec![0xcc; 32],
-            signer_pubkey: pk.to_bytes().to_vec(),
-            signature: Vec::new(),
-        };
-        let payload = crate::hyper::token_lock::token_lock_signing_payload(&body);
-        body.signature = sk.sign(&payload).to_bytes().to_vec();
-        runtime
-            .submit_message(proto::HyperMessage {
-                message_type: proto::HyperMessageType::TokenLock as i32,
-                body: Some(proto::hyper_message::Body::TokenLock(body)),
-            })
-            .unwrap();
+        // Seed a lock directly via the store. The transparent
+        // FID-keyed lock body is gone; the bridge merkle tree only
+        // cares that a `TokenLockState` row exists, regardless of
+        // which apply path produced it.
+        {
+            let lock_state = proto::TokenLockState {
+                sender_fid: 1,
+                amount: 1_000,
+                destination_chain_id: 10,
+                destination_address: vec![0xab; 20],
+                lock_id: vec![0xcc; 32],
+            };
+            let mut txn = crate::storage::db::RocksDbTransactionBatch::new();
+            runtime
+                .reward_store
+                .put_lock_state(1, &lock_state, &mut txn)
+                .unwrap();
+            runtime.db.commit(txn).unwrap();
+        }
 
         let outbound = HyperActor::drive_events(
             runtime,
@@ -3639,7 +3974,7 @@ mod tests {
         let block = proposer_out
             .into_iter()
             .find_map(|o| match o {
-                HyperActorOutbound::BroadcastBlock(b) => Some(b),
+                HyperActorOutbound::BroadcastBlock { block, .. } => Some(block),
                 _ => None,
             })
             .expect("proposer should have broadcast a block");
@@ -4000,7 +4335,7 @@ mod tests {
             let payload = block
                 .envelope
                 .metadata
-                .signing_payload(block.signature.epoch);
+                .signing_payload(block.signature.epoch, &block.signature.signer_indices);
             let digest = keccak256(&payload);
             let sig = hypersnap_crypto::dkls_sign::run_local_dkls_sign(&dkg.parties[0], digest)
                 .expect("local sign");
@@ -4193,7 +4528,7 @@ mod tests {
             let payload = block
                 .envelope
                 .metadata
-                .signing_payload(block.signature.epoch);
+                .signing_payload(block.signature.epoch, &block.signature.signer_indices);
             let digest = keccak256(&payload);
             let sig = hypersnap_crypto::dkls_sign::run_local_dkls_sign(&dkg.parties[0], digest)
                 .expect("local sign");
@@ -4379,6 +4714,7 @@ mod tests {
         let mut actor = HyperActor {
             runtime,
             active_dkls: None,
+            pending_dkls_inbound: std::collections::BTreeMap::new(),
             active_dkls_sign: None,
             pending_dkls_blocks: std::collections::BTreeMap::new(),
             pending_dkls_messages: std::collections::BTreeMap::new(),
@@ -4471,6 +4807,7 @@ mod tests {
         let mut actor = HyperActor {
             runtime,
             active_dkls: None,
+            pending_dkls_inbound: std::collections::BTreeMap::new(),
             active_dkls_sign: None,
             pending_dkls_blocks: std::collections::BTreeMap::new(),
             pending_dkls_messages: std::collections::BTreeMap::new(),
@@ -4595,6 +4932,7 @@ mod tests {
         let mut actor = HyperActor {
             runtime,
             active_dkls: None,
+            pending_dkls_inbound: std::collections::BTreeMap::new(),
             active_dkls_sign: None,
             pending_dkls_blocks: std::collections::BTreeMap::new(),
             pending_dkls_messages: std::collections::BTreeMap::new(),
@@ -4697,6 +5035,7 @@ mod tests {
         let mut actor = HyperActor {
             runtime,
             active_dkls: None,
+            pending_dkls_inbound: std::collections::BTreeMap::new(),
             active_dkls_sign: None,
             pending_dkls_blocks: std::collections::BTreeMap::new(),
             pending_dkls_messages: std::collections::BTreeMap::new(),
@@ -4786,6 +5125,7 @@ mod tests {
         let mut actor = HyperActor {
             runtime,
             active_dkls: None,
+            pending_dkls_inbound: std::collections::BTreeMap::new(),
             active_dkls_sign: None,
             pending_dkls_blocks: std::collections::BTreeMap::new(),
             pending_dkls_messages: std::collections::BTreeMap::new(),

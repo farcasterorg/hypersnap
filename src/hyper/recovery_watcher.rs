@@ -64,6 +64,12 @@ pub struct RecoveryWatcherConfig {
     pub poll_interval: Duration,
     /// Block-batch size override (some RPCs cap at less than 8K).
     pub block_batch: u64,
+    /// Number of confirmations to wait before treating a block as
+    /// final. F097 fix: without this the watcher could record a
+    /// Recover event from a block that later reorgs out, leaving
+    /// stale recovery state. OP's reorg window is typically <= 2
+    /// blocks but ~64 mirrors the inbound-burn watcher's default.
+    pub finality_confirmations: u64,
 }
 
 impl Default for RecoveryWatcherConfig {
@@ -73,6 +79,7 @@ impl Default for RecoveryWatcherConfig {
             start_block: 108_864_739,
             poll_interval: Duration::from_secs(30),
             block_batch: DEFAULT_BLOCK_BATCH,
+            finality_confirmations: 64,
         }
     }
 }
@@ -128,13 +135,19 @@ pub async fn run(
             }
         };
 
-        if next_block > head {
+        // F097: only scan up to `head - finality_confirmations` so
+        // a reorged Recover event never makes it into the recovery
+        // store. Without this the watcher could observe a Recover
+        // in a now-orphaned block and treat the orphaned ownership
+        // change as canonical.
+        let finalized_head = head.saturating_sub(cfg.finality_confirmations);
+        if next_block > finalized_head {
             // Caught up. Sleep and try again.
             time::sleep(cfg.poll_interval).await;
             continue;
         }
 
-        let stop = (next_block + cfg.block_batch - 1).min(head);
+        let stop = (next_block + cfg.block_batch - 1).min(finalized_head);
         if let Err(e) = scan_range(&provider, &store, next_block, stop).await {
             error!(
                 "recovery watcher: scan {}..={} failed: {}; retrying in {:?}",

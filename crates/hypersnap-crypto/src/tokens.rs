@@ -234,6 +234,12 @@ impl TransferTx {
     /// Canonical signing payload — what each input's spend signature signs.
     /// Binds the signature to the entire transaction so it cannot be replayed
     /// against a different transfer.
+    ///
+    /// F149: production callers must use [`Self::signing_payload_with_envelope`]
+    /// so the signature covers the per-output `one_time_pubkey`
+    /// and the prover-supplied `blinding_diff_scalar`. The bare
+    /// `signing_payload` is kept for test/round-trip fixtures that
+    /// don't populate the wire envelope.
     pub fn signing_payload(&self) -> [u8; 32] {
         let mut h = Sha256::new();
         h.update(b"hypersnap-transfer-v1");
@@ -249,6 +255,52 @@ impl TransferTx {
             h.update(&out.range_proof);
         }
         h.update(self.fee_atoms.to_be_bytes());
+        let digest = h.finalize();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&digest);
+        out
+    }
+
+    /// F149: extended signing payload that also binds the per-output
+    /// stealth `one_time_pubkey`s and the prover-supplied
+    /// `blinding_diff_scalar`. Without these in the digest, a
+    /// gossip-relay attacker can rewrite the recipient's pubkey on a
+    /// captured transfer (winning the mempool dedup race keyed on the
+    /// first input's nullifier) and durably record the attacker's
+    /// pubkey for the recipient's stealth output — a targeted
+    /// output-burn primitive against the legitimate recipient.
+    /// Pedersen balance closure prevents value extraction, so the
+    /// damage is bounded to forced loss-of-funds, not theft.
+    ///
+    /// `output_pubkeys.len()` must equal `self.outputs.len()`.
+    pub fn signing_payload_with_envelope(
+        &self,
+        output_pubkeys: &[[u8; 56]],
+        blinding_diff_scalar: &[u8; 56],
+    ) -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(b"hypersnap-transfer-v1");
+        h.update((self.inputs.len() as u32).to_be_bytes());
+        for inp in &self.inputs {
+            h.update(inp.commitment.to_bytes());
+            h.update(inp.nullifier.0);
+        }
+        h.update((self.outputs.len() as u32).to_be_bytes());
+        for (i, out) in self.outputs.iter().enumerate() {
+            h.update(out.commitment.to_bytes());
+            h.update((out.range_proof.len() as u32).to_be_bytes());
+            h.update(&out.range_proof);
+            // Envelope binding: per-output one_time_pubkey. Empty
+            // slot is encoded as `[0u8; 56]` for callers that lack a
+            // pubkey for an output (which production callers must
+            // not — `extract_output_pubkeys` rejects missing
+            // entries).
+            let pk_bytes = output_pubkeys.get(i).copied().unwrap_or([0u8; 56]);
+            h.update(pk_bytes);
+        }
+        h.update(self.fee_atoms.to_be_bytes());
+        // Envelope binding: blinding_diff_scalar.
+        h.update(blinding_diff_scalar);
         let digest = h.finalize();
         let mut out = [0u8; 32];
         out.copy_from_slice(&digest);
@@ -481,12 +533,38 @@ pub enum NotePayloadError {
     InvalidBlinding,
 }
 
+/// Build the AAD for a note payload (F052 hardening). The AEAD now
+/// binds the per-note Pedersen commitment + the sender's tx_pubkey
+/// (`R = r·G`) + the recipient's view pubkey into the auth tag, so
+/// the ciphertext cannot be rebound to a different note or a
+/// different stealth context. The static DST `NOTE_PAYLOAD_HKDF_INFO`
+/// remains the version prefix.
+fn note_payload_aad(
+    commitment: &PedersenCommitment,
+    tx_pubkey: &Point,
+    recipient_view_pubkey: &Point,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(NOTE_PAYLOAD_HKDF_INFO.len() + 56 * 3);
+    buf.extend_from_slice(NOTE_PAYLOAD_HKDF_INFO);
+    buf.extend_from_slice(&commitment.to_bytes());
+    buf.extend_from_slice(&point_to_compressed(tx_pubkey));
+    buf.extend_from_slice(&point_to_compressed(recipient_view_pubkey));
+    buf
+}
+
 /// Encrypt `(value, blinding)` to the recipient's view pubkey using the
 /// sender's ephemeral secret `r`. The shared secret is `r·A`, derived
 /// identically by recipient via `a·R`.
+///
+/// `commitment` is the note's Pedersen commitment and `tx_pubkey` is
+/// the sender's published `R = r·G`. Both are bound into the AEAD's
+/// AAD (F052 fix) so the ciphertext cannot be rebound to a different
+/// note or stealth context.
 pub fn encrypt_note_payload<R: RngCore + CryptoRng>(
     sender_secret: &Scalar,
     recipient_view_pubkey: &Point,
+    commitment: &PedersenCommitment,
+    tx_pubkey: &Point,
     value: u64,
     blinding: &Scalar,
     rng: &mut R,
@@ -503,12 +581,13 @@ pub fn encrypt_note_payload<R: RngCore + CryptoRng>(
     plaintext[..8].copy_from_slice(&value.to_be_bytes());
     plaintext[8..64].copy_from_slice(&blinding.to_bytes());
 
+    let aad = note_payload_aad(commitment, tx_pubkey, recipient_view_pubkey);
     let ciphertext = cipher
         .encrypt(
             nonce,
             Payload {
                 msg: &plaintext,
-                aad: NOTE_PAYLOAD_HKDF_INFO,
+                aad: &aad,
             },
         )
         .expect("ChaCha20-Poly1305 encrypt cannot fail on 64 bytes");
@@ -580,9 +659,15 @@ impl NoteStoreMut for MemoryNoteStore {
 }
 
 /// Decrypt with the recipient's view secret + sender's published `R`.
+/// `commitment` and `sender_tx_pubkey` MUST match the values the
+/// sender bound into the AAD at encryption time (F052 hardening) —
+/// the recipient gets them from the on-chain note row alongside the
+/// encrypted payload.
 pub fn decrypt_note_payload(
     receiver_view_secret: &Scalar,
     sender_tx_pubkey: &Point,
+    commitment: &PedersenCommitment,
+    receiver_view_pubkey: &Point,
     encrypted: &EncryptedNotePayload,
 ) -> Result<(u64, Scalar), NotePayloadError> {
     let shared = Point::multiscalar_mul(&[*receiver_view_secret], &[*sender_tx_pubkey]);
@@ -590,12 +675,13 @@ pub fn decrypt_note_payload(
     let cipher = ChaCha20Poly1305::new(&key.into());
 
     let nonce = Nonce::from_slice(&encrypted.nonce);
+    let aad = note_payload_aad(commitment, sender_tx_pubkey, receiver_view_pubkey);
     let plaintext = cipher
         .decrypt(
             nonce,
             Payload {
                 msg: &encrypted.ciphertext,
-                aad: NOTE_PAYLOAD_HKDF_INFO,
+                aad: &aad,
             },
         )
         .map_err(|_| NotePayloadError::Decryption)?;
@@ -1140,16 +1226,29 @@ mod tests {
 
         let value = 1_234_567u64;
         let blinding = Scalar::random(&mut rng);
+        let pc = PedersenGens::default();
+        let commitment = PedersenCommitment(Point::multiscalar_mul(
+            &[Scalar::from(value), blinding],
+            &[pc.B, pc.B_blinding],
+        ));
         let payload = encrypt_note_payload(
             &stealth_out.sender_secret,
             &address.view_pubkey,
+            &commitment,
+            &stealth_out.tx_pubkey,
             value,
             &blinding,
             &mut rng,
         );
 
-        let (rec_value, rec_blinding) =
-            decrypt_note_payload(&recipient.view_secret, &stealth_out.tx_pubkey, &payload).unwrap();
+        let (rec_value, rec_blinding) = decrypt_note_payload(
+            &recipient.view_secret,
+            &stealth_out.tx_pubkey,
+            &commitment,
+            &recipient.public_address().view_pubkey,
+            &payload,
+        )
+        .unwrap();
         assert_eq!(rec_value, value);
         assert_eq!(rec_blinding, blinding);
     }
@@ -1162,15 +1261,28 @@ mod tests {
         let stealth_out = create_stealth_output(&recipient.public_address(), &mut rng);
 
         let blinding = Scalar::random(&mut rng);
+        let pc = PedersenGens::default();
+        let commitment = PedersenCommitment(Point::multiscalar_mul(
+            &[Scalar::from(42u64), blinding],
+            &[pc.B, pc.B_blinding],
+        ));
         let payload = encrypt_note_payload(
             &stealth_out.sender_secret,
             &recipient.public_address().view_pubkey,
+            &commitment,
+            &stealth_out.tx_pubkey,
             42,
             &blinding,
             &mut rng,
         );
 
-        let result = decrypt_note_payload(&stranger.view_secret, &stealth_out.tx_pubkey, &payload);
+        let result = decrypt_note_payload(
+            &stranger.view_secret,
+            &stealth_out.tx_pubkey,
+            &commitment,
+            &stranger.public_address().view_pubkey,
+            &payload,
+        );
         assert!(result.is_err());
     }
 
@@ -1180,15 +1292,28 @@ mod tests {
         let recipient = StealthKeypair::generate(&mut rng);
         let stealth_out = create_stealth_output(&recipient.public_address(), &mut rng);
         let blinding = Scalar::random(&mut rng);
+        let pc = PedersenGens::default();
+        let commitment = PedersenCommitment(Point::multiscalar_mul(
+            &[Scalar::from(42u64), blinding],
+            &[pc.B, pc.B_blinding],
+        ));
         let mut payload = encrypt_note_payload(
             &stealth_out.sender_secret,
             &recipient.public_address().view_pubkey,
+            &commitment,
+            &stealth_out.tx_pubkey,
             42,
             &blinding,
             &mut rng,
         );
         payload.ciphertext[0] ^= 0x01;
-        let result = decrypt_note_payload(&recipient.view_secret, &stealth_out.tx_pubkey, &payload);
+        let result = decrypt_note_payload(
+            &recipient.view_secret,
+            &stealth_out.tx_pubkey,
+            &commitment,
+            &recipient.public_address().view_pubkey,
+            &payload,
+        );
         assert!(result.is_err());
     }
 
@@ -1297,6 +1422,8 @@ mod tests {
         let _payload = encrypt_note_payload(
             &stealth.sender_secret,
             &address.view_pubkey,
+            &commitment,
+            &stealth.tx_pubkey,
             value,
             &blinding,
             &mut rng,

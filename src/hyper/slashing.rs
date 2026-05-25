@@ -95,7 +95,7 @@ pub fn verify_evidence_signatures(
         let payload = block
             .envelope
             .metadata
-            .signing_payload(block.signature.epoch);
+            .signing_payload(block.signature.epoch, &block.signature.signer_indices);
         crate::hyper::sig_verify::verify_hyperblock_signature(
             &payload,
             &block.signature.ecdsa_signature,

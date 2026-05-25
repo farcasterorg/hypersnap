@@ -154,6 +154,14 @@ mod tests {
             .filter(|&f| f <= seed_max_fid)
             .collect();
         let mut params = ScoringParams::default();
+        // Override the F009 + F013 defaults for this synthetic test:
+        // the small universe + sparse interactions would push real
+        // accounts below the new floors, hiding the property the
+        // test exercises (real account ranks above sybil). Production
+        // defaults stay tighter; this test only needs the relative
+        // ordering of trust + reward to hold.
+        params.crediter_trust_threshold = 0.0;
+        params.vouch_boost_min_vouchee_trust = 0.0;
         params
             .market_budgets
             .insert(proof_of_quality::WorkMarket::Growth, 1_000_000);

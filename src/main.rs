@@ -312,9 +312,29 @@ async fn start_servers(
         let http_service = HubHttpServiceImpl {
             service: service.clone(),
         };
+        // F031 fix: per-IP token-bucket rate limit on HTTP accept.
+        // No new deps; minimal in-process limiter keyed by source
+        // address. The CONFIGURABLE knobs are baked at compile time
+        // here (60 req/min/IP); a future patch can plumb these from
+        // `http_server_config` if operators need to tune.
+        let rate_limiter = std::sync::Arc::new(hypersnap::network::rate_limit::IpRateLimiter::new(
+            /* max_per_window = */ 60,
+            /* window = */ std::time::Duration::from_secs(60),
+        ));
         loop {
             match listener.accept().await {
-                Ok((stream, _)) => {
+                Ok((stream, peer_addr)) => {
+                    if !rate_limiter.allow(peer_addr.ip()) {
+                        // Refuse the connection without serving — the
+                        // peer either retries (rate-limited normal
+                        // client) or stops (flood).
+                        tracing::debug!(
+                            peer = %peer_addr,
+                            "rate limit: refusing HTTP accept"
+                        );
+                        drop(stream);
+                        continue;
+                    }
                     let io = TokioIo::new(stream);
                     let http_server_config = http_server_config.clone();
                     let service_clone = http_service.clone();
@@ -1286,6 +1306,7 @@ async fn build_hyper_handler(
         start_block: file_cfg.recovery_watcher.start_block,
         poll_interval: std::time::Duration::from_secs(file_cfg.recovery_watcher.poll_interval_secs),
         block_batch: file_cfg.recovery_watcher.block_batch,
+        finality_confirmations: file_cfg.recovery_watcher.finality_confirmations,
     };
     if !watcher_cfg.rpc_url.is_empty() {
         tokio::spawn(async move {

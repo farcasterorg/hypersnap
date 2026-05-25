@@ -88,6 +88,29 @@ fn rank_for(epoch: u64, digest: &B256, index: u8) -> B256 {
     keccak256(&buf)
 }
 
+/// Build a committee-selection seed that excludes proposer-grindable
+/// fields (audit finding F036). The proposer-grindable risk is
+/// hyperblock production specifically — the production digest is
+/// `keccak(signing_payload(epoch))` which mixes in mempool ordering,
+/// `missed_proposals`, and chosen anchor block/hash/timestamp.
+///
+/// Committee selection only needs a seed that is **uniformly random**
+/// and **pinned by consensus before block composition**. `(epoch,
+/// height, parent_hash)` qualifies: the proposer cannot choose any of
+/// the three (epoch comes from the resolver, height is the next slot,
+/// parent_hash is the canonical hash of the previously finalized block).
+/// Use this helper at the hyperblock-production site instead of the
+/// full signing_payload digest.
+pub fn committee_seed_for_block(epoch: u64, height: u64, parent_hash: &[u8]) -> B256 {
+    let mut buf = Vec::with_capacity(8 + 8 + parent_hash.len() + 32);
+    buf.extend_from_slice(b"hypersnap-committee-seed-block-v1:");
+    buf.extend_from_slice(&epoch.to_be_bytes());
+    buf.extend_from_slice(&height.to_be_bytes());
+    buf.extend_from_slice(&(parent_hash.len() as u32).to_be_bytes());
+    buf.extend_from_slice(parent_hash);
+    keccak256(&buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

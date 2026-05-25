@@ -128,12 +128,67 @@ impl BridgeBurnStore {
         &self,
         source_chain_id: u32,
     ) -> Result<Option<u64>, BridgeBurnStoreError> {
+        // F094 fix: prefer the persisted high-watermark. The
+        // drainable-queue walk (kept as a fallback for first-run
+        // boot before any watermark has been written) reports None
+        // once all observed burns are processed, which loses
+        // restart-resume state.
+        if let Some(w) = self.persisted_watermark(source_chain_id)? {
+            return Ok(Some(w));
+        }
         let burns = self.iter_all()?;
         Ok(burns
             .iter()
             .filter(|b| b.source_chain_id == source_chain_id)
             .map(|b| b.source_block_number)
             .max())
+    }
+
+    fn watermark_key(source_chain_id: u32) -> Vec<u8> {
+        let mut k = Vec::with_capacity(1 + 4);
+        k.push(crate::storage::constants::RootPrefix::HyperBridgeBurnWatermark as u8);
+        k.extend_from_slice(&source_chain_id.to_be_bytes());
+        k
+    }
+
+    /// Read the persisted high-watermark for `source_chain_id`. The
+    /// watermark is the highest L1 block the watcher has fully
+    /// scanned (events up to that block are either drained from the
+    /// queue or in transit to the consensus side).
+    pub fn persisted_watermark(
+        &self,
+        source_chain_id: u32,
+    ) -> Result<Option<u64>, BridgeBurnStoreError> {
+        match self
+            .db
+            .get(&Self::watermark_key(source_chain_id))
+            .map_err(crate::core::error::HubError::from)?
+        {
+            Some(bytes) if bytes.len() == 8 => {
+                let mut be = [0u8; 8];
+                be.copy_from_slice(&bytes);
+                Ok(Some(u64::from_be_bytes(be)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Advance the persisted high-watermark for `source_chain_id`.
+    /// Monotonic — refuses to move the watermark backwards even if
+    /// the caller passes a smaller value.
+    pub fn advance_watermark(
+        &self,
+        source_chain_id: u32,
+        block: u64,
+    ) -> Result<(), BridgeBurnStoreError> {
+        let current = self.persisted_watermark(source_chain_id)?.unwrap_or(0);
+        if block <= current {
+            return Ok(());
+        }
+        self.db
+            .put(&Self::watermark_key(source_chain_id), &block.to_be_bytes())
+            .map_err(crate::core::error::HubError::from)?;
+        Ok(())
     }
 }
 

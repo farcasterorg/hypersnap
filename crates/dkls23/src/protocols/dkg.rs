@@ -317,17 +317,23 @@ where
 {
     let mut committed_points: BTreeMap<u8, C::AffinePoint> = BTreeMap::new(); //The "public key fragments"
 
-    // Verify the proofs and gather the committed points.
+    // Verify the proofs and gather the committed points. F107: do NOT
+    // skip verification when `party_j.index == party_index`. The
+    // `index` field is attacker-controlled wire data (see F018/F114
+    // family) — a peer can plant a `ProofCommitment` claiming
+    // `index = verifier_index` and bypass the DLog check entirely,
+    // inserting an unverified "public-key fragment" into the
+    // verifier's own slot. The honest verifier's own proof is also
+    // delivered as an inbound message and is cheap to re-verify, so
+    // unconditional verification is the safe path.
     for party_j in proofs_commitments {
-        if party_j.index != party_index {
-            let verification =
-                DLogProof::<C>::decommit_verify(&party_j.proof, &party_j.commitment, session_id);
-            if !verification {
-                return Err(Abort::new(
-                    party_index,
-                    &format!("Proof from Party {} failed!", party_j.index),
-                ));
-            }
+        let verification =
+            DLogProof::<C>::decommit_verify(&party_j.proof, &party_j.commitment, session_id);
+        if !verification {
+            return Err(Abort::new(
+                party_index,
+                &format!("Proof from Party {} failed!", party_j.index),
+            ));
         }
         committed_points.insert(party_j.index, party_j.proof.point);
     }
