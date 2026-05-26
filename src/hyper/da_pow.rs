@@ -37,7 +37,10 @@ pub const CHALLENGES_PER_EPOCH: u32 = 100;
 /// CHALLENGE_RESPONSE_WINDOW` at apply time.
 pub const CHALLENGE_RESPONSE_WINDOW_BLOCKS: u64 = 25;
 /// First 16 bytes of the SHA-256 seed are the trie-key prefix.
-pub const CHALLENGE_PREFIX_BYTES: usize = 16;
+/// F135: the prefix length equals the trie's FID-key size
+/// (1 shard byte + 4 FID bytes = 5). The prior value of 16 was a
+/// truncated SHA-256 that never matched the structured trie layout.
+pub const CHALLENGE_PREFIX_BYTES: usize = 5;
 
 const DA_RESPONSE_DST: &[u8] = b"hypersnap-da-response-v2\x00\x00\x00\x00\x00\x00\x00\x00";
 const DA_CHALLENGE_DST: &[u8] = b"FIP-PoW-da-v2\x00\x00\x00";
@@ -66,16 +69,31 @@ pub enum DaPowValidationError {
     SignatureVerifyFailed,
 }
 
-/// Per-validator per-epoch per-index challenge prefix. Returns the
-/// first `CHALLENGE_PREFIX_BYTES` bytes of the SHA-256 seed; the
-/// validator must serve a trie key beginning with these bytes.
+/// Per-validator per-epoch per-index challenge prefix. Returns a
+/// valid TrieKey prefix that the validator must prove they store.
+///
+/// F135 fix: the prior implementation returned `SHA256(...)[0..16]`
+/// — a random 16-byte hash that never matches the trie's structured
+/// key layout (`[shard_byte, fid_u32_be, msg_type_byte, ...]`). The
+/// fix derives a deterministic FID from the hash seed and produces
+/// the real `TrieKey::for_fid(derived_fid)` prefix (5 bytes:
+/// shard_byte + fid_u32_be), which matches exactly when the
+/// validator stores any message for that FID.
+///
+/// `max_fid` is the highest registered FID at the epoch boundary;
+/// the derived FID is `1 + (seed_u32 % max_fid)` so it falls in
+/// the live FID space. Callers that don't know the universe should
+/// pass `u32::MAX` for uniform random behavior (lower hit rate but
+/// no false positives).
 pub fn derive_challenge_prefix(
     epoch_boundary_hash: &[u8],
     validator_pubkey: &[u8],
     epoch: u64,
     challenge_index: u32,
     chain_id: u64,
+    max_fid: u64,
 ) -> [u8; CHALLENGE_PREFIX_BYTES] {
+    use crate::storage::trie::merkle_trie::TrieKey;
     let mut h = Sha256::new();
     h.update(DA_CHALLENGE_DST);
     h.update(&chain_id.to_be_bytes());
@@ -84,8 +102,19 @@ pub fn derive_challenge_prefix(
     h.update(&epoch.to_be_bytes());
     h.update(&challenge_index.to_be_bytes());
     let full = h.finalize();
+    let mut seed_bytes = [0u8; 4];
+    seed_bytes.copy_from_slice(&full[..4]);
+    let seed_u32 = u32::from_be_bytes(seed_bytes);
+    let capped = if max_fid > 0 {
+        max_fid.min(u32::MAX as u64)
+    } else {
+        u32::MAX as u64
+    };
+    let derived_fid = 1 + (seed_u32 as u64 % capped);
+    let fid_key = TrieKey::for_fid(derived_fid);
     let mut out = [0u8; CHALLENGE_PREFIX_BYTES];
-    out.copy_from_slice(&full[..CHALLENGE_PREFIX_BYTES]);
+    let copy_len = fid_key.len().min(CHALLENGE_PREFIX_BYTES);
+    out[..copy_len].copy_from_slice(&fid_key[..copy_len]);
     out
 }
 
@@ -212,6 +241,7 @@ pub fn check_served_key_prefix(
     body: &proto::DaChallengeResponseBody,
     epoch_boundary_hash: &[u8],
     chain_id: u64,
+    max_fid: u64,
 ) -> Result<(), DaPowValidationError> {
     let derived = derive_challenge_prefix(
         epoch_boundary_hash,
@@ -219,6 +249,7 @@ pub fn check_served_key_prefix(
         body.epoch,
         body.challenge_index,
         chain_id,
+        max_fid,
     );
     if body.served_key.len() < CHALLENGE_PREFIX_BYTES
         || &body.served_key[..CHALLENGE_PREFIX_BYTES] != &derived[..]
@@ -272,6 +303,7 @@ mod tests {
             5,
             0,
             crate::hyper::DEFAULT_PROTOCOL_CHAIN_ID,
+            u32::MAX as u64,
         );
         let p1_again = derive_challenge_prefix(
             &boundary,
@@ -279,6 +311,7 @@ mod tests {
             5,
             0,
             crate::hyper::DEFAULT_PROTOCOL_CHAIN_ID,
+            u32::MAX as u64,
         );
         assert_eq!(p1, p1_again);
         // Different validator key → different prefix (in practice).
@@ -288,6 +321,7 @@ mod tests {
             5,
             0,
             crate::hyper::DEFAULT_PROTOCOL_CHAIN_ID,
+            u32::MAX as u64,
         );
         assert_ne!(p1, p2);
         // Different challenge_index → different prefix.
@@ -297,6 +331,7 @@ mod tests {
             5,
             1,
             crate::hyper::DEFAULT_PROTOCOL_CHAIN_ID,
+            u32::MAX as u64,
         );
         assert_ne!(p1, p1b);
         // Different epoch → different prefix.
@@ -306,6 +341,7 @@ mod tests {
             6,
             0,
             crate::hyper::DEFAULT_PROTOCOL_CHAIN_ID,
+            u32::MAX as u64,
         );
         assert_ne!(p1, p1c);
     }
@@ -357,17 +393,27 @@ mod tests {
         let sk = SigningKey::from_bytes(&[3u8; 32]);
         let pk = sk.verifying_key();
         let boundary = [0xabu8; 32];
+        let max_fid = u32::MAX as u64;
         let prefix = derive_challenge_prefix(
             &boundary,
             &pk.to_bytes(),
             5,
             0,
             crate::hyper::DEFAULT_PROTOCOL_CHAIN_ID,
+            max_fid,
         );
-        let mut key = [0u8; 32];
-        key[..CHALLENGE_PREFIX_BYTES].copy_from_slice(&prefix);
-        let body = build_signed(42, pk.to_bytes(), 5, 0, key, &sk);
-        check_served_key_prefix(&body, &boundary, crate::hyper::DEFAULT_PROTOCOL_CHAIN_ID).unwrap();
+        let mut key = prefix.to_vec();
+        key.resize(32, 0);
+        let mut key_arr = [0u8; 32];
+        key_arr[..key.len().min(32)].copy_from_slice(&key[..key.len().min(32)]);
+        let body = build_signed(42, pk.to_bytes(), 5, 0, key_arr, &sk);
+        check_served_key_prefix(
+            &body,
+            &boundary,
+            crate::hyper::DEFAULT_PROTOCOL_CHAIN_ID,
+            max_fid,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -376,9 +422,13 @@ mod tests {
         let pk = sk.verifying_key();
         let boundary = [0xabu8; 32];
         let body = build_signed(42, pk.to_bytes(), 5, 0, [0u8; 32], &sk);
-        // Key is all-zero; derived prefix is almost certainly not.
         assert_eq!(
-            check_served_key_prefix(&body, &boundary, crate::hyper::DEFAULT_PROTOCOL_CHAIN_ID),
+            check_served_key_prefix(
+                &body,
+                &boundary,
+                crate::hyper::DEFAULT_PROTOCOL_CHAIN_ID,
+                u32::MAX as u64
+            ),
             Err(DaPowValidationError::PrefixMismatch)
         );
     }

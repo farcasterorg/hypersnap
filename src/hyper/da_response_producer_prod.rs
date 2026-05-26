@@ -15,6 +15,11 @@ pub struct BlockEngineDaResponseProducer {
     validator_pubkey: Vec<u8>,
     fid: u64,
     chain_id: u64,
+    /// F135: highest registered FID at the epoch boundary. Passed
+    /// to `derive_challenge_prefix` so the derived FID falls within
+    /// the live FID space. Set by the supervisor when constructing
+    /// the producer.
+    pub max_fid: u64,
 }
 
 impl BlockEngineDaResponseProducer {
@@ -24,6 +29,7 @@ impl BlockEngineDaResponseProducer {
         validator_pubkey: Vec<u8>,
         fid: u64,
         chain_id: u64,
+        max_fid: u64,
     ) -> Self {
         Self {
             engine,
@@ -31,6 +37,7 @@ impl BlockEngineDaResponseProducer {
             validator_pubkey,
             fid,
             chain_id,
+            max_fid,
         }
     }
 }
@@ -51,6 +58,7 @@ impl DaResponseProducer for BlockEngineDaResponseProducer {
                     &self.validator_pubkey,
                     self.fid,
                     self.chain_id,
+                    self.max_fid,
                     &self.signer_sk,
                     |prefix| {
                         let matches = engine.trie_values_with_prefix(&ctx, prefix);

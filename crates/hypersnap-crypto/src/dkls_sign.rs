@@ -277,6 +277,19 @@ impl DklsSignCoordinator {
                 if receiver != self.party.party_index {
                     return Ok(());
                 }
+                // F108: cross-check inner parties.sender against the
+                // outer wire sender. Without this, a validator can
+                // inject a Phase1Send naming `parties.sender = Q`
+                // (for some innocent party Q) and the downstream
+                // `sign_phase2` blame string names Q instead of the
+                // actual attacker. Drop mismatches silently — the
+                // honest counterparty will retransmit.
+                if transmit.parties.sender != sender {
+                    return Ok(());
+                }
+                if !self.signing_committee.contains(&sender) {
+                    return Ok(());
+                }
                 self.received_1to2.insert(sender, transmit);
             }
             DklsSignRoundMessage::Phase2Send {
@@ -287,9 +300,19 @@ impl DklsSignCoordinator {
                 if receiver != self.party.party_index {
                     return Ok(());
                 }
+                // F108: same inner/outer cross-check for Phase2.
+                if transmit.parties.sender != sender {
+                    return Ok(());
+                }
+                if !self.signing_committee.contains(&sender) {
+                    return Ok(());
+                }
                 self.received_2to3.insert(sender, transmit);
             }
             DklsSignRoundMessage::Phase3Broadcast { sender, broadcast } => {
+                if !self.signing_committee.contains(&sender) {
+                    return Ok(());
+                }
                 self.broadcasts_3to4.insert(sender, broadcast);
             }
         }

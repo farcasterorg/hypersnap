@@ -250,17 +250,21 @@ impl BlockProductionScheduler {
 
         loop {
             ticker.tick().await;
-            // Resolve current epoch + active set via the actor.
-            let epoch = match client.current_epoch().await {
-                Ok(e) => e,
-                Err(_) => break, // actor closed
-            };
+            // F004: snapshot the anchor FIRST, then derive epoch +
+            // active set from it — this ensures all three values
+            // belong to the same point in time. Previously, epoch
+            // was resolved via the actor (which could advance between
+            // reads), and the anchor was read AFTER the active set,
+            // so a refresh tick between the two changed which
+            // validators gate the decision vs. which anchor the
+            // produced block commits to.
+            let anchor = latest_anchor.lock().await.clone();
+            let epoch = crate::hyper::epoch::epoch_for(anchor.block);
             let active = match client.active_validators(epoch, true).await {
                 Ok(Ok(a)) => a,
-                _ => continue, // transient — try again next tick
+                _ => continue,
             };
             let validators: Vec<Vec<u8>> = active.keys().cloned().collect();
-            let anchor = latest_anchor.lock().await.clone();
             let mut g = ctx.lock().await;
             g.anchor_block = anchor.block;
             g.anchor_block_hash = anchor.hash;

@@ -101,6 +101,21 @@ fn rank_for(epoch: u64, digest: &B256, index: u8) -> B256 {
 /// parent_hash is the canonical hash of the previously finalized block).
 /// Use this helper at the hyperblock-production site instead of the
 /// full signing_payload digest.
+/// F036: non-grindable per-epoch committee seed for non-block
+/// ceremonies (reward issuance, trust snapshot, lock-root update,
+/// inbound-burn, DA-PoW seed). These are triggered at epoch
+/// boundaries where the epoch itself is pinned by consensus. A
+/// `message_tag` domain-separates by ceremony type so the same
+/// epoch doesn't produce the same committee for every ceremony.
+pub fn committee_seed_for_epoch(epoch: u64, message_tag: &[u8]) -> B256 {
+    let mut buf = Vec::with_capacity(40 + message_tag.len());
+    buf.extend_from_slice(b"hypersnap-committee-seed-epoch-v1:");
+    buf.extend_from_slice(&epoch.to_be_bytes());
+    buf.extend_from_slice(&(message_tag.len() as u32).to_be_bytes());
+    buf.extend_from_slice(message_tag);
+    keccak256(&buf)
+}
+
 pub fn committee_seed_for_block(epoch: u64, height: u64, parent_hash: &[u8]) -> B256 {
     let mut buf = Vec::with_capacity(8 + 8 + parent_hash.len() + 32);
     buf.extend_from_slice(b"hypersnap-committee-seed-block-v1:");

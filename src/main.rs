@@ -272,7 +272,14 @@ async fn start_servers(
 
     tokio::spawn(async move {
         info!(grpc_addr = grpc_addr, "GrpcService listening",);
-        let mut server = Server::builder().add_service(HubServiceServer::from_arc(grpc_service));
+        // F031: bound concurrent RPCs per connection. The full per-IP
+        // token-bucket rate limiter requires a custom tower Layer that
+        // extracts `ConnectInfo<SocketAddr>` from the request; the
+        // concurrency_limit bounds resource consumption from any single
+        // connection as a first defense.
+        let mut server = Server::builder()
+            .concurrency_limit_per_connection(64)
+            .add_service(HubServiceServer::from_arc(grpc_service));
 
         if admin_service.enabled() {
             let admin_service = AdminServiceServer::new(admin_service);
@@ -340,9 +347,15 @@ async fn start_servers(
                     let service_clone = http_service.clone();
                     let api = api_handler.clone();
                     let hyper_h = hyper_handler_slot_for_http.read().await.clone();
+                    // F031: clone the rate limiter + capture the peer
+                    // IP so each request on this connection is checked,
+                    // not just the accept.
+                    let rl = rate_limiter.clone();
+                    let peer_ip = peer_addr.ip();
                     tokio::spawn(async move {
                         let mut router =
-                            hypersnap::network::http_server::Router::new(service_clone);
+                            hypersnap::network::http_server::Router::new(service_clone)
+                                .with_rate_limiter(rl, peer_ip);
                         if let Some(handler) = api {
                             router = router.with_api_handler(handler);
                         }

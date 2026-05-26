@@ -375,6 +375,6 @@ async fn test_hyper_envelope_messages_are_ignored_on_receive() {
     .encode_to_vec();
 
     assert!(gossip
-        .map_gossip_bytes_to_system_message(PeerId::random(), bytes)
+        .map_gossip_bytes_to_system_message(PeerId::random(), bytes, None)
         .is_none());
 }

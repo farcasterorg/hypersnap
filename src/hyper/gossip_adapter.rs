@@ -435,9 +435,11 @@ mod tests {
         let mut b = sample_block();
         a.envelope.metadata.hyper_state_root = vec![0xaa; 48];
         b.envelope.metadata.hyper_state_root = vec![0xbb; 48];
+        let b_epoch = b.signature.epoch;
 
         let ev = ConflictingBlocksEvidence {
-            epoch: a.signature.epoch,
+            epoch_a: a.signature.epoch,
+            epoch_b: b_epoch,
             canonical_block_id: a.envelope.metadata.canonical_block_id,
             block_a_hash: [0u8; 32],
             block_b_hash: [0u8; 32],

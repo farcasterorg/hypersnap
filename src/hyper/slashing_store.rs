@@ -50,8 +50,12 @@ impl SlashingEvidenceStore {
     pub fn record(&self, ev: &ConflictingBlocksEvidence) -> Result<(), SlashingStoreError> {
         let key = Self::make_key(ev);
         let exists = self.db.get(&key).map_err(HubError::from)?.is_some();
+        // F026: use the lower of the two epoch tags for the height-
+        // scoped cap (cross-epoch evidence is rare; either epoch's
+        // bound is fine for counting purposes).
+        let cap_epoch = ev.epoch_a.min(ev.epoch_b);
         if !exists
-            && self.count_for_height(ev.epoch, ev.canonical_block_id)?
+            && self.count_for_height(cap_epoch, ev.canonical_block_id)?
                 >= MAX_DISTINCT_CONFLICTS_PER_HEIGHT
         {
             return Ok(());
@@ -154,7 +158,9 @@ impl SlashingEvidenceStore {
         };
         let mut k = Vec::with_capacity(1 + 8 + 8 + 32 + 32);
         k.push(RootPrefix::HyperSlashingEvidence as u8);
-        k.extend_from_slice(&ev.epoch.to_be_bytes());
+        // F026: store under the lower epoch so same-height evidence
+        // from different epoch pairs still keys deterministically.
+        k.extend_from_slice(&ev.epoch_a.min(ev.epoch_b).to_be_bytes());
         k.extend_from_slice(&ev.canonical_block_id.to_be_bytes());
         k.extend_from_slice(&lo);
         k.extend_from_slice(&hi);
@@ -241,7 +247,8 @@ mod tests {
         let mut hash_b = [0u8; 32];
         hash_b[0] = root_b;
         ConflictingBlocksEvidence {
-            epoch,
+            epoch_a: epoch,
+            epoch_b: epoch,
             canonical_block_id: height,
             block_a_hash: hash_a,
             block_b_hash: hash_b,

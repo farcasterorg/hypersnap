@@ -40,6 +40,8 @@ pub enum RoutingError {
     FeeDeposit(String),
     #[error("confidential transfer rejected: {0}")]
     Transfer(String),
+    #[error("transparent lock rejected: {0}")]
+    Lock(String),
     #[error("confidential lock rejected: {0}")]
     ConfidentialLock(String),
     #[error("shield (transparent\u{2192}confidential) rejected: {0}")]
@@ -128,9 +130,15 @@ impl HyperRouter {
     /// the caller may log and continue.
     pub fn route_inbound(&mut self, msg: proto::HyperMessage) -> Result<(), RoutingError> {
         match msg.body.ok_or(RoutingError::MissingBody)? {
-            proto::hyper_message::Body::Lock(event) => {
-                self.mempool.submit_lock(event)?;
-                Ok(())
+            proto::hyper_message::Body::Lock(_) => {
+                // F058 cleanup: the transparent HyperLockEvent path
+                // is dead code — the production bridge uses
+                // ConfidentialLockBody. Admitting Lock events would
+                // let any gossip peer insert attacker-chosen leaves
+                // into the verkle tree (state-bloat/DoS). Reject.
+                Err(RoutingError::Lock(
+                    "transparent lock path removed; use ConfidentialLockBody".to_string(),
+                ))
             }
             proto::hyper_message::Body::Transfer(_) => {
                 // Confidential transfers must be admitted through

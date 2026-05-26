@@ -81,8 +81,13 @@ impl NotificationStore {
         let primary_key = make_primary_key(app_id, fid);
         let mut txn = RocksDbTransactionBatch::new();
 
-        // If a previous record exists, drop its URL-grouping entry first.
+        // If a previous record exists, drop its URL-grouping entry
+        // first. F158(a): also enforce monotonic `updated_at` so a
+        // replayed stale envelope can't overwrite a newer URL/token.
         if let Some(prev) = self.get(app_id, fid)? {
+            if prev.updated_at > details.updated_at {
+                return Ok(());
+            }
             if prev.url != details.url {
                 txn.delete(make_url_index_key(app_id, &prev.url, fid));
             }

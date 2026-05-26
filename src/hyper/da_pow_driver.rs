@@ -27,6 +27,7 @@ pub fn produce_da_response_for_index(
     fid: u64,
     challenge_index: u32,
     chain_id: u64,
+    max_fid: u64,
     signer_sk: &SigningKey,
     trie: &mut MerkleTrie,
     db: &RocksDB,
@@ -38,6 +39,7 @@ pub fn produce_da_response_for_index(
         fid,
         challenge_index,
         chain_id,
+        max_fid,
         signer_sk,
         |prefix| {
             trie.get_all_values(&Context::new(), db, prefix)
@@ -56,6 +58,7 @@ pub fn produce_da_response_for_index_via<F>(
     fid: u64,
     challenge_index: u32,
     chain_id: u64,
+    max_fid: u64,
     signer_sk: &SigningKey,
     mut lookup: F,
 ) -> Option<proto::DaChallengeResponseBody>
@@ -71,6 +74,7 @@ where
         epoch,
         challenge_index,
         chain_id,
+        max_fid,
     );
     let served = lookup(&prefix)?;
     // F135 fix: serve the natural-length trie key, not a 32-byte
@@ -109,6 +113,7 @@ pub fn produce_da_responses(
     validator_pubkey: &[u8],
     fid: u64,
     chain_id: u64,
+    max_fid: u64,
     signer_sk: &SigningKey,
     trie: &mut MerkleTrie,
     db: &RocksDB,
@@ -119,6 +124,7 @@ pub fn produce_da_responses(
         validator_pubkey,
         fid,
         chain_id,
+        max_fid,
         signer_sk,
         |prefix| {
             trie.get_all_values(&Context::new(), db, prefix)
@@ -135,6 +141,7 @@ pub fn produce_da_responses_via<F>(
     validator_pubkey: &[u8],
     fid: u64,
     chain_id: u64,
+    max_fid: u64,
     signer_sk: &SigningKey,
     mut lookup: F,
 ) -> Vec<proto::DaChallengeResponseBody>
@@ -150,6 +157,7 @@ where
             fid,
             i,
             chain_id,
+            max_fid,
             signer_sk,
             &mut lookup,
         ) {
@@ -189,6 +197,7 @@ mod tests {
             &validator_pk,
             42,
             crate::hyper::DEFAULT_PROTOCOL_CHAIN_ID,
+            u32::MAX as u64,
             &sk,
             &mut trie,
             &db,
@@ -206,18 +215,23 @@ mod tests {
             .verifying_key()
             .to_bytes();
         let boundary_hash = [0xabu8; 32];
+        let max_fid = u32::MAX as u64;
         let prefix = derive_challenge_prefix(
             &boundary_hash,
             &validator_pk,
             5,
             0,
             crate::hyper::DEFAULT_PROTOCOL_CHAIN_ID,
+            max_fid,
         );
-        let mut key_a = [0u8; 32];
-        let mut key_b = [0u8; 32];
-        key_a[..CHALLENGE_PREFIX_BYTES].copy_from_slice(&prefix);
-        key_b[..CHALLENGE_PREFIX_BYTES].copy_from_slice(&prefix);
-        key_b[CHALLENGE_PREFIX_BYTES] = 0x80;
+        // Build a trie key that starts with the derived prefix.
+        let mut key_a = vec![0u8; 32];
+        let plen = prefix.len().min(key_a.len());
+        key_a[..plen].copy_from_slice(&prefix[..plen]);
+        let mut key_b = key_a.clone();
+        if plen < key_b.len() {
+            key_b[plen] = 0x80;
+        }
         let mut txn = RocksDbTransactionBatch::new();
         trie.insert(&Context::new(), &db, &mut txn, vec![&key_a[..], &key_b[..]])
             .unwrap();
@@ -228,6 +242,7 @@ mod tests {
             42,
             0,
             crate::hyper::DEFAULT_PROTOCOL_CHAIN_ID,
+            max_fid,
             &sk,
             &mut trie,
             &db,

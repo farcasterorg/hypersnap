@@ -287,7 +287,8 @@ mod tests {
         let block_a = mk(0xaa);
         let block_b = mk(0xbb);
         let evidence = ConflictingBlocksEvidence {
-            epoch: 9,
+            epoch_a: 9,
+            epoch_b: 9,
             canonical_block_id: 17,
             block_a_hash: crate::hyper::chain::hyper_block_hash(&block_a),
             block_b_hash: crate::hyper::chain::hyper_block_hash(&block_b),

@@ -3269,6 +3269,13 @@ pub struct Router<Service: HubService> {
     service: Arc<HubHttpServiceImpl<Service>>,
     api_handler: Option<ApiHttpHandler>,
     hyper_handler: Option<crate::hyper::http_handler::HyperHttpHandler>,
+    /// F031: per-request rate limiter. When set, every request
+    /// (not just the initial TCP accept) is gated by the limiter
+    /// before any work. Keeps keep-alive pipelining bounded.
+    rate_limiter: Option<(
+        std::sync::Arc<crate::network::rate_limit::IpRateLimiter>,
+        std::net::IpAddr,
+    )>,
 }
 
 impl<Service> Router<Service>
@@ -3280,7 +3287,21 @@ where
             service: Arc::new(service),
             api_handler: None,
             hyper_handler: None,
+            rate_limiter: None,
         }
+    }
+
+    /// F031: attach a per-request rate limiter for this peer IP. The
+    /// limiter is consulted at the top of every `handle()` call, not
+    /// just at TCP accept — so keep-alive/pipelined requests on a
+    /// single connection are also bounded.
+    pub fn with_rate_limiter(
+        mut self,
+        limiter: std::sync::Arc<crate::network::rate_limit::IpRateLimiter>,
+        peer_ip: std::net::IpAddr,
+    ) -> Self {
+        self.rate_limiter = Some((limiter, peer_ip));
+        self
     }
 
     /// Set the API handler for v2 API endpoints.
@@ -3304,6 +3325,16 @@ where
         req: Request<hyper::body::Incoming>,
         config: &Config,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        // F031: per-request rate check. Gates keep-alive and
+        // pipelined requests, not just TCP accepts.
+        if let Some((ref limiter, peer_ip)) = self.rate_limiter {
+            if !limiter.allow(peer_ip) {
+                return Ok(Response::builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .body(Full::new(Bytes::from_static(b"rate limit exceeded")).boxed())
+                    .unwrap());
+            }
+        }
         // CORS preflight short-circuit. Browsers send `OPTIONS` before
         // any cross-origin POST with a non-simple `Content-Type`
         // (e.g. `application/json`) or any custom header like

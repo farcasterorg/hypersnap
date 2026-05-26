@@ -1520,6 +1520,28 @@ impl HyperActor {
             }
             HyperActorEvent::StartDklsSign { driver } => {
                 let mut driver = *driver;
+                // F023(b) fix: don't silently clobber an in-flight
+                // signing ceremony. A block-production ceremony that
+                // overwrites a scoring/lock-root/burn ceremony loses
+                // the latter's state and the epoch's reward/bridge
+                // updates never land. Refuse the new ceremony if one
+                // is already active at the same epoch; if at a
+                // different epoch, the old ceremony is stale and we
+                // replace it with a warning.
+                if let Some(active) = self.active_dkls_sign.as_ref() {
+                    if active.epoch() == driver.epoch() {
+                        tracing::warn!(
+                            epoch = driver.epoch(),
+                            "StartDklsSign for already-active sign ceremony — keeping existing"
+                        );
+                        return Ok(());
+                    }
+                    tracing::warn!(
+                        active_epoch = active.epoch(),
+                        new_epoch = driver.epoch(),
+                        "StartDklsSign for different epoch; replacing stale ceremony"
+                    );
+                }
                 driver.start()?;
                 self.flush_dkls_sign_outbound(&mut driver).await;
                 self.active_dkls_sign = Some(driver);
@@ -1554,25 +1576,20 @@ impl HyperActor {
                 } else {
                     (evidence.block_b_hash, evidence.block_a_hash)
                 };
-                let dedupe_key = (evidence.epoch, lo, hi);
+                // F026: dedupe key uses both epochs so cross-epoch
+                // evidence at the same (lo, hi) pair is distinct from
+                // same-epoch evidence (unlikely but defensible).
+                let dedupe_key = (evidence.epoch_a.min(evidence.epoch_b), lo, hi);
                 if self.recent_evidence.contains(&dedupe_key) {
-                    // Gossip replay — store + downstream readers
-                    // already have this pair. Drop before sig-verify.
                     self.metric_count("hyper.evidence.dropped_replay", 1);
                     return Ok(());
                 }
-                // Authenticate both blocks under the conflict epoch's
-                // group key before persisting. Without this, any peer
-                // can submit two unsigned blocks naming arbitrary
-                // `signer_indices` and slash arbitrary validators via
-                // the next-epoch active-set filter.
-                let group_address = self
-                    .runtime
-                    .dkls_group_address_for_epoch(evidence.epoch)
-                    .ok_or(EvidenceError::UnknownEpochGroupKey {
-                        epoch: evidence.epoch,
-                    })?;
-                verify_evidence_signatures(&evidence, &group_address)?;
+                // F026: verify each evidence block against its own
+                // epoch's group key — cross-epoch equivocation is now
+                // a valid slashing condition.
+                verify_evidence_signatures(&evidence, |epoch| {
+                    self.runtime.dkls_group_address_for_epoch(epoch)
+                })?;
                 if let Err(e) = self.runtime.record_evidence(&evidence) {
                     tracing::warn!("failed to persist slashing evidence: {}", e);
                 }
@@ -2675,6 +2692,20 @@ impl HyperActor {
                 .clone();
             self.finalize_dkls_signature(epoch, digest, signature).await;
         } else {
+            // F023(b): if an existing sign ceremony is in flight
+            // for a different digest, the new one takes priority
+            // (block production outranks scoring/lock-root) — but
+            // log so operator knows the old ceremony was dropped.
+            if let Some(existing) = self.active_dkls_sign.as_ref() {
+                if *existing.coordinator.digest() != digest {
+                    tracing::warn!(
+                        epoch,
+                        old_digest = hex::encode(existing.coordinator.digest()),
+                        new_digest = hex::encode(digest),
+                        "block-production sign ceremony replaces existing sign ceremony"
+                    );
+                }
+            }
             self.active_dkls_sign = Some(driver);
         }
         Ok(())
@@ -2987,9 +3018,13 @@ impl HyperActor {
         for iss in unsigned.issuances {
             let payload = crate::hyper::rewards::issuance_signing_payload(&iss);
             let digest = alloy_primitives::keccak256(&payload);
+            // F036: non-grindable per-epoch seed, not the proposer-
+            // influenced signing_payload digest.
+            let seed =
+                crate::hyper::dkls_committee::committee_seed_for_epoch(epoch, b"reward-issuance");
             let committee = crate::hyper::dkls_committee::select_signing_committee(
                 epoch,
-                &digest,
+                &seed,
                 parameters.share_count,
                 parameters.threshold,
             )
@@ -3011,9 +3046,10 @@ impl HyperActor {
         let snap = unsigned.trust_snapshot;
         let payload = crate::hyper::rewards::trust_snapshot_signing_payload(&snap);
         let digest = alloy_primitives::keccak256(&payload);
+        let seed = crate::hyper::dkls_committee::committee_seed_for_epoch(epoch, b"trust-snapshot");
         let committee = crate::hyper::dkls_committee::select_signing_committee(
             epoch,
-            &digest,
+            &seed,
             parameters.share_count,
             parameters.threshold,
         )
@@ -3145,9 +3181,11 @@ impl HyperActor {
                 self.runtime.protocol_chain_id,
             );
             let digest = alloy_primitives::keccak256(&payload);
+            let seed =
+                crate::hyper::dkls_committee::committee_seed_for_epoch(epoch, b"inbound-burn");
             let committee = crate::hyper::dkls_committee::select_signing_committee(
                 epoch,
-                &digest,
+                &seed,
                 parameters.share_count,
                 parameters.threshold,
             )
@@ -3211,9 +3249,11 @@ impl HyperActor {
             root,
         );
         let digest = alloy_primitives::keccak256(&payload);
+        let seed =
+            crate::hyper::dkls_committee::committee_seed_for_epoch(epoch, b"lock-merkle-root");
         let committee = crate::hyper::dkls_committee::select_signing_committee(
             epoch,
-            &digest,
+            &seed,
             parameters.share_count,
             parameters.threshold,
         )
@@ -3282,9 +3322,11 @@ impl HyperActor {
             self.runtime.protocol_chain_id,
         );
         let digest = alloy_primitives::keccak256(&payload);
+        let seed =
+            crate::hyper::dkls_committee::committee_seed_for_epoch(signer_epoch, b"da-epoch-seed");
         let committee = crate::hyper::dkls_committee::select_signing_committee(
             signer_epoch,
-            &digest,
+            &seed,
             parameters.share_count,
             parameters.threshold,
         )
@@ -4090,7 +4132,8 @@ mod tests {
         };
         runtime
             .record_evidence(&ConflictingBlocksEvidence {
-                epoch: 4,
+                epoch_a: 4,
+                epoch_b: 4,
                 canonical_block_id: 1,
                 block_a_hash: [0xaa; 32],
                 block_b_hash: [0xbb; 32],
@@ -4235,7 +4278,8 @@ mod tests {
         };
         runtime
             .record_evidence(&ConflictingBlocksEvidence {
-                epoch: 0,
+                epoch_a: 0,
+                epoch_b: 0,
                 canonical_block_id: 1,
                 block_a_hash: [0xaa; 32],
                 block_b_hash: [0xbb; 32],

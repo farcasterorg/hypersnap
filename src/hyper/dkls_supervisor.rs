@@ -122,16 +122,31 @@ pub async fn run(
             }
         }
 
-        let already_dispatched_for_next = dispatched
-            .as_ref()
-            .map(|d| d.epoch == next_epoch)
-            .unwrap_or(false);
-
-        if blocks_until_next <= inputs.start_lead_blocks && !already_dispatched_for_next {
-            match build_driver(&inputs, &client, next_epoch).await {
+        // F024: if the anchor jumped past the lead window for one
+        // or more epochs, catch up by dispatching DKGs for every
+        // undispatched epoch in the gap. Without this, a single
+        // anchor jump from epoch N to epoch N+K leaves epochs
+        // N+1..N+K-1 without group keys, and blocks for those
+        // epochs can never be signed (permanent gap in the chain).
+        let last_dispatched_epoch = dispatched.as_ref().map(|d| d.epoch).unwrap_or(0);
+        let first_undispatched = last_dispatched_epoch.max(current_epoch) + 1;
+        for target in first_undispatched..=next_epoch {
+            let target_start = target * EPOCH_LENGTH;
+            let blocks_until_target = target_start.saturating_sub(anchor);
+            if blocks_until_target > inputs.start_lead_blocks {
+                break;
+            }
+            let already = dispatched
+                .as_ref()
+                .map(|d| d.epoch == target)
+                .unwrap_or(false);
+            if already {
+                continue;
+            }
+            match build_driver(&inputs, &client, target).await {
                 Ok(driver) => {
                     info!(
-                        target_epoch = next_epoch,
+                        target_epoch = target,
                         own_idx = driver.party_index(),
                         "starting DKLS ceremony"
                     );
@@ -145,12 +160,12 @@ pub async fn run(
                         break;
                     }
                     dispatched = Some(Dispatched {
-                        epoch: next_epoch,
+                        epoch: target,
                         ticks_since: 0,
                     });
                 }
                 Err(e) => {
-                    warn!(target_epoch = next_epoch, "skip StartDkls: {}", e);
+                    warn!(target_epoch = target, "skip StartDkls: {}", e);
                 }
             }
         }

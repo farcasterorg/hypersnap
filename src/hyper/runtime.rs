@@ -1224,19 +1224,29 @@ impl HyperRuntime {
     /// "registry-unknown" and decide policy (drop or accept). Default
     /// `peer_id_to_party_index_for_epoch` returns the full map for
     /// reverse lookup.
+    /// F018 residual fix: index into the FULL active set (same
+    /// ordering `compute_active_set` uses for committee enumeration),
+    /// then look up the peer-id for that validator_key in the
+    /// peer-ids map. The prior implementation indexed into
+    /// `compute_active_peer_ids` directly, which omits validators
+    /// without a registered peer-id — during gradual rollout this
+    /// smaller map caused `nth(party_index - 1)` to land on the
+    /// wrong validator, false-rejecting honest frames.
     pub fn peer_id_for_party(&self, epoch: u64, party_index: u8) -> Option<Vec<u8>> {
         if party_index == 0 {
             return None;
         }
+        let active = self
+            .validator_registry
+            .compute_active_set(epoch, &self.bootstrap_validators)
+            .ok()?;
+        let target = (party_index as usize).checked_sub(1)?;
+        let (validator_key, _) = active.iter().nth(target)?;
         let peer_ids = self
             .validator_registry
             .compute_active_peer_ids(epoch)
             .ok()?;
-        // Same canonical ordering: BTreeMap iterates by validator_key
-        // and DKLS committees number parties 1..=N over that order.
-        let target = (party_index as usize).checked_sub(1)?;
-        let (_, peer_id) = peer_ids.iter().nth(target)?;
-        Some(peer_id.clone())
+        peer_ids.get(validator_key).cloned()
     }
 
     /// F018: build the per-epoch reverse map
@@ -3311,7 +3321,14 @@ impl HyperRuntime {
             ))
         })?;
 
-        check_served_key_prefix(body, &boundary_hash, self.protocol_chain_id)
+        // F135: pass max_fid so derive_challenge_prefix produces a
+        // trie-key-shaped prefix matching the stored FID layout.
+        // seed_max_fid is the EigenTrust cohort cap; it's a
+        // conservative upper bound for the FID keyspace that
+        // actually has stored data. A more precise count would
+        // require a full OnchainEventStore scan.
+        let max_fid = self.seed_max_fid;
+        check_served_key_prefix(body, &boundary_hash, self.protocol_chain_id, max_fid)
             .map_err(|e| RewardError::Custom(format!("DA response prefix: {}", e)))?;
 
         if let Some(lookup) = self.da_trie_lookup.as_ref() {
@@ -9399,9 +9416,11 @@ mod tests {
             epoch,
             challenge_index,
             crate::hyper::DEFAULT_PROTOCOL_CHAIN_ID,
+            u32::MAX as u64,
         );
         let mut served_key = [0u8; 32];
-        served_key[..CHALLENGE_PREFIX_BYTES].copy_from_slice(&prefix);
+        let plen = prefix.len().min(32);
+        served_key[..plen].copy_from_slice(&prefix[..plen]);
         sign_da_response(
             fid,
             validator_pubkey,

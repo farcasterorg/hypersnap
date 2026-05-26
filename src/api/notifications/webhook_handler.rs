@@ -139,14 +139,17 @@ impl NotificationWebhookHandler {
         };
 
         // F158: enforce a per-envelope nullifier keyed on
-        // `(fid, blake3(payload_bytes))`. The signed JFS envelope
-        // does not carry `app_id`, so a captured envelope sent by
-        // Alice's client to `app_id_A` can otherwise be re-POSTed
-        // against attacker-owned `app_id_B` and the signature
-        // still verifies. Blocking re-use here prevents cross-app
-        // replay; benign retries against the original app are
-        // idempotent.
-        let payload_hash: [u8; 32] = *blake3::hash(&body).as_bytes();
+        // `(fid, blake3(signing_input))`. Hash the JFS-canonical
+        // `payload_bytes` (the bytes the signer actually signed),
+        // NOT the raw HTTP body — raw JSON has whitespace/key-order
+        // variance that would let an attacker re-encode the same
+        // payload with different framing and bypass the nullifier.
+        // Cross-deployment replay (different hypersnap instance,
+        // different chain-id) is an upstream Farcaster spec gap:
+        // the signed payload contains no domain binding. Documented
+        // as out-of-scope until the spec adds `app_id` + `domain`
+        // to the wire format.
+        let payload_hash: [u8; 32] = *blake3::hash(&verified.payload_bytes).as_bytes();
         if let Err(e) = self
             .store
             .claim_envelope(&app_id, verified.fid, &payload_hash)

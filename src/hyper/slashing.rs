@@ -16,16 +16,14 @@ use alloy_primitives::Address;
 
 #[derive(Clone, Debug)]
 pub struct ConflictingBlocksEvidence {
-    pub epoch: u64,
+    /// F026: blocks may carry different epoch tags (cross-epoch
+    /// equivocation). Each block is verified against its own epoch's
+    /// group key in `verify_evidence_signatures`.
+    pub epoch_a: u64,
+    pub epoch_b: u64,
     pub canonical_block_id: u64,
     pub block_a_hash: [u8; 32],
     pub block_b_hash: [u8; 32],
-    /// Both blocks must carry a valid threshold signature against the
-    /// epoch's group key. `detect_conflicting_blocks` does **not**
-    /// verify signatures — that gate lives at the gossip ingest path
-    /// in `HyperActor::dispatch::InboundEvidence` (see
-    /// `verify_evidence_signatures`). Constructing this struct
-    /// directly bypasses that gate.
     pub block_a: Box<HyperBlock>,
     pub block_b: Box<HyperBlock>,
 }
@@ -34,8 +32,6 @@ pub struct ConflictingBlocksEvidence {
 pub enum EvidenceError {
     #[error("blocks are at different heights ({a} vs {b}); not a conflict")]
     DifferentHeights { a: u64, b: u64 },
-    #[error("blocks are at different epochs ({a} vs {b}); not a conflict for one epoch's set")]
-    DifferentEpochs { a: u64, b: u64 },
     #[error("blocks are byte-identical; no conflict")]
     SameBlock,
     #[error("no group key known for evidence epoch {epoch}")]
@@ -48,6 +44,11 @@ pub enum EvidenceError {
 ///
 /// Returns `Ok(evidence)` if the two blocks form a valid conflict;
 /// `Err` if they don't.
+/// F026: accepts cross-epoch conflicts. A validator holding shares
+/// for two consecutive epochs can sign conflicting blocks at the
+/// same `canonical_block_id` with different epoch tags. Without
+/// accepting this case, `DifferentEpochs` drops the evidence and
+/// the equivocator evades slashing.
 pub fn detect_conflicting_blocks(
     a: &HyperBlock,
     b: &HyperBlock,
@@ -58,12 +59,6 @@ pub fn detect_conflicting_blocks(
         return Err(EvidenceError::DifferentHeights { a: h_a, b: h_b });
     }
 
-    let e_a = a.signature.epoch;
-    let e_b = b.signature.epoch;
-    if e_a != e_b {
-        return Err(EvidenceError::DifferentEpochs { a: e_a, b: e_b });
-    }
-
     let hash_a = hyper_block_hash(a);
     let hash_b = hyper_block_hash(b);
     if hash_a == hash_b {
@@ -71,7 +66,8 @@ pub fn detect_conflicting_blocks(
     }
 
     Ok(ConflictingBlocksEvidence {
-        epoch: e_a,
+        epoch_a: a.signature.epoch,
+        epoch_b: b.signature.epoch,
         canonical_block_id: h_a,
         block_a_hash: hash_a,
         block_b_hash: hash_b,
@@ -86,12 +82,19 @@ pub fn detect_conflicting_blocks(
 /// blocks naming arbitrary `signer_indices` and slash arbitrary
 /// validators at the next epoch boundary — the persisted record
 /// drives `slashed_validators_for_epoch`.
+/// F026: verify each evidence block against its OWN epoch's group
+/// key. Cross-epoch equivocation (same `canonical_block_id`, different
+/// epoch tags) is a valid slashing condition, so we resolve the
+/// group address per-block, not per-evidence.
 pub fn verify_evidence_signatures(
     ev: &ConflictingBlocksEvidence,
-    group_address: &Address,
+    resolve_group_address: impl Fn(u64) -> Option<Address>,
 ) -> Result<(), EvidenceError> {
-    let expected = crate::hyper::sig_verify::ExpectedGroupKey::ecdsa_only(group_address);
     for (which, block) in [('a', ev.block_a.as_ref()), ('b', ev.block_b.as_ref())] {
+        let epoch = block.signature.epoch;
+        let group_address =
+            resolve_group_address(epoch).ok_or(EvidenceError::UnknownEpochGroupKey { epoch })?;
+        let expected = crate::hyper::sig_verify::ExpectedGroupKey::ecdsa_only(&group_address);
         let payload = block
             .envelope
             .metadata
@@ -144,7 +147,7 @@ mod tests {
         let a = make_block(10, 5, vec![0xaa; 48]);
         let b = make_block(10, 5, vec![0xbb; 48]);
         let evidence = detect_conflicting_blocks(&a, &b).unwrap();
-        assert_eq!(evidence.epoch, 5);
+        assert_eq!(evidence.epoch_a, 5);
         assert_eq!(evidence.canonical_block_id, 10);
         assert_ne!(evidence.block_a_hash, evidence.block_b_hash);
     }
@@ -159,14 +162,16 @@ mod tests {
         ));
     }
 
+    /// F026: cross-epoch blocks at the same height are now accepted
+    /// as valid evidence (previously dropped by DifferentEpochs).
     #[test]
-    fn rejects_different_epochs() {
+    fn accepts_cross_epoch_conflicts() {
         let a = make_block(10, 5, vec![0xaa; 48]);
         let b = make_block(10, 6, vec![0xbb; 48]);
-        assert!(matches!(
-            detect_conflicting_blocks(&a, &b),
-            Err(EvidenceError::DifferentEpochs { a: 5, b: 6 })
-        ));
+        let ev = detect_conflicting_blocks(&a, &b).expect("cross-epoch conflict is valid evidence");
+        assert_eq!(ev.epoch_a, 5);
+        assert_eq!(ev.epoch_b, 6);
+        assert_eq!(ev.canonical_block_id, 10);
     }
 
     #[test]
@@ -189,7 +194,7 @@ mod tests {
         a.envelope.metadata.parent_hash = vec![0x11; 32];
         b.envelope.metadata.parent_hash = vec![0x22; 32];
         let evidence = detect_conflicting_blocks(&a, &b).unwrap();
-        assert_eq!(evidence.epoch, 5);
+        assert_eq!(evidence.epoch_a, 5);
         assert_ne!(evidence.block_a_hash, evidence.block_b_hash);
     }
 

@@ -660,7 +660,12 @@ impl SnapchainGossip {
                             let maybe_sender = self.system_tx.as_ref().cloned();
                             if let Some(system_tx) = maybe_sender {
                                 let data = message.data.clone();
-                                if let Some(system_message) = self.map_gossip_bytes_to_system_message(peer_id, data) {
+                                // F018: capture the gossipsub
+                                // originator (author who signed the
+                                // frame) so the DKLS ingress path uses
+                                // it instead of the forwarding neighbor.
+                                let originator = message.source;
+                                if let Some(system_message) = self.map_gossip_bytes_to_system_message(peer_id, data, originator) {
                                     if let Err(e) = system_tx.send(system_message).await {
                                         warn!("Failed to send system block message: {}", e);
                                     }
@@ -861,6 +866,13 @@ impl SnapchainGossip {
         &mut self,
         peer_id: PeerId,
         gossip_message: Vec<u8>,
+        // F018: gossipsub originator (message.source). `None` if
+        // gossipsub is configured without author signing (shouldn't
+        // be, but defensively handled). Used by the DKLS ingress
+        // path as the authoritative sender identity instead of
+        // `propagation_source` (which is just the forwarding
+        // neighbor in a multi-hop mesh).
+        originator: Option<PeerId>,
     ) -> Option<SystemMessage> {
         match proto::GossipMessage::decode(gossip_message.as_slice()) {
             Ok(gossip_message) => match gossip_message.gossip_message {
@@ -983,13 +995,19 @@ impl SnapchainGossip {
                         return None;
                     }
                     if let Some(tx) = self.hyper_actor_tx.as_ref() {
-                        // F018: pass libp2p propagation_source through
-                        // so the actor can cross-check DKLS inner
-                        // `sender` against the per-epoch
-                        // (committee_party_index → peer_id) registry.
+                        // F018: pass the gossipsub ORIGINATOR
+                        // (message.source), not the forwarding
+                        // neighbor (propagation_source). In a
+                        // multi-hop mesh, propagation_source is
+                        // just the relay; the originator is the
+                        // actual author who signed the gossipsub
+                        // frame. Fallback to propagation_source
+                        // only if gossipsub author signing is off
+                        // (shouldn't happen in production).
+                        let sender_bytes = originator.unwrap_or(peer_id).to_bytes();
                         match crate::hyper::gossip_adapter::wire_to_event_with_source(
                             wire,
-                            Some(peer_id.to_bytes()),
+                            Some(sender_bytes),
                         ) {
                             Ok(event) => {
                                 if let Err(e) = tx.try_send(event) {

@@ -106,8 +106,11 @@ impl Codec<StreamMessage<FullProposal>> for SnapchainCodec {
 
     fn decode(&self, bytes: Bytes) -> Result<StreamMessage<FullProposal>, Self::Error> {
         let proposal: FullProposal = Self.decode(bytes)?;
+        let height = proposal.height.ok_or_else(|| {
+            SnapchainCodecError::InvalidField("FullProposal::height missing".into())
+        })?;
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&proposal.height.unwrap().as_u64().to_be_bytes());
+        bytes.extend_from_slice(&height.as_u64().to_be_bytes());
         bytes.extend_from_slice(&proposal.round.to_be_bytes());
         let stream_id = StreamId::new(bytes.into());
 
