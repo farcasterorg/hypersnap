@@ -158,15 +158,16 @@ pub struct ScoringParams {
     /// disables the gate (any vouch boosts unconditionally).
     pub vouch_boost_min_vouchee_trust: f64,
 
-    /// F009: per-crediter contribution cap. A single crediter u
-    /// can contribute at most this fraction of f's total growth
-    /// accumulator. A dense sybil ring where every member engages
-    /// equally with every other member hits this cap per-pair,
-    /// diluting the ring's total captured budget. `0.0` disables
-    /// the cap; `0.05` means no single crediter can be more than
-    /// 5% of any recipient's growth, which requires at least 20
-    /// distinct reciprocating crediters to saturate.
+    /// F009: per-crediter contribution cap (DEPRECATED — inert for
+    /// dense rings; superseded by `min_distinct_crediters` + sqrt
+    /// damping). Retained for config compat; no longer evaluated.
     pub max_growth_fraction_per_crediter: f64,
+
+    /// F009: minimum number of distinct reciprocating crediters
+    /// required for any growth contribution. Below this count,
+    /// growth is zero — a 2-person sybil pair gets nothing.
+    /// Default 3.
+    pub min_distinct_crediters: usize,
 }
 
 /// FIP §8.3 calibration + threshold knobs. Defaults match the
@@ -297,6 +298,7 @@ impl Default for ScoringParams {
             // crediter contributes at most 5%, so legitimate users
             // with diverse engagement outcompete a homogeneous ring.
             max_growth_fraction_per_crediter: 0.05,
+            min_distinct_crediters: 3,
         }
     }
 }

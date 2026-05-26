@@ -107,6 +107,23 @@ fn build_aad(epoch: u64, round_tag: u8, sender: u8, receiver: u8) -> Vec<u8> {
     buf
 }
 
+/// F023: sign-frame AAD that also binds the digest. Cross-digest
+/// frames (phase-1 for digest D_A submitted to a driver signing
+/// D_B) fail the AEAD tag check at decrypt time, preventing the
+/// liveness-griefing vector where an authenticated committee member
+/// can stall a same-epoch sign ceremony by injecting frames from a
+/// different ceremony.
+fn build_sign_aad(epoch: u64, sender: u8, receiver: u8, digest: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(AAD_PREFIX.len() + 8 + 1 + 1 + 1 + 32);
+    buf.extend_from_slice(AAD_PREFIX);
+    buf.extend_from_slice(&epoch.to_be_bytes());
+    buf.push(ROUND_TAG_SIGN);
+    buf.push(sender);
+    buf.push(receiver);
+    buf.extend_from_slice(digest);
+    buf
+}
+
 /// Seal a DKLS DKG round message. P2P-addressed variants get
 /// encrypted to the receiver's transport pubkey; broadcasts go
 /// out plaintext.
@@ -155,6 +172,7 @@ where
 pub fn seal_dkls_sign_round_message<R, F>(
     message: &DklsSignRoundMessage,
     epoch: u64,
+    digest: &[u8],
     transport_pubkey_for_party: F,
     rng: &mut R,
 ) -> Result<Vec<u8>, DklsWireError>
@@ -174,7 +192,7 @@ where
             let sender = message.sender();
             let recipient_pk = transport_pubkey_for_party(receiver)
                 .ok_or(DklsWireError::UnknownReceiverTransport(receiver))?;
-            let aad = build_aad(epoch, ROUND_TAG_SIGN, sender, receiver);
+            let aad = build_sign_aad(epoch, sender, receiver, digest);
             let sealed = recipient_pk.seal(&raw, &aad, rng);
             let mut out = Vec::with_capacity(1 + 2 + sealed.len());
             out.push(DISCRIMINATOR_ENCRYPTED);
@@ -285,9 +303,14 @@ pub enum OpenedDklsSignMessage {
 
 /// Decode an incoming DKLS sign frame. Mirror of
 /// [`open_dkls_round_message`] with the sign-round-tag domain.
+/// F023: the `digest` parameter binds the AEAD AAD to the signing
+/// ceremony's target digest, so cross-digest frames (same epoch,
+/// different ceremony) fail the AEAD tag check at decrypt time. The
+/// caller provides the active driver's digest at decode time.
 pub fn open_dkls_sign_round_message(
     bytes: &[u8],
     epoch: u64,
+    digest: &[u8],
     local_secret: &TransportSecretKey,
     local_party_index: u8,
 ) -> Result<OpenedDklsSignMessage, DklsWireError> {
@@ -310,7 +333,7 @@ pub fn open_dkls_sign_round_message(
                 return Ok(OpenedDklsSignMessage::NotForUs { sender, receiver });
             }
             let sealed = &bytes[3..];
-            let aad = build_aad(epoch, ROUND_TAG_SIGN, sender, receiver);
+            let aad = build_sign_aad(epoch, sender, receiver, digest);
             let plaintext = local_secret.open(sealed, &aad)?;
             let message = DklsSignRoundMessage::from_bytes(&plaintext)
                 .map_err(|e| DklsWireError::Bincode(e.to_string()))?;

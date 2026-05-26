@@ -53,6 +53,15 @@ struct Args {
 
     #[arg(long, default_value = "4")]
     num_nodes: u32,
+
+    /// Enable hyper protocol layer. Generates DKLS23 shares, genesis
+    /// config, and appends [hyper] sections to each node's TOML.
+    #[arg(long, default_value = "false")]
+    hyper_enabled: bool,
+
+    /// DKLS23 signing threshold. For a 3-node network, 2 is typical.
+    #[arg(long, default_value = "1")]
+    dkls_threshold: u8,
 }
 
 fn parse_duration(arg: &str) -> Result<Duration, String> {
@@ -208,7 +217,77 @@ aws_secret_access_key = "{aws_secret_access_key}"
             config_file_content,
         )
         .expect("Failed to write config file");
-        // Print a message
     }
+
+    if args.hyper_enabled {
+        let threshold = args.dkls_threshold;
+        let share_count = num_nodes as u8;
+        println!(
+            "Generating {}-of-{} DKLS23 shares...",
+            threshold, share_count
+        );
+        let dkg =
+            hypersnap_crypto::dkls_threshold::run_honest_dkg(threshold, share_count, [0xab; 32])
+                .expect("DKG");
+        let group_addr_hex = hex::encode(dkg.group_address.as_slice());
+
+        // Serialize per-node shares.
+        for i in 0..share_count {
+            let share_path = format!("nodes/{}/epoch0.share", i + 1);
+            let share_bytes =
+                bincode::serialize(&dkg.parties[i as usize]).expect("serialize share");
+            std::fs::write(&share_path, share_bytes).expect("Failed to write DKLS share");
+        }
+
+        // Build bootstrap_validators from the node keypairs +
+        // transport keys (devnet uses zero transport keys).
+        let mut bootstrap_entries = String::new();
+        for i in 0..share_count {
+            let validator_key_hex = &all_public_keys[i as usize];
+            bootstrap_entries.push_str(&format!(
+                r#"
+[[bootstrap_validators]]
+validator_key_hex = "{validator_key_hex}"
+transport_pubkey_hex = "{}"
+validator_address_hex = "0x{group_addr_hex}"
+"#,
+                hex::encode([0u8; 32]),
+            ));
+        }
+        let genesis_content = format!(
+            r#"genesis_group_address_hex = "0x{group_addr_hex}"
+{bootstrap_entries}"#,
+        );
+        std::fs::write("nodes/genesis.toml", genesis_content.trim())
+            .expect("Failed to write genesis.toml");
+
+        // Append [hyper] section to each node's config.
+        for i in 1..=num_nodes {
+            let party_index = i;
+            let hyper_section = format!(
+                r#"
+
+[hyper]
+enabled = true
+allow_random_kzg_srs = true
+genesis_path = "nodes/genesis.toml"
+local_dkls_share_path = "nodes/{i}/epoch0.share"
+local_dkls_share_party_index = {party_index}
+retro_vesting_on_protocol_epochs = 1
+auto_generate_transport_secret = true
+transport_secret_path = "nodes/{i}/transport.key"
+"#,
+            );
+            let config_path = format!("nodes/{i}/hypersnap.toml");
+            let mut content = std::fs::read_to_string(&config_path).unwrap();
+            content.push_str(&hyper_section);
+            std::fs::write(&config_path, content).unwrap();
+        }
+
+        println!("  Group address: 0x{}", group_addr_hex);
+        println!("  Genesis config: nodes/genesis.toml");
+        println!("  Shares: nodes/{{1..{}}}/epoch0.share", share_count);
+    }
+
     println!("Created configs for {num_nodes} nodes");
 }

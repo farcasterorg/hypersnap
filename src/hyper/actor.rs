@@ -1482,15 +1482,19 @@ impl HyperActor {
                 encoded,
                 propagation_source,
             } => {
-                let local_party = self
+                let active_sign = self
                     .active_dkls_sign
                     .as_ref()
                     .filter(|d| d.epoch() == epoch)
-                    .ok_or(HyperActorError::NoActiveDkg(epoch))?
-                    .party_index();
+                    .ok_or(HyperActorError::NoActiveDkg(epoch))?;
+                let local_party = active_sign.party_index();
+                // F023: bind the digest into the AEAD AAD so
+                // cross-digest frames fail at decrypt time.
+                let active_digest = active_sign.coordinator.digest();
                 let opened = crate::hyper::dkls_wire_codec::open_dkls_sign_round_message(
                     &encoded,
                     epoch,
+                    active_digest.as_slice(),
                     &self.runtime.local_transport_secret,
                     local_party,
                 )
@@ -2556,11 +2560,13 @@ impl HyperActor {
         driver: &mut crate::hyper::dkls_sign_driver::DklsSignDriver,
     ) {
         let epoch = driver.epoch();
+        let digest = driver.coordinator.digest().as_slice().to_vec();
         for msg in driver.drain_outbound() {
             let mut rng = rand::rngs::OsRng;
             let encoded = match crate::hyper::dkls_wire_codec::seal_dkls_sign_round_message(
                 &msg,
                 epoch,
+                &digest,
                 |party_index| self.runtime.transport_pubkey_for_party(epoch, party_index),
                 &mut rng,
             ) {

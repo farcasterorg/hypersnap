@@ -272,14 +272,32 @@ async fn start_servers(
 
     tokio::spawn(async move {
         info!(grpc_addr = grpc_addr, "GrpcService listening",);
-        // F031: bound concurrent RPCs per connection. The full per-IP
-        // token-bucket rate limiter requires a custom tower Layer that
-        // extracts `ConnectInfo<SocketAddr>` from the request; the
-        // concurrency_limit bounds resource consumption from any single
-        // connection as a first defense.
+        // F031: per-IP rate limit on gRPC. Create a rate-limited
+        // wrapper service so every RPC (not just connection) is
+        // gated. The interceptor extracts the peer socket address
+        // from tonic's ConnectInfo and checks the shared limiter.
+        let grpc_rate_limiter =
+            std::sync::Arc::new(hypersnap::network::rate_limit::IpRateLimiter::new(
+                120,
+                std::time::Duration::from_secs(60),
+            ));
+        let grpc_rl = grpc_rate_limiter.clone();
+        let rate_limit_interceptor =
+            move |req: tonic::Request<()>| -> Result<tonic::Request<()>, tonic::Status> {
+                if let Some(addr) = req.remote_addr() {
+                    if !grpc_rl.allow(addr.ip()) {
+                        return Err(tonic::Status::resource_exhausted("rate limit exceeded"));
+                    }
+                }
+                Ok(req)
+            };
+        let grpc_svc = HubServiceServer::with_interceptor(
+            grpc_service.as_ref().clone(),
+            rate_limit_interceptor,
+        );
         let mut server = Server::builder()
             .concurrency_limit_per_connection(64)
-            .add_service(HubServiceServer::from_arc(grpc_service));
+            .add_service(grpc_svc);
 
         if admin_service.enabled() {
             let admin_service = AdminServiceServer::new(admin_service);
@@ -1401,12 +1419,19 @@ async fn build_hyper_handler(
                     };
                     if validator_pubkey.len() == 32 {
                         let chain_id = hypersnap::hyper::DEFAULT_PROTOCOL_CHAIN_ID;
+                        let fid_count = runtime.count_registered_fids().max(1);
+                        tracing::info!(
+                            fid_count,
+                            "DA-PoW challenge space: {} registered FIDs",
+                            fid_count
+                        );
                         let producer = hypersnap::hyper::da_response_producer_prod::BlockEngineDaResponseProducer::new(
                             engine,
                             signer_sk,
                             validator_pubkey,
                             fid,
                             chain_id,
+                            fid_count,
                         );
                         tracing::info!(operator_fid = fid, "DA-PoW driver wired");
                         Some(Arc::new(producer)

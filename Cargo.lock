@@ -4726,6 +4726,7 @@ dependencies = [
  "hyper-util",
  "hypersnap-crypto",
  "hypersnap-proto",
+ "hypersnap-wallet",
  "indicatif",
  "informalsystems-malachitebft-codec",
  "informalsystems-malachitebft-config",
@@ -4849,6 +4850,25 @@ dependencies = [
  "tonic",
  "tonic-build",
  "variant_count",
+]
+
+[[package]]
+name = "hypersnap-wallet"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "ed25519-dalek",
+ "hex",
+ "hypersnap-crypto",
+ "hypersnap-proto",
+ "prost 0.13.5",
+ "rand 0.8.6",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]

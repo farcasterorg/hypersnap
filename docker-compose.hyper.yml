@@ -1,0 +1,77 @@
+version: "3.8"
+
+x-common: &common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  restart: unless-stopped
+
+services:
+  node1:
+    <<: *common
+    container_name: hyper-node1
+    command: ["./hypersnap", "--config-path", "./nodes/1/hypersnap.toml"]
+    volumes:
+      - ./nodes:/app/nodes
+      - node1-data:/app/nodes/1/.rocks
+    ports:
+      - "3483:3483"
+      - "3383:3383"
+    networks:
+      hyper-net:
+        ipv4_address: 172.101.0.11
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3483/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  node2:
+    <<: *common
+    container_name: hyper-node2
+    command: ["./hypersnap", "--config-path", "./nodes/2/hypersnap.toml"]
+    volumes:
+      - ./nodes:/app/nodes
+      - node2-data:/app/nodes/2/.rocks
+    ports:
+      - "3484:3484"
+      - "3384:3384"
+    networks:
+      hyper-net:
+        ipv4_address: 172.101.0.12
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3484/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  node3:
+    <<: *common
+    container_name: hyper-node3
+    command: ["./hypersnap", "--config-path", "./nodes/3/hypersnap.toml"]
+    volumes:
+      - ./nodes:/app/nodes
+      - node3-data:/app/nodes/3/.rocks
+    ports:
+      - "3485:3485"
+      - "3385:3385"
+    networks:
+      hyper-net:
+        ipv4_address: 172.101.0.13
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3485/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+
+networks:
+  hyper-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.101.0.0/24

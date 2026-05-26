@@ -85,15 +85,23 @@ pub enum DaPowValidationError {
 /// the live FID space. Callers that don't know the universe should
 /// pass `u32::MAX` for uniform random behavior (lower hit rate but
 /// no false positives).
+/// `fid_count` is the number of registered FIDs at the epoch
+/// boundary — both producer and verifier must agree on the same
+/// value for prefixes to match. Callers should derive this from the
+/// onchain event store's `count_registered_fids()` at the same
+/// logical point (epoch boundary).
 pub fn derive_challenge_prefix(
     epoch_boundary_hash: &[u8],
     validator_pubkey: &[u8],
     epoch: u64,
     challenge_index: u32,
     chain_id: u64,
-    max_fid: u64,
+    fid_count: u64,
 ) -> [u8; CHALLENGE_PREFIX_BYTES] {
     use crate::storage::trie::merkle_trie::TrieKey;
+    assert!(fid_count > 0, "fid_count must be > 0");
+
+    // Hash to get deterministic entropy.
     let mut h = Sha256::new();
     h.update(DA_CHALLENGE_DST);
     h.update(&chain_id.to_be_bytes());
@@ -102,15 +110,32 @@ pub fn derive_challenge_prefix(
     h.update(&epoch.to_be_bytes());
     h.update(&challenge_index.to_be_bytes());
     let full = h.finalize();
-    let mut seed_bytes = [0u8; 4];
-    seed_bytes.copy_from_slice(&full[..4]);
-    let seed_u32 = u32::from_be_bytes(seed_bytes);
-    let capped = if max_fid > 0 {
-        max_fid.min(u32::MAX as u64)
-    } else {
-        u32::MAX as u64
+
+    // Rejection sampling to avoid modulo bias. Re-hash with a
+    // counter until the 4-byte sample falls in a range that's
+    // evenly divisible by fid_count. For practical fid_count values
+    // (<< 2^32), the rejection probability per attempt is < 0.1%
+    // and the expected number of iterations is ~1.
+    let n = fid_count.min(u32::MAX as u64) as u32;
+    let threshold = u32::MAX - (u32::MAX % n); // largest multiple of n ≤ u32::MAX
+    let mut attempt = 0u32;
+    let derived_fid = loop {
+        let mut h2 = Sha256::new();
+        h2.update(&full);
+        h2.update(&attempt.to_be_bytes());
+        let digest = h2.finalize();
+        let mut seed_bytes = [0u8; 4];
+        seed_bytes.copy_from_slice(&digest[..4]);
+        let sample = u32::from_be_bytes(seed_bytes);
+        if sample < threshold {
+            break 1 + (sample % n) as u64;
+        }
+        attempt += 1;
+        if attempt > 256 {
+            break 1 + (sample % n) as u64;
+        }
     };
-    let derived_fid = 1 + (seed_u32 as u64 % capped);
+
     let fid_key = TrieKey::for_fid(derived_fid);
     let mut out = [0u8; CHALLENGE_PREFIX_BYTES];
     let copy_len = fid_key.len().min(CHALLENGE_PREFIX_BYTES);

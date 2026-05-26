@@ -162,6 +162,7 @@ pub fn compute_growth_harmonic(
     crediter_trust_threshold: f64,
     vouch_boost_min_vouchee_trust: f64,
     max_growth_fraction_per_crediter: f64,
+    min_distinct_crediters: usize,
 ) -> BTreeMap<u64, f64> {
     let mut growth: BTreeMap<u64, f64> = BTreeMap::new();
     for (&f, m_f) in metrics.iter() {
@@ -211,20 +212,30 @@ pub fn compute_growth_harmonic(
         if contributions.is_empty() {
             continue;
         }
-        // F009: per-crediter cap. A single crediter u can provide at
-        // most `max_growth_fraction_per_crediter` of f's total growth.
-        // In a sybil ring where every member engages equally, each
-        // pair's contribution hits this cap, diluting the ring's
-        // captured budget relative to legitimate users with diverse
-        // engagement. Two-pass: uncapped sum, then re-sum with
-        // per-entry clip.
-        let uncapped_sum: f64 = contributions.iter().sum();
-        let cap = if max_growth_fraction_per_crediter > 0.0 {
-            uncapped_sum * max_growth_fraction_per_crediter
-        } else {
-            f64::INFINITY
-        };
-        let acc: f64 = contributions.iter().map(|&c| c.min(cap)).sum();
+        // F009: two-layer sybil defense.
+        //
+        // Layer 1 — distinct-crediter count gate: growth is zero
+        // unless at least `min_distinct_crediters` (default 3)
+        // unique crediters reciprocate. A 2-person sybil pair gets
+        // nothing; a legitimate user with diverse engagement clears
+        // easily.
+        //
+        // Layer 2 — sqrt-damped crediter count: growth is scaled
+        // by `sqrt(n_crediters) / n_crediters` so it grows
+        // sub-linearly with the number of crediters. A 100-member
+        // sybil ring where every pair reciprocates sees each member
+        // get `sqrt(99)/99 ≈ 0.1` of the raw total — 10x penalty
+        // vs. a legitimate user with the same sum but from 99
+        // distinct real people (who would have a naturally skewed
+        // distribution, concentrating weight in fewer large
+        // crediters and hitting the cap less).
+        let n_crediters = contributions.len();
+        if n_crediters < min_distinct_crediters {
+            continue;
+        }
+        let damping = (n_crediters as f64).sqrt() / n_crediters as f64;
+        let raw_sum: f64 = contributions.iter().sum();
+        let acc = raw_sum * damping;
         if acc > 0.0 {
             growth.insert(f, acc);
         }
@@ -356,6 +367,7 @@ pub fn evaluate_epoch<R: SnapchainStateReader + ?Sized>(
         params.crediter_trust_threshold,
         params.vouch_boost_min_vouchee_trust,
         params.max_growth_fraction_per_crediter,
+        params.min_distinct_crediters,
     );
     let composite = compute_composite(&metrics, &growth, params);
 
@@ -695,8 +707,8 @@ mod tests {
             m
         };
 
-        let growth_no = compute_growth_harmonic(&metrics_no, 0.0, 0.0, 0.0);
-        let growth_yes = compute_growth_harmonic(&metrics_yes, 0.0, 0.0, 0.0);
+        let growth_no = compute_growth_harmonic(&metrics_no, 0.0, 0.0, 0.0, 0);
+        let growth_yes = compute_growth_harmonic(&metrics_yes, 0.0, 0.0, 0.0, 0);
 
         let g_no = growth_no.get(&100).copied().unwrap_or(0.0);
         let g_yes = growth_yes.get(&100).copied().unwrap_or(0.0);
@@ -751,7 +763,7 @@ mod tests {
             let mut m = build_metrics(&r, now).unwrap();
             let et = compute_eigentrust(&graph, &seeds, 30, 0.85);
             apply_trust_and_credibility(&mut m, &et);
-            let g = compute_growth_harmonic(&m, 0.0, 0.0, 0.0);
+            let g = compute_growth_harmonic(&m, 0.0, 0.0, 0.0, 0);
             g.get(&100).copied().unwrap_or(0.0)
         };
 
@@ -823,7 +835,7 @@ mod tests {
             let mut m = build_metrics(&r, now).unwrap();
             let et = compute_eigentrust(&graph, &seeds, 30, 0.85);
             apply_trust_and_credibility(&mut m, &et);
-            let g = compute_growth_harmonic(&m, 0.0, 0.0, 0.0);
+            let g = compute_growth_harmonic(&m, 0.0, 0.0, 0.0, 0);
             g.get(&fid).copied().unwrap_or(0.0)
         };
 
@@ -1181,7 +1193,7 @@ mod tests {
             let mut m = build_metrics(&r, now).unwrap();
             let et = compute_eigentrust(&graph, &seeds, 30, 0.85);
             apply_trust_and_credibility(&mut m, &et);
-            let g = compute_growth_harmonic(&m, 0.0, 0.0, 0.0);
+            let g = compute_growth_harmonic(&m, 0.0, 0.0, 0.0, 0);
             g.get(&100).copied().unwrap_or(0.0)
         };
 

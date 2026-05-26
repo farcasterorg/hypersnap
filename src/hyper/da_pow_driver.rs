@@ -77,12 +77,11 @@ where
         max_fid,
     );
     let served = lookup(&prefix)?;
-    // F135 fix: serve the natural-length trie key, not a 32-byte
-    // zero-padded version. The apply-path lookup runs an exact-byte
-    // `contains_key` against the trie, which stores natural-length
-    // keys; zero-padding to 32 bytes never matches. The bottom
-    // `CHALLENGE_PREFIX_BYTES` (16) must still match the derived
-    // prefix; the rest is whatever the trie stores beyond the prefix.
+    // F135 fix: serve the natural-length trie key. The apply-path
+    // lookup runs an exact-byte `contains_key` against the trie.
+    // The prefix is now a 5-byte structured key (shard + fid_u32)
+    // derived from `derive_challenge_prefix`; the served key must
+    // start with those 5 bytes.
     if served.len() < CHALLENGE_PREFIX_BYTES || served[..CHALLENGE_PREFIX_BYTES] != prefix[..] {
         return None;
     }

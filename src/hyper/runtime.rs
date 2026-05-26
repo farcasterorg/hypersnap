@@ -491,6 +491,15 @@ impl HyperRuntime {
     /// block. Currently uses the OnchainEventStore's `get_fids` to
     /// enumerate all known FIDs. A future optimization could filter to
     /// FIDs whose Register event happened ≤ the anchor block.
+    /// Count of registered FIDs in the onchain event store. Used by
+    /// DA-PoW challenge derivation so both producer and verifier
+    /// agree on the FID-space size. Deterministic at any given
+    /// snapchain state — every validator scanning the same store
+    /// gets the same count.
+    pub fn count_registered_fids(&self) -> u64 {
+        self.fids_for_scoring().len() as u64
+    }
+
     pub fn fids_for_scoring(&self) -> std::collections::BTreeSet<u64> {
         use crate::storage::store::account::{OnchainEventStore, StoreEventHandler};
         let handler = StoreEventHandler::new_no_persist();
@@ -3321,14 +3330,12 @@ impl HyperRuntime {
             ))
         })?;
 
-        // F135: pass max_fid so derive_challenge_prefix produces a
-        // trie-key-shaped prefix matching the stored FID layout.
-        // seed_max_fid is the EigenTrust cohort cap; it's a
-        // conservative upper bound for the FID keyspace that
-        // actually has stored data. A more precise count would
-        // require a full OnchainEventStore scan.
-        let max_fid = self.seed_max_fid;
-        check_served_key_prefix(body, &boundary_hash, self.protocol_chain_id, max_fid)
+        // F135: derive fid_count from the onchain store so the
+        // challenge prefix is bounded to real registered FIDs.
+        // Both producer and verifier compute this from the same
+        // deterministic store state.
+        let fid_count = self.count_registered_fids().max(1);
+        check_served_key_prefix(body, &boundary_hash, self.protocol_chain_id, fid_count)
             .map_err(|e| RewardError::Custom(format!("DA response prefix: {}", e)))?;
 
         if let Some(lookup) = self.da_trie_lookup.as_ref() {
@@ -4178,17 +4185,23 @@ impl HyperRuntime {
     ///
     /// Returns the set of validator keys that should be excluded at the
     /// next epoch boundary.
+    /// F026: resolve each evidence block's `signer_indices` against
+    /// that block's own epoch's active set. For cross-epoch evidence
+    /// (block_a signed at epoch X, block_b at epoch Y), using a
+    /// single epoch's active set for both would resolve block_b's
+    /// indices against the wrong key ordering — potentially slashing
+    /// innocent validators or missing the actual equivocators.
     pub fn slashed_validators_for_epoch(
         &self,
         epoch: u64,
-        active_set_at_epoch: &std::collections::BTreeMap<Vec<u8>, (Vec<u8>, Vec<u8>)>,
+        _active_set_at_epoch: &std::collections::BTreeMap<Vec<u8>, (Vec<u8>, Vec<u8>)>,
     ) -> Result<std::collections::BTreeSet<Vec<u8>>, crate::hyper::slashing_store::SlashingStoreError>
     {
         let evidence = self.slashing_store.get_for_epoch(epoch)?;
-        let keys: Vec<&Vec<u8>> = active_set_at_epoch.keys().collect();
-
         let mut slashed = std::collections::BTreeSet::new();
         for ev in evidence {
+            // Resolve each block's signer_indices against its own
+            // epoch's active set.
             for block in [ev.block_a.as_ref(), ev.block_b.as_ref()]
                 .into_iter()
                 .flatten()
@@ -4196,8 +4209,16 @@ impl HyperRuntime {
                 let Some(sig) = block.signature.as_ref() else {
                     continue;
                 };
+                let block_epoch = sig.epoch;
+                let active = match self
+                    .validator_registry
+                    .compute_active_set(block_epoch, &self.bootstrap_validators)
+                {
+                    Ok(a) => a,
+                    Err(_) => continue,
+                };
+                let keys: Vec<&Vec<u8>> = active.keys().collect();
                 for idx in &sig.signer_indices {
-                    // 1-based index into the sorted active set.
                     if *idx == 0 {
                         continue;
                     }
