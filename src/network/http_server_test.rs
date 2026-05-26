@@ -296,7 +296,7 @@ pub mod tests {
 
         async fn get_signers_by_fid(
             &self,
-            _request: Request<FidRequest>,
+            _request: Request<crate::proto::SignersByFidRequest>,
         ) -> Result<Response<crate::proto::SignersByFidResponse>, Status> {
             Ok(Response::new(crate::proto::SignersByFidResponse::default()))
         }

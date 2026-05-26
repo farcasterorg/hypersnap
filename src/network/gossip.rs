@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io;
 use tokio::sync::mpsc::Sender;
@@ -208,6 +209,12 @@ pub struct SnapchainGossip {
     peers: BTreeMap<PeerId, ContactInfoBody>,
     capabilities: Vec<String>,
     hyper_enabled: bool,
+    direct_peers: HashSet<PeerId>,
+    local_topics: Vec<gossipsub::IdentTopic>,
+    boot_resub_done: Arc<std::sync::atomic::AtomicBool>,
+    last_force_bounce_at: HashMap<PeerId, tokio::time::Instant>,
+    peer_connected_at: HashMap<PeerId, tokio::time::Instant>,
+    direct_peer_force_bounce_count: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl SnapchainGossip {
@@ -316,6 +323,8 @@ impl SnapchainGossip {
             let _ = Self::dial(&mut swarm, &addr);
         }
 
+        let mut local_topics: Vec<gossipsub::IdentTopic> = Vec::new();
+
         if read_node {
             let topic = gossipsub::IdentTopic::new(READ_NODE_PEER_STATUSES);
             let result = swarm.behaviour_mut().gossipsub.subscribe(&topic);
@@ -323,6 +332,7 @@ impl SnapchainGossip {
                 warn!("Failed to subscribe to topic: {:?}", e);
                 return Err(Box::new(e));
             }
+            local_topics.push(topic);
 
             let topic = gossipsub::IdentTopic::new(MEMPOOL_TOPIC);
             let result = swarm.behaviour_mut().gossipsub.subscribe(&topic);
@@ -330,15 +340,15 @@ impl SnapchainGossip {
                 warn!("Failed to subscribe to topic: {:?}", e);
                 return Err(Box::new(e));
             }
+            local_topics.push(topic);
         } else {
-            // Create a Gossipsub topic
             let topic = gossipsub::IdentTopic::new(CONSENSUS_TOPIC);
-            // subscribes to our topic
             let result = swarm.behaviour_mut().gossipsub.subscribe(&topic);
             if let Err(e) = result {
                 warn!("Failed to subscribe to topic: {:?}", e);
                 return Err(Box::new(e));
             }
+            local_topics.push(topic);
 
             let topic = gossipsub::IdentTopic::new(MEMPOOL_TOPIC);
             let result = swarm.behaviour_mut().gossipsub.subscribe(&topic);
@@ -346,6 +356,7 @@ impl SnapchainGossip {
                 warn!("Failed to subscribe to topic: {:?}", e);
                 return Err(Box::new(e));
             }
+            local_topics.push(topic);
         }
 
         let topic = gossipsub::IdentTopic::new(CONTACT_INFO);
@@ -354,6 +365,7 @@ impl SnapchainGossip {
             warn!("Failed to subscribe to topic: {:?}", e);
             return Err(Box::new(e));
         }
+        local_topics.push(topic);
 
         // Listen on all assigned port for this id
         swarm.listen_on(config.address.parse()?)?;
@@ -380,7 +392,10 @@ impl SnapchainGossip {
             if let Err(e) = swarm.behaviour_mut().gossipsub.subscribe(&topic) {
                 warn!("Failed to subscribe to topic: {:?}", e);
             }
+            local_topics.push(topic);
         }
+
+        let direct_peers: HashSet<PeerId> = config.direct_peers().into_iter().collect();
 
         Ok(SnapchainGossip {
             swarm,
@@ -401,6 +416,12 @@ impl SnapchainGossip {
             peers: BTreeMap::new(),
             capabilities,
             hyper_enabled,
+            direct_peers,
+            local_topics,
+            boot_resub_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_force_bounce_at: HashMap::new(),
+            peer_connected_at: HashMap::new(),
+            direct_peer_force_bounce_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -527,6 +548,59 @@ impl SnapchainGossip {
                     self.check_and_reconnect_to_bootstrap_peers().await;
                     self.statsd_client.gauge("gossip.connected_peers", self.swarm.connected_peers().count() as u64, vec![]);
                     self.statsd_client.gauge("gossip.sync_channels", self.sync_channels.len() as u64, vec![]);
+
+                    // Mesh self-healing sweep: check direct peers for missing CONTACT_INFO topic
+                    if !self.direct_peers.is_empty() {
+                        let contact_info_hash = gossipsub::IdentTopic::new(CONTACT_INFO).hash();
+                        let peer_topics: HashMap<PeerId, Vec<gossipsub::TopicHash>> = self
+                            .swarm
+                            .behaviour()
+                            .gossipsub
+                            .all_peers()
+                            .map(|(pid, topics)| (*pid, topics.into_iter().cloned().collect()))
+                            .collect();
+
+                        // Reconcile peer_connected_at: remove peers no longer connected
+                        let connected: HashSet<PeerId> = self.swarm.connected_peers().cloned().collect();
+                        self.peer_connected_at.retain(|pid, _| connected.contains(pid));
+
+                        let now = tokio::time::Instant::now();
+                        let mut missing_count = 0u64;
+                        let settle_secs = 30;
+                        let bounce_cooldown_secs = 60;
+
+                        for direct_peer in &self.direct_peers {
+                            if !connected.contains(direct_peer) {
+                                continue;
+                            }
+                            let has_contact_info = peer_topics
+                                .get(direct_peer)
+                                .map_or(false, |topics| topics.contains(&contact_info_hash));
+                            if has_contact_info {
+                                continue;
+                            }
+                            missing_count += 1;
+
+                            let connected_at = self.peer_connected_at.get(direct_peer).copied().unwrap_or(now);
+                            if now.duration_since(connected_at).as_secs() < settle_secs {
+                                continue;
+                            }
+                            if let Some(last_bounce) = self.last_force_bounce_at.get(direct_peer) {
+                                if now.duration_since(*last_bounce).as_secs() < bounce_cooldown_secs {
+                                    continue;
+                                }
+                            }
+
+                            info!(peer = %direct_peer, "Force-bouncing direct peer missing CONTACT_INFO topic");
+                            let _ = self.swarm.disconnect_peer_id(*direct_peer);
+                            self.last_force_bounce_at.insert(*direct_peer, now);
+                            self.direct_peer_force_bounce_count
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            self.statsd_client.count("gossip.direct_peer_force_bounce", 1, vec![]);
+                        }
+
+                        self.statsd_client.gauge("gossip.direct_peer_missing_contact_info_topic", missing_count, vec![]);
+                    }
                 },
                 _ = publish_contact_info_timer.tick() => {
                     if self.read_node {
@@ -544,6 +618,24 @@ impl SnapchainGossip {
                                     warn!("Failed to send connection established message: {}", e);
                                 }
                             }
+
+                            // Track connection time for direct peers (settle-time gate)
+                            if self.direct_peers.contains(&peer_id) {
+                                self.peer_connected_at.entry(peer_id).or_insert_with(tokio::time::Instant::now);
+
+                                // Boot one-shot: on first direct peer connection, cycle unsub/sub
+                                // to force fresh SUBSCRIBE control RPCs
+                                if !self.boot_resub_done.load(std::sync::atomic::Ordering::Relaxed) {
+                                    self.boot_resub_done.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    info!("Boot resub: cycling topic subscriptions for mesh recovery");
+                                    for topic in &self.local_topics {
+                                        let _ = self.swarm.behaviour_mut().gossipsub.unsubscribe(topic);
+                                        let _ = self.swarm.behaviour_mut().gossipsub.subscribe(topic);
+                                    }
+                                    self.statsd_client.count("gossip.boot_resub_fired", 1, vec![]);
+                                }
+                            }
+
                             match endpoint {
                                 libp2p::core::ConnectedPoint::Dialer { address, ..} => {
                                     if self.bootstrap_addrs.contains(&address.to_string()) {
@@ -556,6 +648,7 @@ impl SnapchainGossip {
                         },
                         SwarmEvent::ConnectionClosed {peer_id, cause, endpoint, ..} => {
                             info!("Connection closed with peer: {:?} due to: {:?}", peer_id, cause);
+                            self.peer_connected_at.remove(&peer_id);
                             if let Some(system_tx) = &self.system_tx {
                                 let event = MalachiteNetworkEvent::PeerDisconnected(MalachitePeerId::from_libp2p(&peer_id));
                                 if let Err(e) = system_tx.send(SystemMessage::MalachiteNetwork(MalachiteEventShard::None, event)).await {

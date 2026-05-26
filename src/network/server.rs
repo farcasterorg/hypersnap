@@ -25,10 +25,10 @@ use crate::proto::{
     NameLookupRequest, NameToAddressResponse, OnChainEvent, OnChainEventRequest,
     OnChainEventResponse, ReactionRequest, ReactionType, ReactionsByFidRequest,
     ReactionsByTargetRequest, ShardChunk, ShardChunksRequest, ShardChunksResponse, Signer,
-    SignerEventType, SignerRequest, SignerResponse, SignerSource, SignersByFidResponse,
-    StorageLimitsResponse, SubscribeRequest, TrieNodeMetadataRequest, TrieNodeMetadataResponse,
-    UserDataRequest, UserNameProof, UserNameType, UsernameProofRequest, UsernameProofsResponse,
-    ValidationResponse, VerificationAddAddressBody, VerificationRequest,
+    SignerEventType, SignerRequest, SignerResponse, SignerSource, SignersByFidRequest,
+    SignersByFidResponse, StorageLimitsResponse, SubscribeRequest, TrieNodeMetadataRequest,
+    TrieNodeMetadataResponse, UserDataRequest, UserNameProof, UserNameType, UsernameProofRequest,
+    UsernameProofsResponse, ValidationResponse, VerificationAddAddressBody, VerificationRequest,
 };
 use crate::storage::constants::OnChainEventPostfix;
 use crate::storage::constants::RootPrefix;
@@ -37,8 +37,9 @@ use crate::storage::db::RocksDbTransactionBatch;
 use crate::storage::store::account::MessagesPage;
 use crate::storage::store::account::UsernameProofStore;
 use crate::storage::store::account::{
-    get_gasless_key_count, get_gasless_key_record, get_last_used_at, list_gasless_keys_by_fid,
-    CastStore, GaslessKeyRecord, LinkStore, ReactionStore, UserDataStore, VerificationStore,
+    get_app_nonce, get_gasless_key_count, get_gasless_key_record, get_last_used_at, get_user_nonce,
+    list_gasless_keys_by_fid, CastStore, GaslessKeyRecord, LinkStore, ReactionStore, UserDataStore,
+    VerificationStore,
 };
 use crate::storage::store::account::{message_bytes_decode, IntoI32};
 use crate::storage::store::account::{EventsPage, HubEventIdGenerator};
@@ -2697,7 +2698,7 @@ impl HubService for MyHubService {
 
     async fn get_signers_by_fid(
         &self,
-        request: Request<FidRequest>,
+        request: Request<SignersByFidRequest>,
     ) -> Result<Response<SignersByFidResponse>, Status> {
         let req = request.into_inner();
         let fid = req.fid;
@@ -2706,11 +2707,26 @@ impl HubService for MyHubService {
         let page_options = req.page_options();
         let page = list_signers_for_fid(stores, fid, &page_options)?;
 
+        let nonce_txn = RocksDbTransactionBatch::new();
+        let current_user_nonce = get_user_nonce(&stores.db, &nonce_txn, fid)
+            .map_err(signer_store_error_to_status)?
+            .unwrap_or(0);
+        let mut requester_fid_nonces: HashMap<u64, u32> =
+            HashMap::with_capacity(req.requester_fids.len());
+        for requester_fid in &req.requester_fids {
+            let nonce = get_app_nonce(&stores.db, &nonce_txn, *requester_fid)
+                .map_err(signer_store_error_to_status)?
+                .unwrap_or(0);
+            requester_fid_nonces.insert(*requester_fid, nonce);
+        }
+
         Ok(Response::new(SignersByFidResponse {
             signers: page.signers,
             next_page_token: page.next_page_token,
             gasless_signer_count: page.gasless_signer_count,
             gasless_signer_limit: crate::core::validations::key::MAX_GASLESS_KEYS_PER_FID,
+            current_user_nonce,
+            requester_fid_nonces,
         }))
     }
 
