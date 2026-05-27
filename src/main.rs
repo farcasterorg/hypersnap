@@ -291,8 +291,8 @@ async fn start_servers(
                 }
                 Ok(req)
             };
-        let grpc_svc = HubServiceServer::with_interceptor(
-            grpc_service.as_ref().clone(),
+        let grpc_svc = tonic::codegen::InterceptedService::new(
+            HubServiceServer::from_arc(grpc_service),
             rate_limit_interceptor,
         );
         let mut server = Server::builder()
@@ -1419,19 +1419,48 @@ async fn build_hyper_handler(
                     };
                     if validator_pubkey.len() == 32 {
                         let chain_id = hypersnap::hyper::DEFAULT_PROTOCOL_CHAIN_ID;
-                        let fid_count = runtime.count_registered_fids().max(1);
+                        let initial_fid_count = runtime.count_registered_fids().max(1);
                         tracing::info!(
-                            fid_count,
+                            fid_count = initial_fid_count,
                             "DA-PoW challenge space: {} registered FIDs",
-                            fid_count
+                            initial_fid_count
                         );
+                        let fid_count_db = runtime.db.clone();
+                        let fid_count_fn = Box::new(move || -> u64 {
+                            use hypersnap::storage::store::account::{
+                                OnchainEventStore, StoreEventHandler,
+                            };
+                            let handler = StoreEventHandler::new_no_persist();
+                            let onchain = OnchainEventStore::new(fid_count_db.clone(), handler);
+                            let mut count = 0u64;
+                            let mut next: Option<Vec<u8>> = None;
+                            loop {
+                                let opts = hypersnap::storage::db::PageOptions {
+                                    page_size: Some(10_000),
+                                    page_token: next.clone(),
+                                    reverse: false,
+                                };
+                                match onchain.get_fids(&opts) {
+                                    Ok((fids, token)) => {
+                                        count += fids.len() as u64;
+                                        if let Some(t) = token {
+                                            next = Some(t);
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            count.max(1)
+                        });
                         let producer = hypersnap::hyper::da_response_producer_prod::BlockEngineDaResponseProducer::new(
                             engine,
                             signer_sk,
                             validator_pubkey,
                             fid,
                             chain_id,
-                            fid_count,
+                            fid_count_fn,
                         );
                         tracing::info!(operator_fid = fid, "DA-PoW driver wired");
                         Some(Arc::new(producer)

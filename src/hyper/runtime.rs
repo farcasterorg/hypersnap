@@ -4211,8 +4211,7 @@ impl HyperRuntime {
                 };
                 let block_epoch = sig.epoch;
                 let active = match self
-                    .validator_registry
-                    .compute_active_set(block_epoch, &self.bootstrap_validators)
+                    .get_active_validators_enforced(block_epoch, &self.bootstrap_validators)
                 {
                     Ok(a) => a,
                     Err(_) => continue,

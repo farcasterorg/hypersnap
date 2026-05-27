@@ -15,12 +15,7 @@ pub struct BlockEngineDaResponseProducer {
     validator_pubkey: Vec<u8>,
     fid: u64,
     chain_id: u64,
-    /// F135: number of registered FIDs. Passed to
-    /// `derive_challenge_prefix` so the derived FID is bounded to
-    /// the real FID space. Must match the verifier's count exactly.
-    /// Set by the operator at construction; for dynamic updates,
-    /// reconstruct the producer at each epoch boundary.
-    pub fid_count: u64,
+    fid_count_fn: Box<dyn Fn() -> u64 + Send + Sync>,
 }
 
 impl BlockEngineDaResponseProducer {
@@ -30,7 +25,7 @@ impl BlockEngineDaResponseProducer {
         validator_pubkey: Vec<u8>,
         fid: u64,
         chain_id: u64,
-        fid_count: u64,
+        fid_count_fn: Box<dyn Fn() -> u64 + Send + Sync>,
     ) -> Self {
         Self {
             engine,
@@ -38,7 +33,7 @@ impl BlockEngineDaResponseProducer {
             validator_pubkey,
             fid,
             chain_id,
-            fid_count,
+            fid_count_fn,
         }
     }
 }
@@ -53,13 +48,14 @@ impl DaResponseProducer for BlockEngineDaResponseProducer {
             tokio::runtime::Handle::current().block_on(async {
                 let mut engine = self.engine.lock().await;
                 let ctx = merkle_trie::Context::new();
+                let fid_count = (self.fid_count_fn)();
                 produce_da_responses_via(
                     epoch,
                     epoch_boundary_seed,
                     &self.validator_pubkey,
                     self.fid,
                     self.chain_id,
-                    self.fid_count,
+                    fid_count,
                     &self.signer_sk,
                     |prefix| {
                         let matches = engine.trie_values_with_prefix(&ctx, prefix);

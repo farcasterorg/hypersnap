@@ -1236,9 +1236,9 @@ mod tests {
         metrics.insert(100, m_f);
 
         // Ungated: full 2× boost applies.
-        let g_open = compute_growth_harmonic(&metrics, 0.0, 0.0);
+        let g_open = compute_growth_harmonic(&metrics, 0.0, 0.0, 0.0, 0);
         // Gated at 0.5: vouchee's 0.10 < 0.5 → boost suppressed.
-        let g_gated = compute_growth_harmonic(&metrics, 0.0, 0.5);
+        let g_gated = compute_growth_harmonic(&metrics, 0.0, 0.5, 0.0, 0);
 
         let v_open = g_open.get(&100).copied().unwrap_or(0.0);
         let v_gated = g_gated.get(&100).copied().unwrap_or(0.0);
@@ -1270,8 +1270,8 @@ mod tests {
         m_f.all_time_engagement.insert(1, 10);
         metrics.insert(100, m_f);
 
-        let g_open = compute_growth_harmonic(&metrics, 0.0, 0.0);
-        let g_gated = compute_growth_harmonic(&metrics, 0.0, 0.5);
+        let g_open = compute_growth_harmonic(&metrics, 0.0, 0.0, 0.0, 0);
+        let g_gated = compute_growth_harmonic(&metrics, 0.0, 0.5, 0.0, 0);
         // Identical (vouchee passes floor → boost identical).
         let v_open = g_open.get(&100).copied().unwrap_or(0.0);
         let v_gated = g_gated.get(&100).copied().unwrap_or(0.0);
