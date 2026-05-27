@@ -77,6 +77,15 @@ impl Address {
         Self(bytes)
     }
 
+    pub fn try_from_vec(vec: Vec<u8>) -> Result<Self, &'static str> {
+        if vec.len() != 32 {
+            return Err("Address must be 32 bytes");
+        }
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&vec);
+        Ok(Self(bytes))
+    }
+
     pub fn prefix(&self) -> String {
         format!("0x{}", &self.to_hex()[0..4])
     }
@@ -435,6 +444,27 @@ impl Vote {
         }
     }
 
+    pub fn try_from_proto(proto: proto::Vote) -> Result<Self, &'static str> {
+        let vote_type = match proto.r#type {
+            0 => VoteType::Prevote,
+            1 => VoteType::Precommit,
+            _ => return Err("Vote::type out of range"),
+        };
+        let shard_hash = match proto.value {
+            None => NilOrVal::Nil,
+            Some(value) => NilOrVal::Val(value),
+        };
+        let height = proto.height.ok_or("Vote::height missing")?;
+        let voter = Address::try_from_vec(proto.voter)?;
+        Ok(Self {
+            vote_type,
+            height,
+            round: Round::from(proto.round),
+            voter,
+            shard_hash,
+        })
+    }
+
     pub fn to_sign_bytes(&self) -> Vec<u8> {
         self.to_proto().encode_to_vec()
     }
@@ -469,6 +499,19 @@ impl Proposal {
             proposer: Address::from_vec(proto.proposer),
         }
     }
+    pub fn try_from_proto(proto: proto::Proposal) -> Result<Self, &'static str> {
+        let height = proto.height.ok_or("Proposal::height missing")?;
+        let shard_hash = proto.value.ok_or("Proposal::value missing")?;
+        let proposer = Address::try_from_vec(proto.proposer)?;
+        Ok(Self {
+            height,
+            round: Round::from(proto.round),
+            shard_hash,
+            pol_round: Round::from(proto.pol_round),
+            proposer,
+        })
+    }
+
     pub fn to_sign_bytes(&self) -> Vec<u8> {
         // TODO: Should we be signing the hash?
         self.to_proto().encode_to_vec()
@@ -698,6 +741,12 @@ pub trait CommitsExt {
     fn to_commit_certificate(
         &self,
     ) -> informalsystems_malachitebft_core_types::CommitCertificate<SnapchainValidatorContext>;
+    fn try_to_commit_certificate(
+        &self,
+    ) -> Result<
+        informalsystems_malachitebft_core_types::CommitCertificate<SnapchainValidatorContext>,
+        &'static str,
+    >;
     fn from_commit_certificate(
         certificate: &informalsystems_malachitebft_core_types::CommitCertificate<
             SnapchainValidatorContext,
@@ -728,6 +777,35 @@ impl CommitsExt for Commits {
             value_id,
             aggregated_signature: AggregatedSignature::new(signatures),
         }
+    }
+
+    fn try_to_commit_certificate(
+        &self,
+    ) -> Result<
+        informalsystems_malachitebft_core_types::CommitCertificate<SnapchainValidatorContext>,
+        &'static str,
+    > {
+        let height = self.height.ok_or("Commits::height missing")?;
+        let round = Round::from(self.round);
+        let value_id = self.value.clone().ok_or("Commits::value missing")?;
+
+        let signatures = self
+            .signatures
+            .iter()
+            .map(|commit| {
+                Address::try_from_vec(commit.signer.clone()).map(|address| CommitSignature {
+                    address,
+                    signature: Signature(commit.signature.clone()),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(informalsystems_malachitebft_core_types::CommitCertificate {
+            height,
+            round,
+            value_id,
+            aggregated_signature: AggregatedSignature::new(signatures),
+        })
     }
 
     fn from_commit_certificate(
