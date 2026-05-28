@@ -164,6 +164,14 @@ mod tests {
         params.vouch_boost_min_vouchee_trust = 0.0;
         params.min_distinct_crediters = 0;
         params.max_growth_fraction_per_crediter = 0.0;
+        // F009 L2 distribution-aware damping: disabled for this
+        // synthetic test. The 4-FID universe has near-uniform
+        // contributions (every reciprocal pair has the same single-
+        // count engagement), so the production default of 2.0
+        // damps everyone to zero. The test exercises the relative
+        // ordering of trust/reward, not the sybil-damping itself
+        // (covered separately in proof-of-quality unit tests).
+        params.growth_distribution_skew_exponent = 0.0;
         // FIP §8.3 eligibility filters: loosen the synthetic-cohort
         // gates so a 4-FID universe with sparse interactions can
         // still pass F2 (min engagers) and F3/F5/F6 (percentile

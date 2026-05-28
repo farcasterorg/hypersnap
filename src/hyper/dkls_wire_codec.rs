@@ -51,6 +51,19 @@ use rand::{CryptoRng, RngCore};
 
 pub const DISCRIMINATOR_PLAINTEXT: u8 = 0;
 pub const DISCRIMINATOR_ENCRYPTED: u8 = 1;
+/// F023 phase-3 fix: digest-bound plaintext broadcast for sign
+/// frames. Encoded as `[disc][digest_32B][raw_message_bytes]`.
+/// Receivers check the prefix digest equals the active driver's
+/// digest before deserializing the payload — cross-digest
+/// broadcasts (a phase-3 frame from ceremony D_A injected into a
+/// driver signing D_B) are rejected structurally. The binding is
+/// not cryptographic (the digest is public), but it closes the
+/// liveness-grief vector where an attacker can stall a co-running
+/// ceremony with one frame.
+pub const DISCRIMINATOR_SIGN_BROADCAST: u8 = 2;
+/// Length of a sign-ceremony digest (keccak256 of the signing
+/// payload). Matches the encrypted-frame AAD layout.
+pub const SIGN_DIGEST_LEN: usize = 32;
 
 /// Wire-round-tag bytes baked into the AAD. Domain-separates DKG
 /// and sign so a ciphertext sealed during a DKG round cannot be
@@ -93,6 +106,15 @@ pub enum DklsWireError {
     /// ceremony abort.
     #[error("no transport pubkey registered for party {0}")]
     UnknownReceiverTransport(u8),
+    /// F023 phase-3 fix: sign-broadcast frame's digest prefix
+    /// disagrees with the active driver's digest. Caller drops
+    /// the frame rather than feeding it to the wrong ceremony.
+    #[error("sign-broadcast digest mismatch: frame {frame:?}, active {active:?}")]
+    SignBroadcastDigestMismatch { frame: Vec<u8>, active: Vec<u8> },
+    /// F023 phase-3 fix: sign-broadcast frame truncated below the
+    /// minimum `[disc][digest_32B][...]` layout.
+    #[error("sign-broadcast frame truncated: need ≥ 1+32 bytes, got {0}")]
+    SignBroadcastTruncated(usize),
 }
 
 /// Build the AEAD AAD for a DKLS wire frame. Receivers reconstruct
@@ -183,8 +205,18 @@ where
     let raw = message.to_bytes();
     match message.receiver() {
         None => {
-            let mut out = Vec::with_capacity(1 + raw.len());
-            out.push(DISCRIMINATOR_PLAINTEXT);
+            // F023 phase-3 fix: prefix the digest so receivers can
+            // reject cross-digest broadcasts before deserializing.
+            // The digest is public — this is structural binding, not
+            // cryptographic — but it's sufficient to prevent the
+            // liveness-griefing vector where a phase-3 frame from
+            // ceremony D_A is injected into a driver signing D_B.
+            if digest.len() != SIGN_DIGEST_LEN {
+                return Err(DklsWireError::SignBroadcastTruncated(digest.len()));
+            }
+            let mut out = Vec::with_capacity(1 + SIGN_DIGEST_LEN + raw.len());
+            out.push(DISCRIMINATOR_SIGN_BROADCAST);
+            out.extend_from_slice(digest);
             out.extend_from_slice(&raw);
             Ok(out)
         }
@@ -318,8 +350,25 @@ pub fn open_dkls_sign_round_message(
         return Err(DklsWireError::Empty);
     }
     match bytes[0] {
-        DISCRIMINATOR_PLAINTEXT => {
-            let message = DklsSignRoundMessage::from_bytes(&bytes[1..])
+        DISCRIMINATOR_SIGN_BROADCAST => {
+            // F023 phase-3 fix: structural digest binding. A phase-3
+            // broadcast frame carries its target digest in the clear
+            // (the digest is public); the receiver rejects frames
+            // whose prefix-digest disagrees with the active driver's
+            // digest. Cross-digest frames (same epoch, different
+            // ceremony) are dropped here rather than being fed into
+            // the wrong ceremony and triggering an abort.
+            if bytes.len() < 1 + SIGN_DIGEST_LEN {
+                return Err(DklsWireError::SignBroadcastTruncated(bytes.len()));
+            }
+            let frame_digest = &bytes[1..1 + SIGN_DIGEST_LEN];
+            if frame_digest != digest {
+                return Err(DklsWireError::SignBroadcastDigestMismatch {
+                    frame: frame_digest.to_vec(),
+                    active: digest.to_vec(),
+                });
+            }
+            let message = DklsSignRoundMessage::from_bytes(&bytes[1 + SIGN_DIGEST_LEN..])
                 .map_err(|e| DklsWireError::Bincode(e.to_string()))?;
             Ok(OpenedDklsSignMessage::Broadcast(message))
         }
@@ -567,5 +616,63 @@ mod tests {
         let secret = TransportSecretKey::random(&mut rng);
         let r = open_dkls_round_message(&[0xff, 0x00], 0, &secret, 1);
         assert!(matches!(r, Err(DklsWireError::UnknownDiscriminator(0xff))));
+    }
+
+    /// F023 phase-3 fix: a sign-broadcast frame's digest prefix must
+    /// match the active driver's digest. Mismatch → rejection at
+    /// decode time, not propagation into the wrong ceremony.
+    #[test]
+    fn sign_broadcast_cross_digest_rejected() {
+        let mut rng = OsRng;
+        let secret = TransportSecretKey::random(&mut rng);
+
+        // Frame digest D_A and active driver digest D_B (same epoch,
+        // different ceremony — the F023 phase-3 cross-routing scenario).
+        let frame_digest = [0xa0u8; SIGN_DIGEST_LEN];
+        let active_digest = [0xb0u8; SIGN_DIGEST_LEN];
+
+        // Build a sign-broadcast wire frame directly. We don't need a
+        // real `DklsSignRoundMessage` body for this test — the digest
+        // check fires BEFORE deserialization, so any trailing bytes
+        // are fine.
+        let mut wire = Vec::with_capacity(1 + SIGN_DIGEST_LEN + 4);
+        wire.push(DISCRIMINATOR_SIGN_BROADCAST);
+        wire.extend_from_slice(&frame_digest);
+        wire.extend_from_slice(&[0u8; 4]); // dummy payload
+
+        let opened = open_dkls_sign_round_message(&wire, 0, &active_digest, &secret, 1);
+        match opened {
+            Err(DklsWireError::SignBroadcastDigestMismatch { frame, active }) => {
+                assert_eq!(frame, frame_digest.to_vec());
+                assert_eq!(active, active_digest.to_vec());
+            }
+            other => panic!("expected SignBroadcastDigestMismatch, got {other:?}"),
+        }
+    }
+
+    /// F023 phase-3 fix: a sign-broadcast frame truncated below the
+    /// required prefix layout is rejected at decode time.
+    #[test]
+    fn sign_broadcast_truncated_rejected() {
+        let mut rng = OsRng;
+        let secret = TransportSecretKey::random(&mut rng);
+        let digest = [0u8; SIGN_DIGEST_LEN];
+
+        // Just the discriminator — no digest, no payload.
+        let wire = vec![DISCRIMINATOR_SIGN_BROADCAST];
+        let opened = open_dkls_sign_round_message(&wire, 0, &digest, &secret, 1);
+        assert!(matches!(
+            opened,
+            Err(DklsWireError::SignBroadcastTruncated(_))
+        ));
+
+        // Discriminator + half a digest.
+        let mut wire = vec![DISCRIMINATOR_SIGN_BROADCAST];
+        wire.extend_from_slice(&[0xaa; SIGN_DIGEST_LEN / 2]);
+        let opened = open_dkls_sign_round_message(&wire, 0, &digest, &secret, 1);
+        assert!(matches!(
+            opened,
+            Err(DklsWireError::SignBroadcastTruncated(_))
+        ));
     }
 }

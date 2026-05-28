@@ -1555,16 +1555,16 @@ async fn build_hyper_handler(
 
             // Shared "latest snapchain anchor" — scheduler uses the
             // full struct, supervisor only needs the block number.
-            // Both poll from the actor's last-imported block since
-            // direct BlockEventStore access is operator-side and not
-            // exposed via this handler.
-            let scheduler_anchor: Arc<Mutex<LatestAnchor>> =
+            // F004: a single shared `LatestAnchor` source. The
+            // scheduler reads the full struct; the supervisor reads
+            // `.block` from the same mutex. Eliminates the prior
+            // window where the two were updated in separate lock
+            // acquisitions and could disagree by a full epoch.
+            let shared_anchor: Arc<Mutex<LatestAnchor>> =
                 Arc::new(Mutex::new(LatestAnchor::default()));
-            let supervisor_anchor: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
             spawn_anchor_poller(
                 client.clone(),
-                scheduler_anchor.clone(),
-                supervisor_anchor.clone(),
+                shared_anchor.clone(),
                 Duration::from_secs(1),
             );
 
@@ -1575,7 +1575,7 @@ async fn build_hyper_handler(
                 ctx_handle,
                 client.clone(),
                 validator_key.clone(),
-                scheduler_anchor.clone(),
+                shared_anchor.clone(),
                 Duration::from_secs(5),
                 cutover_snapchain_block,
             ));
@@ -1591,7 +1591,7 @@ async fn build_hyper_handler(
                 hypersnap::hyper::dkls_supervisor::DklsSupervisorInputs {
                     local_validator_key: validator_key,
                     threshold: dkls_threshold,
-                    latest_anchor: supervisor_anchor,
+                    latest_anchor: shared_anchor,
                     tick_interval: supervisor_tick,
                     start_lead_blocks: supervisor_lead_blocks,
                     cutover_block: cutover_snapchain_block,
@@ -1623,12 +1623,14 @@ fn actor_handles_inbound_for_scheduler(
 }
 
 /// Periodically poll the actor for the latest imported block and
-/// fan its `snapchain_anchor_*` metadata into the shared anchor
-/// handles the scheduler + supervisor read from.
+/// fan its `snapchain_anchor_*` metadata into the single shared
+/// `LatestAnchor` the scheduler and supervisor both read from.
+/// F004: collapsed from a two-mutex split (scheduler/supervisor)
+/// into one shared source so the two views can no longer drift
+/// between non-atomic writes.
 fn spawn_anchor_poller(
     client: hypersnap::hyper::actor::HyperActorClient,
-    scheduler_anchor: std::sync::Arc<tokio::sync::Mutex<hypersnap::hyper::scheduler::LatestAnchor>>,
-    supervisor_anchor: std::sync::Arc<tokio::sync::Mutex<u64>>,
+    anchor: std::sync::Arc<tokio::sync::Mutex<hypersnap::hyper::scheduler::LatestAnchor>>,
     interval: std::time::Duration,
 ) {
     tokio::spawn(async move {
@@ -1654,8 +1656,7 @@ fn spawn_anchor_poller(
                 hash: meta.snapchain_anchor_hash.clone(),
                 timestamp: meta.snapchain_anchor_timestamp,
             };
-            *scheduler_anchor.lock().await = snapshot;
-            *supervisor_anchor.lock().await = meta.snapchain_anchor_block;
+            *anchor.lock().await = snapshot;
         }
     });
 }

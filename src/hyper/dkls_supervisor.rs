@@ -38,7 +38,13 @@ use tracing::{info, warn};
 pub struct DklsSupervisorInputs {
     pub local_validator_key: Vec<u8>,
     pub threshold: u8,
-    pub latest_anchor: Arc<Mutex<u64>>,
+    /// F004: shared anchor source. Both the scheduler and the
+    /// supervisor read from this same `Arc<Mutex<LatestAnchor>>`,
+    /// eliminating the prior dual-anchor desync where the supervisor
+    /// kept a separate `Arc<Mutex<u64>>` and the two could disagree
+    /// by a full epoch between the two non-atomic writes in the
+    /// anchor poller.
+    pub latest_anchor: Arc<Mutex<crate::hyper::scheduler::LatestAnchor>>,
     pub tick_interval: Duration,
     pub start_lead_blocks: u64,
     pub cutover_block: u64,
@@ -65,8 +71,10 @@ pub async fn run(
 
         // Snapshot the anchor once per tick — every derivation in
         // this tick (epoch calculation, lead-window check,
-        // build_driver) uses this single value.
-        let anchor = *inputs.latest_anchor.lock().await;
+        // build_driver) uses this single value. F004: same shared
+        // `LatestAnchor` source as the scheduler — `.block` is the
+        // snapchain block number we need.
+        let anchor = inputs.latest_anchor.lock().await.block;
         let current_epoch = epoch_for_with_offset(anchor, inputs.cutover_block);
         let next_epoch = current_epoch + 1;
 

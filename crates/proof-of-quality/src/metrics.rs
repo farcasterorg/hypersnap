@@ -207,6 +207,44 @@ pub fn normalized_entropy(counts: &BTreeMap<u64, u32>) -> f64 {
     h / (n as f64).log2()
 }
 
+/// Normalized Shannon entropy of a non-negative real-valued
+/// distribution. Same domain + semantics as [`normalized_entropy`]
+/// but for `Vec<f64>` rather than count maps — used by F009's
+/// growth-L2 distribution-aware damping over per-crediter
+/// contribution magnitudes. Returns 0 for fewer than 2 positive
+/// entries or zero total, 1.0 when the distribution is perfectly
+/// uniform across all entries.
+///
+/// Determinism: the caller MUST pass the values in a canonical
+/// order (e.g. sorted by FID at the call site); this function
+/// iterates in slice order and the running sum is order-sensitive
+/// at the f64 ULP. Production callers in this crate iterate
+/// `BTreeMap` in key order, which is canonical.
+pub fn normalized_entropy_of_values(values: &[f64]) -> f64 {
+    if values.len() < 2 {
+        return 0.0;
+    }
+    let mut total = 0.0_f64;
+    let mut positive_count = 0usize;
+    for &v in values {
+        if v > 0.0 {
+            total += v;
+            positive_count += 1;
+        }
+    }
+    if total <= 0.0 || positive_count < 2 {
+        return 0.0;
+    }
+    let mut h = 0.0_f64;
+    for &v in values {
+        if v > 0.0 {
+            let p = v / total;
+            h -= p * p.log2();
+        }
+    }
+    h / (positive_count as f64).log2()
+}
+
 /// Build per-FID metrics from the reader state. Single pass over every
 /// FID; reads are deterministic by trait contract. The returned map is
 /// keyed by FID (BTreeMap → ascending iteration).

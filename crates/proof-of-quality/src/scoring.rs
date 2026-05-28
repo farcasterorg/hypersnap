@@ -161,8 +161,9 @@ pub fn compute_growth_harmonic(
     metrics: &BTreeMap<u64, FidMetrics>,
     crediter_trust_threshold: f64,
     vouch_boost_min_vouchee_trust: f64,
-    max_growth_fraction_per_crediter: f64,
+    _max_growth_fraction_per_crediter: f64,
     min_distinct_crediters: usize,
+    growth_distribution_skew_exponent: f64,
 ) -> BTreeMap<u64, f64> {
     let mut growth: BTreeMap<u64, f64> = BTreeMap::new();
     for (&f, m_f) in metrics.iter() {
@@ -170,6 +171,9 @@ pub fn compute_growth_harmonic(
             continue;
         }
         // First pass: collect raw per-crediter contributions.
+        // `all_time_engagement` is a BTreeMap so iteration is in
+        // ascending crediter-FID order — deterministic across
+        // validators (required for the entropy reduction below).
         let mut contributions: Vec<f64> = Vec::new();
         for (&u, &count_uf) in m_f.all_time_engagement.iter() {
             let count_fu = metrics
@@ -212,30 +216,46 @@ pub fn compute_growth_harmonic(
         if contributions.is_empty() {
             continue;
         }
-        // F009: two-layer sybil defense.
+        // F009: three-layer sybil defense.
+        //
+        // Layer 0 — crediter trust floor (enforced above via
+        // `crediter_trust_threshold`): noise-floor accounts with
+        // trust < 0.05 don't contribute, so a same-trust-tier sybil
+        // ring contributes nothing here.
         //
         // Layer 1 — distinct-crediter count gate: growth is zero
         // unless at least `min_distinct_crediters` (default 3)
         // unique crediters reciprocate. A 2-person sybil pair gets
-        // nothing; a legitimate user with diverse engagement clears
-        // easily.
+        // nothing; a legitimate user with diverse engagement
+        // clears easily.
         //
-        // Layer 2 — sqrt-damped crediter count: growth is scaled
-        // by `sqrt(n_crediters) / n_crediters` so it grows
-        // sub-linearly with the number of crediters. A 100-member
-        // sybil ring where every pair reciprocates sees each member
-        // get `sqrt(99)/99 ≈ 0.1` of the raw total — 10x penalty
-        // vs. a legitimate user with the same sum but from 99
-        // distinct real people (who would have a naturally skewed
-        // distribution, concentrating weight in fewer large
-        // crediters and hitting the cap less).
+        // Layer 2 — distribution-aware damping. Mirrors the retro
+        // reward algorithm's `(engager_entropy * interaction_entropy)
+        // ^ ring_symmetry_exponent` factor in `compute_composite`.
+        // The growth-side analogue computes the normalized Shannon
+        // entropy of the per-crediter contributions and damps the
+        // sum by `(1 - H_norm)^growth_distribution_skew_exponent`,
+        // composed multiplicatively with the count-based
+        // `sqrt(n)/n`. A 100-member sybil ring where every pair
+        // reciprocates with similar engagement has near-uniform
+        // contributions (`H_norm ≈ 1`) → damping toward zero. A
+        // real user with skewed engagement (`H_norm ≈ 0.4-0.6`)
+        // keeps most of the sum. Distribution-blind by the prior
+        // sqrt-only damping is closed (see audit F009 R5 caveat).
         let n_crediters = contributions.len();
         if n_crediters < min_distinct_crediters {
             continue;
         }
-        let damping = (n_crediters as f64).sqrt() / n_crediters as f64;
+        let count_damping = (n_crediters as f64).sqrt() / n_crediters as f64;
+        let entropy = crate::metrics::normalized_entropy_of_values(&contributions);
+        let skew = (1.0 - entropy).max(0.0);
+        let distribution_damping = if growth_distribution_skew_exponent > 0.0 {
+            skew.powf(growth_distribution_skew_exponent)
+        } else {
+            1.0
+        };
         let raw_sum: f64 = contributions.iter().sum();
-        let acc = raw_sum * damping;
+        let acc = raw_sum * count_damping * distribution_damping;
         if acc > 0.0 {
             growth.insert(f, acc);
         }
@@ -368,6 +388,7 @@ pub fn evaluate_epoch<R: SnapchainStateReader + ?Sized>(
         params.vouch_boost_min_vouchee_trust,
         params.max_growth_fraction_per_crediter,
         params.min_distinct_crediters,
+        params.growth_distribution_skew_exponent,
     );
     let composite = compute_composite(&metrics, &growth, params);
 
@@ -707,8 +728,8 @@ mod tests {
             m
         };
 
-        let growth_no = compute_growth_harmonic(&metrics_no, 0.0, 0.0, 0.0, 0);
-        let growth_yes = compute_growth_harmonic(&metrics_yes, 0.0, 0.0, 0.0, 0);
+        let growth_no = compute_growth_harmonic(&metrics_no, 0.0, 0.0, 0.0, 0, 0.0);
+        let growth_yes = compute_growth_harmonic(&metrics_yes, 0.0, 0.0, 0.0, 0, 0.0);
 
         let g_no = growth_no.get(&100).copied().unwrap_or(0.0);
         let g_yes = growth_yes.get(&100).copied().unwrap_or(0.0);
@@ -763,7 +784,7 @@ mod tests {
             let mut m = build_metrics(&r, now).unwrap();
             let et = compute_eigentrust(&graph, &seeds, 30, 0.85);
             apply_trust_and_credibility(&mut m, &et);
-            let g = compute_growth_harmonic(&m, 0.0, 0.0, 0.0, 0);
+            let g = compute_growth_harmonic(&m, 0.0, 0.0, 0.0, 0, 0.0);
             g.get(&100).copied().unwrap_or(0.0)
         };
 
@@ -835,7 +856,7 @@ mod tests {
             let mut m = build_metrics(&r, now).unwrap();
             let et = compute_eigentrust(&graph, &seeds, 30, 0.85);
             apply_trust_and_credibility(&mut m, &et);
-            let g = compute_growth_harmonic(&m, 0.0, 0.0, 0.0, 0);
+            let g = compute_growth_harmonic(&m, 0.0, 0.0, 0.0, 0, 0.0);
             g.get(&fid).copied().unwrap_or(0.0)
         };
 
@@ -1193,7 +1214,7 @@ mod tests {
             let mut m = build_metrics(&r, now).unwrap();
             let et = compute_eigentrust(&graph, &seeds, 30, 0.85);
             apply_trust_and_credibility(&mut m, &et);
-            let g = compute_growth_harmonic(&m, 0.0, 0.0, 0.0, 0);
+            let g = compute_growth_harmonic(&m, 0.0, 0.0, 0.0, 0, 0.0);
             g.get(&100).copied().unwrap_or(0.0)
         };
 
@@ -1236,9 +1257,9 @@ mod tests {
         metrics.insert(100, m_f);
 
         // Ungated: full 2× boost applies.
-        let g_open = compute_growth_harmonic(&metrics, 0.0, 0.0, 0.0, 0);
+        let g_open = compute_growth_harmonic(&metrics, 0.0, 0.0, 0.0, 0, 0.0);
         // Gated at 0.5: vouchee's 0.10 < 0.5 → boost suppressed.
-        let g_gated = compute_growth_harmonic(&metrics, 0.0, 0.5, 0.0, 0);
+        let g_gated = compute_growth_harmonic(&metrics, 0.0, 0.5, 0.0, 0, 0.0);
 
         let v_open = g_open.get(&100).copied().unwrap_or(0.0);
         let v_gated = g_gated.get(&100).copied().unwrap_or(0.0);
@@ -1270,11 +1291,118 @@ mod tests {
         m_f.all_time_engagement.insert(1, 10);
         metrics.insert(100, m_f);
 
-        let g_open = compute_growth_harmonic(&metrics, 0.0, 0.0, 0.0, 0);
-        let g_gated = compute_growth_harmonic(&metrics, 0.0, 0.5, 0.0, 0);
+        let g_open = compute_growth_harmonic(&metrics, 0.0, 0.0, 0.0, 0, 0.0);
+        let g_gated = compute_growth_harmonic(&metrics, 0.0, 0.5, 0.0, 0, 0.0);
         // Identical (vouchee passes floor → boost identical).
         let v_open = g_open.get(&100).copied().unwrap_or(0.0);
         let v_gated = g_gated.get(&100).copied().unwrap_or(0.0);
         assert!((v_open - v_gated).abs() < 1e-12);
+    }
+
+    /// Build a metrics map where FID `recipient` receives reciprocal
+    /// engagement from `crediters`, each with the specified
+    /// `(recipient_count, crediter_count)` shape — i.e. how many
+    /// engagements each side directed at the other. Used to set up
+    /// known-shape per-crediter contribution distributions for the
+    /// F009 L2 damping tests.
+    fn build_metrics_with_shape(
+        recipient: u64,
+        recipient_trust: f64,
+        crediters: &[(u64, u32, u32)], // (crediter_fid, recipient→crediter, crediter→recipient)
+    ) -> BTreeMap<u64, FidMetrics> {
+        let mut metrics: BTreeMap<u64, FidMetrics> = BTreeMap::new();
+        let mut m_r = FidMetrics::new(recipient);
+        m_r.trust_score = recipient_trust;
+        m_r.credibility_weight = recipient_trust;
+        for &(c_fid, r_to_c, _c_to_r) in crediters {
+            m_r.all_time_engagement.insert(c_fid, r_to_c);
+        }
+        metrics.insert(recipient, m_r);
+        for &(c_fid, _r_to_c, c_to_r) in crediters {
+            let mut m_c = FidMetrics::new(c_fid);
+            m_c.trust_score = 1.0;
+            m_c.credibility_weight = 1.0;
+            m_c.all_time_engagement.insert(recipient, c_to_r);
+            metrics.insert(c_fid, m_c);
+        }
+        metrics
+    }
+
+    /// F009 L2: a recipient with skewed per-crediter contributions
+    /// (the real-user pattern — one or two heavy engagers among many
+    /// lighter ones) keeps most of its growth; a sybil ring with
+    /// uniform per-crediter contributions gets heavily damped.
+    #[test]
+    fn distribution_aware_damping_penalizes_uniform_rings() {
+        // Real-user pattern: one heavy crediter dominates, several
+        // lighter ones tail off. Asymmetric harmonic means produce
+        // a skewed contribution distribution.
+        let real_crediters: Vec<(u64, u32, u32)> = vec![
+            (10, 100, 100), // heavy reciprocal
+            (11, 20, 20),
+            (12, 10, 10),
+            (13, 5, 5),
+            (14, 5, 5),
+            (15, 3, 3),
+            (16, 3, 3),
+            (17, 2, 2),
+            (18, 2, 2),
+            (19, 2, 2),
+        ];
+        let m_real = build_metrics_with_shape(100, 1.0, &real_crediters);
+
+        // Sybil-ring pattern: 10 crediters with identical reciprocal
+        // engagement → perfectly uniform contributions.
+        let ring_crediters: Vec<(u64, u32, u32)> = (10u64..20).map(|c| (c, 5u32, 5u32)).collect();
+        let m_ring = build_metrics_with_shape(100, 1.0, &ring_crediters);
+
+        let skew_exp = 2.0;
+        let g_real = compute_growth_harmonic(&m_real, 0.0, 0.0, 0.0, 3, skew_exp);
+        let g_ring = compute_growth_harmonic(&m_ring, 0.0, 0.0, 0.0, 3, skew_exp);
+
+        let v_real = g_real.get(&100).copied().unwrap_or(0.0);
+        let v_ring = g_ring.get(&100).copied().unwrap_or(0.0);
+        assert!(
+            v_real > 0.0,
+            "real-user growth must be positive; got {}",
+            v_real
+        );
+        // The ring's uniform distribution lands at H_norm ≈ 1, so
+        // (1 - H_norm)^2 ≈ 0 → ring growth should be at least an
+        // order of magnitude below the real user's.
+        assert!(
+            v_ring < v_real / 10.0,
+            "ring should be damped >10× below real user: real={}, ring={}",
+            v_real,
+            v_ring
+        );
+
+        // Sanity check: with the skew exponent off, the ring is NOT
+        // damped distribution-wise (the prior count-only behavior).
+        let g_real_no_l2 = compute_growth_harmonic(&m_real, 0.0, 0.0, 0.0, 3, 0.0);
+        let g_ring_no_l2 = compute_growth_harmonic(&m_ring, 0.0, 0.0, 0.0, 3, 0.0);
+        let v_ring_no_l2 = g_ring_no_l2.get(&100).copied().unwrap_or(0.0);
+        let v_real_no_l2 = g_real_no_l2.get(&100).copied().unwrap_or(0.0);
+        // Without L2, the ring is much closer to the real user (the
+        // count-only sqrt-damping is the same for both n=10).
+        assert!(
+            v_ring_no_l2 > v_real_no_l2 / 4.0,
+            "without L2 damping, ring should NOT be heavily penalized: real={}, ring={}",
+            v_real_no_l2,
+            v_ring_no_l2
+        );
+    }
+
+    /// F009 L2: setting `growth_distribution_skew_exponent = 0`
+    /// recovers the prior count-only sqrt-damping behavior.
+    #[test]
+    fn distribution_skew_exponent_zero_recovers_count_only() {
+        let ring_crediters: Vec<(u64, u32, u32)> = (10u64..15).map(|c| (c, 5u32, 5u32)).collect();
+        let metrics = build_metrics_with_shape(100, 1.0, &ring_crediters);
+
+        // With L2 disabled (exp = 0), distribution_damping = 1, so
+        // the result is `raw_sum * sqrt(n) / n` — the prior behavior.
+        let g = compute_growth_harmonic(&metrics, 0.0, 0.0, 0.0, 3, 0.0);
+        assert!(g.get(&100).copied().unwrap_or(0.0) > 0.0);
     }
 }

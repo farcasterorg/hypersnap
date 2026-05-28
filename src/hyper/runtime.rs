@@ -336,7 +336,15 @@ pub struct DklsEpochState {
 
 impl HyperRuntime {
     pub fn new(config: HyperRuntimeConfig) -> Self {
-        let manager = EpochManager::new();
+        // F004 (R6): cutover-aware epoch resolver. Without this, the
+        // authoritative `epoch_resolver.current_epoch()` reports the
+        // raw `cutover_block / EPOCH_LENGTH` post-cutover, while the
+        // genesis DKLS share is keyed at epoch 0 — block signing
+        // misses the share and the chain halts on the first post-
+        // cutover block. The peripheral timing loops (actor /
+        // supervisor / scheduler) already use the offset; the
+        // resolver must match.
+        let manager = EpochManager::with_cutover(config.cutover_snapchain_block);
         let epoch_resolver = EpochResolver::new(manager);
 
         let block_index = HyperBlockIndex::new(config.db.clone());
@@ -4955,6 +4963,77 @@ mod tests {
             local_transport_secret_bytes: [0u8; 32],
         };
         (HyperRuntime::new(config), dir)
+    }
+
+    /// F004 (R6) regression: after `apply_cutover` at a mainnet-shaped
+    /// cutover height, the authoritative `epoch_resolver.current_epoch()`
+    /// must report 0 (genesis), not the raw `cutover / EPOCH_LENGTH`.
+    /// Without the cutover-aware `EpochManager`, the genesis DKLS share
+    /// (keyed at epoch 0) is unreachable from the signer's lookup and
+    /// the chain halts on the first post-cutover block.
+    #[test]
+    fn cutover_aware_resolver_reports_epoch_zero_post_cutover() {
+        use crate::hyper::epoch::{epoch_for_with_offset, EPOCH_LENGTH};
+
+        let cutover: u64 = 5_000_000;
+        assert!(cutover >= EPOCH_LENGTH);
+
+        let dir = TempDir::new().unwrap();
+        let db = RocksDB::new(dir.path().to_str().unwrap());
+        db.open().unwrap();
+        let mut rng = rand::rngs::OsRng;
+        let srs = Arc::new(KzgSrs::random_unsafe(
+            &mut rng,
+            hypersnap_crypto::kzg_lagrange::VERKLE_DOMAIN,
+        ));
+        let config = HyperRuntimeConfig {
+            db: Arc::new(db),
+            srs,
+            mempool_capacity: 100,
+            score_weights: ScoreWeights::default(),
+            bootstrap_validators: vec![],
+            max_reward_per_epoch: None,
+            max_reward_per_epoch_per_market: std::collections::HashMap::new(),
+            cutover_snapchain_block: cutover,
+            min_validator_trust_score: 0.0,
+            protocol_chain_id: crate::hyper::DEFAULT_PROTOCOL_CHAIN_ID,
+            scoring_params: proof_of_quality::ScoringParams::default(),
+            seed_max_fid: 50_000,
+            retro_vesting_on_protocol_epochs: RETRO_VESTING_ON_PROTOCOL_EPOCHS_DEFAULT,
+            local_transport_secret_bytes: [0u8; 32],
+        };
+        let mut rt = HyperRuntime::new(config);
+
+        // Pre-cutover: the resolver is also cutover-aware.
+        assert_eq!(epoch_for_with_offset(cutover, cutover), 0);
+
+        let dkg = hypersnap_crypto::dkls_threshold::run_honest_dkg(1, 1, [0xab; 32]).unwrap();
+        rt.apply_cutover(cutover, &[0x11; 32], dkg.group_address, &[], &[])
+            .expect("apply_cutover");
+
+        // Post-cutover: the authoritative resolver reports epoch 0,
+        // matching where genesis DKLS material is installed.
+        assert_eq!(
+            rt.epoch_resolver.current_epoch(),
+            0,
+            "resolver must report epoch 0 immediately post-cutover"
+        );
+        assert!(rt.dkls_signers.get(&0).is_none()); // address installed, not share
+
+        // Install the genesis share (mirrors genesis.rs) and confirm
+        // block production lands cleanly — the signer's lookup at
+        // epoch 0 now finds the share.
+        rt.install_local_dkls_share(0, 1, dkg.parties[0].clone(), dkg.group_address);
+        let produced = rt.produce_signed_block_dkls_local(0, vec![], 0, cutover, vec![0x11; 32], 0);
+        assert!(
+            produced.is_ok(),
+            "cutover-aware resolver must let the genesis block produce: {:?}",
+            produced.err()
+        );
+
+        // And the resolver advances cutover-relative as new anchors land.
+        rt.epoch_resolver.observe_anchor(cutover + EPOCH_LENGTH);
+        assert_eq!(rt.epoch_resolver.current_epoch(), 1);
     }
 
     fn sample_lock(byte: u8) -> proto::HyperLockEvent {

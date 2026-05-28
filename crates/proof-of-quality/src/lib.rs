@@ -168,6 +168,27 @@ pub struct ScoringParams {
     /// growth is zero — a 2-person sybil pair gets nothing.
     /// Default 3.
     pub min_distinct_crediters: usize,
+
+    /// F009 L2 (distribution-aware): exponent for the
+    /// distribution-skew damping over per-crediter contributions.
+    /// The retro reward algorithm uses Shannon entropy raised to
+    /// `ring_symmetry_exponent` on `engager_entropy *
+    /// interaction_entropy` (see `compute_composite`). The
+    /// symmetric construction here computes the normalized entropy
+    /// of the per-crediter growth contributions and damps the
+    /// growth sum by `(1 - H_norm)^growth_distribution_skew_exponent`:
+    /// a real user's contributions are skewed (one heavy crediter
+    /// dominates → low entropy → low penalty) while a sybil ring's
+    /// contributions are uniform (high entropy → heavy penalty,
+    /// approaching zero growth as the distribution becomes
+    /// perfectly flat).
+    ///
+    /// Default 2.0: tightens the prior count-only `sqrt(n)/n`
+    /// damping with distribution-awareness while leaving small,
+    /// naturally-uniform legitimate clusters (≤ `min_distinct_crediters`
+    /// reciprocating friends) gated by L1 rather than L2. Set to 0
+    /// to recover the count-only behavior.
+    pub growth_distribution_skew_exponent: f64,
 }
 
 /// FIP §8.3 calibration + threshold knobs. Defaults match the
@@ -299,6 +320,20 @@ impl Default for ScoringParams {
             // with diverse engagement outcompete a homogeneous ring.
             max_growth_fraction_per_crediter: 0.05,
             min_distinct_crediters: 3,
+            // F009 L2: distribution-aware sybil-ring damping.
+            // Mirrors `ring_symmetry_exponent = 3.0` (used on
+            // `engager_entropy * interaction_entropy` in
+            // `compute_composite`); the growth-side construction
+            // applies an analogous `(1 - normalized_entropy)^k`
+            // factor over the per-crediter contributions, so a
+            // ring's uniformly-distributed contributions damp
+            // toward zero while a real user's skewed distribution
+            // keeps most of the growth sum. 2.0 is the default
+            // because the growth damping composes multiplicatively
+            // with the count-based sqrt-damping; a lower exponent
+            // there gives the same effective tightness as the
+            // composite's 3.0 acting alone.
+            growth_distribution_skew_exponent: 2.0,
         }
     }
 }
