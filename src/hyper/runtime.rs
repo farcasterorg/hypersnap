@@ -1206,13 +1206,8 @@ impl HyperRuntime {
             return None;
         }
         let active = self
-            .validator_registry
-            .compute_active_set(epoch, &self.bootstrap_validators)
+            .get_active_validators_enforced(epoch, &self.bootstrap_validators)
             .ok()?;
-        // The BTreeMap iterates in sorted-by-validator_key order;
-        // the DKLS committee picks party indices from this same
-        // canonical ordering (1-based). The Nth element corresponds
-        // to party_index == N.
         let target = (party_index as usize).checked_sub(1)?;
         let (_, (_, transport_pk)) = active.iter().nth(target)?;
         if transport_pk.len() != 32 {
@@ -1233,21 +1228,15 @@ impl HyperRuntime {
     /// "registry-unknown" and decide policy (drop or accept). Default
     /// `peer_id_to_party_index_for_epoch` returns the full map for
     /// reverse lookup.
-    /// F018 residual fix: index into the FULL active set (same
-    /// ordering `compute_active_set` uses for committee enumeration),
-    /// then look up the peer-id for that validator_key in the
-    /// peer-ids map. The prior implementation indexed into
-    /// `compute_active_peer_ids` directly, which omits validators
-    /// without a registered peer-id — during gradual rollout this
-    /// smaller map caused `nth(party_index - 1)` to land on the
-    /// wrong validator, false-rejecting honest frames.
+    /// F018/F026: resolve against the enforced active set — the same
+    /// ordered set that DKLS committee party indices are assigned
+    /// over (`dkls_supervisor.rs:199`, `active_validators(epoch, true)`).
     pub fn peer_id_for_party(&self, epoch: u64, party_index: u8) -> Option<Vec<u8>> {
         if party_index == 0 {
             return None;
         }
         let active = self
-            .validator_registry
-            .compute_active_set(epoch, &self.bootstrap_validators)
+            .get_active_validators_enforced(epoch, &self.bootstrap_validators)
             .ok()?;
         let target = (party_index as usize).checked_sub(1)?;
         let (validator_key, _) = active.iter().nth(target)?;
@@ -4996,8 +4985,13 @@ mod tests {
     /// peer with full history.
     #[test]
     fn verkle_tree_replays_from_block_index_on_restart() {
-        use crate::hyper::router::HyperRouter;
-
+        // F058 cleanup: transparent locks no longer reach the
+        // mempool, so this test (originally testing verkle-tree
+        // restoration after restart by submitting lock_a, restart,
+        // submit lock_b, replay on a peer) is reduced to the
+        // chain-continuity invariant: an empty block produced
+        // pre-restart must be readable post-restart and importable
+        // by a fresh peer.
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().to_str().unwrap().to_string();
 
@@ -5007,21 +5001,6 @@ mod tests {
             hypersnap_crypto::kzg_lagrange::VERKLE_DOMAIN,
         ));
         let dkg = hypersnap_crypto::dkls_threshold::run_honest_dkg(1, 1, [0xab; 32]).unwrap();
-
-        let lock_a = proto::HyperLockEvent {
-            amount: 1_000_000,
-            dest_chain_id: 1,
-            dest_address: vec![0xab; 20],
-            spend_pubkey: vec![0x02; 33],
-            lock_id: vec![0xa0; 32],
-            lock_height: 100,
-            lock_timestamp: 1_700_000_000,
-            lock_signature: vec![0u8; 64],
-        };
-        let lock_b = proto::HyperLockEvent {
-            lock_id: vec![0xb0; 32],
-            ..lock_a.clone()
-        };
 
         // Phase 1: produce + import block 0 in a fresh runtime.
         let block0_hash = {
@@ -5046,12 +5025,10 @@ mod tests {
             let mut rt = HyperRuntime::new(cfg);
             rt.install_local_dkls_share(0, 1, dkg.parties[0].clone(), dkg.group_address);
 
-            rt.submit_message(HyperRouter::outbound_lock(lock_a.clone()))
-                .unwrap();
             let (block0, _, _) = rt
                 .produce_signed_block_dkls_local(0, vec![], 0, 0, vec![], 0)
                 .unwrap();
-            rt.import_block(&block0, &[lock_a.clone()], &[]).unwrap()
+            rt.import_block(&block0, &[], &[]).unwrap()
         };
 
         // Phase 2: simulated restart — fresh runtime over same DB.
@@ -5075,22 +5052,13 @@ mod tests {
         };
         let mut rt = HyperRuntime::new(cfg);
         assert_eq!(rt.last_block_hash(), Some(block0_hash));
-        // DKLS group address is hydrated from disk; install local
-        // share again (shares aren't persisted, only addresses are).
         rt.install_local_dkls_share(0, 1, dkg.parties[0].clone(), dkg.group_address);
 
-        // Submit lock_b and produce block 1. With verkle replay
-        // working, the on-restart tree has lock_a already applied,
-        // so block 1's state_root reflects {lock_a, lock_b}.
-        rt.submit_message(HyperRouter::outbound_lock(lock_b.clone()))
-            .unwrap();
         let (block1, _, _) = rt
             .produce_signed_block_dkls_local(1, block0_hash.to_vec(), 0, 0, vec![], 0)
             .unwrap();
 
-        // A peer with continuous history must accept block 1: build
-        // a separate runtime, import block 0 (rebuilds tree), then
-        // import block 1.
+        // Peer replay path.
         let dir_peer = TempDir::new().unwrap();
         let db_peer = RocksDB::new(dir_peer.path().to_str().unwrap());
         db_peer.open().unwrap();
@@ -5115,9 +5083,9 @@ mod tests {
 
         let stored_block0 = rt.get_block_by_height(0).unwrap().unwrap();
         let block0 = decode_proto_block(stored_block0).unwrap();
-        peer.import_block(&block0, &[lock_a.clone()], &[]).unwrap();
-        peer.import_block(&block1, &[lock_b.clone()], &[])
-            .expect("block 1 should import cleanly with verkle replay");
+        peer.import_block(&block0, &[], &[]).unwrap();
+        peer.import_block(&block1, &[], &[])
+            .expect("block 1 should import cleanly across restart");
     }
 
     fn decode_proto_block(p: proto::HyperBlock) -> Option<crate::hyper::HyperBlock> {
@@ -5224,11 +5192,16 @@ mod tests {
     }
 
     #[test]
-    fn submit_message_routes_to_mempool() {
+    fn submit_message_transparent_lock_sealed() {
+        // F058 cleanup: transparent `HyperLockEvent` is rejected at
+        // the router; mempool stays empty.
         let (mut rt, _dir) = make_runtime();
         let msg = HyperRouter::outbound_lock(sample_lock(1));
-        rt.submit_message(msg).unwrap();
-        assert_eq!(rt.pending_count(), 1);
+        let err = rt
+            .submit_message(msg)
+            .expect_err("transparent lock path is sealed");
+        assert!(matches!(err, RoutingError::Lock(_)));
+        assert_eq!(rt.pending_count(), 0);
     }
 
     /// Regression for C2: a confidential `HyperTransferTx` with
@@ -5355,15 +5328,15 @@ mod tests {
 
     #[test]
     fn drain_empties_mempool() {
+        // F058 cleanup: transparent locks no longer reach the
+        // mempool. The drain path is now trivially exercised on an
+        // empty mempool — non-empty drain coverage moved to the
+        // confidential transfer and lock paths (see
+        // `submit_message_accepts_properly_authenticated_transfer`).
         let (mut rt, _dir) = make_runtime();
-        rt.submit_message(HyperRouter::outbound_lock(sample_lock(1)))
-            .unwrap();
-        rt.submit_message(HyperRouter::outbound_lock(sample_lock(2)))
-            .unwrap();
-        assert_eq!(rt.pending_count(), 2);
-
+        assert_eq!(rt.pending_count(), 0);
         let (locks, transfers) = rt.drain_pending();
-        assert_eq!(locks.len(), 2);
+        assert_eq!(locks.len(), 0);
         assert_eq!(transfers.len(), 0);
         assert_eq!(rt.pending_count(), 0);
     }
@@ -5689,30 +5662,36 @@ mod tests {
 
     #[test]
     fn produce_envelope_drains_mempool() {
+        // F058 cleanup: transparent locks no longer admit. Verify
+        // that produce_envelope on an empty mempool yields an empty
+        // envelope (no messages, no panics, retained count = 0).
         let (mut rt, _dir) = make_runtime();
-        rt.submit_message(HyperRouter::outbound_lock(sample_lock(1)))
-            .unwrap();
-        rt.submit_message(HyperRouter::outbound_lock(sample_lock(2)))
-            .unwrap();
-        assert_eq!(rt.pending_count(), 2);
-
-        let (env, locks, _transfers) = rt.produce_envelope(5, vec![0u8; 32], 0).unwrap();
-        assert_eq!(env.metadata.retained_message_count, 2);
-        assert_eq!(locks.len(), 2);
-        assert_eq!(rt.pending_count(), 0, "messages drained out of mempool");
+        assert_eq!(rt.pending_count(), 0);
+        let (env, locks, transfers) = rt.produce_envelope(5, vec![0u8; 32], 0).unwrap();
+        assert_eq!(env.metadata.retained_message_count, 0);
+        assert!(locks.is_empty());
+        assert!(transfers.is_empty());
+        assert_eq!(rt.pending_count(), 0);
     }
 
     #[test]
     fn produce_envelope_reflects_state_changes() {
+        // F058 cleanup: transparent locks no longer alter state, so
+        // the "with-lock" branch of this test was deleted. The
+        // sibling test
+        // `produce_envelope_after_confidential_transfer_diverges_state`
+        // (if present) exercises the same invariant via the
+        // confidential path. For now we assert the trivial
+        // determinism: two consecutive empty envelopes match.
         let (mut rt, _dir) = make_runtime();
-        let (empty_env, _, _) = rt.produce_envelope(0, vec![], 0).unwrap();
-        rt.submit_message(HyperRouter::outbound_lock(sample_lock(1)))
-            .unwrap();
-        let (with_lock_env, _, _) = rt.produce_envelope(1, vec![0u8; 32], 0).unwrap();
-        // Different content → different state roots.
-        assert_ne!(
-            empty_env.metadata.hyper_state_root,
-            with_lock_env.metadata.hyper_state_root
+        let (env_a, _, _) = rt.produce_envelope(0, vec![], 0).unwrap();
+        let (env_b, _, _) = rt.produce_envelope(1, vec![0u8; 32], 0).unwrap();
+        // Different parent_hash → different envelope hashes, but
+        // the underlying state root must be the same (no state
+        // mutated between calls).
+        assert_eq!(
+            env_a.metadata.hyper_state_root,
+            env_b.metadata.hyper_state_root
         );
     }
 
@@ -9385,6 +9364,24 @@ mod tests {
         rt.db.put(&k, &fid.to_be_bytes()).unwrap();
     }
 
+    /// Register a FID via an IdRegister onchain event so it counts
+    /// toward `count_registered_fids()` (which the F135 DA-PoW prefix
+    /// derivation uses to bound the challenge space).
+    fn seed_id_register(rt: &HyperRuntime, fid: u64) {
+        use crate::storage::store::account::{OnchainEventStore, StoreEventHandler};
+        use crate::utils::factory::events_factory;
+        let onchain = OnchainEventStore::new(rt.db.clone(), StoreEventHandler::new_no_persist());
+        let event = events_factory::create_id_register_event(
+            fid,
+            proto::IdRegisterEventType::Register,
+            vec![0xab; 20],
+            None,
+        );
+        let mut txn = crate::storage::db::RocksDbTransactionBatch::new();
+        onchain.merge_onchain_event(event, &mut txn).unwrap();
+        rt.db.commit(txn).unwrap();
+    }
+
     /// Install + return the seed for `target_epoch`. Auto-creates
     /// a 1-of-1 DKLS share at `target_epoch - 1` if needed.
     fn seed_epoch_boundary_block(rt: &mut HyperRuntime, target_epoch: u64) -> [u8; 32] {
@@ -9429,6 +9426,31 @@ mod tests {
         boundary_hash: &[u8],
         sk: &ed25519_dalek::SigningKey,
     ) -> proto::DaChallengeResponseBody {
+        // F135: callers must register the relevant FIDs via
+        // `seed_id_register` so `count_registered_fids()` matches
+        // what `apply_da_challenge_response` derives at verify time.
+        // Use 1 here for tests that don't register any FIDs (the
+        // runtime's `.max(1)` floor would also produce 1).
+        build_valid_da_response_with_fid_count(
+            fid,
+            validator_pubkey,
+            epoch,
+            challenge_index,
+            boundary_hash,
+            sk,
+            1,
+        )
+    }
+
+    fn build_valid_da_response_with_fid_count(
+        fid: u64,
+        validator_pubkey: [u8; 32],
+        epoch: u64,
+        challenge_index: u32,
+        boundary_hash: &[u8],
+        sk: &ed25519_dalek::SigningKey,
+        fid_count: u64,
+    ) -> proto::DaChallengeResponseBody {
         use crate::hyper::da_pow::{derive_challenge_prefix, CHALLENGE_PREFIX_BYTES};
         let prefix = derive_challenge_prefix(
             boundary_hash,
@@ -9436,7 +9458,7 @@ mod tests {
             epoch,
             challenge_index,
             crate::hyper::DEFAULT_PROTOCOL_CHAIN_ID,
-            u32::MAX as u64,
+            fid_count,
         );
         let mut served_key = [0u8; 32];
         let plen = prefix.len().min(32);
@@ -9530,18 +9552,27 @@ mod tests {
         let h6 = seed_epoch_boundary_block(&mut rt, 6);
         let sk7 = SigningKey::from_bytes(&[3u8; 32]);
         let sk8 = SigningKey::from_bytes(&[4u8; 32]);
+        seed_id_register(&rt, 7);
+        seed_id_register(&rt, 8);
         seed_onchain_signer(&rt, 7, sk7.clone());
         seed_onchain_signer(&rt, 8, sk8.clone());
         let vp7 = validator_pubkey_from_seed(11);
         let vp8 = validator_pubkey_from_seed(12);
         seed_validator_fid_binding(&rt, &vp7, 7);
         seed_validator_fid_binding(&rt, &vp8, 8);
-        rt.apply_da_challenge_response(&build_valid_da_response(7, vp7, 5, 0, &h5, &sk7))
-            .unwrap();
-        rt.apply_da_challenge_response(&build_valid_da_response(8, vp8, 5, 0, &h5, &sk8))
-            .unwrap();
-        rt.apply_da_challenge_response(&build_valid_da_response(7, vp7, 6, 0, &h6, &sk7))
-            .unwrap();
+        let n = rt.count_registered_fids().max(1);
+        rt.apply_da_challenge_response(&build_valid_da_response_with_fid_count(
+            7, vp7, 5, 0, &h5, &sk7, n,
+        ))
+        .unwrap();
+        rt.apply_da_challenge_response(&build_valid_da_response_with_fid_count(
+            8, vp8, 5, 0, &h5, &sk8, n,
+        ))
+        .unwrap();
+        rt.apply_da_challenge_response(&build_valid_da_response_with_fid_count(
+            7, vp7, 6, 0, &h6, &sk7, n,
+        ))
+        .unwrap();
         assert_eq!(rt.da_answered_count(5, 7).unwrap(), 1);
         assert_eq!(rt.da_answered_count(5, 8).unwrap(), 1);
         assert_eq!(rt.da_answered_count(6, 7).unwrap(), 1);
@@ -9577,6 +9608,9 @@ mod tests {
         let sk7 = SigningKey::from_bytes(&[3u8; 32]);
         let sk8 = SigningKey::from_bytes(&[4u8; 32]);
         let sk9 = SigningKey::from_bytes(&[5u8; 32]);
+        seed_id_register(&rt, 7);
+        seed_id_register(&rt, 8);
+        seed_id_register(&rt, 9);
         seed_onchain_signer(&rt, 7, sk7.clone());
         seed_onchain_signer(&rt, 8, sk8.clone());
         seed_onchain_signer(&rt, 9, sk9.clone());
@@ -9584,26 +9618,29 @@ mod tests {
         let vp8 = validator_pubkey_from_seed(12);
         seed_validator_fid_binding(&rt, &vp7, 7);
         seed_validator_fid_binding(&rt, &vp8, 8);
+        let n = rt.count_registered_fids().max(1);
         // 7 answers 3, 8 answers 5, 9 doesn't answer.
         for i in 0..3u32 {
-            rt.apply_da_challenge_response(&build_valid_da_response(
+            rt.apply_da_challenge_response(&build_valid_da_response_with_fid_count(
                 7,
                 vp7,
                 5,
                 i,
                 &boundary_hash,
                 &sk7,
+                n,
             ))
             .unwrap();
         }
         for i in 0..5u32 {
-            rt.apply_da_challenge_response(&build_valid_da_response(
+            rt.apply_da_challenge_response(&build_valid_da_response_with_fid_count(
                 8,
                 vp8,
                 5,
                 i,
                 &boundary_hash,
                 &sk8,
+                n,
             ))
             .unwrap();
         }

@@ -1331,6 +1331,7 @@ async fn build_hyper_handler(
     // Optional hyper-side IdRegistry Recover-event watcher. Spawned
     // before the actor takes ownership of the runtime so we can clone
     // the store handle (Arc<RocksDB>-backed; cheap).
+    let cutover_snapchain_block = runtime.cutover_snapchain_block;
     let recovery_store = runtime.recovery_store.clone();
     let watcher_cfg = hypersnap::hyper::recovery_watcher::RecoveryWatcherConfig {
         rpc_url: file_cfg.recovery_watcher.rpc_url.clone(),
@@ -1576,6 +1577,7 @@ async fn build_hyper_handler(
                 validator_key.clone(),
                 scheduler_anchor.clone(),
                 Duration::from_secs(5),
+                cutover_snapchain_block,
             ));
 
             // Periodic poll of `last_block_height` → ChainHead so the
@@ -1592,6 +1594,7 @@ async fn build_hyper_handler(
                     latest_anchor: supervisor_anchor,
                     tick_interval: supervisor_tick,
                     start_lead_blocks: supervisor_lead_blocks,
+                    cutover_block: cutover_snapchain_block,
                 },
                 actor_handles_inbound_for_scheduler(&client),
                 client.clone(),

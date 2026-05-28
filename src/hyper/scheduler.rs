@@ -243,6 +243,7 @@ impl BlockProductionScheduler {
         local_key: Vec<u8>,
         latest_anchor: Arc<Mutex<LatestAnchor>>,
         refresh_interval: Duration,
+        cutover_block: u64,
     ) {
         let mut ticker = time::interval(refresh_interval);
         ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
@@ -259,7 +260,7 @@ impl BlockProductionScheduler {
             // validators gate the decision vs. which anchor the
             // produced block commits to.
             let anchor = latest_anchor.lock().await.clone();
-            let epoch = crate::hyper::epoch::epoch_for(anchor.block);
+            let epoch = crate::hyper::epoch::epoch_for_with_offset(anchor.block, cutover_block);
             let active = match client.active_validators(epoch, true).await {
                 Ok(Ok(a)) => a,
                 _ => continue,
@@ -620,6 +621,7 @@ mod tests {
             local_key.clone(),
             anchor.clone(),
             Duration::from_millis(20),
+            0,
         ));
         // Wait long enough for the first tick to complete.
         tokio::time::sleep(Duration::from_millis(80)).await;

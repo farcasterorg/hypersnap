@@ -18,20 +18,35 @@ pub const EPOCH_LENGTH: u64 = 432_000;
 /// at epoch N+1.
 pub const EPOCH_BUFFER: u64 = 1;
 
-/// Compute the epoch number for a given snapchain anchor block height.
-pub const fn epoch_for(anchor_block_number: u64) -> u64 {
-    anchor_block_number / EPOCH_LENGTH
+/// Compute the epoch number for a given snapchain anchor block height,
+/// offset by the cutover block so genesis epoch 0 starts at the
+/// cutover point rather than at snapchain block 0.
+pub const fn epoch_for_with_offset(anchor_block_number: u64, cutover_block: u64) -> u64 {
+    anchor_block_number.saturating_sub(cutover_block) / EPOCH_LENGTH
 }
 
-/// First snapchain anchor block in `epoch`.
+/// Compute the epoch number for a given snapchain anchor block height.
+/// Uses a zero cutover offset (suitable for devnet / test where
+/// cutover is at block 0).
+pub const fn epoch_for(anchor_block_number: u64) -> u64 {
+    epoch_for_with_offset(anchor_block_number, 0)
+}
+
+/// First snapchain anchor block in `epoch`, given the cutover offset.
+pub const fn epoch_start_block_with_offset(epoch: u64, cutover_block: u64) -> u64 {
+    cutover_block + epoch * EPOCH_LENGTH
+}
+
+/// First snapchain anchor block in `epoch` (zero cutover offset).
 pub const fn epoch_start_block(epoch: u64) -> u64 {
-    epoch * EPOCH_LENGTH
+    epoch_start_block_with_offset(epoch, 0)
 }
 
 /// Tracks the current hyper epoch as new snapchain anchor heights arrive.
 #[derive(Debug, Clone, Copy)]
 pub struct EpochManager {
     current_epoch: u64,
+    cutover_block: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,7 +58,17 @@ pub struct EpochTransition {
 
 impl EpochManager {
     pub fn new() -> Self {
-        Self { current_epoch: 0 }
+        Self {
+            current_epoch: 0,
+            cutover_block: 0,
+        }
+    }
+
+    pub fn with_cutover(cutover_block: u64) -> Self {
+        Self {
+            current_epoch: 0,
+            cutover_block,
+        }
     }
 
     /// Initialize from an existing anchor height — useful when restarting a
@@ -51,7 +76,19 @@ impl EpochManager {
     pub fn from_anchor(anchor_block_number: u64) -> Self {
         Self {
             current_epoch: epoch_for(anchor_block_number),
+            cutover_block: 0,
         }
+    }
+
+    pub fn from_anchor_with_cutover(anchor_block_number: u64, cutover_block: u64) -> Self {
+        Self {
+            current_epoch: epoch_for_with_offset(anchor_block_number, cutover_block),
+            cutover_block,
+        }
+    }
+
+    pub fn cutover_block(&self) -> u64 {
+        self.cutover_block
     }
 
     pub fn current(&self) -> u64 {
@@ -62,7 +99,7 @@ impl EpochManager {
     /// transition that occurred, if any. Anchor heights going backward (e.g.
     /// from a re-org) do not roll the epoch back; epochs only advance.
     pub fn observe_anchor(&mut self, anchor_block_number: u64) -> Option<EpochTransition> {
-        let new_epoch = epoch_for(anchor_block_number);
+        let new_epoch = epoch_for_with_offset(anchor_block_number, self.cutover_block);
         if new_epoch > self.current_epoch {
             let from = self.current_epoch;
             self.current_epoch = new_epoch;
@@ -80,6 +117,56 @@ impl EpochManager {
 impl Default for EpochManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod offset_tests {
+    use super::*;
+
+    #[test]
+    fn epoch_for_with_cutover_offset() {
+        let cutover = 5_000_000u64;
+        assert_eq!(epoch_for_with_offset(cutover, cutover), 0);
+        assert_eq!(
+            epoch_for_with_offset(cutover + EPOCH_LENGTH - 1, cutover),
+            0
+        );
+        assert_eq!(epoch_for_with_offset(cutover + EPOCH_LENGTH, cutover), 1);
+        assert_eq!(
+            epoch_for_with_offset(cutover + 2 * EPOCH_LENGTH, cutover),
+            2
+        );
+    }
+
+    #[test]
+    fn epoch_start_block_with_cutover_offset() {
+        let cutover = 5_000_000u64;
+        assert_eq!(epoch_start_block_with_offset(0, cutover), cutover);
+        assert_eq!(
+            epoch_start_block_with_offset(1, cutover),
+            cutover + EPOCH_LENGTH
+        );
+    }
+
+    #[test]
+    fn manager_with_cutover_resolves_correctly() {
+        let cutover = 5_000_000u64;
+        let mut m = EpochManager::from_anchor_with_cutover(cutover + 100, cutover);
+        assert_eq!(m.current(), 0);
+        let t = m
+            .observe_anchor(cutover + EPOCH_LENGTH)
+            .expect("must transition");
+        assert_eq!(t.from, 0);
+        assert_eq!(t.to, 1);
+        assert_eq!(m.current(), 1);
+    }
+
+    #[test]
+    fn pre_cutover_anchors_saturate_to_epoch_zero() {
+        let cutover = 5_000_000u64;
+        assert_eq!(epoch_for_with_offset(0, cutover), 0);
+        assert_eq!(epoch_for_with_offset(cutover - 1, cutover), 0);
     }
 }
 

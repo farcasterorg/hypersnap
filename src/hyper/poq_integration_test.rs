@@ -162,6 +162,16 @@ mod tests {
         // ordering of trust + reward to hold.
         params.crediter_trust_threshold = 0.0;
         params.vouch_boost_min_vouchee_trust = 0.0;
+        params.min_distinct_crediters = 0;
+        params.max_growth_fraction_per_crediter = 0.0;
+        // FIP §8.3 eligibility filters: loosen the synthetic-cohort
+        // gates so a 4-FID universe with sparse interactions can
+        // still pass F2 (min engagers) and F3/F5/F6 (percentile
+        // thresholds calibrated over a tiny cohort).
+        params.eligibility.min_engagers = 1;
+        params.eligibility.calibration_min_casts = 0;
+        params.eligibility.calibration_min_active_days = 0;
+        params.eligibility.threshold_percentile = 0.0;
         params
             .market_budgets
             .insert(proof_of_quality::WorkMarket::Growth, 1_000_000);

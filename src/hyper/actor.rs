@@ -266,6 +266,9 @@ pub enum HyperActorQuery {
         epoch: u64,
         reply: oneshot::Sender<bool>,
     },
+    HighestInstalledDklsEpoch {
+        reply: oneshot::Sender<u64>,
+    },
     /// Validator's registry event history up to `max_epoch`.
     ValidatorEvents {
         validator_key: Vec<u8>,
@@ -459,6 +462,9 @@ impl std::fmt::Debug for HyperActorQuery {
                 .debug_struct("HasDklsShareForEpoch")
                 .field("epoch", epoch)
                 .finish(),
+            Self::HighestInstalledDklsEpoch { .. } => {
+                f.debug_struct("HighestInstalledDklsEpoch").finish()
+            }
             Self::ValidatorEvents { max_epoch, .. } => f
                 .debug_struct("ValidatorEvents")
                 .field("max_epoch", max_epoch)
@@ -837,6 +843,11 @@ impl HyperActorClient {
         epoch: u64,
     ) -> Result<bool, HyperActorClientError> {
         self.ask(move |reply| HyperActorQuery::HasDklsShareForEpoch { epoch, reply })
+            .await
+    }
+
+    pub async fn highest_installed_dkls_epoch(&self) -> Result<u64, HyperActorClientError> {
+        self.ask(move |reply| HyperActorQuery::HighestInstalledDklsEpoch { reply })
             .await
     }
 
@@ -1715,6 +1726,16 @@ impl HyperActor {
                 let has = self.runtime.dkls_share_for_epoch(epoch).is_some();
                 let _ = reply.send(has);
             }
+            HyperActorQuery::HighestInstalledDklsEpoch { reply } => {
+                let highest = self
+                    .runtime
+                    .dkls_signers
+                    .keys()
+                    .next_back()
+                    .copied()
+                    .unwrap_or(0);
+                let _ = reply.send(highest);
+            }
             HyperActorQuery::ValidatorEvents {
                 validator_key,
                 max_epoch,
@@ -2180,8 +2201,9 @@ impl HyperActor {
     }
 
     async fn maybe_trigger_scoring(&mut self, anchor_block: u64, anchor_timestamp: u64) {
-        use crate::hyper::epoch::epoch_for;
-        let current_epoch = epoch_for(anchor_block);
+        use crate::hyper::epoch::epoch_for_with_offset;
+        let current_epoch =
+            epoch_for_with_offset(anchor_block, self.runtime.cutover_snapchain_block);
         let last = self.runtime.last_scored_epoch;
         let next_to_score = match last {
             None => {
@@ -2275,8 +2297,9 @@ impl HyperActor {
     /// ≥2-of-N enqueues via `start_dkls_da_epoch_seed_multi_party`.
     /// Idempotent on `last_da_seed_signed_for_epoch`.
     async fn maybe_sign_da_epoch_seed(&mut self, anchor_block: u64) {
-        use crate::hyper::epoch::epoch_for;
-        let current_epoch = epoch_for(anchor_block);
+        use crate::hyper::epoch::epoch_for_with_offset;
+        let current_epoch =
+            epoch_for_with_offset(anchor_block, self.runtime.cutover_snapchain_block);
         if current_epoch == 0 {
             return;
         }
@@ -2357,12 +2380,13 @@ impl HyperActor {
     /// responses for the current epoch. Idempotent per epoch via
     /// `last_da_responded_epoch`. No-op without a producer.
     async fn maybe_trigger_da_responses(&mut self, anchor_block: u64) {
-        use crate::hyper::epoch::epoch_for;
+        use crate::hyper::epoch::epoch_for_with_offset;
         let producer = match self.da_response_producer.clone() {
             Some(p) => p,
             None => return,
         };
-        let current_epoch = epoch_for(anchor_block);
+        let current_epoch =
+            epoch_for_with_offset(anchor_block, self.runtime.cutover_snapchain_block);
         if current_epoch == 0 {
             return;
         }
@@ -3467,6 +3491,10 @@ mod tests {
 
     #[tokio::test]
     async fn produce_block_emits_broadcast_and_advances_chain() {
+        // F058 cleanup: transparent locks are sealed; drop the
+        // InboundMessage from the sequence. The block-production
+        // path doesn't depend on mempool contents here, so just
+        // assert that ProduceBlockDkls emits the broadcast cleanly.
         let mut rng = OsRng;
         let srs = Arc::new(KzgSrs::random_unsafe(&mut rng, VERKLE_DOMAIN));
         let (mut runtime, _dir) = make_runtime_with_srs(srs);
@@ -3474,17 +3502,14 @@ mod tests {
 
         let outbound = HyperActor::drive_events(
             runtime,
-            vec![
-                HyperActorEvent::InboundMessage(HyperRouter::outbound_lock(sample_lock(1))),
-                HyperActorEvent::ProduceBlockDkls {
-                    height: 0,
-                    parent_hash: vec![],
-                    extra_rules_version: 0,
-                    snapchain_anchor_block: 0,
-                    snapchain_anchor_hash: vec![],
-                    snapchain_anchor_timestamp: 0,
-                },
-            ],
+            vec![HyperActorEvent::ProduceBlockDkls {
+                height: 0,
+                parent_hash: vec![],
+                extra_rules_version: 0,
+                snapchain_anchor_block: 0,
+                snapchain_anchor_hash: vec![],
+                snapchain_anchor_timestamp: 0,
+            }],
         )
         .await;
 
@@ -3999,13 +4024,11 @@ mod tests {
         proposer.install_local_dkls_share(0, 1, dkg.parties[0].clone(), dkg.group_address);
         let _ = &mut rng;
 
-        // Submit a lock to the proposer.
-        let lock = sample_lock(0xaa);
-        proposer
-            .submit_message(HyperRouter::outbound_lock(lock.clone()))
-            .unwrap();
+        // F058 cleanup: transparent locks are sealed at the router.
+        // Drive the proposer to produce + broadcast an empty block;
+        // the importer round-trip below still validates the
+        // proposer→wire→importer pipeline.
 
-        // Drive the proposer to produce + broadcast a block.
         let proposer_out = HyperActor::drive_events(
             proposer,
             vec![HyperActorEvent::ProduceBlockDkls {
@@ -4027,8 +4050,6 @@ mod tests {
             })
             .expect("proposer should have broadcast a block");
 
-        // The importer needs to know the same lock was in the payload.
-        // (The gossip wire format will carry locks alongside the block.)
         let importer_out = HyperActor::drive_events(
             {
                 let mut imp = importer;
@@ -4037,7 +4058,7 @@ mod tests {
             },
             vec![HyperActorEvent::InboundBlock {
                 block,
-                locks: vec![lock],
+                locks: vec![],
                 transfers: vec![],
             }],
         )
@@ -4068,7 +4089,10 @@ mod tests {
         assert_eq!(client.current_epoch().await.unwrap(), 0);
         assert_eq!(client.pending_count().await.unwrap(), 0);
 
-        // Submit a message → mempool grows.
+        // F058 cleanup: transparent locks are now sealed at the
+        // router; submitting one leaves the mempool empty. The
+        // query round-trip is still exercised — what changed is
+        // the assertion on pending_count (0, not 1).
         handles
             .inbound
             .send(HyperActorEvent::InboundMessage(HyperRouter::outbound_lock(
@@ -4076,10 +4100,7 @@ mod tests {
             )))
             .await
             .unwrap();
-        // Allow the actor to drain the inbound; await the count query as
-        // a built-in synchronization point (the query runs after the
-        // earlier event has been dispatched).
-        assert_eq!(client.pending_count().await.unwrap(), 1);
+        assert_eq!(client.pending_count().await.unwrap(), 0);
 
         // Block lookup for an unknown height returns None.
         assert!(client.get_block_by_height(99).await.unwrap().is_none());
@@ -4673,7 +4694,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_submit_message_emits_broadcast() {
+    async fn local_submit_message_sealed_lock_emits_no_broadcast() {
+        // F058 cleanup: transparent locks are sealed at the router.
+        // `LocalSubmitMessage` must not broadcast a rejected message
+        // (broken messages must NOT reach the wire — see
+        // `submit_message` comments).
         let mut rng = OsRng;
         let srs = Arc::new(KzgSrs::random_unsafe(&mut rng, VERKLE_DOMAIN));
         let (runtime, _dir) = make_runtime_with_srs(srs);
@@ -4684,17 +4709,16 @@ mod tests {
             )],
         )
         .await;
-        // Exactly one BroadcastMessage outbound, no errors.
         let broadcasts = outbound
             .iter()
             .filter(|o| matches!(o, HyperActorOutbound::BroadcastMessage(_)))
             .count();
-        assert_eq!(broadcasts, 1);
+        assert_eq!(broadcasts, 0, "rejected lock must not be broadcast");
         let errors = outbound
             .iter()
             .filter(|o| matches!(o, HyperActorOutbound::EventError(_)))
             .count();
-        assert_eq!(errors, 0);
+        assert_eq!(errors, 1, "should emit one EventError for the sealed lock");
     }
 
     #[tokio::test]
@@ -5067,7 +5091,8 @@ mod tests {
         let payload =
             crate::hyper::rewards::da_epoch_seed_signing_payload(5, runtime.protocol_chain_id);
         let digest = alloy_primitives::keccak256(&payload);
-        let committee = crate::hyper::dkls_committee::select_signing_committee(4, &digest, 3, 2)
+        let seed = crate::hyper::dkls_committee::committee_seed_for_epoch(4, b"da-epoch-seed");
+        let committee = crate::hyper::dkls_committee::select_signing_committee(4, &seed, 3, 2)
             .expect("committee");
         assert_eq!(committee.len(), 2);
         // Pick the lowest committee member as our local share.
@@ -5160,7 +5185,8 @@ mod tests {
         let payload =
             crate::hyper::rewards::da_epoch_seed_signing_payload(5, runtime.protocol_chain_id);
         let digest = alloy_primitives::keccak256(&payload);
-        let committee = crate::hyper::dkls_committee::select_signing_committee(4, &digest, 3, 2)
+        let seed = crate::hyper::dkls_committee::committee_seed_for_epoch(4, b"da-epoch-seed");
+        let committee = crate::hyper::dkls_committee::select_signing_committee(4, &seed, 3, 2)
             .expect("committee");
         // Pick the party_index NOT in the committee.
         let excluded = (1u8..=3)

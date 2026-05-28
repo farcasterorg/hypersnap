@@ -1704,7 +1704,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_messages_accepts_well_formed_lock() {
+    async fn post_messages_rejects_transparent_lock() {
+        // F058 cleanup: the transparent `HyperLockEvent` path is
+        // sealed at the router layer; HTTP POST of a Lock must not
+        // make it into the mempool.
         use crate::hyper::router::HyperRouter;
 
         let (runtime, _dir) = make_runtime(vec![]);
@@ -1725,18 +1728,19 @@ mod tests {
         let bytes = Bytes::from(msg.encode_to_vec());
 
         let resp = h.handle(&Method::POST, "/hyper/v1/messages", bytes).await;
-        let (status, body) = read_body(resp).await;
-        assert_eq!(status, StatusCode::ACCEPTED);
-        assert_eq!(body["accepted"], true);
+        let (status, _body) = read_body(resp).await;
+        // HTTP layer accepts the request body (status 202 with
+        // `accepted: false`) but the router rejects on the actor
+        // side. Either way, the mempool stays empty.
+        let _ = status;
 
-        // Confirm the actor admitted it: pending count should be 1.
         let (status, body) = read_body(
             h.handle(&Method::GET, "/hyper/v1/mempool/pending", Bytes::new())
                 .await,
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["pending"], 1);
+        assert_eq!(body["pending"], 0);
 
         handles
             .inbound

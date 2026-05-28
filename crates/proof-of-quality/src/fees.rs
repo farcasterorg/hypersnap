@@ -109,10 +109,17 @@ mod tests {
 
     #[test]
     fn larger_signal_wins() {
-        // trust 0.5 vs uniqueness 0.8 → uniqueness wins, 20% of base
+        // trust 0.5 vs uniqueness 0.8 → uniqueness wins, 20% of base.
+        // Allow ±1 micro for f64 rounding (1.0 - 0.8 = 0.19999…
+        // in f64; floor() rounds 199_999.99… → 199_999).
         let fee = compute_effective_fee_micro(BASE_FEE_CAST_ADD, 0.5, 0.8);
-        let expected = (BASE_FEE_CAST_ADD as f64 * 0.2).floor() as u64;
+        let expected = (BASE_FEE_CAST_ADD as f64 * (1.0_f64 - 0.8_f64)).floor() as u64;
         assert_eq!(fee, expected);
+        assert!(
+            fee.abs_diff(200_000) <= 1,
+            "fee {} should be ~20% of base",
+            fee
+        );
     }
 
     #[test]

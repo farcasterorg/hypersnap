@@ -125,7 +125,13 @@ pub fn classify_one(
             true
         },
     );
-    flags.set(5, m.new_user_engagement_share < t.new_user_share);
+    // Use `<=` not `<` so FIDs with zero new-user engagement still
+    // pass when the calibration cohort yields a zero threshold
+    // (e.g. tiny universes where everyone is older than the
+    // new-user window). Spam farms with high new_user_share are
+    // still filtered because their share strictly exceeds any
+    // non-zero threshold.
+    flags.set(5, m.new_user_engagement_share <= t.new_user_share);
     flags.set(6, m.replies_per_cast >= t.replies_per_cast);
     flags
 }

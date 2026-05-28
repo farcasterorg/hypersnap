@@ -441,12 +441,19 @@ mod tests {
     }
 
     #[test]
-    fn inbound_lock_routes_to_mempool() {
+    fn inbound_lock_at_router_layer_is_sealed() {
+        // F058 cleanup: the transparent `HyperLockEvent` ingress was
+        // removed — production locks go through `ConfidentialLockBody`.
+        // Confirm the router rejects rather than admitting attacker-
+        // chosen verkle leaves.
         let mempool = HyperMempool::new();
         let mut router = HyperRouter::new(mempool, None, 0);
         let env = HyperRouter::outbound_lock(sample_lock(1));
-        router.route_inbound(env).unwrap();
-        assert_eq!(router.mempool.lock_count(), 1);
+        let err = router
+            .route_inbound(env)
+            .expect_err("transparent lock path is sealed");
+        assert!(matches!(err, RoutingError::Lock(_)));
+        assert_eq!(router.mempool.lock_count(), 0);
     }
 
     #[test]
@@ -480,20 +487,23 @@ mod tests {
     }
 
     #[test]
-    fn full_wire_round_trip_lock() {
-        // Wire path: outbound → encode → decode → route → mempool.
+    fn full_wire_round_trip_lock_sealed_at_router() {
+        // F058 cleanup: wire still encodes/decodes the transparent
+        // lock envelope (proto compatibility), but the router rejects
+        // on ingress so attacker-chosen leaves can't reach the
+        // verkle tree.
         let event = sample_lock(42);
-        let outbound = HyperRouter::outbound_lock(event.clone());
+        let outbound = HyperRouter::outbound_lock(event);
         let bytes = outbound.encode_to_vec();
         let inbound = proto::HyperMessage::decode(bytes.as_slice()).unwrap();
 
         let mempool = HyperMempool::new();
         let mut router = HyperRouter::new(mempool, None, 0);
-        router.route_inbound(inbound).unwrap();
-        assert_eq!(router.mempool.lock_count(), 1);
-        let recovered = router.mempool.locks().next().unwrap();
-        assert_eq!(recovered.lock_id, event.lock_id);
-        assert_eq!(recovered.amount, event.amount);
+        let err = router
+            .route_inbound(inbound)
+            .expect_err("transparent lock path is sealed");
+        assert!(matches!(err, RoutingError::Lock(_)));
+        assert_eq!(router.mempool.lock_count(), 0);
     }
 
     #[test]
@@ -561,12 +571,14 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_inbound_lock_returns_mempool_error() {
+    fn duplicate_inbound_lock_sealed_at_router() {
+        // F058 cleanup: every lock — duplicate or not — is rejected
+        // at the router layer; the dedup primitive now lives in the
+        // confidential-lock apply path.
         let mempool = HyperMempool::new();
         let mut router = HyperRouter::new(mempool, None, 0);
         let env = HyperRouter::outbound_lock(sample_lock(1));
-        router.route_inbound(env.clone()).unwrap();
         let result = router.route_inbound(env);
-        assert!(matches!(result, Err(RoutingError::Mempool(_))));
+        assert!(matches!(result, Err(RoutingError::Lock(_))));
     }
 }
