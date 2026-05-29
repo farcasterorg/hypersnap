@@ -189,6 +189,28 @@ pub struct ScoringParams {
     /// reciprocating friends) gated by L1 rather than L2. Set to 0
     /// to recover the count-only behavior.
     pub growth_distribution_skew_exponent: f64,
+
+    /// F009 L2 fairness floor (R6 audit caveat): minimum value the
+    /// distribution-damping factor is clamped to before composing
+    /// with `sqrt(n)/n`. Without a floor, perfectly uniform
+    /// per-crediter contributions (entropy = 1.0) drive the
+    /// `(1 - H_norm)^exp` factor to exactly 0 — which correctly
+    /// zeroes a sybil ring but ALSO zeroes a legitimate popular
+    /// account whose many real fans engage at similar magnitudes
+    /// (creator with equal-weight engaged community). The audit
+    /// flagged this as a fairness/false-positive concern, not a
+    /// security hole (L0 — the `crediter_trust_threshold` — is the
+    /// real sybil gate; sybil rings are killed there). Clamping to
+    /// a small floor preserves a fraction of growth for the
+    /// uniform-legit case while keeping L2 effective as a backstop
+    /// for rings that somehow corrupt the trust graph past L0.
+    ///
+    /// Default 0.05 (5%): a uniform-distribution legit user with N
+    /// crediters keeps `raw_sum × sqrt(N)/N × 0.05` of their growth
+    /// (≈0.7% of raw for N=50, ≈0.5% for N=100) — small but
+    /// non-zero. Set to 0.0 to reproduce the strict R6 behavior
+    /// (uniform → 0).
+    pub growth_distribution_min_damping: f64,
 }
 
 /// FIP §8.3 calibration + threshold knobs. Defaults match the
@@ -334,6 +356,15 @@ impl Default for ScoringParams {
             // there gives the same effective tightness as the
             // composite's 3.0 acting alone.
             growth_distribution_skew_exponent: 2.0,
+            // F009 L2 fairness floor (R6 audit caveat): without this,
+            // perfectly uniform contributions zero out — penalizing
+            // a legit creator with equal-weight engaged fans
+            // identically to a sybil ring. Clamping to 5% keeps L2
+            // effective as backstop (sybils get
+            // `0.05 × sqrt(N)/N ≈ 0.5%` of raw_sum at N=100, on top
+            // of being killed by L0) while preserving a small slice
+            // of growth for uniform-engagement legitimate users.
+            growth_distribution_min_damping: 0.05,
         }
     }
 }

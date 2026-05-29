@@ -164,6 +164,7 @@ pub fn compute_growth_harmonic(
     _max_growth_fraction_per_crediter: f64,
     min_distinct_crediters: usize,
     growth_distribution_skew_exponent: f64,
+    growth_distribution_min_damping: f64,
 ) -> BTreeMap<u64, f64> {
     let mut growth: BTreeMap<u64, f64> = BTreeMap::new();
     for (&f, m_f) in metrics.iter() {
@@ -250,7 +251,17 @@ pub fn compute_growth_harmonic(
         let entropy = crate::metrics::normalized_entropy_of_values(&contributions);
         let skew = (1.0 - entropy).max(0.0);
         let distribution_damping = if growth_distribution_skew_exponent > 0.0 {
+            // F009 L2 fairness floor (R6 audit caveat): clamp the
+            // distribution-damping factor so a perfectly uniform
+            // contribution distribution (H_norm = 1) doesn't zero
+            // out a legit popular user with equal-weight fans. L0
+            // (the trust floor) is the real sybil gate; this floor
+            // only matters when an attacker has already corrupted
+            // the trust graph past L0, in which case the residual
+            // damping (`min × sqrt(N)/N`) still penalizes large
+            // rings heavily.
             skew.powf(growth_distribution_skew_exponent)
+                .max(growth_distribution_min_damping)
         } else {
             1.0
         };
@@ -389,6 +400,7 @@ pub fn evaluate_epoch<R: SnapchainStateReader + ?Sized>(
         params.max_growth_fraction_per_crediter,
         params.min_distinct_crediters,
         params.growth_distribution_skew_exponent,
+        params.growth_distribution_min_damping,
     );
     let composite = compute_composite(&metrics, &growth, params);
 
@@ -728,8 +740,8 @@ mod tests {
             m
         };
 
-        let growth_no = compute_growth_harmonic(&metrics_no, 0.0, 0.0, 0.0, 0, 0.0);
-        let growth_yes = compute_growth_harmonic(&metrics_yes, 0.0, 0.0, 0.0, 0, 0.0);
+        let growth_no = compute_growth_harmonic(&metrics_no, 0.0, 0.0, 0.0, 0, 0.0, 0.0);
+        let growth_yes = compute_growth_harmonic(&metrics_yes, 0.0, 0.0, 0.0, 0, 0.0, 0.0);
 
         let g_no = growth_no.get(&100).copied().unwrap_or(0.0);
         let g_yes = growth_yes.get(&100).copied().unwrap_or(0.0);
@@ -784,7 +796,7 @@ mod tests {
             let mut m = build_metrics(&r, now).unwrap();
             let et = compute_eigentrust(&graph, &seeds, 30, 0.85);
             apply_trust_and_credibility(&mut m, &et);
-            let g = compute_growth_harmonic(&m, 0.0, 0.0, 0.0, 0, 0.0);
+            let g = compute_growth_harmonic(&m, 0.0, 0.0, 0.0, 0, 0.0, 0.0);
             g.get(&100).copied().unwrap_or(0.0)
         };
 
@@ -856,7 +868,7 @@ mod tests {
             let mut m = build_metrics(&r, now).unwrap();
             let et = compute_eigentrust(&graph, &seeds, 30, 0.85);
             apply_trust_and_credibility(&mut m, &et);
-            let g = compute_growth_harmonic(&m, 0.0, 0.0, 0.0, 0, 0.0);
+            let g = compute_growth_harmonic(&m, 0.0, 0.0, 0.0, 0, 0.0, 0.0);
             g.get(&fid).copied().unwrap_or(0.0)
         };
 
@@ -1214,7 +1226,7 @@ mod tests {
             let mut m = build_metrics(&r, now).unwrap();
             let et = compute_eigentrust(&graph, &seeds, 30, 0.85);
             apply_trust_and_credibility(&mut m, &et);
-            let g = compute_growth_harmonic(&m, 0.0, 0.0, 0.0, 0, 0.0);
+            let g = compute_growth_harmonic(&m, 0.0, 0.0, 0.0, 0, 0.0, 0.0);
             g.get(&100).copied().unwrap_or(0.0)
         };
 
@@ -1257,9 +1269,9 @@ mod tests {
         metrics.insert(100, m_f);
 
         // Ungated: full 2× boost applies.
-        let g_open = compute_growth_harmonic(&metrics, 0.0, 0.0, 0.0, 0, 0.0);
+        let g_open = compute_growth_harmonic(&metrics, 0.0, 0.0, 0.0, 0, 0.0, 0.0);
         // Gated at 0.5: vouchee's 0.10 < 0.5 → boost suppressed.
-        let g_gated = compute_growth_harmonic(&metrics, 0.0, 0.5, 0.0, 0, 0.0);
+        let g_gated = compute_growth_harmonic(&metrics, 0.0, 0.5, 0.0, 0, 0.0, 0.0);
 
         let v_open = g_open.get(&100).copied().unwrap_or(0.0);
         let v_gated = g_gated.get(&100).copied().unwrap_or(0.0);
@@ -1291,8 +1303,8 @@ mod tests {
         m_f.all_time_engagement.insert(1, 10);
         metrics.insert(100, m_f);
 
-        let g_open = compute_growth_harmonic(&metrics, 0.0, 0.0, 0.0, 0, 0.0);
-        let g_gated = compute_growth_harmonic(&metrics, 0.0, 0.5, 0.0, 0, 0.0);
+        let g_open = compute_growth_harmonic(&metrics, 0.0, 0.0, 0.0, 0, 0.0, 0.0);
+        let g_gated = compute_growth_harmonic(&metrics, 0.0, 0.5, 0.0, 0, 0.0, 0.0);
         // Identical (vouchee passes floor → boost identical).
         let v_open = g_open.get(&100).copied().unwrap_or(0.0);
         let v_gated = g_gated.get(&100).copied().unwrap_or(0.0);
@@ -1357,8 +1369,10 @@ mod tests {
         let m_ring = build_metrics_with_shape(100, 1.0, &ring_crediters);
 
         let skew_exp = 2.0;
-        let g_real = compute_growth_harmonic(&m_real, 0.0, 0.0, 0.0, 3, skew_exp);
-        let g_ring = compute_growth_harmonic(&m_ring, 0.0, 0.0, 0.0, 3, skew_exp);
+        // floor = 0.0 keeps the original (R6) discrimination — a
+        // perfectly uniform ring gets damped all the way to zero.
+        let g_real = compute_growth_harmonic(&m_real, 0.0, 0.0, 0.0, 3, skew_exp, 0.0);
+        let g_ring = compute_growth_harmonic(&m_ring, 0.0, 0.0, 0.0, 3, skew_exp, 0.0);
 
         let v_real = g_real.get(&100).copied().unwrap_or(0.0);
         let v_ring = g_ring.get(&100).copied().unwrap_or(0.0);
@@ -1369,7 +1383,7 @@ mod tests {
         );
         // The ring's uniform distribution lands at H_norm ≈ 1, so
         // (1 - H_norm)^2 ≈ 0 → ring growth should be at least an
-        // order of magnitude below the real user's.
+        // order of magnitude below the real user's (with floor=0).
         assert!(
             v_ring < v_real / 10.0,
             "ring should be damped >10× below real user: real={}, ring={}",
@@ -1379,8 +1393,8 @@ mod tests {
 
         // Sanity check: with the skew exponent off, the ring is NOT
         // damped distribution-wise (the prior count-only behavior).
-        let g_real_no_l2 = compute_growth_harmonic(&m_real, 0.0, 0.0, 0.0, 3, 0.0);
-        let g_ring_no_l2 = compute_growth_harmonic(&m_ring, 0.0, 0.0, 0.0, 3, 0.0);
+        let g_real_no_l2 = compute_growth_harmonic(&m_real, 0.0, 0.0, 0.0, 3, 0.0, 0.0);
+        let g_ring_no_l2 = compute_growth_harmonic(&m_ring, 0.0, 0.0, 0.0, 3, 0.0, 0.0);
         let v_ring_no_l2 = g_ring_no_l2.get(&100).copied().unwrap_or(0.0);
         let v_real_no_l2 = g_real_no_l2.get(&100).copied().unwrap_or(0.0);
         // Without L2, the ring is much closer to the real user (the
@@ -1402,7 +1416,67 @@ mod tests {
 
         // With L2 disabled (exp = 0), distribution_damping = 1, so
         // the result is `raw_sum * sqrt(n) / n` — the prior behavior.
-        let g = compute_growth_harmonic(&metrics, 0.0, 0.0, 0.0, 3, 0.0);
+        let g = compute_growth_harmonic(&metrics, 0.0, 0.0, 0.0, 3, 0.0, 0.0);
         assert!(g.get(&100).copied().unwrap_or(0.0) > 0.0);
+    }
+
+    /// F009 L2 fairness floor (R6 audit caveat): a uniform-engagement
+    /// LEGIT user (e.g. a creator with equal-weight engaged fans)
+    /// gets a non-zero growth contribution when the floor is set,
+    /// addressing the "uniform = sybil-shaped" false-positive the
+    /// auditor flagged. The floor preserves a small slice of growth
+    /// for uniform-distribution legit users while still heavily
+    /// damping them (L0 — the crediter trust floor — is the real
+    /// sybil gate; this is just defense-in-depth not falsely
+    /// zeroing legit accounts).
+    #[test]
+    fn distribution_min_damping_preserves_uniform_legit_user() {
+        // 50 crediters, all with identical reciprocal engagement —
+        // the structurally-indistinguishable-from-ring case.
+        let crediters: Vec<(u64, u32, u32)> = (10u64..60).map(|c| (c, 5u32, 5u32)).collect();
+        let metrics = build_metrics_with_shape(100, 1.0, &crediters);
+        let skew_exp = 2.0;
+
+        // R6 strict behavior (floor = 0): uniform → exactly 0.
+        let g_no_floor = compute_growth_harmonic(&metrics, 0.0, 0.0, 0.0, 3, skew_exp, 0.0);
+        let v_no_floor = g_no_floor.get(&100).copied().unwrap_or(0.0);
+        assert_eq!(
+            v_no_floor, 0.0,
+            "without floor, uniform distribution → exactly 0 (R6 behavior)"
+        );
+
+        // With production default floor (0.05): uniform keeps a
+        // small slice — `raw_sum × sqrt(N)/N × 0.05`.
+        let g_with_floor = compute_growth_harmonic(&metrics, 0.0, 0.0, 0.0, 3, skew_exp, 0.05);
+        let v_with_floor = g_with_floor.get(&100).copied().unwrap_or(0.0);
+        assert!(
+            v_with_floor > 0.0,
+            "with floor=0.05, uniform legit user should keep a small slice; got {}",
+            v_with_floor
+        );
+
+        // The floor should be a small slice of the floor-disabled
+        // case (where the full sqrt-damping × raw_sum lands without
+        // distribution penalty). At N=50 with floor=0.05, we expect
+        // `floor × sqrt-damping × raw_sum` ≈ 5% × 0.141 × raw_sum.
+        // Compare against the floor-=1.0 (no distribution damping)
+        // case to bound the slice.
+        let g_no_l2 = compute_growth_harmonic(&metrics, 0.0, 0.0, 0.0, 3, 0.0, 0.0);
+        let v_no_l2 = g_no_l2.get(&100).copied().unwrap_or(0.0);
+        assert!(
+            v_with_floor < v_no_l2 / 10.0,
+            "uniform user with floor must still be heavily damped vs no-L2: \
+             floor={}, no_l2={}",
+            v_with_floor,
+            v_no_l2
+        );
+
+        // Ratio should be approximately the floor itself (0.05).
+        let ratio = v_with_floor / v_no_l2;
+        assert!(
+            (ratio - 0.05).abs() < 0.005,
+            "floor ratio expected ≈0.05, got {}",
+            ratio
+        );
     }
 }

@@ -172,6 +172,7 @@ mod tests {
         // ordering of trust/reward, not the sybil-damping itself
         // (covered separately in proof-of-quality unit tests).
         params.growth_distribution_skew_exponent = 0.0;
+        params.growth_distribution_min_damping = 0.0;
         // FIP §8.3 eligibility filters: loosen the synthetic-cohort
         // gates so a 4-FID universe with sparse interactions can
         // still pass F2 (min engagers) and F3/F5/F6 (percentile
