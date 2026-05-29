@@ -195,6 +195,8 @@ impl LiveAtRateLimits {
         Self {
             shard_stores,
             rate_limits_by_fid: CacheBuilder::new(1_000_000)
+                // 2× the 1h quota window: prevents idle eviction from refreshing an hourly
+                // bucket early while still allowing LRU cleanup for inactive FIDs.
                 .time_to_idle(Duration::from_secs(60 * 60 * 2))
                 .eviction_policy(EvictionPolicy::lru())
                 .build(),
@@ -749,6 +751,10 @@ impl Mempool {
                                 &key,
                                 &next_message,
                             );
+                            // `at_admission = false`: keeps the feature-gate, BlockEvent-shard,
+                            // and post-merge duplicate checks but skips the token-consuming
+                            // rate limiter. The token was already consumed at insertion; a
+                            // second check would always fail and permanently drop the message.
                             let result =
                                 self.message_is_valid(request.shard_id, &next_message, false);
                             if result.is_ok() {
@@ -921,8 +927,6 @@ impl Mempool {
         message: MempoolMessage,
         source: MempoolSource,
     ) -> Result<(), HubError> {
-        let evict_key = self.prepare_live_at_insert(shard_id, &message)?;
-
         match self.messages.get_mut(&shard_id) {
             Some(shard_messages) => {
                 if shard_messages.contains_key(&message.mempool_key()) {
@@ -932,16 +936,21 @@ impl Mempool {
             None => {}
         }
 
-        if let Some(old_key) = &evict_key {
-            if let Some(shard_messages) = self.messages.get_mut(&shard_id) {
-                shard_messages.remove(old_key);
-            }
-        }
+        // FIP-268 LIVE_AT mempool parity with upstream snapchain
+        // (farcasterxyz/snapchain#899, c292bfd): the old pending
+        // LIVE_AT must be evicted ONLY in the `result.is_ok()`
+        // branch below. A newer LIVE_AT that fails admission
+        // (feature gate, post-merge duplicate, rate limit) must
+        // not displace the prior pending one.
+        let live_at_to_replace = self.prepare_live_at_insert(shard_id, &message)?;
 
         let result = self.message_is_valid(shard_id, &message, true);
         if result.is_ok() {
-            self.index_live_at_insert(shard_id, &message);
-
+            if let Some(old_key) = live_at_to_replace {
+                if let Some(shard_messages) = self.messages.get_mut(&shard_id) {
+                    shard_messages.remove(&old_key);
+                }
+            }
             match self.messages.get_mut(&shard_id) {
                 None => {
                     let mut messages = BTreeMap::new();
@@ -959,6 +968,7 @@ impl Mempool {
                     );
                 }
             }
+            self.index_live_at_insert(shard_id, &message);
 
             self.statsd_client
                 .count_with_shard(shard_id, "mempool.insert.success", 1, vec![]);
@@ -1013,6 +1023,7 @@ impl Mempool {
                     mempool.remove(&system_message.mempool_key());
                     if let Some(onchain_event) = &system_message.on_chain_event {
                         if onchain_event.r#type() == OnChainEventType::EventTypeStorageRent {
+                            // If the user buys more storage, we should bump their rate limit
                             if let Some(rate_limits) = &mut self.rate_limits {
                                 rate_limits.invalidate_rate_limiter_for_fid(onchain_event.fid);
                             }
