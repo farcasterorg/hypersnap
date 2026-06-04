@@ -296,6 +296,16 @@ message SignersByFidResponse {
   // Per-FID cap on active gasless keys (NEYN-10579). Lets clients show
   // "X/Y delegations" without hardcoding the limit on their side.
   uint32 gasless_signer_limit = 4;
+  uint32 current_user_nonce = 5;
+  map<uint64, uint32> requester_fid_nonces = 6;
+}
+
+message SignersByFidRequest {
+  uint64 fid = 1;
+  optional uint32 page_size = 2;
+  optional bytes page_token = 3;
+  optional bool reverse = 4;
+  repeated uint64 requester_fids = 5;
 }
 
 message LinkRequest {
