@@ -90,8 +90,14 @@ pub fn bootstrap<F>(
 where
     F: FnMut(HyperActorOutbound) + Send + 'static,
 {
+    // R4 audit fix: gossip is wired via the post-spawn-settable
+    // `OnceLock`, not a direct `&mut` mutation. Production callers
+    // do the split themselves in main.rs; this helper retains a
+    // pre-spawn `&mut gossip` API for tests, performing both the
+    // topic subscription and the actor-cell set in one call.
     let handles = HyperActor::spawn(runtime, inbound_capacity);
-    gossip.attach_hyper_actor(handles.inbound.clone(), is_validator);
+    gossip.subscribe_hyper_topics(is_validator);
+    let _ = gossip.hyper_actor_tx_handle().set(handles.inbound.clone());
     let gossip_tx = gossip.tx.clone();
     let pump = tokio::spawn(run_outbound_pump(
         handles.outbound,

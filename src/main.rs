@@ -4,6 +4,7 @@ use hyper_util::rt::TokioIo;
 use hypersnap::connectors::fname::FnameRequest;
 use hypersnap::connectors::onchain_events::{ChainClients, OnchainEventsRequest};
 use hypersnap::consensus::consensus::SystemMessage;
+use hypersnap::core::types::SnapchainValidatorContext;
 use hypersnap::hyper as snapchain_hyper;
 use hypersnap::mempool::block_receiver::BlockReceiver;
 use hypersnap::mempool::mempool::{Mempool, MempoolRequest, ReadNodeMempool};
@@ -26,6 +27,7 @@ use hypersnap::storage::store::node_local_state::{self, LocalStateStore};
 use hypersnap::storage::store::stores::Stores;
 use hypersnap::utils::statsd_wrapper::StatsdClientWrapper;
 use informalsystems_malachitebft_metrics::{Metrics, SharedRegistry};
+use libp2p::PeerId;
 use snapchain_hyper::CAPABILITY_HYPER;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
@@ -46,7 +48,8 @@ const VERSION: Option<&str> = option_env!("CARGO_PKG_VERSION");
 
 async fn start_servers(
     app_config: &hypersnap::cfg::Config,
-    mut gossip: SnapchainGossip,
+    gossip_tx: mpsc::Sender<GossipEvent<SnapchainValidatorContext>>,
+    local_peer_id: PeerId,
     mempool_tx: mpsc::Sender<MempoolRequest>,
     shutdown_tx: mpsc::Sender<()>,
     onchain_events_request_tx: broadcast::Sender<OnchainEventsRequest>,
@@ -60,9 +63,13 @@ async fn start_servers(
     local_state_store: LocalStateStore,
     api_handler: Option<hypersnap::api::ApiHttpHandler>,
     api_system_search_indexer: Option<Arc<hypersnap::api::SearchIndexer>>,
-    hyper_block_engine: Option<
-        Arc<tokio::sync::Mutex<hypersnap::storage::store::block_engine::BlockEngine>>,
-    >,
+    // R4 + main-merge: hyper handler is now built in the caller
+    // BEFORE the gossip spawn (so QUIC keepalives flow during heavy
+    // RocksDB init and the hyper actor wires through a
+    // post-spawn-settable `OnceLock`). `None` means the node runs
+    // without hyper handlers (read nodes, or validators with hyper
+    // disabled in config).
+    hyper_handler: Option<hypersnap::hyper::http_handler::HyperHttpHandler>,
 ) {
     let grpc_addr = app_config.rpc_address.clone();
     let grpc_socket_addr: SocketAddr = grpc_addr.parse().unwrap();
@@ -128,10 +135,10 @@ async fn start_servers(
         app_config.fc_network,
         Box::new(routing::ShardRouter {}),
         mempool_tx.clone(),
-        gossip.tx.clone(),
+        gossip_tx.clone(),
         chain_clients,
         VERSION.unwrap_or("unknown").to_string(),
-        gossip.swarm.local_peer_id().to_string(),
+        local_peer_id.to_string(),
         fname_lookup.clone(),
     ));
 
@@ -148,12 +155,12 @@ async fn start_servers(
         app_config.fc_network,
         Box::new(routing::ShardRouter {}),
         mempool_tx.clone(),
-        gossip.tx.clone(),
+        gossip_tx.clone(),
         ChainClients {
             chain_api_map: HashMap::new(),
         },
         VERSION.unwrap_or("unknown").to_string(),
-        gossip.swarm.local_peer_id().to_string(),
+        local_peer_id.to_string(),
         fname_lookup,
     ));
 
@@ -401,28 +408,19 @@ async fn start_servers(
         http_shutdown_tx.send(()).await.ok();
     });
 
-    // FIP hyper: if enabled with a runtime config path, build the
-    // HyperRuntime, spawn the actor, attach it to gossip, and populate
-    // the HTTP handler slot. Done last so the actor sees the gossip
-    // layer fully constructed.
-    if app_config.hyper.enabled && app_config.hyper.runtime_config_path.is_some() {
-        match build_hyper_handler(app_config, &mut gossip, hyper_block_engine.clone()).await {
-            Ok(h) => {
-                *hyper_handler_slot.write().await = Some(h);
-                info!("Hyper actor + HTTP handler attached");
-            }
-            Err(e) => {
-                error!(error = ?e, "Failed to start hyper actor; node continues without hyper handlers");
-            }
-        }
+    // FIP hyper: handler is built upstream (before the gossip
+    // spawn) so the actor's inbound channel can be installed into
+    // gossip's `OnceLock` cell while the swarm still has a live
+    // `&mut`. Here we just publish the pre-built handler into the
+    // slot the HTTP loop reads from, if hyper is configured.
+    if let Some(h) = hyper_handler {
+        *hyper_handler_slot.write().await = Some(h);
+        info!("Hyper actor + HTTP handler attached");
     }
 
-    // Start gossip last
-    tokio::spawn(async move {
-        info!("Starting gossip");
-        gossip.start().await;
-        info!("Gossip Stopped");
-    });
+    // R4 audit fix: the gossip task was already spawned by the caller
+    // BEFORE node creation, so QUIC keepalives flow during heavy
+    // RocksDB shard init. Nothing to do here.
 }
 
 async fn schedule_background_jobs(
@@ -674,7 +672,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let keypair = app_config.consensus.keypair().clone();
 
-    let (system_tx, mut system_rx) = mpsc::channel::<SystemMessage>(1000);
+    let (system_tx, mut system_rx) = mpsc::channel::<SystemMessage>(16384);
     let (mempool_tx, mempool_rx) = mpsc::channel(app_config.mempool.queue_size as usize);
 
     let node_capabilities = if app_config.hyper.enabled {
@@ -699,7 +697,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    let gossip = gossip_result?;
+    let mut gossip = gossip_result?;
     let local_peer_id = gossip.swarm.local_peer_id().clone();
     let read_or_validator = if app_config.read_node {
         "read"
@@ -714,6 +712,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
 
     let gossip_tx = gossip.tx.clone();
+
+    // R4 audit fix + main-merge: subscribe gossip to the hyper
+    // topics and capture the `OnceLock` setter for the hyper actor's
+    // inbound channel BEFORE the spawn — the swarm and actor-cell
+    // mutations both need a live `&mut`. The actor itself is wired
+    // post-node-creation via `build_hyper_handler` (which `.set()`s
+    // the OnceLock); until then, hyper-topic frames are dropped.
+    let hyper_actor_tx_setter = gossip.hyper_actor_tx_handle();
+    if app_config.hyper.enabled && app_config.hyper.runtime_config_path.is_some() {
+        gossip.subscribe_hyper_topics(!app_config.read_node);
+    }
+
+    // Spawn gossip early — before node creation — so the QUIC keep-alive and
+    // gossipsub control loop runs during the potentially heavy RocksDB shard
+    // initialization, preventing peer timeouts.
+    tokio::spawn(async move {
+        info!("Starting gossip");
+        gossip.start().await;
+        info!("Gossip Stopped");
+    });
 
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
 
@@ -860,7 +878,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
         start_servers(
             &app_config,
-            gossip,
+            gossip_tx.clone(),
+            local_peer_id,
             mempool_tx,
             shutdown_tx,
             onchain_events_request_tx,
@@ -875,7 +894,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             api_handler,
             api_search_indexer,
             // SnapchainReadNode doesn't host a hyper block engine
-            // (read nodes don't participate in DA-PoW consensus).
+            // (read nodes don't participate in DA-PoW consensus)
+            // and is not wired with a hyper handler.
             None,
         )
         .await;
@@ -1178,9 +1198,37 @@ async fn main() -> Result<(), Box<dyn Error>> {
         });
         let api_search_indexer = api_system.as_ref().and_then(|s| s.search_indexer.clone());
 
+        // R4 + main-merge: build the hyper handler here (after the
+        // node — needs its hyper_block_engine — but before
+        // `start_servers`). The pre-spawn `subscribe_hyper_topics`
+        // already happened upstream of the gossip spawn; this call
+        // populates the `OnceLock` so inbound hyper frames start
+        // routing to the actor as soon as the actor is up.
+        let hyper_handler = if app_config.hyper.enabled
+            && app_config.hyper.runtime_config_path.is_some()
+        {
+            match build_hyper_handler(
+                &app_config,
+                gossip_tx.clone(),
+                hyper_actor_tx_setter.clone(),
+                node.hyper_block_engine.clone(),
+            )
+            .await
+            {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    error!(error = ?e, "Failed to start hyper actor; node continues without hyper handlers");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         start_servers(
             &app_config,
-            gossip,
+            gossip_tx.clone(),
+            local_peer_id,
             mempool_tx.clone(),
             shutdown_tx.clone(),
             onchain_events_request_tx,
@@ -1194,7 +1242,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             local_state_store.clone(),
             api_handler,
             api_search_indexer,
-            node.hyper_block_engine.clone(),
+            hyper_handler,
         )
         .await;
 
@@ -1286,7 +1334,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 async fn build_hyper_handler(
     app_config: &hypersnap::cfg::Config,
-    gossip: &mut SnapchainGossip,
+    gossip_tx: mpsc::Sender<hypersnap::network::gossip::GossipEvent<SnapchainValidatorContext>>,
+    hyper_actor_tx_setter: Arc<
+        std::sync::OnceLock<mpsc::Sender<hypersnap::hyper::actor::HyperActorEvent>>,
+    >,
     hyper_block_engine: Option<
         Arc<tokio::sync::Mutex<hypersnap::storage::store::block_engine::BlockEngine>>,
     >,
@@ -1495,16 +1546,22 @@ async fn build_hyper_handler(
     let inbound_for_http = actor_handles.inbound;
     let client = HyperActorClient::new(inbound_for_client);
 
-    // Inbound: gossip → actor.
-    gossip.attach_hyper_actor(inbound_for_gossip, !app_config.read_node);
+    // Inbound: gossip → actor. R4 audit fix preserved: the gossip
+    // task has already been spawned in the caller (before heavy
+    // RocksDB shard init). Topic subscription happened pre-spawn via
+    // `subscribe_hyper_topics`; here we just write the actor inbound
+    // channel into the shared `OnceLock` the spawned loop reads
+    // from. If something already set it (shouldn't happen), the
+    // `.set()` returns `Err` which we ignore — there can only be
+    // one hyper actor per node.
+    let _ = hyper_actor_tx_setter.set(inbound_for_gossip);
 
     // Outbound: actor → gossip publish channel. The pump task lives
     // until the actor closes; we detach the JoinHandle since the node
     // supervisor shuts down on a different signal path.
-    let gossip_tx = gossip.tx.clone();
     tokio::spawn(run_outbound_pump(
         actor_handles.outbound,
-        gossip_tx,
+        gossip_tx.clone(),
         |item| tracing::info!(?item, "hyper actor non-network outbound"),
     ));
 

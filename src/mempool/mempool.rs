@@ -16,6 +16,7 @@ use crate::core::util::FarcasterTime;
 use crate::mempool::routing;
 use crate::proto::{Block, FarcasterNetwork, Height, MessageType, OnChainEventType, Transaction};
 use crate::storage::store::block_engine::BlockStores;
+use crate::storage::util::bytes_compare;
 use crate::{
     core::types::SnapchainValidatorContext,
     network::gossip::GossipEvent,
@@ -175,6 +176,68 @@ impl KeyAddRateLimits {
     }
 }
 
+pub struct LiveAtRateLimits {
+    shard_stores: HashMap<u32, Stores>,
+    rate_limits_by_fid: Cache<u64, Arc<DirectRateLimiter>>,
+    statsd_client: StatsdClientWrapper,
+    message_router: Box<dyn MessageRouter>,
+    num_shards: u32,
+}
+
+impl LiveAtRateLimits {
+    const RATE_LIMIT_PER_STORAGE_UNIT: u32 = 5000;
+
+    pub fn new(
+        shard_stores: HashMap<u32, Stores>,
+        statsd_client: StatsdClientWrapper,
+        num_shards: u32,
+    ) -> Self {
+        Self {
+            shard_stores,
+            rate_limits_by_fid: CacheBuilder::new(1_000_000)
+                // 2× the 1h quota window: prevents idle eviction from refreshing an hourly
+                // bucket early while still allowing LRU cleanup for inactive FIDs.
+                .time_to_idle(Duration::from_secs(60 * 60 * 2))
+                .eviction_policy(EvictionPolicy::lru())
+                .build(),
+            statsd_client,
+            message_router: Box::new(ShardRouter {}),
+            num_shards,
+        }
+    }
+
+    pub fn consume_for_fid(&self, fid: u64) -> bool {
+        let rate_limiter = self.rate_limits_by_fid.optionally_get_with(fid, || {
+            let shard_id = self.message_router.route_fid(fid, self.num_shards);
+            let stores = self.shard_stores.get(&shard_id).unwrap();
+            let storage_limits = stores.get_storage_limits(fid).unwrap();
+            if storage_limits.units == 0 {
+                None
+            } else {
+                let quota = storage_limits
+                    .units
+                    .saturating_mul(Self::RATE_LIMIT_PER_STORAGE_UNIT);
+                Some(Arc::new(RateLimiter::direct(Quota::per_hour(
+                    NonZeroU32::new(quota).unwrap(),
+                ))))
+            }
+        });
+        self.statsd_client.gauge(
+            "mempool.live_at_rate_limiter_entries",
+            self.rate_limits_by_fid.entry_count(),
+            vec![],
+        );
+        match rate_limiter {
+            Some(rate_limiter) => rate_limiter.check().is_ok(),
+            None => false,
+        }
+    }
+
+    fn invalidate_rate_limiter_for_fid(&self, fid: u64) {
+        self.rate_limits_by_fid.invalidate(&fid);
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub queue_size: u32,
@@ -196,13 +259,13 @@ impl Default for Config {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MempoolMessageKind {
     ValidatorMessage = 1,
     UserMessage = 2,
 }
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MempoolKey {
     message_kind: MempoolMessageKind,
     timestamp: u64, // in unix seconds
@@ -542,6 +605,26 @@ fn is_key_add(message: &proto::Message) -> bool {
     }
 }
 
+fn is_live_at(message: &proto::Message) -> bool {
+    match &message.data {
+        Some(data) => matches!(
+            data.body,
+            Some(proto::message_data::Body::UserDataBody(ref body))
+                if body.r#type == proto::UserDataType::LiveAt as i32
+        ),
+        None => false,
+    }
+}
+
+fn live_at_lww_compare(existing: &proto::Message, incoming: &proto::Message) -> Option<i8> {
+    let existing_data = existing.data.as_ref()?;
+    let incoming_data = incoming.data.as_ref()?;
+    let existing_ts_hash = make_ts_hash(existing_data.timestamp, &existing.hash).ok()?;
+    let incoming_ts_hash = make_ts_hash(incoming_data.timestamp, &incoming.hash).ok()?;
+
+    Some(bytes_compare(&existing_ts_hash, &incoming_ts_hash))
+}
+
 pub struct Mempool {
     config: Config,
     messages_request_rx: mpsc::Receiver<MempoolMessagesRequest>,
@@ -554,6 +637,8 @@ pub struct Mempool {
     // Always present (not `Option`) — KEY_ADD rate limiting is a FIP-required safety
     // guardrail, not a configurable throughput knob. See `KeyAddRateLimits`.
     key_add_rate_limits: KeyAddRateLimits,
+    live_at_rate_limits: LiveAtRateLimits,
+    live_at_messages_by_fid: HashMap<(u32, u64), MempoolKey>,
 }
 
 impl Mempool {
@@ -586,6 +671,12 @@ impl Mempool {
                 None
             },
             key_add_rate_limits: KeyAddRateLimits::new(statsd_client.clone()),
+            live_at_rate_limits: LiveAtRateLimits::new(
+                shard_stores.clone(),
+                statsd_client.clone(),
+                num_shards,
+            ),
+            live_at_messages_by_fid: HashMap::new(),
             config,
             read_node_mempool: ReadNodeMempool::new(
                 mempool_rx,
@@ -618,6 +709,15 @@ impl Mempool {
                     }
                 }
 
+                if is_live_at(user_msg) {
+                    if !self.live_at_rate_limits.consume_for_fid(fid) {
+                        self.statsd_client
+                            .count("mempool.live_at_rate_limit_hit", 1, vec![]);
+                        return true;
+                    }
+                    return false;
+                }
+
                 if let Some(rate_limits) = &mut self.rate_limits {
                     !rate_limits.consume_for_fid(fid)
                 } else {
@@ -645,7 +745,12 @@ impl Mempool {
                 Some(shard_messages) => {
                     match shard_messages.pop_first() {
                         None => break,
-                        Some((_, next_message)) => {
+                        Some((key, next_message)) => {
+                            self.remove_live_at_index_for_message(
+                                request.shard_id,
+                                &key,
+                                &next_message,
+                            );
                             // `at_admission = false`: keeps the feature-gate, BlockEvent-shard,
                             // and post-merge duplicate checks but skips the token-consuming
                             // rate limiter. The token was already consumed at insertion; a
@@ -716,6 +821,76 @@ impl Mempool {
         Ok(())
     }
 
+    fn remove_live_at_index_for_message(
+        &mut self,
+        shard_id: u32,
+        key: &MempoolKey,
+        message: &MempoolMessage,
+    ) {
+        if let MempoolMessage::UserMessage(user_msg) = message {
+            if is_live_at(user_msg) {
+                let index_key = (shard_id, user_msg.fid());
+                if self
+                    .live_at_messages_by_fid
+                    .get(&index_key)
+                    .is_some_and(|indexed_key| indexed_key == key)
+                {
+                    self.live_at_messages_by_fid.remove(&index_key);
+                }
+            }
+        }
+    }
+
+    fn prepare_live_at_insert(
+        &mut self,
+        shard_id: u32,
+        message: &MempoolMessage,
+    ) -> Result<Option<MempoolKey>, HubError> {
+        let MempoolMessage::UserMessage(user_msg) = message else {
+            return Ok(None);
+        };
+        if !is_live_at(user_msg) {
+            return Ok(None);
+        }
+
+        let index_key = (shard_id, user_msg.fid());
+        let Some(existing_key) = self.live_at_messages_by_fid.get(&index_key).cloned() else {
+            return Ok(None);
+        };
+        let Some(existing_message) = self
+            .messages
+            .get(&shard_id)
+            .and_then(|shard_messages| shard_messages.get(&existing_key))
+            .cloned()
+        else {
+            self.live_at_messages_by_fid.remove(&index_key);
+            return Ok(None);
+        };
+
+        let MempoolMessage::UserMessage(existing_user_msg) = &existing_message else {
+            self.live_at_messages_by_fid.remove(&index_key);
+            return Ok(None);
+        };
+
+        if live_at_lww_compare(existing_user_msg, user_msg).unwrap_or(1) > 0 {
+            return Err(HubError::duplicate(
+                "superseded by newer live_at in mempool",
+            ));
+        }
+
+        Ok(Some(existing_key))
+    }
+
+    fn index_live_at_insert(&mut self, shard_id: u32, message: &MempoolMessage) {
+        let MempoolMessage::UserMessage(user_msg) = message else {
+            return;
+        };
+        if is_live_at(user_msg) {
+            self.live_at_messages_by_fid
+                .insert((shard_id, user_msg.fid()), user_msg.mempool_key());
+        }
+    }
+
     async fn insert(
         &mut self,
         message: MempoolMessage,
@@ -755,16 +930,27 @@ impl Mempool {
         match self.messages.get_mut(&shard_id) {
             Some(shard_messages) => {
                 if shard_messages.contains_key(&message.mempool_key()) {
-                    // Exit early if the message already exists in the mempool
                     return Err(HubError::duplicate("message already in the mempool"));
                 }
             }
             None => {}
         }
 
-        // TODO(aditi): Maybe we don't need to run validations here?
+        // FIP-268 LIVE_AT mempool parity with upstream snapchain
+        // (farcasterxyz/snapchain#899, c292bfd): the old pending
+        // LIVE_AT must be evicted ONLY in the `result.is_ok()`
+        // branch below. A newer LIVE_AT that fails admission
+        // (feature gate, post-merge duplicate, rate limit) must
+        // not displace the prior pending one.
+        let live_at_to_replace = self.prepare_live_at_insert(shard_id, &message)?;
+
         let result = self.message_is_valid(shard_id, &message, true);
         if result.is_ok() {
+            if let Some(old_key) = live_at_to_replace {
+                if let Some(shard_messages) = self.messages.get_mut(&shard_id) {
+                    shard_messages.remove(&old_key);
+                }
+            }
             match self.messages.get_mut(&shard_id) {
                 None => {
                     let mut messages = BTreeMap::new();
@@ -782,6 +968,7 @@ impl Mempool {
                     );
                 }
             }
+            self.index_live_at_insert(shard_id, &message);
 
             self.statsd_client
                 .count_with_shard(shard_id, "mempool.insert.success", 1, vec![]);
@@ -799,7 +986,32 @@ impl Mempool {
         if let Some(mempool) = self.messages.get_mut(&height.shard_index) {
             for transaction in transactions {
                 for user_message in &transaction.user_messages {
-                    mempool.remove(&user_message.mempool_key());
+                    let key = user_message.mempool_key();
+                    mempool.remove(&key);
+                    if let Some(data) = &user_message.data {
+                        if let Some(proto::message_data::Body::LendStorageBody(lend_storage)) =
+                            &data.body
+                        {
+                            self.live_at_rate_limits
+                                .invalidate_rate_limiter_for_fid(data.fid);
+                            self.live_at_rate_limits
+                                .invalidate_rate_limiter_for_fid(lend_storage.to_fid);
+                            if let Some(rate_limits) = &mut self.rate_limits {
+                                rate_limits.invalidate_rate_limiter_for_fid(data.fid);
+                                rate_limits.invalidate_rate_limiter_for_fid(lend_storage.to_fid);
+                            }
+                        }
+                    }
+                    if is_live_at(user_message) {
+                        let index_key = (height.shard_index, user_message.fid());
+                        if self
+                            .live_at_messages_by_fid
+                            .get(&index_key)
+                            .is_some_and(|indexed_key| indexed_key == &key)
+                        {
+                            self.live_at_messages_by_fid.remove(&index_key);
+                        }
+                    }
                     self.statsd_client.count_with_shard(
                         height.shard_index,
                         "mempool.remove.success",
@@ -815,6 +1027,8 @@ impl Mempool {
                             if let Some(rate_limits) = &mut self.rate_limits {
                                 rate_limits.invalidate_rate_limiter_for_fid(onchain_event.fid);
                             }
+                            self.live_at_rate_limits
+                                .invalidate_rate_limiter_for_fid(onchain_event.fid);
                         }
                     }
                     self.statsd_client.count_with_shard(

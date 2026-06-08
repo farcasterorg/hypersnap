@@ -77,12 +77,6 @@ impl Address {
         Self(bytes)
     }
 
-    /// F151: fallible counterpart used by peer-reachable decode
-    /// paths. `from_vec` panics on length mismatch (via
-    /// `copy_from_slice`'s internal `assert!`), which on a
-    /// libp2p-supplied byte string is a remote panic-DoS. Callers
-    /// that decode untrusted bytes should use this and propagate
-    /// the error.
     pub fn try_from_vec(vec: Vec<u8>) -> Result<Self, &'static str> {
         if vec.len() != 32 {
             return Err("Address must be 32 bytes");
@@ -461,10 +455,6 @@ impl Vote {
         }
     }
 
-    /// F151: fallible counterpart for the peer-decode path. Rejects
-    /// malformed inputs (unknown vote type, missing `height`,
-    /// short/long `voter`) with an error instead of panicking the
-    /// consensus actor.
     pub fn try_from_proto(proto: proto::Vote) -> Result<Self, &'static str> {
         let vote_type = match proto.r#type {
             0 => VoteType::Prevote,
@@ -521,7 +511,6 @@ impl Proposal {
         }
     }
 
-    /// F151: fallible counterpart for the peer-decode path.
     pub fn try_from_proto(proto: proto::Proposal) -> Result<Self, &'static str> {
         let height = proto.height.ok_or("Proposal::height missing")?;
         let shard_hash = proto.value.ok_or("Proposal::value missing")?;
@@ -764,7 +753,6 @@ pub trait CommitsExt {
     fn to_commit_certificate(
         &self,
     ) -> informalsystems_malachitebft_core_types::CommitCertificate<SnapchainValidatorContext>;
-    /// F151: fallible variant for the peer-decode path.
     fn try_to_commit_certificate(
         &self,
     ) -> Result<

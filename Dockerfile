@@ -12,7 +12,7 @@ ENV RUST_BACKTRACE=1
 RUN echo "clear cache" # Invalidate cache to pick up latest eth-signature-verifier
 RUN <<EOF
 set -eu
-apt-get update && apt-get install -y libclang-dev git libjemalloc-dev llvm-dev make protobuf-compiler libssl-dev openssh-client cmake
+apt-get update && apt-get install -y build-essential libclang-dev git libjemalloc-dev llvm-dev make protobuf-compiler libssl-dev openssh-client cmake
 cd ..
 git clone $ETH_SIGNATURE_VERIFIER_GIT_REPO_URL
 cd eth-signature-verifier

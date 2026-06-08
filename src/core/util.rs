@@ -100,7 +100,27 @@ pub fn calculate_message_hash(data_bytes: &[u8]) -> Vec<u8> {
 }
 
 pub fn verify_signatures(commits: &proto::Commits, validator_sets: &StoredValidatorSets) -> bool {
-    let certificate = commits.to_commit_certificate();
+    // F185 (F151 residual): use the fallible decoder. `to_commit_certificate`
+    // panics on peer-controlled inputs — missing `height`/`value`, or any
+    // `CommitSignature.signer` whose length is not 32 → `Address::from_vec`
+    // `copy_from_slice` abort. The decided-value path on read nodes
+    // receives `proto::Commits` via raw `proto::GossipMessage::decode`
+    // (`gossip.rs::map_gossip_bytes_to_system_message`) and the sync
+    // value-response path re-decodes the embedded `Block`/`ShardChunk`
+    // (`read_sync.rs` ValueResponse handler) — both bypass the codec
+    // arm that F151 made fallible, so any peer can crash every
+    // subscribed read-node pre-verify with a single gossip frame. Drop
+    // the block on Err rather than panicking the actor.
+    let certificate = match commits.try_to_commit_certificate() {
+        Ok(c) => c,
+        Err(e) => {
+            error!(
+                error = e,
+                "Malformed Commits in verify_signatures; dropping"
+            );
+            return false;
+        }
+    };
 
     let validator_set = validator_sets.get_validator_set(certificate.height.as_u64());
 
@@ -179,5 +199,102 @@ mod tests {
 
         let time = from_farcaster_time(1);
         assert_eq!(time, FARCASTER_EPOCH + 1000);
+    }
+
+    /// F185 regression: peer-gossiped `Commits` with a malformed
+    /// `CommitSignature.signer` (length ≠ 32) must NOT panic
+    /// `verify_signatures` via `Address::from_vec`'s `copy_from_slice`.
+    /// Before the fix, `to_commit_certificate()` was called as the
+    /// function's first statement and triggered a remote-panic-DoS on
+    /// every subscribed read-node from a single gossip frame. After
+    /// the fix, the malformed Commits returns `false` (block dropped).
+    #[test]
+    fn verify_signatures_drops_commits_with_short_signer() {
+        use crate::consensus::consensus::ValidatorSetConfig;
+        use crate::consensus::validator::StoredValidatorSet;
+        use crate::core::types::{ShardId, SnapchainShard};
+
+        let cfg = ValidatorSetConfig {
+            effective_at: 0,
+            validator_public_keys: vec![],
+            validator_bls_public_keys: vec![],
+            shard_ids: vec![0],
+        };
+        let stored = StoredValidatorSet::new(SnapchainShard::new(0), &cfg);
+        let sets = StoredValidatorSets::new(0, vec![stored]);
+
+        let commits = proto::Commits {
+            height: Some(proto::Height {
+                shard_index: 0,
+                block_number: 1,
+            }),
+            round: 0,
+            value: Some(proto::ShardHash {
+                shard_index: 0,
+                hash: vec![0u8; 32],
+            }),
+            signatures: vec![proto::CommitSignature {
+                signer: vec![0u8; 16], // ≠ 32 bytes — would panic Address::from_vec
+                signature: vec![0u8; 64],
+            }],
+        };
+        assert!(!verify_signatures(&commits, &sets));
+    }
+
+    /// F185 regression: peer-gossiped `Commits` with missing `height`
+    /// must NOT panic via `to_commit_certificate`'s `unwrap()`.
+    #[test]
+    fn verify_signatures_drops_commits_with_missing_height() {
+        use crate::consensus::consensus::ValidatorSetConfig;
+        use crate::consensus::validator::StoredValidatorSet;
+        use crate::core::types::{ShardId, SnapchainShard};
+
+        let cfg = ValidatorSetConfig {
+            effective_at: 0,
+            validator_public_keys: vec![],
+            validator_bls_public_keys: vec![],
+            shard_ids: vec![0],
+        };
+        let stored = StoredValidatorSet::new(SnapchainShard::new(0), &cfg);
+        let sets = StoredValidatorSets::new(0, vec![stored]);
+
+        let commits = proto::Commits {
+            height: None,
+            round: 0,
+            value: Some(proto::ShardHash {
+                shard_index: 0,
+                hash: vec![0u8; 32],
+            }),
+            signatures: vec![],
+        };
+        assert!(!verify_signatures(&commits, &sets));
+    }
+
+    /// F185 regression: missing `value` (ShardHash) must NOT panic.
+    #[test]
+    fn verify_signatures_drops_commits_with_missing_value() {
+        use crate::consensus::consensus::ValidatorSetConfig;
+        use crate::consensus::validator::StoredValidatorSet;
+        use crate::core::types::{ShardId, SnapchainShard};
+
+        let cfg = ValidatorSetConfig {
+            effective_at: 0,
+            validator_public_keys: vec![],
+            validator_bls_public_keys: vec![],
+            shard_ids: vec![0],
+        };
+        let stored = StoredValidatorSet::new(SnapchainShard::new(0), &cfg);
+        let sets = StoredValidatorSets::new(0, vec![stored]);
+
+        let commits = proto::Commits {
+            height: Some(proto::Height {
+                shard_index: 0,
+                block_number: 1,
+            }),
+            round: 0,
+            value: None,
+            signatures: vec![],
+        };
+        assert!(!verify_signatures(&commits, &sets));
     }
 }

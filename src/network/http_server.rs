@@ -6,6 +6,7 @@ use hyper::{body::Bytes, Method};
 use hyper::{HeaderMap, Request, Response, StatusCode};
 use libp2p::PeerId;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::Future;
 use std::str::FromStr;
@@ -174,6 +175,10 @@ pub struct MessageData {
     pub link_compact_state_body: Option<LinkCompactStateBody>,
     #[serde(rename = "lendStorageBody", skip_serializing_if = "Option::is_none")]
     pub lend_storage_body: Option<LendStorageBody>,
+    #[serde(rename = "keyAddBody", skip_serializing_if = "Option::is_none")]
+    pub key_add_body: Option<KeyAddBody>,
+    #[serde(rename = "keyRemoveBody", skip_serializing_if = "Option::is_none")]
+    pub key_remove_body: Option<KeyRemoveBody>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -311,6 +316,38 @@ pub struct LendStorageBody {
     pub num_units: u64,
     #[serde(rename = "unitType")]
     pub unit_type: StorageUnitType,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyAddBody {
+    #[serde(with = "serdehex")]
+    pub key: Vec<u8>,
+    #[serde(rename = "keyType")]
+    pub key_type: u32,
+    #[serde(with = "serdehex", rename = "custodySignature")]
+    pub custody_signature: Vec<u8>,
+    pub deadline: u32,
+    pub nonce: u32,
+    #[serde(with = "serdehex")]
+    pub metadata: Vec<u8>,
+    #[serde(rename = "metadataType")]
+    pub metadata_type: u32,
+    #[serde(with = "serdehex", rename = "registrationTxHash")]
+    pub registration_tx_hash: Vec<u8>,
+    pub scopes: Vec<String>,
+    pub ttl: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyRemoveBody {
+    #[serde(with = "serdehex")]
+    pub key: Vec<u8>,
+    #[serde(with = "serdehex")]
+    pub signature: Vec<u8>,
+    #[serde(rename = "signatureType")]
+    pub signature_type: u32,
+    pub deadline: u32,
+    pub nonce: u32,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1132,6 +1169,128 @@ pub struct OnChainEventResponse {
     pub next_page_token: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+pub enum SignerSource {
+    SIGNER_SOURCE_NONE = 0,
+    SIGNER_SOURCE_ONCHAIN = 1,
+    SIGNER_SOURCE_OFFCHAIN = 2,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HttpSigner {
+    pub source: SignerSource,
+    #[serde(with = "serdehex")]
+    pub key: Vec<u8>,
+    #[serde(rename = "keyType")]
+    pub key_type: u32,
+    pub fid: u64,
+
+    #[serde(rename = "addedAt", skip_serializing_if = "Option::is_none")]
+    pub added_at: Option<u64>,
+    #[serde(rename = "lastUsedAt", skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<u32>,
+    #[serde(rename = "expiresAt", skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
+
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
+    #[serde(rename = "requestFid", skip_serializing_if = "Option::is_none")]
+    pub request_fid: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nonce: Option<u32>,
+
+    #[serde(rename = "onChainEvent", skip_serializing_if = "Option::is_none")]
+    pub onchain_event: Option<OnChainEvent>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HttpSignerResponse {
+    pub signer: HttpSigner,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HttpSignersByFidResponse {
+    pub signers: Vec<HttpSigner>,
+    #[serde(rename = "nextPageToken", skip_serializing_if = "Option::is_none")]
+    pub next_page_token: Option<String>,
+    #[serde(rename = "gaslessSignerCount")]
+    pub gasless_signer_count: u32,
+    #[serde(rename = "gaslessSignerLimit")]
+    pub gasless_signer_limit: u32,
+    #[serde(rename = "currentUserNonce")]
+    pub current_user_nonce: u32,
+    #[serde(
+        rename = "requesterFidNonces",
+        skip_serializing_if = "HashMap::is_empty"
+    )]
+    pub requester_fid_nonces: HashMap<u64, u32>,
+}
+
+#[allow(non_snake_case)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SignersByFidHttpRequest {
+    pub fid: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<u32>,
+    #[serde(
+        default,
+        with = "serdebase64opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub page_token: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reverse: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requester_fids: Vec<u64>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pageSize: Option<u32>,
+    #[serde(
+        default,
+        with = "serdebase64opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub pageToken: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requesterFids: Vec<u64>,
+}
+
+impl SignersByFidHttpRequest {
+    pub fn to_proto(self) -> proto::SignersByFidRequest {
+        let requester_fids = if self.requester_fids.is_empty() {
+            self.requesterFids
+        } else {
+            self.requester_fids
+        };
+        proto::SignersByFidRequest {
+            fid: self.fid,
+            page_size: self.page_size.or(self.pageSize),
+            page_token: self.page_token.or(self.pageToken),
+            reverse: self.reverse,
+            requester_fids,
+        }
+    }
+}
+
+#[allow(non_snake_case)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SignerHttpRequest {
+    pub fid: u64,
+    #[serde(with = "serdehex")]
+    pub signer: Vec<u8>,
+}
+
+impl SignerHttpRequest {
+    pub fn to_proto(self) -> proto::SignerRequest {
+        proto::SignerRequest {
+            fid: self.fid,
+            signer: self.signer,
+        }
+    }
+}
+
 #[allow(non_snake_case)]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FidAddressTypeRequest {
@@ -1726,6 +1885,82 @@ fn map_proto_lend_storage_body_to_json_lend_storage_body(
     })
 }
 
+fn map_proto_key_add_body_to_json_key_add_body(
+    key_add_body: proto::KeyAddBody,
+) -> Result<KeyAddBody, ErrorResponse> {
+    let scopes: Vec<String> = key_add_body
+        .scopes
+        .iter()
+        .filter_map(|i| {
+            MessageType::try_from(*i)
+                .ok()
+                .map(|t| t.as_str_name().to_string())
+        })
+        .collect();
+    Ok(KeyAddBody {
+        key: key_add_body.key,
+        key_type: key_add_body.key_type,
+        custody_signature: key_add_body.custody_signature,
+        deadline: key_add_body.deadline,
+        nonce: key_add_body.nonce,
+        metadata: key_add_body.metadata,
+        metadata_type: key_add_body.metadata_type,
+        registration_tx_hash: key_add_body.registration_tx_hash,
+        scopes,
+        ttl: key_add_body.ttl,
+    })
+}
+
+fn map_proto_key_remove_body_to_json_key_remove_body(
+    key_remove_body: proto::KeyRemoveBody,
+) -> Result<KeyRemoveBody, ErrorResponse> {
+    Ok(KeyRemoveBody {
+        key: key_remove_body.key,
+        signature: key_remove_body.signature,
+        signature_type: key_remove_body.signature_type,
+        deadline: key_remove_body.deadline,
+        nonce: key_remove_body.nonce,
+    })
+}
+
+fn map_proto_signer_to_json_signer(
+    proto_signer: proto::Signer,
+) -> Result<HttpSigner, ErrorResponse> {
+    let scopes: Vec<String> = proto_signer
+        .scopes
+        .iter()
+        .filter_map(|i| {
+            MessageType::try_from(*i)
+                .ok()
+                .map(|t| t.as_str_name().to_string())
+        })
+        .collect();
+
+    let onchain_event = match proto_signer.onchain_event {
+        Some(event) => Some(map_proto_on_chain_event_to_json_on_chain_event(event)?),
+        None => None,
+    };
+
+    Ok(HttpSigner {
+        source: match proto_signer.source {
+            1 => SignerSource::SIGNER_SOURCE_ONCHAIN,
+            2 => SignerSource::SIGNER_SOURCE_OFFCHAIN,
+            _ => SignerSource::SIGNER_SOURCE_NONE,
+        },
+        key: proto_signer.key,
+        key_type: proto_signer.key_type,
+        fid: proto_signer.fid,
+        added_at: proto_signer.added_at,
+        last_used_at: proto_signer.last_used_at,
+        ttl: proto_signer.ttl,
+        expires_at: proto_signer.expires_at,
+        scopes,
+        request_fid: proto_signer.request_fid,
+        nonce: proto_signer.nonce,
+        onchain_event,
+    })
+}
+
 fn map_proto_message_data_to_json_message_data(
     message_data: proto::MessageData,
 ) -> Result<MessageData, ErrorResponse> {
@@ -1760,6 +1995,8 @@ fn map_proto_message_data_to_json_message_data(
                 frame_action_body: None,
                 link_compact_state_body: None,
                 lend_storage_body: None,
+                key_add_body: None,
+                key_remove_body: None,
             })
         }
         Some(Body::CastRemoveBody(cast_remove_body)) => Ok(MessageData {
@@ -1792,6 +2029,8 @@ fn map_proto_message_data_to_json_message_data(
             frame_action_body: None,
             link_compact_state_body: None,
             lend_storage_body: None,
+            key_add_body: None,
+            key_remove_body: None,
         }),
         Some(Body::FrameActionBody(frame_action_body)) => {
             return Ok(MessageData {
@@ -1833,6 +2072,8 @@ fn map_proto_message_data_to_json_message_data(
                 }),
                 link_compact_state_body: None,
                 lend_storage_body: None,
+                key_add_body: None,
+                key_remove_body: None,
             });
         }
         Some(Body::LinkBody(link_body)) => {
@@ -1865,6 +2106,8 @@ fn map_proto_message_data_to_json_message_data(
                 frame_action_body: None,
                 link_compact_state_body: None,
                 lend_storage_body: None,
+                key_add_body: None,
+                key_remove_body: None,
             });
         }
         Some(Body::LinkCompactStateBody(link_compact_state_body)) => {
@@ -1898,6 +2141,8 @@ fn map_proto_message_data_to_json_message_data(
                 frame_action_body: None,
                 lend_storage_body: None,
                 link_compact_state_body: Some(result),
+                key_add_body: None,
+                key_remove_body: None,
             });
         }
         Some(Body::ReactionBody(reaction_body)) => {
@@ -1930,6 +2175,8 @@ fn map_proto_message_data_to_json_message_data(
                 frame_action_body: None,
                 link_compact_state_body: None,
                 lend_storage_body: None,
+                key_add_body: None,
+                key_remove_body: None,
             });
         }
         Some(Body::UserDataBody(user_data_body)) => {
@@ -1962,6 +2209,8 @@ fn map_proto_message_data_to_json_message_data(
                 frame_action_body: None,
                 link_compact_state_body: None,
                 lend_storage_body: None,
+                key_add_body: None,
+                key_remove_body: None,
             });
         }
         Some(Body::UsernameProofBody(username_proof_body)) => {
@@ -1995,6 +2244,8 @@ fn map_proto_message_data_to_json_message_data(
                 frame_action_body: None,
                 link_compact_state_body: None,
                 lend_storage_body: None,
+                key_add_body: None,
+                key_remove_body: None,
             });
         }
         Some(Body::VerificationAddAddressBody(verification_add_address_body)) => {
@@ -2029,6 +2280,8 @@ fn map_proto_message_data_to_json_message_data(
                 frame_action_body: None,
                 link_compact_state_body: None,
                 lend_storage_body: None,
+                key_add_body: None,
+                key_remove_body: None,
             });
         }
         Some(Body::VerificationRemoveBody(verification_remove_body)) => {
@@ -2063,6 +2316,8 @@ fn map_proto_message_data_to_json_message_data(
                 frame_action_body: None,
                 link_compact_state_body: None,
                 lend_storage_body: None,
+                key_add_body: None,
+                key_remove_body: None,
             });
         }
         Some(Body::LendStorageBody(lend_storage_body)) => {
@@ -2095,14 +2350,78 @@ fn map_proto_message_data_to_json_message_data(
                 frame_action_body: None,
                 link_compact_state_body: None,
                 lend_storage_body: Some(result),
+                key_add_body: None,
+                key_remove_body: None,
             });
         }
-        // KEY_ADD/KEY_REMOVE JSON mappings are added in a follow-up task; for now expose them
-        // as a clear error so callers see the type isn't supported on the JSON surface yet.
-        Some(Body::KeyAddBody(_)) | Some(Body::KeyRemoveBody(_)) => Err(ErrorResponse {
-            error: "Unsupported message type for JSON: KEY_ADD/KEY_REMOVE".to_string(),
-            error_detail: None,
-        }),
+        Some(Body::KeyAddBody(key_add_body)) => {
+            let result = map_proto_key_add_body_to_json_key_add_body(key_add_body)?;
+            Ok(MessageData {
+                message_type: MessageType::try_from(message_data.r#type)
+                    .map_err(|_| ErrorResponse {
+                        error: "Invalid message type".to_string(),
+                        error_detail: None,
+                    })?
+                    .as_str_name()
+                    .to_owned(),
+                fid: message_data.fid,
+                network: FarcasterNetwork::try_from(message_data.network)
+                    .map_err(|_| ErrorResponse {
+                        error: "Invalid network".to_string(),
+                        error_detail: None,
+                    })?
+                    .as_str_name()
+                    .to_owned(),
+                timestamp: message_data.timestamp,
+                cast_add_body: None,
+                cast_remove_body: None,
+                reaction_body: None,
+                verification_add_address_body: None,
+                verification_remove_body: None,
+                user_data_body: None,
+                link_body: None,
+                username_proof_body: None,
+                frame_action_body: None,
+                link_compact_state_body: None,
+                lend_storage_body: None,
+                key_add_body: Some(result),
+                key_remove_body: None,
+            })
+        }
+        Some(Body::KeyRemoveBody(key_remove_body)) => {
+            let result = map_proto_key_remove_body_to_json_key_remove_body(key_remove_body)?;
+            Ok(MessageData {
+                message_type: MessageType::try_from(message_data.r#type)
+                    .map_err(|_| ErrorResponse {
+                        error: "Invalid message type".to_string(),
+                        error_detail: None,
+                    })?
+                    .as_str_name()
+                    .to_owned(),
+                fid: message_data.fid,
+                network: FarcasterNetwork::try_from(message_data.network)
+                    .map_err(|_| ErrorResponse {
+                        error: "Invalid network".to_string(),
+                        error_detail: None,
+                    })?
+                    .as_str_name()
+                    .to_owned(),
+                timestamp: message_data.timestamp,
+                cast_add_body: None,
+                cast_remove_body: None,
+                reaction_body: None,
+                verification_add_address_body: None,
+                verification_remove_body: None,
+                user_data_body: None,
+                link_body: None,
+                username_proof_body: None,
+                frame_action_body: None,
+                link_compact_state_body: None,
+                lend_storage_body: None,
+                key_add_body: None,
+                key_remove_body: Some(result),
+            })
+        }
         None => Err(ErrorResponse {
             error: "No message data".to_string(),
             error_detail: None,
@@ -2429,6 +2748,12 @@ pub trait HubHttpService {
         &self,
         req: FidRequest,
     ) -> Result<OnChainEventResponse, ErrorResponse>;
+    async fn get_signer(&self, req: SignerHttpRequest)
+        -> Result<HttpSignerResponse, ErrorResponse>;
+    async fn get_signers_by_fid(
+        &self,
+        req: SignersByFidHttpRequest,
+    ) -> Result<HttpSignersByFidResponse, ErrorResponse>;
     async fn get_on_chain_events_by_fid(
         &self,
         req: OnChainEventRequest,
@@ -3145,6 +3470,60 @@ where
         })
     }
 
+    /// GET /v1/signer
+    async fn get_signer(
+        &self,
+        req: SignerHttpRequest,
+    ) -> Result<HttpSignerResponse, ErrorResponse> {
+        let grpc_req = tonic::Request::new(req.to_proto());
+        let response = self
+            .service
+            .get_signer(grpc_req)
+            .await
+            .map_err(|e| ErrorResponse {
+                error: "Failed to get signer".to_string(),
+                error_detail: Some(e.to_string()),
+            })?;
+        let inner = response.into_inner();
+        let signer = inner.signer.ok_or_else(|| ErrorResponse {
+            error: "Signer not found".to_string(),
+            error_detail: None,
+        })?;
+        Ok(HttpSignerResponse {
+            signer: map_proto_signer_to_json_signer(signer)?,
+        })
+    }
+
+    /// GET /v1/signersByFid
+    async fn get_signers_by_fid(
+        &self,
+        req: SignersByFidHttpRequest,
+    ) -> Result<HttpSignersByFidResponse, ErrorResponse> {
+        let grpc_req = tonic::Request::new(req.to_proto());
+        let response = self
+            .service
+            .get_signers_by_fid(grpc_req)
+            .await
+            .map_err(|e| ErrorResponse {
+                error: "Failed to get signers by fid".to_string(),
+                error_detail: Some(e.to_string()),
+            })?;
+        let inner = response.into_inner();
+        let signers = inner
+            .signers
+            .into_iter()
+            .map(map_proto_signer_to_json_signer)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(HttpSignersByFidResponse {
+            signers,
+            next_page_token: inner.next_page_token.map(|t| BASE64_STANDARD.encode(t)),
+            gasless_signer_count: inner.gasless_signer_count,
+            gasless_signer_limit: inner.gasless_signer_limit,
+            current_user_nonce: inner.current_user_nonce,
+            requester_fid_nonces: inner.requester_fid_nonces,
+        })
+    }
+
     /// GET /v1/onChainEventsByFid
     async fn get_on_chain_events_by_fid(
         &self,
@@ -3589,6 +3968,20 @@ where
                 self.handle_request::<FidRequest, OnChainEventResponse, _>(req, |service, req| {
                     Box::pin(async move { service.get_on_chain_signers_by_fid(req).await })
                 })
+                .await
+            }
+            (&Method::GET, "/v1/signer") => {
+                self.handle_request::<SignerHttpRequest, HttpSignerResponse, _>(
+                    req,
+                    |service, req| Box::pin(async move { service.get_signer(req).await }),
+                )
+                .await
+            }
+            (&Method::GET, "/v1/signersByFid") => {
+                self.handle_request::<SignersByFidHttpRequest, HttpSignersByFidResponse, _>(
+                    req,
+                    |service, req| Box::pin(async move { service.get_signers_by_fid(req).await }),
+                )
                 .await
             }
             (&Method::GET, "/v1/onChainEventsByFid") => {

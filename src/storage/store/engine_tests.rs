@@ -602,6 +602,129 @@ mod tests {
         assert_eq!(1, user_data_result.unwrap().messages.len());
     }
 
+    /// FIP-268 hypersnap-specific: LIVE_AT user data must land in
+    /// the hyper trie under the same 1-phase Set CRDT semantics as
+    /// every other UserDataType — overwrite-by-(fid, type), with
+    /// the latest value winning on the LIVE_AT slot per FID and a
+    /// clear-by-empty-string deleting the active value. The hyper
+    /// store is not pruned, so prior values written into the legacy
+    /// store are still queryable on the hyper side via lookup of
+    /// the most recently merged add at that (fid, type) slot.
+    #[tokio::test]
+    async fn test_live_at_user_data_lands_in_hyper_trie() {
+        let (mut engine, _tmpdir) = test_helper::new_engine().await;
+        test_helper::register_user(
+            FID_FOR_TEST,
+            test_helper::default_signer(),
+            test_helper::default_custody_address(),
+            &mut engine,
+        )
+        .await;
+        let timestamp = messages_factory::farcaster_time();
+
+        // 1. Initial LIVE_AT set — must land in both legacy + hyper.
+        let first = messages_factory::user_data::create_user_data_add(
+            FID_FOR_TEST,
+            proto::UserDataType::LiveAt,
+            &"https://example.com/live/one".to_string(),
+            Some(timestamp),
+            Some(&test_helper::default_signer()),
+        );
+        commit_message(&mut engine, &first).await;
+
+        let hyper = engine
+            .get_hyper_stores()
+            .expect("hyper stores should be initialized");
+        let live_at = UserDataStore::get_user_data_by_fid_and_type(
+            &hyper.user_data_store,
+            FID_FOR_TEST,
+            proto::UserDataType::LiveAt,
+        )
+        .expect("LIVE_AT should be retrievable from the hyper store");
+        let body = match live_at.data.as_ref().unwrap().body.as_ref().unwrap() {
+            proto::message_data::Body::UserDataBody(b) => b,
+            _ => panic!("expected UserDataBody"),
+        };
+        assert_eq!(body.value, "https://example.com/live/one");
+
+        // 2. Overwrite — newer LIVE_AT wins on the same (fid, type)
+        //    slot; hyper store reflects the latest value.
+        let second = messages_factory::user_data::create_user_data_add(
+            FID_FOR_TEST,
+            proto::UserDataType::LiveAt,
+            &"https://example.com/live/two".to_string(),
+            Some(timestamp + 1),
+            Some(&test_helper::default_signer()),
+        );
+        commit_message(&mut engine, &second).await;
+
+        let hyper = engine.get_hyper_stores().unwrap();
+        let live_at = UserDataStore::get_user_data_by_fid_and_type(
+            &hyper.user_data_store,
+            FID_FOR_TEST,
+            proto::UserDataType::LiveAt,
+        )
+        .expect("overwriting LIVE_AT should still resolve via the hyper store");
+        let body = match live_at.data.as_ref().unwrap().body.as_ref().unwrap() {
+            proto::message_data::Body::UserDataBody(b) => b,
+            _ => panic!("expected UserDataBody"),
+        };
+        assert_eq!(body.value, "https://example.com/live/two");
+
+        // 3. Clear-by-empty-string deletes the active LIVE_AT on the
+        //    UserData Set CRDT — the hyper store mirrors that the
+        //    current value is now the empty heartbeat.
+        let cleared = messages_factory::user_data::create_user_data_add(
+            FID_FOR_TEST,
+            proto::UserDataType::LiveAt,
+            &"".to_string(),
+            Some(timestamp + 2),
+            Some(&test_helper::default_signer()),
+        );
+        commit_message(&mut engine, &cleared).await;
+
+        let hyper = engine.get_hyper_stores().unwrap();
+        let live_at = UserDataStore::get_user_data_by_fid_and_type(
+            &hyper.user_data_store,
+            FID_FOR_TEST,
+            proto::UserDataType::LiveAt,
+        )
+        .expect("cleared LIVE_AT is still a UserDataAdd record (empty value)");
+        let body = match live_at.data.as_ref().unwrap().body.as_ref().unwrap() {
+            proto::message_data::Body::UserDataBody(b) => b,
+            _ => panic!("expected UserDataBody"),
+        };
+        assert_eq!(body.value, "");
+
+        // 4. The (fid, type) slot is single-valued — no orphaned
+        //    duplicates accumulate in the hyper store across the
+        //    three writes.
+        let all_user_data = hyper
+            .user_data_store
+            .get_adds_by_fid::<fn(&proto::Message) -> bool>(
+                FID_FOR_TEST,
+                &PageOptions::default(),
+                None,
+            )
+            .unwrap();
+        let live_at_count = all_user_data
+            .messages
+            .iter()
+            .filter(|m| match m.data.as_ref().unwrap().body.as_ref().unwrap() {
+                proto::message_data::Body::UserDataBody(b) => {
+                    b.r#type == proto::UserDataType::LiveAt as i32
+                }
+                _ => false,
+            })
+            .count();
+        assert_eq!(
+            live_at_count, 1,
+            "hyper store must hold exactly one LIVE_AT add per (fid, type) slot, \
+             got {} for FID {}",
+            live_at_count, FID_FOR_TEST
+        );
+    }
+
     #[tokio::test]
     async fn test_commit_verification_messages() {
         let timestamp = messages_factory::farcaster_time();
