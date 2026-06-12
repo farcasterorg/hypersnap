@@ -170,6 +170,38 @@ impl ReadValidator {
         verify_signatures(&commits, &self.validator_sets)
     }
 
+    /// F012: re-derive `hash` from `blake3(header.encode_to_vec())` and
+    /// compare against the proto field. The signed consensus value is
+    /// `commits.value.hash`; once we've verified the quorum signed
+    /// that, this check binds it to the actual `header` (and via the
+    /// header's `state_root`/`events_hash`/`shard_witnesses_hash`, to
+    /// the body).
+    fn validate_block_hash_matches_header(&self, value: &DecidedValue) -> bool {
+        use prost::Message;
+        match value.value.as_ref() {
+            Some(proto::decided_value::Value::Block(block)) => {
+                let header = match block.header.as_ref() {
+                    Some(h) => h,
+                    None => return false,
+                };
+                let expected = blake3::hash(&header.encode_to_vec()).as_bytes().to_vec();
+                block.hash == expected
+            }
+            Some(proto::decided_value::Value::Shard(chunk)) => {
+                let header = match chunk.header.as_ref() {
+                    Some(h) => h,
+                    None => return false,
+                };
+                let expected = blake3::hash(&header.encode_to_vec()).as_bytes().to_vec();
+                chunk.hash == expected
+            }
+            // Hyperblocks have their own integrity model (threshold-
+            // signed state-root over a metadata payload). Not gated
+            // by this check.
+            _ => true,
+        }
+    }
+
     pub fn validate_protocol_version(&self, value: &DecidedValue) -> bool {
         match &value.value {
             Some(proto::decided_value::Value::Block(block)) => {
@@ -203,9 +235,79 @@ impl ReadValidator {
                     return false;
                 }
             }
+            Some(proto::decided_value::Value::Shard(chunk)) => {
+                // F011 fix: shard chunks have no header.version field
+                // (ShardHeader carries only height/timestamp/parent_hash/
+                // shard_root), so the old code returned `true` here —
+                // letting a stale binary commit chunks under a
+                // locally-derived `EngineVersion` and silently diverge
+                // from the network state across a time-gated upgrade
+                // boundary.
+                //
+                // Heuristic check: if `version_for(timestamp, network)`
+                // maps to the binary's latest known version AND the
+                // timestamp is past the latest schedule entry's
+                // `active_at`, the binary may be missing newer
+                // schedule entries. Halt rather than silently apply.
+                if let Engine::ShardEngine(engine) = &self.engine {
+                    // Devnet ships with a single-entry schedule; there's no
+                    // upgrade cadence to stale against. Skip the heuristic.
+                    if engine.network == FarcasterNetwork::Devnet {
+                        return true;
+                    }
+                    let header = match chunk.header.as_ref() {
+                        Some(h) => h,
+                        None => return false,
+                    };
+                    let timestamp = FarcasterTime::new(header.timestamp);
+                    let derived = EngineVersion::version_for(&timestamp, engine.network);
+                    if derived == EngineVersion::latest()
+                        && EngineVersion::next_version_timestamp_for(&timestamp, engine.network)
+                            .is_none()
+                    {
+                        // Use the actual schedule horizon: the
+                        // active_at of the latest entry the binary
+                        // knows about. Any chunk timestamp far past
+                        // that horizon is suspicious — the network
+                        // has shipped a newer EngineVersion we don't
+                        // know about. Grace period is intentionally
+                        // long (60d) so routine off-cycle deploys
+                        // don't trip the halt.
+                        const SHARD_STALENESS_GRACE_SECS: u64 = 60 * 24 * 60 * 60;
+                        if let Some(horizon) =
+                            EngineVersion::latest_schedule_active_at(engine.network)
+                        {
+                            if timestamp.to_unix_seconds()
+                                > horizon.saturating_add(SHARD_STALENESS_GRACE_SECS)
+                            {
+                                let block_number =
+                                    header.height.map(|h| h.block_number).unwrap_or(0);
+                                let error_message = format!(
+                                    "Shard chunk at height {} timestamp {} is more than {} \
+                                     days past the binary's known schedule horizon ({}). \
+                                     Does your node need an upgrade?",
+                                    block_number,
+                                    timestamp.to_unix_seconds(),
+                                    SHARD_STALENESS_GRACE_SECS / 86400,
+                                    horizon,
+                                );
+                                error!(%self.last_height, error_message);
+                                self.system_tx
+                                    .try_send(SystemMessage::ExitWithError(error_message))
+                                    .unwrap_or_else(|e| {
+                                        error!(
+                                            %self.last_height,
+                                            "Failed to send system message: {}", e
+                                        );
+                                    });
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
             _ => {
-                // no-op. Only blocks have protocol version. Unknown
-                // (None) variants are dropped earlier in process_decided_value.
+                // Unknown (None) variants are dropped earlier in process_decided_value.
             }
         }
         true
@@ -228,6 +330,23 @@ impl ReadValidator {
         let verified = self.verify_signatures(&value);
         if !verified {
             error!(%height, last_height = %self.last_height, "Dropping decided block because its signatures are invalid");
+            return 0;
+        }
+
+        // F012 fix: the quorum signed `commits.value = ShardHash{hash}`,
+        // but `hash` is a proposer-set proto field. Pre-fix nothing
+        // rederived `blake3(header)` on the read path, so a relayer
+        // with a valid `Commits` for height H could wrap it around a
+        // Block/ShardChunk whose `hash` equals the signed value but
+        // whose `header`+body were attacker-chosen. Bind hash → header
+        // here so the signed value transitively covers the body via
+        // `state_root`/`events_hash`/`shard_witnesses_hash`.
+        if !self.validate_block_hash_matches_header(&value) {
+            error!(
+                %height,
+                last_height = %self.last_height,
+                "F012: decided block hash does not match blake3(header); dropping"
+            );
             return 0;
         }
 

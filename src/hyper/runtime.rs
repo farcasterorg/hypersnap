@@ -364,10 +364,19 @@ impl HyperRuntime {
         if let Some((tip_height, _)) = block_index.latest_height_and_hash().ok().flatten() {
             for h in 0..=tip_height {
                 if let Ok((locks, transfers)) = block_index.get_messages(h) {
-                    let mut messages = Vec::with_capacity(locks.len() + transfers.len());
-                    for l in locks {
-                        messages.push(crate::hyper::builder::PendingMessage::Lock(l));
+                    // F035 fix: the transparent-lock path is gated off
+                    // in `import_hyper_block`, so any stored block from
+                    // a previous build version may still carry locks.
+                    // Skip them on replay — re-applying would commit
+                    // unbacked-mint leaves into the verkle root.
+                    if !locks.is_empty() {
+                        tracing::warn!(
+                            height = h,
+                            count = locks.len(),
+                            "skipping transparent locks during verkle replay (F035-disabled path)"
+                        );
                     }
+                    let mut messages = Vec::with_capacity(transfers.len());
                     for t in transfers {
                         messages.push(crate::hyper::builder::PendingMessage::Transfer(t));
                     }
@@ -942,6 +951,10 @@ impl HyperRuntime {
         epoch: u64,
         block_number: u64,
     ) -> Result<proto::HyperLockMerkleRootUpdate, RuntimeRewardError> {
+        // Honest-signer sanity cap: refuse to produce any universal
+        // bridge payload with a watermark-saturating block_number.
+        hypersnap_crypto::bridge_payload::validate_bridge_block_number(block_number)
+            .map_err(|e| RuntimeRewardError::Reward(RewardError::Custom(e.to_string())))?;
         let share = self
             .dkls_share_for_epoch(epoch)
             .ok_or(RuntimeRewardError::UnknownEpoch(epoch))?;
@@ -1069,6 +1082,9 @@ impl HyperRuntime {
         incoming_epoch: u64,
         block_number: u64,
     ) -> Result<proto::HyperOwnerRotation, RuntimeRewardError> {
+        // Honest-signer sanity cap.
+        hypersnap_crypto::bridge_payload::validate_bridge_block_number(block_number)
+            .map_err(|e| RuntimeRewardError::Reward(RewardError::Custom(e.to_string())))?;
         let outgoing = self
             .dkls_share_for_epoch(outgoing_epoch)
             .ok_or(RuntimeRewardError::UnknownEpoch(outgoing_epoch))?;
@@ -1217,7 +1233,10 @@ impl HyperRuntime {
             .get_active_validators_enforced(epoch, &self.bootstrap_validators)
             .ok()?;
         let target = (party_index as usize).checked_sub(1)?;
-        let (_, (_, transport_pk)) = active.iter().nth(target)?;
+        // F025: use committee-rank order, not lex order.
+        let party_order = crate::hyper::dkls_committee::committee_party_order(epoch, active.keys());
+        let validator_key = party_order.get(target)?;
+        let (_, transport_pk) = active.get(validator_key)?;
         if transport_pk.len() != 32 {
             return None;
         }
@@ -1247,7 +1266,9 @@ impl HyperRuntime {
             .get_active_validators_enforced(epoch, &self.bootstrap_validators)
             .ok()?;
         let target = (party_index as usize).checked_sub(1)?;
-        let (validator_key, _) = active.iter().nth(target)?;
+        // F025: committee-rank order.
+        let party_order = crate::hyper::dkls_committee::committee_party_order(epoch, active.keys());
+        let validator_key = party_order.get(target)?;
         let peer_ids = self
             .validator_registry
             .compute_active_peer_ids(epoch)
@@ -1267,11 +1288,19 @@ impl HyperRuntime {
             .validator_registry
             .compute_active_peer_ids(epoch)
             .unwrap_or_default();
+        // F025: party indices must follow the committee-rank order
+        // used by `dkls_supervisor::build_driver`, not BTreeMap lex
+        // order — otherwise the per-epoch
+        // `peer_id → committee_party_index` map disagrees with the
+        // ceremony's view and the F018 sender check rejects every
+        // honest frame.
+        let party_order =
+            crate::hyper::dkls_committee::committee_party_order(epoch, peer_ids.keys());
         let mut map = std::collections::BTreeMap::new();
-        for (idx, (_, peer_id)) in peer_ids.iter().enumerate() {
-            // Party indices are 1-based; the BTreeMap iter is in
-            // sorted-by-validator_key order, matching the DKLS
-            // committee enumeration.
+        for (idx, validator_key) in party_order.iter().enumerate() {
+            let Some(peer_id) = peer_ids.get(validator_key) else {
+                continue;
+            };
             if let Ok(party_index) = u8::try_from(idx + 1) {
                 map.insert(peer_id.clone(), party_index);
             }
@@ -3879,11 +3908,29 @@ impl HyperRuntime {
 
         // Wrap our state in a router and delegate. This keeps the routing
         // logic in one place.
+        //
+        // F070 fix: attach a `StoreBackedCustodyResolver` so the router's
+        // validator-event arm takes the STRICT path
+        // (`validate_and_check_quota` → EIP-712 custody cross-sign +
+        // per-FID quota). Without this, `route_inbound` falls back to
+        // `ValidatorRegistry::validate_event(.., None)` which skips the
+        // custody-signature check entirely — letting an unauthenticated
+        // gossip peer register arbitrary validator keys under any FID
+        // (the prerequisite for the F025 → F028 → bridge-custody attack
+        // chain).
+        use crate::hyper::validator_registry::StoreBackedCustodyResolver;
+        use crate::storage::store::account::{OnchainEventStore, StoreEventHandler};
+        let handler = StoreEventHandler::new_no_persist();
+        let onchain = OnchainEventStore::new(self.db.clone(), handler);
+        let custody: std::sync::Arc<dyn crate::hyper::validator_registry::CustodyResolver> =
+            std::sync::Arc::new(StoreBackedCustodyResolver::new(onchain));
+
         let mut router = HyperRouter::new(
             std::mem::take(&mut self.mempool),
             Some(self.validator_registry.clone()),
             self.epoch_resolver.current_epoch(),
-        );
+        )
+        .with_custody_resolver(custody);
         let result = router.route_inbound(msg);
         // Move mempool back.
         self.mempool = router.mempool;
@@ -4197,32 +4244,44 @@ impl HyperRuntime {
         let evidence = self.slashing_store.get_for_epoch(epoch)?;
         let mut slashed = std::collections::BTreeSet::new();
         for ev in evidence {
+            // F002 fix: a validator is only an equivocator if they
+            // signed BOTH conflicting blocks. The pre-fix code unioned
+            // signers from both blocks and slashed every signer — which
+            // for cross-epoch evidence punished honest validators who
+            // only signed one of the two epochs.
+            //
             // Resolve each block's signer_indices against its own
-            // epoch's active set.
-            for block in [ev.block_a.as_ref(), ev.block_b.as_ref()]
-                .into_iter()
-                .flatten()
-            {
-                let Some(sig) = block.signature.as_ref() else {
-                    continue;
-                };
-                let block_epoch = sig.epoch;
-                let active = match self
-                    .get_active_validators_enforced(block_epoch, &self.bootstrap_validators)
-                {
-                    Ok(a) => a,
-                    Err(_) => continue,
-                };
-                let keys: Vec<&Vec<u8>> = active.keys().collect();
-                for idx in &sig.signer_indices {
-                    if *idx == 0 {
-                        continue;
+            // epoch's active set, then take the intersection (validators
+            // present as signers in BOTH sets).
+            let resolve_signers =
+                |block: &proto::HyperBlock| -> std::collections::BTreeSet<Vec<u8>> {
+                    let mut out = std::collections::BTreeSet::new();
+                    let Some(sig) = block.signature.as_ref() else {
+                        return out;
+                    };
+                    let block_epoch = sig.epoch;
+                    let active = match self
+                        .get_active_validators_enforced(block_epoch, &self.bootstrap_validators)
+                    {
+                        Ok(a) => a,
+                        Err(_) => return out,
+                    };
+                    let keys: Vec<&Vec<u8>> = active.keys().collect();
+                    for idx in &sig.signer_indices {
+                        if *idx == 0 {
+                            continue;
+                        }
+                        let pos = (*idx as usize).saturating_sub(1);
+                        if let Some(vk) = keys.get(pos) {
+                            out.insert((*vk).clone());
+                        }
                     }
-                    let pos = (*idx as usize).saturating_sub(1);
-                    if let Some(vk) = keys.get(pos) {
-                        slashed.insert((*vk).clone());
-                    }
-                }
+                    out
+                };
+            let signers_a = ev.block_a.as_ref().map(resolve_signers).unwrap_or_default();
+            let signers_b = ev.block_b.as_ref().map(resolve_signers).unwrap_or_default();
+            for vk in signers_a.intersection(&signers_b) {
+                slashed.insert(vk.clone());
             }
         }
         Ok(slashed)
@@ -4705,6 +4764,45 @@ impl HyperRuntime {
             }
         }
         Ok((envelope, locks, transfers))
+    }
+
+    /// F018 fix: drop DKLS23 share material for every epoch strictly
+    /// older than `retain_epoch_floor`. Without this prune, retired
+    /// per-epoch shares stayed live and signing-capable for the
+    /// process lifetime — an attacker with kernel-read access to the
+    /// node could harvest old shares and forge group signatures
+    /// against historical state-root claims (the L1 bridge accepts
+    /// any valid epoch-N group signature as long as the matching
+    /// epoch's address is in the registry).
+    ///
+    /// The group-address registry is intentionally NOT pruned: it's
+    /// read-only public material used by verifiers to recover the
+    /// expected `group_address` for any historical block/issuance.
+    /// Only the SECRET share material (`Party`, which contains the
+    /// per-epoch share + pre-computed multiplication shares) is
+    /// dropped here.
+    ///
+    /// Returns the count of epochs whose shares were retired.
+    pub fn prune_retired_dkls_shares(&mut self, retain_epoch_floor: u64) -> usize {
+        let stale: Vec<u64> = self
+            .dkls_signers
+            .range(..retain_epoch_floor)
+            .map(|(e, _)| *e)
+            .collect();
+        for epoch in &stale {
+            // `BTreeMap::remove` drops the `DklsEpochState`, whose
+            // `Party<Secp256k1>` is responsible for zeroizing its
+            // own secret material on drop.
+            self.dkls_signers.remove(epoch);
+        }
+        if !stale.is_empty() {
+            tracing::info!(
+                retired = stale.len(),
+                retain_epoch_floor,
+                "F018: pruned retired DKLS share material"
+            );
+        }
+        stale.len()
     }
 
     /// Install this node's DKLS23 share for `epoch` along with the

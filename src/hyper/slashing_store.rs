@@ -168,21 +168,35 @@ impl SlashingEvidenceStore {
     }
 }
 
+/// F015 fix: persist every `signing_payload`-committed field so the
+/// recorded evidence remains self-verifying — pre-fix this zeroed
+/// `missed_proposals` + every `snapchain_*` field, breaking
+/// independent signature re-verification of the stored evidence and
+/// (combined with F009's signature-mixed conflict hash) further
+/// enabling honest-signer slashing.
 fn encode_block(block: &crate::hyper::HyperBlock) -> proto::HyperBlock {
+    let md = &block.envelope.metadata;
     proto::HyperBlock {
         envelope: Some(proto::HyperEnvelope {
             metadata: Some(proto::HyperBlockMetadata {
-                canonical_block_id: block.envelope.metadata.canonical_block_id,
-                parent_hash: block.envelope.metadata.parent_hash.clone(),
-                hyper_state_root: block.envelope.metadata.hyper_state_root.clone(),
-                extra_rules_version: block.envelope.metadata.extra_rules_version,
-                retained_message_count: block.envelope.metadata.retained_message_count,
-                missed_proposals: vec![],
-                snapchain_anchor_block: 0,
-                snapchain_anchor_hash: vec![],
-                snapchain_range_start_block: 0,
-                snapchain_range_root: vec![],
-                snapchain_anchor_timestamp: 0,
+                canonical_block_id: md.canonical_block_id,
+                parent_hash: md.parent_hash.clone(),
+                hyper_state_root: md.hyper_state_root.clone(),
+                extra_rules_version: md.extra_rules_version,
+                retained_message_count: md.retained_message_count,
+                missed_proposals: md
+                    .missed_proposals
+                    .iter()
+                    .map(|mp| proto::MissedProposal {
+                        validator_key: mp.validator_key.clone(),
+                        round: mp.round,
+                    })
+                    .collect(),
+                snapchain_anchor_block: md.snapchain_anchor_block,
+                snapchain_anchor_hash: md.snapchain_anchor_hash.clone(),
+                snapchain_range_start_block: md.snapchain_range_start_block,
+                snapchain_range_root: md.snapchain_range_root.clone(),
+                snapchain_anchor_timestamp: md.snapchain_anchor_timestamp,
             }),
             payload: block.envelope.payload.clone(),
         }),

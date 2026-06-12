@@ -55,6 +55,15 @@ const MAX_CONTACT_INFO_BYTES: usize = 4 * 1024;
 const MAX_STATUS_BYTES: usize = 4 * 1024;
 const MAX_CONSENSUS_BYTES: usize = 64 * 1024;
 
+/// F022 fix: per-variant size cap on `FullProposal` and `DecidedValue`
+/// gossip frames. Pre-fix these paths were bounded only by the libp2p
+/// transport ceiling (10 MB) — letting a single attacker frame allocate
+/// tens of megabytes of decoded state inside the actor. Sized to fit a
+/// fully-loaded honest block (proposer parts + commits + carried
+/// payload) with comfortable headroom.
+const MAX_FULL_PROPOSAL_BYTES: usize = 2 * 1024 * 1024; // 2 MB
+const MAX_DECIDED_VALUE_BYTES: usize = 2 * 1024 * 1024;
+
 const CONSENSUS_TOPIC: &str = "consensus";
 const MEMPOOL_TOPIC: &str = "mempool";
 const DECIDED_VALUES: &str = "decided-values";
@@ -1010,6 +1019,17 @@ impl SnapchainGossip {
                         None => None,
                         Some(read_node_message) => match read_node_message {
                             read_node_message::ReadNodeMessage::DecidedValue(decided_value) => {
+                                // F022 fix: per-variant size cap on
+                                // DecidedValue ingress.
+                                if decided_value.encoded_len() > MAX_DECIDED_VALUE_BYTES {
+                                    warn!(
+                                        peer_id = peer_id.to_string(),
+                                        len = decided_value.encoded_len(),
+                                        cap = MAX_DECIDED_VALUE_BYTES,
+                                        "Dropping oversized DecidedValue"
+                                    );
+                                    return None;
+                                }
                                 Some(SystemMessage::DecidedValueForReadNode(decided_value))
                             }
                         },
@@ -1017,7 +1037,42 @@ impl SnapchainGossip {
                 }
 
                 Some(proto::gossip_message::GossipMessage::FullProposal(full_proposal)) => {
-                    let height = full_proposal.height();
+                    // F022 fix: per-variant size cap. Without this the
+                    // FullProposal path was bounded only by the 10 MB
+                    // libp2p ceiling — a memory-amplification DoS.
+                    if full_proposal.encoded_len() > MAX_FULL_PROPOSAL_BYTES {
+                        warn!(
+                            peer_id = peer_id.to_string(),
+                            len = full_proposal.encoded_len(),
+                            cap = MAX_FULL_PROPOSAL_BYTES,
+                            "Dropping oversized FullProposal"
+                        );
+                        return None;
+                    }
+                    // F013 fix: `FullProposal::height()` unwrapped a
+                    // peer-controlled `Option<Height>` BEFORE the
+                    // shard-id guard, so any subscribed peer could crash
+                    // every node by sending a height-less FullProposal
+                    // frame. Validate `height` (and `round`) before
+                    // using them.
+                    let Some(height) = full_proposal.height.clone() else {
+                        warn!(
+                            peer_id = peer_id.to_string(),
+                            "Dropping FullProposal with missing height"
+                        );
+                        return None;
+                    };
+                    if full_proposal.round < 0 {
+                        // `FullProposal::round()` (proto/src/lib.rs) calls
+                        // `Round::new(self.round.try_into().unwrap())`
+                        // which panics on negative values. Drop here.
+                        warn!(
+                            peer_id = peer_id.to_string(),
+                            round = full_proposal.round,
+                            "Dropping FullProposal with negative round"
+                        );
+                        return None;
+                    }
                     debug!(
                         "Received block with height {} from peer: {}",
                         height, peer_id

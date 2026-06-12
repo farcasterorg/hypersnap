@@ -37,6 +37,12 @@ use tracing::{info, warn};
 
 pub struct DklsSupervisorInputs {
     pub local_validator_key: Vec<u8>,
+    /// F028: threshold is now derived from active-set size per
+    /// epoch in `build_driver` (BFT-safe floor of `floor(2n/3)+1`).
+    /// This field is retained ONLY for the single-validator devnet
+    /// path (`n == 1`), where any non-zero value works because
+    /// share_count = 1. Production paths ignore this and compute
+    /// the threshold dynamically.
     pub threshold: u8,
     /// F004: shared anchor source. Both the scheduler and the
     /// supervisor read from this same `Arc<Mutex<LatestAnchor>>`,
@@ -48,6 +54,31 @@ pub struct DklsSupervisorInputs {
     pub tick_interval: Duration,
     pub start_lead_blocks: u64,
     pub cutover_block: u64,
+}
+
+/// F028 fix: compute the DKLS reconstruction threshold from active-set
+/// size with a Byzantine-fault-tolerant floor. For `n` validators the
+/// safe threshold is `floor(2n/3) + 1`:
+///
+/// | n | threshold | tolerated-byzantine |
+/// |---|-----------|---------------------|
+/// | 1 | 1         | 0                   |
+/// | 2 | 2         | 0                   |
+/// | 3 | 3         | 0                   |
+/// | 4 | 3         | 1                   |
+/// | 7 | 5         | 2                   |
+/// | 10| 7         | 3                   |
+///
+/// The single-validator devnet case (`n == 1`) keeps `threshold == 1`
+/// by construction. For any production deployment with `n >= 4`, this
+/// guarantees no single committee-elected validator can unilaterally
+/// produce the group signature — closing F028's catastrophic
+/// "threshold hard-pinned to 1" vulnerability.
+pub fn bft_safe_threshold(share_count: u8) -> u8 {
+    let n = share_count as u16;
+    let t = ((2 * n) / 3) + 1;
+    debug_assert!(t <= n, "threshold must not exceed share_count");
+    t as u8
 }
 
 pub const DKLS_RETRY_AFTER_TICKS: u32 = 12;
@@ -191,8 +222,16 @@ async fn build_driver(
     }
     let share_count = active.len() as u8;
 
+    // F025 fix: party indices are no longer lexicographic over the
+    // active set — they're a per-epoch verifiable random permutation
+    // bound to the full active-set hash. An attacker cannot grind
+    // their `validator_key` to land in a target index because the
+    // permutation depends on the set hash (which includes their own
+    // key, creating a fixed-point constraint).
+    let party_order =
+        crate::hyper::dkls_committee::committee_party_order(target_epoch, active.keys());
     let mut own_idx: Option<u8> = None;
-    for (i, vk) in active.keys().enumerate() {
+    for (i, vk) in party_order.iter().enumerate() {
         if vk == &inputs.local_validator_key {
             own_idx = Some((i + 1) as u8);
             break;
@@ -200,8 +239,27 @@ async fn build_driver(
     }
     let own_idx = own_idx.ok_or(BuildError::LocalNotActive(target_epoch))?;
 
+    // F028 fix: derive threshold from active-set size with a
+    // Byzantine-fault-tolerant floor (`floor(2n/3) + 1`). The static
+    // `inputs.threshold` is ignored for `share_count > 1` — using
+    // it (as the pre-fix code did) hard-pinned threshold to 1 and
+    // let any single committee-elected validator unilaterally
+    // produce the group signature over hyperblocks, reward
+    // issuances, and bridge authorizations. The single-validator
+    // devnet (`share_count == 1`) trivially uses threshold = 1.
+    let threshold = bft_safe_threshold(share_count);
+    if share_count > 1 && threshold < 2 {
+        // Defensive — `bft_safe_threshold` returns >= 2 for any n >= 2,
+        // but keep the check so a future change to the formula can't
+        // silently regress the BFT invariant.
+        return Err(BuildError::Ceremony(format!(
+            "BFT invariant violated: share_count={} but threshold={}",
+            share_count, threshold
+        )));
+    }
+
     let parameters = Parameters {
-        threshold: inputs.threshold,
+        threshold,
         share_count,
     };
     let session_id = canonical_session_id(target_epoch, &parameters);
@@ -222,6 +280,52 @@ fn canonical_session_id(target_epoch: u64, params: &Parameters) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F028 regression: production threshold must derive from
+    /// active-set size with a BFT-safe floor of `floor(2n/3) + 1`.
+    /// Pre-fix this was hard-pinned to 1 regardless of `share_count`,
+    /// letting any one committee-elected validator unilaterally
+    /// produce the group threshold signature.
+    #[test]
+    fn bft_safe_threshold_matches_floor_two_thirds_plus_one() {
+        // (n, expected_threshold) — floor(2n/3)+1
+        let cases = [
+            (1u8, 1u8),
+            (2, 2),
+            (3, 3),
+            (4, 3),
+            (5, 4),
+            (6, 5),
+            (7, 5),
+            (10, 7),
+            (100, 67),
+        ];
+        for (n, expected) in cases {
+            assert_eq!(
+                bft_safe_threshold(n),
+                expected,
+                "share_count={} -> threshold={} (got {})",
+                n,
+                expected,
+                bft_safe_threshold(n),
+            );
+        }
+        // Invariant: every n >= 2 yields threshold >= 2 (no
+        // single-signer regression of F028).
+        for n in 2u8..=200u8 {
+            assert!(
+                bft_safe_threshold(n) >= 2,
+                "share_count={} regressed to single-signer threshold",
+                n
+            );
+            assert!(
+                bft_safe_threshold(n) <= n,
+                "share_count={} produced unreachable threshold {}",
+                n,
+                bft_safe_threshold(n)
+            );
+        }
+    }
 
     #[test]
     fn canonical_session_id_is_deterministic() {

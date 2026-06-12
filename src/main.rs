@@ -1600,6 +1600,12 @@ async fn build_hyper_handler(
             let extra_rules_version = 0u32;
             let supervisor_tick = Duration::from_secs(5);
             let supervisor_lead_blocks = hypersnap::hyper::epoch::EPOCH_LENGTH / 10;
+            // F028 fix: the production reconstruction threshold is
+            // derived per-epoch from the active-set size in
+            // `dkls_supervisor::build_driver` via `bft_safe_threshold`
+            // (`floor(2n/3) + 1`). This static value is only consulted
+            // on the single-validator devnet path where `share_count
+            // == 1`; for any `share_count > 1` it is ignored.
             let dkls_threshold = 1u8;
 
             let scheduler = BlockProductionScheduler::new(

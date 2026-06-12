@@ -50,6 +50,58 @@ pub const FAMILY_EVM: u8 = 0;
 pub const FAMILY_SOLANA: u8 = 1;
 pub const FAMILY_QUILIBRIUM: u8 = 2;
 
+/// Honest-signer sanity cap on the `blockNumber` field carried in every
+/// universal bridge payload.
+///
+/// **Why a cap:** the on-chain `HypersnapBridge` gates every universal
+/// action on a strictly-monotonic `latestBlock` watermark with no upper
+/// bound. A single sig at `type(uint64).max` saturates the watermark
+/// permanently — bricking `rotateOwner`/`cancelUpgrade`/`pause`/`claim`
+/// root-advancement and (combined with a pending upgrade) enabling
+/// custody theft via the permissionless `executeUpgrade`. The contract
+/// has no defense; protocol-side, an honest threshold-signing set
+/// must refuse to ever produce such a payload.
+///
+/// **The value:** `2^48 - 1` is ~280 trillion hyperchain blocks. At
+/// any plausible block cadence this exceeds the heat-death horizon by
+/// a comfortable margin, and leaves >16 bits of headroom inside the
+/// `uint64` so the watermark can never be saturated by an honest sig.
+///
+/// **What this does and does not close:** an attacker who has corrupted
+/// a Byzantine supermajority of the active validator set can still
+/// produce sigs at any `blockNumber` they choose (they hold the key —
+/// they sign outside this code path). At that level of compromise the
+/// bridge is already drainable via the documented upgrade flow, so the
+/// "permanent brick" tail is not the binding constraint. This cap
+/// closes the *accidental* / misconfiguration tail and the
+/// single-corrupted-validator tail under the BFT threshold derivation
+/// in `dkls_supervisor::bft_safe_threshold` (F028).
+pub const MAX_SANE_BRIDGE_BLOCK_NUMBER: u64 = (1u64 << 48) - 1;
+
+/// Returned by the bridge-payload sanity check when an honest signer is
+/// about to produce a payload whose `blockNumber` exceeds the cap.
+#[derive(thiserror::Error, Debug, PartialEq, Eq)]
+pub enum BridgeBlockNumberError {
+    #[error(
+        "bridge-payload block_number {block_number} exceeds the honest-signer sanity cap \
+         (MAX_SANE_BRIDGE_BLOCK_NUMBER = {cap}); refusing to sign"
+    )]
+    TooLarge { block_number: u64, cap: u64 },
+}
+
+/// Call this before computing any universal bridge-payload digest from
+/// honest signing-side state. Returns `Err` to make the producer drop
+/// the sign request rather than emit a saturation-capable payload.
+pub fn validate_bridge_block_number(block_number: u64) -> Result<(), BridgeBlockNumberError> {
+    if block_number > MAX_SANE_BRIDGE_BLOCK_NUMBER {
+        return Err(BridgeBlockNumberError::TooLarge {
+            block_number,
+            cap: MAX_SANE_BRIDGE_BLOCK_NUMBER,
+        });
+    }
+    Ok(())
+}
+
 /// Domain tag for `claim`'s root-advancement signature.
 pub const DOMAIN_MERKLE_ROOT_UPDATE: &[u8] = b"HYPERSNAP_MERKLE_ROOT_UPDATE_V1";
 /// Domain tag for `rotateOwner`'s outgoing-owner authorization signature.
@@ -441,6 +493,34 @@ mod tests {
             b32("946e398b9ac10b77850cfc5877dab9207e37c8622db8bbacecbbc1c997818996"),
             "lock-leaf-evm drift"
         );
+    }
+
+    #[test]
+    fn block_number_cap_accepts_sane_values() {
+        for n in [0u64, 1, 1_000_000, 1u64 << 32, MAX_SANE_BRIDGE_BLOCK_NUMBER] {
+            assert!(
+                validate_bridge_block_number(n).is_ok(),
+                "rejected sane n={}",
+                n
+            );
+        }
+    }
+
+    #[test]
+    fn block_number_cap_rejects_saturation_payloads() {
+        // Just-over-cap, halfway-to-u64-max, and u64::MAX all rejected.
+        for n in [
+            MAX_SANE_BRIDGE_BLOCK_NUMBER + 1,
+            1u64 << 60,
+            u64::MAX - 1,
+            u64::MAX,
+        ] {
+            assert!(
+                validate_bridge_block_number(n).is_err(),
+                "accepted saturation-capable n={}",
+                n
+            );
+        }
     }
 
     #[test]

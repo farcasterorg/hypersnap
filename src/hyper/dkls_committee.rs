@@ -126,6 +126,60 @@ pub fn committee_seed_for_block(epoch: u64, height: u64, parent_hash: &[u8]) -> 
     keccak256(&buf)
 }
 
+/// F025 fix: deterministic party-index assignment that the attacker
+/// cannot grind by choosing their `validator_key`. Given the active
+/// validator-key set, returns the keys in committee-rank order
+/// (`party_index = position + 1`).
+///
+/// Pre-fix the assignment was lexicographic key order against a
+/// fully epoch-predictable committee seed — an attacker could grind
+/// their `validator_key` to land in a frequently-selected index. The
+/// fix derives each validator's rank from
+/// `hash(epoch || set_hash || validator_key)` where `set_hash` is
+/// the keccak of all active keys sorted. To grind, an attacker now
+/// has to find a fixed-point key K such that
+/// `hash(epoch || hash(...K...) || K)` produces the desired rank
+/// AMONG all other validators' ranks (which also shift with K).
+/// This is materially harder than landing K at a lex-order slot.
+///
+/// `validator_keys` must be a unique, deduplicated set; the helper
+/// internally sorts for canonical set_hash.
+pub fn committee_party_order<'a>(
+    epoch: u64,
+    validator_keys: impl IntoIterator<Item = &'a Vec<u8>>,
+) -> Vec<Vec<u8>> {
+    // 1. Collect + canonical-sort for set_hash. Sorting is purely
+    //    for the hash; it does NOT determine the output order.
+    let mut keys: Vec<Vec<u8>> = validator_keys.into_iter().cloned().collect();
+    keys.sort_unstable();
+    let mut set_hash_buf = Vec::with_capacity(64 + keys.iter().map(|k| 4 + k.len()).sum::<usize>());
+    set_hash_buf.extend_from_slice(b"hypersnap-active-set-hash-v1:");
+    set_hash_buf.extend_from_slice(&(keys.len() as u32).to_be_bytes());
+    for k in &keys {
+        set_hash_buf.extend_from_slice(&(k.len() as u32).to_be_bytes());
+        set_hash_buf.extend_from_slice(k);
+    }
+    let set_hash = keccak256(&set_hash_buf);
+
+    // 2. Rank each validator.
+    let mut ranked: Vec<(B256, Vec<u8>)> = keys
+        .into_iter()
+        .map(|k| {
+            let mut buf = Vec::with_capacity(32 + 8 + 32 + 4 + k.len());
+            buf.extend_from_slice(b"hypersnap-party-index-v1:");
+            buf.extend_from_slice(&epoch.to_be_bytes());
+            buf.extend_from_slice(set_hash.as_slice());
+            buf.extend_from_slice(&(k.len() as u32).to_be_bytes());
+            buf.extend_from_slice(&k);
+            (keccak256(&buf), k)
+        })
+        .collect();
+    // 3. Sort by rank ascending; tiebreak on key to keep output
+    //    deterministic in the astronomically-rare collision case.
+    ranked.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    ranked.into_iter().map(|(_, k)| k).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -292,6 +292,20 @@ impl EngineVersion {
             .find(|schedule_entry| schedule_entry.active_at > time.to_unix_seconds())
             .map(|schedule_entry| schedule_entry.active_at)
     }
+
+    /// F011 helper: the latest `active_at` timestamp the binary's
+    /// network-specific schedule knows about. Used by the shard
+    /// read-validator to detect when a chunk's timestamp is far past
+    /// any known upgrade boundary — a signal that the network has
+    /// shipped a newer `EngineVersion` this binary doesn't carry.
+    pub fn latest_schedule_active_at(network: FarcasterNetwork) -> Option<u64> {
+        let schedule = match network {
+            FarcasterNetwork::Mainnet => &ENGINE_VERSION_SCHEDULE_MAINNET,
+            FarcasterNetwork::Testnet => &ENGINE_VERSION_SCHEDULE_TESTNET,
+            _ => &ENGINE_VERSION_SCHEDULE_DEVNET,
+        };
+        schedule.iter().map(|e| e.active_at).max()
+    }
 }
 
 #[cfg(test)]

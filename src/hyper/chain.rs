@@ -21,7 +21,11 @@
 use crate::hyper::HyperBlock;
 use sha2::{Digest, Sha256};
 
-/// 32-byte canonical hash of a HyperBlock.
+/// 32-byte canonical hash of a HyperBlock — includes the threshold
+/// signature, binding the chain to a specific *signed* history.
+///
+/// Used for chain-continuity (parent_hash linkage). NOT used for
+/// equivocation/slashing comparison — see [`hyper_block_content_hash`].
 pub fn hyper_block_hash(block: &HyperBlock) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(b"hypersnap-block-hash-v1");
@@ -37,6 +41,78 @@ pub fn hyper_block_hash(block: &HyperBlock) -> [u8; 32] {
     h.update(&block.signature.group_address);
     h.update((block.signature.ecdsa_signature.len() as u32).to_be_bytes());
     h.update(&block.signature.ecdsa_signature);
+    let digest = h.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
+/// F009 fix: 32-byte signature-independent content hash. Used by the
+/// slashing predicate to detect *content* equivocation (two blocks
+/// committing to different state at the same height/epoch).
+///
+/// `hyper_block_hash` mixes in the threshold signature so chain
+/// continuity binds to a specific signed history — but that means two
+/// valid threshold signatures over byte-identical block content (e.g.,
+/// a sign-ceremony retry where the next aggregator picked a different
+/// partial-sig set) hash to different values. The original slashing
+/// predicate compared `hyper_block_hash`s and so flagged that benign
+/// re-sign as double-signing — slashing honest signers.
+///
+/// This hash covers exactly the fields the threshold signature commits
+/// to (via `HyperBlockMetadata::signing_payload`): a single threshold
+/// signature authenticates exactly one content hash, and a second valid
+/// signature over the same metadata cannot move it.
+pub fn hyper_block_content_hash(block: &HyperBlock) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"hypersnap-block-content-hash-v1");
+    h.update(block.envelope.metadata.canonical_block_id.to_be_bytes());
+    h.update((block.envelope.metadata.parent_hash.len() as u32).to_be_bytes());
+    h.update(&block.envelope.metadata.parent_hash);
+    h.update((block.envelope.metadata.hyper_state_root.len() as u32).to_be_bytes());
+    h.update(&block.envelope.metadata.hyper_state_root);
+    h.update(block.envelope.metadata.extra_rules_version.to_be_bytes());
+    h.update(block.envelope.metadata.retained_message_count.to_be_bytes());
+    // F015-adjacent: include every signing-payload-committed field so
+    // the content hash is identical to what the signature authenticates.
+    h.update((block.envelope.metadata.missed_proposals.len() as u32).to_be_bytes());
+    for mp in &block.envelope.metadata.missed_proposals {
+        h.update((mp.validator_key.len() as u32).to_be_bytes());
+        h.update(&mp.validator_key);
+        h.update(mp.round.to_be_bytes());
+    }
+    h.update(block.envelope.metadata.snapchain_anchor_block.to_be_bytes());
+    h.update((block.envelope.metadata.snapchain_anchor_hash.len() as u32).to_be_bytes());
+    h.update(&block.envelope.metadata.snapchain_anchor_hash);
+    h.update(
+        block
+            .envelope
+            .metadata
+            .snapchain_range_start_block
+            .to_be_bytes(),
+    );
+    h.update((block.envelope.metadata.snapchain_range_root.len() as u32).to_be_bytes());
+    h.update(&block.envelope.metadata.snapchain_range_root);
+    h.update(
+        block
+            .envelope
+            .metadata
+            .snapchain_anchor_timestamp
+            .to_be_bytes(),
+    );
+    // Epoch — same content under different epochs is a cross-epoch
+    // equivocation candidate, not the same content. The signing payload
+    // includes epoch via the threshold-sig binding, so the content hash
+    // must too for parity.
+    h.update(block.signature.epoch.to_be_bytes());
+    // Signer indices — bound by the signing payload (F153). Same content
+    // signed by a different signer set IS distinct evidence.
+    let mut sorted = block.signature.signer_indices.clone();
+    sorted.sort_unstable();
+    h.update((sorted.len() as u32).to_be_bytes());
+    for idx in sorted {
+        h.update(idx.to_be_bytes());
+    }
     let digest = h.finalize();
     let mut out = [0u8; 32];
     out.copy_from_slice(&digest);

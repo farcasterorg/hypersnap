@@ -8,7 +8,8 @@ use alloy_primitives::keccak256;
 use hypersnap_crypto::bulletproofs::curve_adapter::{Point, Scalar};
 use hypersnap_crypto::bulletproofs::PedersenGens;
 use hypersnap_crypto::tokens::{
-    schnorr_verify, NoteStore, Nullifier, PedersenCommitment, SchnorrSignature,
+    schnorr_verify, verify_value_range, NoteStore, Nullifier, PedersenCommitment, SchnorrSignature,
+    DEFAULT_RANGE_BITS,
 };
 use sha2::{Digest, Sha256};
 
@@ -52,6 +53,16 @@ pub enum ConfidentialLockError {
     BalanceClosureFailed,
     #[error("derived lock_id collides with an existing TokenLockState")]
     LockIdCollision,
+    /// F036 fix: range proof on the input commitment is mandatory.
+    #[error("range_proof is missing — required for confidential lock admission")]
+    MissingRangeProof,
+    #[error("range_proof failed verification against the input commitment")]
+    BadRangeProof,
+    #[error(
+        "amount + fee_atoms overflows u64 — prover would lock a saturated value larger than \
+         the input commitment can possibly cover"
+    )]
+    AmountFeeOverflow,
 }
 
 /// Deterministic 32-byte lock_id derived from the spent input's
@@ -174,13 +185,52 @@ pub fn validate_against_store<S: NoteStore>(
     // Pedersen balance closure: the input commitment must open to
     // `(amount + fee_atoms)`. Residual = commit_in - (amount + fee)·B,
     // which should equal r·B_blinding where r = blinding_diff.
+    //
+    // F036 fix: reject on u64 overflow rather than saturating_add. The
+    // saturating variant let a prover declare `amount + fee = u64::MAX`
+    // (so balance closure binds the input to a saturated value) while
+    // the L1 bridge minted only `body.amount` — a unit-mismatch
+    // primitive that the range proof + arithmetic-overflow guard close.
+    let total = body
+        .amount
+        .checked_add(body.fee_atoms)
+        .ok_or(ConfidentialLockError::AmountFeeOverflow)?;
     let pc_gens = PedersenGens::default();
-    let total_value = Scalar::from(body.amount.saturating_add(body.fee_atoms));
+    let total_value = Scalar::from(total);
     let value_point = Point::multiscalar_mul(&[total_value], &[pc_gens.B]);
     let residual = commitment.0 - value_point;
     let expected = Point::multiscalar_mul(&[blinding_diff], &[pc_gens.B_blinding]);
     if residual != expected {
         return Err(ConfidentialLockError::BalanceClosureFailed);
+    }
+    // F036 fix: verify the prover-supplied range proof on the input
+    // commitment. Without this gate, a malicious prover could spend a
+    // commitment encoding a value outside `[0, 2^64)` — e.g., a
+    // "negative" value mod the Decaf448 field order — and the balance
+    // closure equation still holds for any `amount + fee` ≤ field
+    // order. The range proof binds the input's true plaintext value
+    // to `[0, 2^DEFAULT_RANGE_BITS)`, eliminating that class.
+    //
+    // Defense-in-depth: by induction every confidential note in the
+    // store is the output of a transfer whose output range proofs were
+    // already verified at transfer admission. Re-verifying here closes
+    // any future path (e.g. bootstrap credits, lock-issued change
+    // commitments) that admits a commitment without a fresh proof.
+    if body.range_proof.is_empty() {
+        return Err(ConfidentialLockError::MissingRangeProof);
+    }
+    let mut commitment_bytes = [0u8; 56];
+    commitment_bytes.copy_from_slice(
+        &body
+            .input
+            .as_ref()
+            .expect("validate_structural ensured input is present")
+            .commitment,
+    );
+    let ok = verify_value_range(&body.range_proof, &commitment_bytes, DEFAULT_RANGE_BITS)
+        .map_err(|_| ConfidentialLockError::BadRangeProof)?;
+    if !ok {
+        return Err(ConfidentialLockError::BadRangeProof);
     }
     Ok(derive_lock_id(&nullifier.0))
 }

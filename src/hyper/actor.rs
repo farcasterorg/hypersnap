@@ -1001,7 +1001,14 @@ pub struct HyperActor {
     /// and drained on the matching `StartDkls`. Prevents stalls
     /// where a fast peer's round-1 message reaches our gossip
     /// before the supervisor decides to fire StartDkls.
-    pending_dkls_inbound: std::collections::BTreeMap<u64, Vec<Vec<u8>>>,
+    ///
+    /// F016 fix: each buffer entry carries the propagation_source
+    /// alongside the encoded bytes so the F018 sender check can run
+    /// at drain time (F024). The outer BTreeMap is bounded by
+    /// `PENDING_DKLS_INBOUND_EPOCH_CAP` (eldest-epoch eviction) so an
+    /// attacker cannot grow it unboundedly by streaming round
+    /// messages for arbitrary attacker-chosen target epochs.
+    pending_dkls_inbound: std::collections::BTreeMap<u64, Vec<BufferedDklsFrame>>,
     /// At most one DKLS23 signing ceremony at a time. Block
     /// production gates on prior completion. May relax to a small
     /// queue if signing rate becomes a bottleneck.
@@ -1043,6 +1050,25 @@ const RECENT_EVIDENCE_CAP: usize = 256;
 /// envelopes is enough headroom for any honest committee while
 /// keeping a Sybil flood bounded.
 const PENDING_DKLS_INBOUND_CAP_PER_EPOCH: usize = 256;
+
+/// F016 fix: global cap on the number of distinct attacker-controlled
+/// `target_epoch` keys in the pre-StartDkls inbound buffer. Without
+/// this, a sustained gossip flood with strictly-increasing fake epoch
+/// values grows the BTreeMap unboundedly even though the per-epoch
+/// cap holds. Eviction policy: when full, drop the **lowest** epoch
+/// entry — that's the staler one and the least likely to ever fire
+/// `StartDkls`. Sized for ~10 in-flight near-cutover epoch attempts
+/// + headroom.
+const PENDING_DKLS_INBOUND_EPOCH_CAP: usize = 16;
+
+/// One pre-StartDkls round message, paired with the `propagation_source`
+/// libp2p peer-id that delivered it. Stored together so the F018
+/// inner/outer sender cross-check (`check_dkls_sender_against_propagation_source`)
+/// runs at drain time too — F024 fix.
+struct BufferedDklsFrame {
+    encoded: Vec<u8>,
+    propagation_source: Option<Vec<u8>>,
+}
 
 struct ActiveDkls {
     driver: crate::hyper::dkls_driver::DklsDriver,
@@ -1281,6 +1307,15 @@ impl HyperActor {
                 if let Err(e) = self.runtime.apply_retro_vesting_tranche(epoch) {
                     tracing::warn!(epoch, error = %e, "retro vesting tranche failed");
                 }
+                // F018: retire DKLS share material for epochs strictly
+                // older than the one most recently signing-eligible.
+                // We keep the immediately-prior epoch + the current
+                // epoch's share live as a small grace window (handles
+                // late inbound burn / lock-root sign tasks queued in
+                // the previous epoch's window). Anything older is
+                // dropped + zeroized.
+                let retain_floor = epoch.saturating_sub(1);
+                self.runtime.prune_retired_dkls_shares(retain_floor);
 
                 let single_party = self
                     .runtime
@@ -1332,9 +1367,30 @@ impl HyperActor {
                     .map(|d| d.driver.target_epoch() == target_epoch)
                     .unwrap_or(false);
                 if !is_active {
+                    // F016 fix: global cap on the number of distinct
+                    // attacker-chosen target epochs. When we'd be
+                    // adding a NEW epoch and we're already at the cap,
+                    // evict the oldest epoch entry. This prevents
+                    // unbounded BTreeMap growth from a Sybil flood
+                    // that varies target_epoch each frame.
+                    if !self.pending_dkls_inbound.contains_key(&target_epoch)
+                        && self.pending_dkls_inbound.len() >= PENDING_DKLS_INBOUND_EPOCH_CAP
+                    {
+                        if let Some((stale_epoch, _)) = self.pending_dkls_inbound.pop_first() {
+                            tracing::warn!(
+                                evicted_epoch = stale_epoch,
+                                new_epoch = target_epoch,
+                                cap = PENDING_DKLS_INBOUND_EPOCH_CAP,
+                                "pre-StartDkls buffer at epoch-cap; evicting oldest epoch"
+                            );
+                        }
+                    }
                     let buf = self.pending_dkls_inbound.entry(target_epoch).or_default();
                     if buf.len() < PENDING_DKLS_INBOUND_CAP_PER_EPOCH {
-                        buf.push(encoded);
+                        buf.push(BufferedDklsFrame {
+                            encoded,
+                            propagation_source,
+                        });
                     } else {
                         tracing::warn!(
                             target_epoch,
@@ -1427,11 +1483,18 @@ impl HyperActor {
                 // dropping behaviour caused a ceremony to stall if
                 // a fast peer's round-1 message hit our actor
                 // before the supervisor dispatched StartDkls.
+                //
+                // F024 fix: every drained frame must pass the same
+                // F018 inner/outer sender cross-check that the live
+                // ingress path runs. Without this, an attacker could
+                // gossip pre-StartDkls round frames that spoof the
+                // inner sender; the drain would feed them straight to
+                // `driver.submit` and skip auth.
                 if let Some(buffered) = self.pending_dkls_inbound.remove(&target) {
-                    for encoded in buffered {
+                    for frame in buffered {
                         let local_party = driver.party_index();
                         match crate::hyper::dkls_wire_codec::open_dkls_round_message(
-                            &encoded,
+                            &frame.encoded,
                             target,
                             &self.runtime.local_transport_secret,
                             local_party,
@@ -1441,6 +1504,13 @@ impl HyperActor {
                                 match opened {
                                     OpenedDklsMessage::ForUs(m)
                                     | OpenedDklsMessage::Broadcast(m) => {
+                                        if !self.check_dkls_sender_against_propagation_source(
+                                            target,
+                                            m.sender(),
+                                            frame.propagation_source.as_deref(),
+                                        ) {
+                                            continue;
+                                        }
                                         if let Err(e) = driver.submit(m) {
                                             tracing::warn!(
                                                 target_epoch = target,
@@ -2472,10 +2542,24 @@ impl HyperActor {
         let registered = match self.runtime.peer_id_for_party(epoch, claimed_sender) {
             Some(p) => p,
             None => {
-                // Permissive: no registered peer-id for this party
-                // in this epoch. Validator registry rollout is
-                // gradual; treat as unverified rather than reject.
-                return true;
+                // F021 fix: previously this returned `true` (fail-open)
+                // when a committee member had no registered peer-id,
+                // letting any libp2p peer spoof that party in a DKLS
+                // round. Now fail-closed — a party that hasn't bound
+                // its libp2p peer-id to its validator registration
+                // cannot participate in DKG. Operators must complete
+                // peer-id registration before bringing validators
+                // online. Drop the frame with a distinct log so the
+                // unregistered party is observable rather than
+                // silently included.
+                tracing::warn!(
+                    epoch,
+                    claimed_sender,
+                    actual_peer = hex::encode(source),
+                    "F021: DKLS frame from party with no registered peer-id; dropping (was \
+                     previously permissive — registry rollout is complete)"
+                );
+                return false;
             }
         };
         if registered == source {
@@ -3262,6 +3346,14 @@ impl HyperActor {
         let Some(block_number) = self.runtime.last_block_height() else {
             return Ok(());
         };
+        // Honest-signer sanity cap on the bridge-payload block_number.
+        // See `MAX_SANE_BRIDGE_BLOCK_NUMBER` for rationale.
+        if let Err(e) = hypersnap_crypto::bridge_payload::validate_bridge_block_number(block_number)
+        {
+            tracing::warn!(epoch, block_number, error = %e,
+                "refusing multi-party lock-root sign — block_number exceeds bridge sanity cap");
+            return Ok(());
+        }
         let local_party_index = share_info.party.party_index;
         let party = share_info.party.clone();
         let parameters = share_info.party.parameters.clone();

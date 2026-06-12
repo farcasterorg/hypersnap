@@ -133,6 +133,16 @@ pub enum LockError {
         "EVM spend authority must be 20-byte address or 33-byte compressed secp256k1 (got {0})"
     )]
     EvmSpendPubkeyLength(usize),
+    /// F035 fix: the transparent `HyperLockEvent` state-change path is
+    /// disabled. Production bridge locks must flow through the
+    /// confidential-lock pipeline (`apply_confidential_lock` →
+    /// `validate_against_store`), which enforces Pedersen balance closure
+    /// + Schnorr authorisation + nullifier double-spend checks. Any
+    /// imported block carrying a transparent `HyperLockEvent` is
+    /// rejected outright — without this gate, a malicious proposer could
+    /// stuff arbitrary unbacked-mint leaves into the verkle root.
+    #[error("transparent HyperLockEvent path disabled; use confidential locks")]
+    TransparentLocksDisabled,
 }
 
 /// Validate the structural invariants of a lock event. Cryptographic

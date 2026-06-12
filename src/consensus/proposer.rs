@@ -224,6 +224,23 @@ impl Proposer for ShardProposer {
                     return Validity::Invalid;
                 }
             };
+            // F012 fix: the consensus value is `chunk.hash`, but
+            // `chunk.hash` is a free-floating proto field that nothing
+            // re-derives on receive. Without this check a relayer with
+            // a valid `Commits` for height H can wrap it with a chunk
+            // whose `hash` equals the signed value but whose header
+            // and body are attacker-chosen; full validators and read
+            // nodes would then commit a forged header bound to no
+            // validator endorsement. Bind hash → header → state here.
+            let expected_hash = blake3::hash(&header.encode_to_vec()).as_bytes().to_vec();
+            if chunk.hash != expected_hash {
+                warn!(
+                    shard = height.shard_index,
+                    proposed_height = height.block_number,
+                    "F012: chunk.hash mismatch with blake3(header); rejecting proposal"
+                );
+                return Validity::Invalid;
+            }
             self.proposed_chunks
                 .add_proposed_value(full_proposal.clone());
             let timestamp = FarcasterTime::new(header.timestamp);
@@ -610,6 +627,19 @@ impl Proposer for BlockProposer {
                     return Validity::Invalid;
                 }
             };
+
+            // F012 fix: bind block.hash to blake3(header) on the
+            // validate path. See ShardProposer::add_proposed_value above
+            // for the full rationale.
+            let expected_hash = blake3::hash(&header.encode_to_vec()).as_bytes().to_vec();
+            if block.hash != expected_hash {
+                warn!(
+                    shard = height.shard_index,
+                    proposed_height = height.block_number,
+                    "F012: block.hash mismatch with blake3(header); rejecting proposal"
+                );
+                return Validity::Invalid;
+            }
 
             if height != self.get_confirmed_height().increment() {
                 warn!(

@@ -257,12 +257,23 @@ pub fn import_hyper_block(
     )
     .map_err(|_| ImportError::SignatureVerificationFailed)?;
 
-    // 3. Apply ALL state transitions via the same builder the proposer used.
-    let mut messages: Vec<PendingMessage> =
-        Vec::with_capacity(locks_in_block.len() + transfers_in_block.len());
-    for lock in locks_in_block {
-        messages.push(PendingMessage::Lock(lock.clone()));
+    // F035 fix: transparent HyperLockEvent state-change path is disabled
+    // in block import. The router already rejects ingress for transparent
+    // `Lock` (router.rs `Body::Lock` arm), but a malicious proposer could
+    // still inject lock events directly into a block's `HyperWireBlock.locks`
+    // — those leaves would be applied with structural validation only (no
+    // Pedersen balance closure, no range proof, no signature check),
+    // becoming an unbacked-mint primitive against the threshold-signed
+    // verkle root. Reject any such block outright; production bridge
+    // locks must flow through `apply_confidential_lock`.
+    if !locks_in_block.is_empty() {
+        return Err(ImportError::Lock(
+            crate::hyper::lock_event::LockError::TransparentLocksDisabled,
+        ));
     }
+
+    // 3. Apply ALL state transitions via the same builder the proposer used.
+    let mut messages: Vec<PendingMessage> = Vec::with_capacity(transfers_in_block.len());
     for tx in transfers_in_block {
         messages.push(PendingMessage::Transfer(tx.clone()));
     }
@@ -292,6 +303,10 @@ pub fn import_hyper_block(
     }
 
     // 5. Forget mempool entries that were included.
+    // F035: locks-in-block path is gated above, so `locks_in_block` is
+    // always empty here in practice; the loop is kept (cheap no-op) for
+    // diff minimisation and to preserve mempool-cleanup semantics if the
+    // gate is ever revisited.
     for lock in locks_in_block {
         mempool.forget_lock(&lock.lock_id);
     }

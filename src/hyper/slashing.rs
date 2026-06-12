@@ -10,7 +10,7 @@
 //! two conflicting blocks. Penalty enforcement happens at the next epoch
 //! boundary by the active set, not in this module.
 
-use crate::hyper::chain::hyper_block_hash;
+use crate::hyper::chain::hyper_block_content_hash;
 use crate::hyper::HyperBlock;
 use alloy_primitives::Address;
 
@@ -59,8 +59,14 @@ pub fn detect_conflicting_blocks(
         return Err(EvidenceError::DifferentHeights { a: h_a, b: h_b });
     }
 
-    let hash_a = hyper_block_hash(a);
-    let hash_b = hyper_block_hash(b);
+    // F009 fix: compare content (signing-payload-equivalent) hashes,
+    // NOT `hyper_block_hash` which mixes in the threshold signature.
+    // Two valid threshold sigs over byte-identical block content
+    // (e.g., a sign-ceremony retry where a different aggregator picked
+    // a different partial-sig set) hash identically here — the
+    // predicate must NOT flag that as a conflict.
+    let hash_a = hyper_block_content_hash(a);
+    let hash_b = hyper_block_content_hash(b);
     if hash_a == hash_b {
         return Err(EvidenceError::SameBlock);
     }
@@ -196,6 +202,41 @@ mod tests {
         let evidence = detect_conflicting_blocks(&a, &b).unwrap();
         assert_eq!(evidence.epoch_a, 5);
         assert_ne!(evidence.block_a_hash, evidence.block_b_hash);
+    }
+
+    /// F009 regression: two valid threshold signatures over byte-
+    /// identical block content (e.g. a sign-ceremony retry) must NOT
+    /// be flagged as a conflict. Pre-fix `hyper_block_hash` mixed in
+    /// the ECDSA signature, so identical content with different sigs
+    /// hashed differently and triggered slashing.
+    #[test]
+    fn identical_content_distinct_signatures_is_not_a_conflict() {
+        let mut a = make_block(10, 5, vec![0xaa; 48]);
+        let mut b = make_block(10, 5, vec![0xaa; 48]);
+        a.signature.ecdsa_signature = vec![0x11; 65];
+        b.signature.ecdsa_signature = vec![0x22; 65];
+        // Same `group_address` too — only the sig bytes differ.
+        a.signature.group_address = vec![0xcc; 20];
+        b.signature.group_address = vec![0xcc; 20];
+        assert!(matches!(
+            detect_conflicting_blocks(&a, &b),
+            Err(EvidenceError::SameBlock)
+        ));
+    }
+
+    /// F009 regression: distinct signer-index sets DO count as
+    /// distinct content — the signing payload binds signer_indices.
+    /// Same block content with disjoint signer sets is legitimate
+    /// evidence of conflicting signer subsets.
+    #[test]
+    fn same_content_different_signer_sets_is_a_conflict() {
+        let mut a = make_block(10, 5, vec![0xaa; 48]);
+        let mut b = make_block(10, 5, vec![0xaa; 48]);
+        a.signature.signer_indices = vec![1, 2, 3];
+        b.signature.signer_indices = vec![1, 4, 5];
+        let ev = detect_conflicting_blocks(&a, &b)
+            .expect("different signer sets produce distinct content hashes");
+        assert_ne!(ev.block_a_hash, ev.block_b_hash);
     }
 
     #[test]

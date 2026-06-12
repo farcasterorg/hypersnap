@@ -104,17 +104,19 @@ impl FeeCharger {
         // UserDataAdd is per-(fid, field), VerificationAdd is per-address),
         // so resubmitting "the same content" is a no-op write, not a
         // spam vector.
+        //
+        // F068 fix: derive uniqueness from a CANONICAL content
+        // representation, not the raw `text`. Pre-fix an empty-text
+        // CastAdd carrying only embeds/mentions/parent always scored
+        // `uniqueness == 1.0` (the fingerprint store never stored
+        // empty-text entries) → effective fee 0 → unbounded spam.
+        // The canonical form folds in embeds + parent + mentions so
+        // an embed-only or reply-only cast is fingerprinted under a
+        // stable content key.
         let uniqueness = if class == FeeClass::CastAdd {
-            let text = data
-                .body
-                .as_ref()
-                .and_then(|b| match b {
-                    proto::message_data::Body::CastAddBody(c) => Some(c.text.as_str()),
-                    _ => None,
-                })
-                .unwrap_or("");
+            let canonical = canonical_cast_content(data);
             self.fingerprint_store
-                .uniqueness_score(text, data.timestamp as u64, batch)
+                .uniqueness_score(&canonical, data.timestamp as u64, batch)
                 .map_err(|e| FeeChargeError::Fingerprint(e.to_string()))?
         } else {
             1.0
@@ -156,19 +158,77 @@ impl FeeCharger {
         if mt != proto::MessageType::CastAdd {
             return Ok(());
         }
-        let text = data
-            .body
-            .as_ref()
-            .and_then(|b| match b {
-                proto::message_data::Body::CastAddBody(c) => Some(c.text.as_str()),
-                _ => None,
-            })
-            .unwrap_or("");
-        if text.is_empty() {
+        // F068 fix: insert the canonical content fingerprint, matching
+        // what `stage_fee` scored. Empty-text casts are now fingerprinted
+        // when they carry an embed/parent/mention, so subsequent
+        // copies of the same embed/parent/mention combo are detected
+        // as near-duplicates and pay the fee.
+        let canonical = canonical_cast_content(data);
+        if canonical.is_empty() {
+            // Truly empty cast (no text, no embeds, no parent, no
+            // mentions) — validation rejects this elsewhere, but
+            // guard anyway.
             return Ok(());
         }
         self.fingerprint_store
-            .stage_insert(data.fid, text, data.timestamp as u64, batch);
+            .stage_insert(data.fid, &canonical, data.timestamp as u64, batch);
         Ok(())
     }
+}
+
+/// F068 fix: build a deterministic content string covering text +
+/// embeds + parent + mentions. Both fee-scoring and fingerprint
+/// insertion use this so the two halves of the uniqueness machinery
+/// can never disagree on what content was. Order-stable: embeds and
+/// mentions are emitted in proto-declared order; the prefix tags
+/// keep the SimHash from collapsing "abc" + embed_X into the same
+/// fingerprint as "abc" alone.
+fn canonical_cast_content(data: &proto::MessageData) -> String {
+    let Some(proto::message_data::Body::CastAddBody(body)) = data.body.as_ref() else {
+        return String::new();
+    };
+    let mut out = String::new();
+    if !body.text.is_empty() {
+        out.push_str("t:");
+        out.push_str(&body.text);
+    }
+    for e in &body.embeds {
+        if let Some(inner) = &e.embed {
+            match inner {
+                proto::embed::Embed::Url(u) => {
+                    out.push_str("|u:");
+                    out.push_str(u);
+                }
+                proto::embed::Embed::CastId(cid) => {
+                    out.push_str("|c:");
+                    out.push_str(&cid.fid.to_string());
+                    out.push(':');
+                    out.push_str(&hex::encode(&cid.hash));
+                }
+            }
+        }
+    }
+    for u in &body.embeds_deprecated {
+        out.push_str("|d:");
+        out.push_str(u);
+    }
+    for fid in &body.mentions {
+        out.push_str("|m:");
+        out.push_str(&fid.to_string());
+    }
+    if let Some(parent) = &body.parent {
+        match parent {
+            proto::cast_add_body::Parent::ParentCastId(cid) => {
+                out.push_str("|p:");
+                out.push_str(&cid.fid.to_string());
+                out.push(':');
+                out.push_str(&hex::encode(&cid.hash));
+            }
+            proto::cast_add_body::Parent::ParentUrl(u) => {
+                out.push_str("|p:url:");
+                out.push_str(u);
+            }
+        }
+    }
+    out
 }
