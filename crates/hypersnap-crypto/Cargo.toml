@@ -33,3 +33,6 @@ k256 = { version = "0.13", features = ["serde", "ecdsa"] }
 elliptic-curve = { version = "0.13", features = ["serde", "sec1"] }
 serde = { version = "1", features = ["derive"] }
 bincode = "1.3"
+
+[dev-dependencies]
+zeroize = "1.7"

@@ -3154,6 +3154,7 @@ dependencies = [
  "serde",
  "serde_bytes",
  "sha3 0.10.9",
+ "zeroize",
 ]
 
 [[package]]
@@ -4836,6 +4837,7 @@ dependencies = [
  "subtle",
  "thiserror 1.0.69",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]

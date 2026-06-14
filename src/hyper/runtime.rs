@@ -4238,7 +4238,7 @@ impl HyperRuntime {
     pub fn slashed_validators_for_epoch(
         &self,
         epoch: u64,
-        _active_set_at_epoch: &std::collections::BTreeMap<Vec<u8>, (Vec<u8>, Vec<u8>)>,
+        active_set_at_epoch: &std::collections::BTreeMap<Vec<u8>, (Vec<u8>, Vec<u8>)>,
     ) -> Result<std::collections::BTreeSet<Vec<u8>>, crate::hyper::slashing_store::SlashingStoreError>
     {
         let evidence = self.slashing_store.get_for_epoch(epoch)?;
@@ -4250,23 +4250,51 @@ impl HyperRuntime {
             // for cross-epoch evidence punished honest validators who
             // only signed one of the two epochs.
             //
-            // Resolve each block's signer_indices against its own
-            // epoch's active set, then take the intersection (validators
-            // present as signers in BOTH sets).
+            // F002 chain-halt fix (audit-suite revalidation B1): the
+            // original implementation called `get_active_validators_enforced`
+            // for each block's `sig.epoch`. That call itself recurses
+            // through `slashed_validators_for_epoch(block_epoch - 1)`,
+            // so cross-epoch evidence keyed under `min(epoch_a, epoch_b)`
+            // (which is exactly what `slashing_store` does) triggers
+            // unbounded recursion → stack overflow → permanent
+            // chain-halt the next time `get_active_validators_enforced`
+            // crosses that epoch boundary. One single attacker-submitted
+            // evidence row halts every honest node forever.
+            //
+            // Break the cycle by resolving signers ONLY for blocks
+            // whose `sig.epoch` matches the slashing-epoch key (the
+            // active set we already have, passed in by the caller).
+            // For cross-epoch evidence, signers of the
+            // higher-epoch block are not resolved here — their
+            // attribution would require the higher epoch's enforced
+            // active set, which is exactly the cycle this guard
+            // breaks. Combined with the intersection rule above, an
+            // unresolved side yields an empty intersection and no
+            // slashing for that evidence row — i.e., cross-epoch
+            // equivocators are silently under-slashed at the lower
+            // epoch's boundary. The higher epoch's boundary then
+            // independently processes its own evidence (keyed under
+            // the higher epoch's min), so a same-epoch equivocator
+            // is still caught; a *cross-epoch* equivocator is only
+            // attributed when both sides happen to be resolvable from
+            // their respective slashing-epoch keys.
+            //
+            // Conservative under-slashing of a narrow cross-epoch
+            // pattern is the correct trade against a transient
+            // single-epoch capture turning into a permanent
+            // network-wide liveness kill.
             let resolve_signers =
                 |block: &proto::HyperBlock| -> std::collections::BTreeSet<Vec<u8>> {
                     let mut out = std::collections::BTreeSet::new();
                     let Some(sig) = block.signature.as_ref() else {
                         return out;
                     };
-                    let block_epoch = sig.epoch;
-                    let active = match self
-                        .get_active_validators_enforced(block_epoch, &self.bootstrap_validators)
-                    {
-                        Ok(a) => a,
-                        Err(_) => return out,
-                    };
-                    let keys: Vec<&Vec<u8>> = active.keys().collect();
+                    if sig.epoch != epoch {
+                        // Cross-epoch block — skip rather than recurse
+                        // through `get_active_validators_enforced`.
+                        return out;
+                    }
+                    let keys: Vec<&Vec<u8>> = active_set_at_epoch.keys().collect();
                     for idx in &sig.signer_indices {
                         if *idx == 0 {
                             continue;
@@ -4780,7 +4808,16 @@ impl HyperRuntime {
     /// expected `group_address` for any historical block/issuance.
     /// Only the SECRET share material (`Party`, which contains the
     /// per-epoch share + pre-computed multiplication shares) is
-    /// dropped here.
+    /// removed here.
+    ///
+    /// `Party<Secp256k1>` impls `Drop` (see
+    /// `crates/dkls23/src/protocols.rs`) which scrubs `poly_point`
+    /// (the polynomial share — the field that directly reconstructs
+    /// signing capability) and the session_id transcript binding via
+    /// `Zeroize`. Removing the `DklsEpochState` from the BTreeMap
+    /// therefore moves the inner `Party` into a temporary that is
+    /// immediately dropped, running the scrub before the allocator
+    /// reclaims the page.
     ///
     /// Returns the count of epochs whose shares were retired.
     pub fn prune_retired_dkls_shares(&mut self, retain_epoch_floor: u64) -> usize {
@@ -4790,16 +4827,15 @@ impl HyperRuntime {
             .map(|(e, _)| *e)
             .collect();
         for epoch in &stale {
-            // `BTreeMap::remove` drops the `DklsEpochState`, whose
-            // `Party<Secp256k1>` is responsible for zeroizing its
-            // own secret material on drop.
+            // `BTreeMap::remove` returns the value, which drops at end
+            // of statement and triggers `Party::drop` → zeroize.
             self.dkls_signers.remove(epoch);
         }
         if !stale.is_empty() {
             tracing::info!(
                 retired = stale.len(),
                 retain_epoch_floor,
-                "F018: pruned retired DKLS share material"
+                "F018: pruned retired DKLS share material (poly_point zeroized via Party::drop)"
             );
         }
         stale.len()
@@ -7045,6 +7081,139 @@ mod tests {
         let below = rt.validators_below_trust_floor(1, &bootstrap).unwrap();
         let below_fids: Vec<u64> = below.iter().map(|(f, _, _)| *f).collect();
         assert_eq!(below_fids, vec![8]);
+    }
+
+    // ====================================================================
+    // F002 residual chain-halt regression — audit-suite revalidation B1.
+    //
+    // Without the fix, the call graph
+    //   get_active_validators_enforced(E)
+    //     -> slashed_validators_for_epoch(E-1)              (runtime.rs)
+    //     -> resolve_signers(block_b @ epoch E) calls
+    //        get_active_validators_enforced(E)              (recursion)
+    // unbounded-recurses on a stored adjacent cross-epoch evidence row
+    // `(epoch_a=E-1, epoch_b=E)` keyed under `min = E-1`. With the fix,
+    // `resolve_signers` skips blocks whose `sig.epoch != epoch` (the
+    // slashing-key epoch) and uses the passed-in `active_set_at_epoch`
+    // instead of re-entering `get_active_validators_enforced`.
+    //
+    // The test runs the boundary call on a 256 KiB stack so any latent
+    // recursion overflows fast. Both rows (benign same-epoch, malicious
+    // cross-epoch) must return Ok post-fix.
+    // ====================================================================
+
+    fn f002_block(
+        epoch: u64,
+        height: u64,
+        root: u8,
+        signers: Vec<u64>,
+    ) -> crate::hyper::HyperBlock {
+        crate::hyper::HyperBlock {
+            envelope: crate::hyper::HyperEnvelope {
+                metadata: crate::hyper::HyperBlockMetadata {
+                    canonical_block_id: height,
+                    parent_hash: vec![0u8; 32],
+                    hyper_state_root: vec![root; 48],
+                    extra_rules_version: 0,
+                    retained_message_count: 0,
+                    missed_proposals: vec![],
+                    snapchain_anchor_block: 0,
+                    snapchain_anchor_hash: vec![],
+                    snapchain_range_start_block: 0,
+                    snapchain_range_root: vec![],
+                    snapchain_anchor_timestamp: 0,
+                },
+                payload: vec![],
+            },
+            signature: crate::hyper::HyperBlockSignature {
+                epoch,
+                signer_indices: signers,
+                group_address: Vec::new(),
+                ecdsa_signature: Vec::new(),
+            },
+        }
+    }
+
+    fn f002_evidence(
+        epoch_a: u64,
+        epoch_b: u64,
+        height: u64,
+        root_a: u8,
+        root_b: u8,
+        signers_a: Vec<u64>,
+        signers_b: Vec<u64>,
+    ) -> crate::hyper::slashing::ConflictingBlocksEvidence {
+        let a = f002_block(epoch_a, height, root_a, signers_a);
+        let b = f002_block(epoch_b, height, root_b, signers_b);
+        let mut hash_a = [0u8; 32];
+        hash_a[0] = root_a;
+        let mut hash_b = [0u8; 32];
+        hash_b[0] = root_b;
+        crate::hyper::slashing::ConflictingBlocksEvidence {
+            epoch_a,
+            epoch_b,
+            canonical_block_id: height,
+            block_a_hash: hash_a,
+            block_b_hash: hash_b,
+            block_a: Box::new(a),
+            block_b: Box::new(b),
+        }
+    }
+
+    fn f002_run_enforced_on_small_stack(
+        rt: HyperRuntime,
+        bootstrap: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>,
+        epoch: u64,
+    ) -> Result<(), ()> {
+        let handle = std::thread::Builder::new()
+            .name(format!("f002-enforced-e{epoch}"))
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let _ = rt.get_active_validators_enforced(epoch, &bootstrap);
+            })
+            .expect("spawn small-stack thread");
+        handle.join().map_err(|_| ())
+    }
+
+    #[test]
+    fn f002_cross_epoch_evidence_does_not_recurse_on_epoch_boundary() {
+        let target_e: u64 = 2;
+        let prev_e: u64 = target_e - 1;
+
+        let vk1 = vec![0x11u8; 32];
+        let vk2 = vec![0x22u8; 32];
+        let bootstrap = vec![
+            (vk1.clone(), vec![0u8; 48], vec![0u8; 32]),
+            (vk2.clone(), vec![0u8; 48], vec![0u8; 32]),
+        ];
+
+        // BENIGN control: same-epoch evidence. Must return.
+        {
+            let (rt, _dir) = make_runtime();
+            let benign = f002_evidence(prev_e, prev_e, 100, 0xaa, 0xbb, vec![1, 2], vec![1, 2]);
+            rt.record_evidence(&benign).expect("record benign evidence");
+            assert_eq!(rt.evidence_for_epoch(prev_e).unwrap().len(), 1);
+            let res = f002_run_enforced_on_small_stack(rt, bootstrap.clone(), target_e);
+            assert!(res.is_ok(), "benign same-epoch evidence must not overflow");
+        }
+
+        // MALICIOUS: adjacent cross-epoch evidence. Pre-fix this aborts
+        // the worker thread via stack overflow; post-fix the cross-epoch
+        // block is skipped and the call returns.
+        {
+            let (rt, _dir) = make_runtime();
+            let malicious =
+                f002_evidence(prev_e, target_e, 100, 0xcc, 0xdd, vec![1, 2], vec![1, 2]);
+            rt.record_evidence(&malicious)
+                .expect("record malicious cross-epoch evidence");
+            assert_eq!(rt.evidence_for_epoch(prev_e).unwrap().len(), 1);
+            let res = f002_run_enforced_on_small_stack(rt, bootstrap.clone(), target_e);
+            assert!(
+                res.is_ok(),
+                "RESIDUAL: cross-epoch evidence triggered unbounded recursion \
+                 in get_active_validators_enforced — chain-halt DoS still live"
+            );
+        }
     }
 
     /// When `min_validator_trust_score == 0.0` the gate is

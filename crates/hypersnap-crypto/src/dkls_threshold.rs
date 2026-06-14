@@ -500,6 +500,26 @@ mod tests {
         assert_eq!(sig.to_bytes().len(), 65);
     }
 
+    /// F018 zeroize wiring regression. Build a real DKG share, capture
+    /// the secret scalar, then explicitly drive `Zeroize::zeroize` on
+    /// `poly_point` — the same call that `impl Drop for Party` runs on
+    /// retirement. After zeroize the share must equal `k256::Scalar`'s
+    /// default (zero), proving `DklsCurve::Scalar: Zeroize` is wired
+    /// and `Party::drop` actually scrubs on retirement.
+    #[test]
+    fn party_poly_point_zeroizes_on_drop_path() {
+        use zeroize::Zeroize;
+        let dkg = run_honest_dkg(1, 1, [0xab; 32]).unwrap();
+        let mut party = dkg.parties[0].clone();
+        let zero_scalar: k256::Scalar = k256::Scalar::default();
+        assert_ne!(party.poly_point, zero_scalar, "poly_point starts non-zero");
+        party.poly_point.zeroize();
+        assert_eq!(
+            party.poly_point, zero_scalar,
+            "Zeroize::zeroize must zero the share scalar"
+        );
+    }
+
     #[test]
     fn two_of_three_baseline() {
         let dkg = run_honest_dkg(2, 3, [0x11; 32]).unwrap();

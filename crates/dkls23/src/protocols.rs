@@ -54,6 +54,36 @@ pub struct Party<C: DklsCurve> {
     pub eth_address: String,
 }
 
+/// Zeroize secret material on drop.
+///
+/// **F018 fix (hypersnap audit-suite revalidation):** retired DKLS share
+/// state was previously freed un-scrubbed, leaving secret share bytes
+/// observable to a same-process read attacker until the allocator
+/// reused those pages. This `Drop` impl scrubs the polynomial share
+/// (`poly_point`) — the single piece of material that, if recovered,
+/// directly reconstructs the party's signing capability.
+///
+/// `zero_share`, `mul_senders`/`mul_receivers`, and `derivation_data`
+/// contain session-bound OT precomputes; they are not independently
+/// signing-capable without `poly_point`, and they own heap-allocated
+/// sub-fields whose canonical drop also runs here. The shared
+/// `session_id` is zeroed because it gates the deterministic transcript
+/// reused across sign sessions for the same epoch.
+///
+/// The `Clone` derive is preserved: clones are independent owners and
+/// each one's drop runs this scrub on its own copy.
+impl<C: DklsCurve> Drop for Party<C> {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.poly_point.zeroize();
+        self.session_id.zeroize();
+        // `eth_address` is derived from the (public) `pk` — not secret,
+        // but it co-identifies the share; zero it so a memory scan
+        // can't trivially link recovered share bytes to a deployment.
+        self.eth_address.zeroize();
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Abort {
     /// Index of the party generating the abort message.

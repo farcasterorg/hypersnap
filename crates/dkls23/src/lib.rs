@@ -37,7 +37,16 @@ use elliptic_curve::{Curve, CurveArithmetic};
 /// the associated-type bounds it actually needs (e.g.
 /// `C::Scalar: Reduce<U256>`).  The trait itself is intentionally kept narrow
 /// so that adding a new curve only requires one `impl` line.
-pub trait DklsCurve: CurveArithmetic + Curve + 'static {}
+///
+/// **`Scalar: Zeroize` is required** so that the `Drop` impl on
+/// [`protocols::Party`] can scrub the secret share. Both supported curves
+/// derive `Zeroize` via `DefaultIsZeroes` on their `Scalar` types in the
+/// RustCrypto crates.
+pub trait DklsCurve: CurveArithmetic + Curve + 'static
+where
+    <Self as CurveArithmetic>::Scalar: zeroize::Zeroize,
+{
+}
 
 impl DklsCurve for k256::Secp256k1 {}
 impl DklsCurve for p256::NistP256 {}
