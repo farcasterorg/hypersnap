@@ -116,6 +116,20 @@ pub mod tests {
             Ok(Response::new(response))
         }
 
+        async fn get_mesh_view(
+            &self,
+            _request: Request<GetMeshViewRequest>,
+        ) -> Result<Response<MeshView>, Status> {
+            Ok(Response::new(MeshView::default()))
+        }
+
+        async fn get_mesh_topology(
+            &self,
+            _request: Request<GetMeshViewRequest>,
+        ) -> Result<Response<MeshTopology>, Status> {
+            Ok(Response::new(MeshTopology::default()))
+        }
+
         type SubscribeStream = ReceiverStream<Result<HubEvent, Status>>;
         async fn subscribe(
             &self,
@@ -447,6 +461,7 @@ pub mod tests {
                 timestamp: FARCASTER_EPOCH,
                 capabilities: vec![],
             }],
+            peers: vec![],
         });
         let http_service = HubHttpServiceImpl {
             service: Arc::new(mock_hub_service),
@@ -468,7 +483,8 @@ pub mod tests {
               "timestamp": 1609459200000,
               "capabilities": []
             }
-          ]
+          ],
+          "peers": []
         }
         "#);
     }

@@ -117,8 +117,15 @@ async fn start_servers(
             None
         };
 
+    // Validator public keys (hex) used to classify peers in the mesh view by
+    // deriving each validator's PeerId — the latest set per shard, unioned
+    // (same source as the diagnostics gate, so the two stay consistent).
+    let validator_hex_keys: Vec<String> = app_config.consensus.latest_validator_public_keys();
+
     let service = Arc::new(MyHubService::new(
         app_config.rpc_auth.clone(),
+        app_config.admin_rpc_auth.clone(),
+        validator_hex_keys.clone(),
         block_stores.clone(),
         shard_stores.clone(),
         hyper_shard_stores.clone(),
@@ -139,6 +146,8 @@ async fn start_servers(
     // This ensures API consumers see full message history without pruning.
     let api_service = Arc::new(MyHubService::new(
         app_config.rpc_auth.clone(),
+        app_config.admin_rpc_auth.clone(),
+        validator_hex_keys,
         block_stores.clone(),
         hyper_shard_stores,
         HashMap::new(), // no shadow stores needed for the API service
@@ -616,6 +625,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let mut gossip = gossip_result?;
+    // Validator PeerIds permitted to query the mesh-diagnostics behaviour;
+    // the gossip responder answers only these peers (fail-closed otherwise).
+    let validator_peers: HashSet<_> = snapchain::network::mesh::view::build_validator_peer_ids(
+        app_config.consensus.latest_validator_public_keys().iter(),
+    )
+    .into_keys()
+    .collect();
+    gossip.set_validator_peers(validator_peers);
     let local_peer_id = gossip.swarm.local_peer_id().clone();
     let read_or_validator = if app_config.read_node {
         "read"
@@ -630,6 +647,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
 
     let gossip_tx = gossip.tx.clone();
+    // Grab a handle to the per-peer gossip metrics before the gossip value is
+    // moved into the spawned task, so we can register the counters into the
+    // shared Prometheus registry below.
+    let gossip_metrics = gossip.metrics();
 
     // Spawn gossip early — before node creation — so the QUIC keep-alive and
     // gossipsub control loop runs during the potentially heavy RocksDB shard
@@ -645,6 +666,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let registry = SharedRegistry::global();
     // Use the new non-global metrics registry when we upgrade to newer version of malachite
     let _ = Metrics::register(registry);
+    // Register per-peer gossip counters alongside the consensus metrics.
+    gossip_metrics.register(registry);
     let (messages_request_tx, messages_request_rx) = mpsc::channel(100);
 
     let chains_clients = ChainClients::new(&app_config);

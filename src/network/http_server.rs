@@ -1557,9 +1557,53 @@ impl TryFrom<proto::ContactInfoBody> for ContactInfoBody {
     }
 }
 
+/// Source-tagged connected peer. `DERIVED` entries (e.g. validators, which
+/// never publish contact info) carry only the PeerId + observed connection
+/// address — never conflated with `COLLECTED` peer-attested contact info.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ConnectedPeerJson {
+    source: String,
+    peer_id: String,
+    observed_address: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    contact_info: Option<ContactInfoBody>,
+}
+
+impl TryFrom<proto::ConnectedPeer> for ConnectedPeerJson {
+    type Error = ErrorResponse;
+
+    fn try_from(value: proto::ConnectedPeer) -> Result<Self, Self::Error> {
+        let peer_id = PeerId::from_bytes(&value.peer_id)
+            .map(|p| p.to_string())
+            .unwrap_or_else(|_| hex::encode(&value.peer_id));
+        let source = contact_source_label(value.source).to_string();
+        let contact_info = value
+            .contact_info
+            .map(ContactInfoBody::try_from)
+            .transpose()?;
+        Ok(ConnectedPeerJson {
+            source,
+            peer_id,
+            observed_address: value.observed_address,
+            contact_info,
+        })
+    }
+}
+
+fn contact_source_label(source: i32) -> &'static str {
+    match proto::ContactSource::try_from(source) {
+        Ok(proto::ContactSource::Collected) => "collected",
+        Ok(proto::ContactSource::Derived) => "derived",
+        _ => "unknown",
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GetConnectedPeersResponse {
     contacts: Vec<ContactInfoBody>,
+    // Source-tagged view incl. connected peers we have no collected contact
+    // info for (DERIVED). Distinct from `contacts` (COLLECTED only).
+    peers: Vec<ConnectedPeerJson>,
 }
 
 impl TryFrom<proto::GetConnectedPeersResponse> for GetConnectedPeersResponse {
@@ -1571,6 +1615,11 @@ impl TryFrom<proto::GetConnectedPeersResponse> for GetConnectedPeersResponse {
                 .contacts
                 .into_iter()
                 .map(ContactInfoBody::try_from)
+                .collect::<Result<_, _>>()?,
+            peers: value
+                .peers
+                .into_iter()
+                .map(ConnectedPeerJson::try_from)
                 .collect::<Result<_, _>>()?,
         })
     }
@@ -1608,6 +1657,40 @@ pub struct ValidationResult {
 pub struct ErrorResponse {
     pub error: String,
     pub error_detail: Option<String>,
+}
+
+// Shared response builders for the mesh endpoints (local view + crawl topology).
+fn text_plain_ok(body: String) -> Response<BoxBody<Bytes, Infallible>> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/plain; charset=utf-8")
+        .body(Full::new(Bytes::from(body)).boxed())
+        .unwrap()
+}
+
+fn json_ok(json: serde_json::Value) -> Response<BoxBody<Bytes, Infallible>> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(serde_json::to_vec(&json).unwrap())).boxed())
+        .unwrap()
+}
+
+fn mesh_error_response(status: tonic::Status) -> Response<BoxBody<Bytes, Infallible>> {
+    let code = if status.code() == tonic::Code::Unauthenticated {
+        StatusCode::UNAUTHORIZED
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    let err = ErrorResponse {
+        error: status.message().to_string(),
+        error_detail: None,
+    };
+    Response::builder()
+        .status(code)
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(serde_json::to_vec(&err).unwrap())).boxed())
+        .unwrap()
 }
 
 // Implementation struct
@@ -2546,7 +2629,7 @@ fn map_proto_on_chain_event_to_json_on_chain_event(
     })
 }
 
-fn map_proto_hub_event_to_json_hub_event(
+pub fn map_proto_hub_event_to_json_hub_event(
     hub_event: proto::HubEvent,
 ) -> Result<HubEvent, ErrorResponse> {
     let mut merge_message_body: Option<MergeMessageBody> = None;
@@ -3943,6 +4026,7 @@ where
                 )
                 .await
             }
+            (&Method::GET, "/v1/mesh") => self.handle_mesh_view(req).await,
             _ => Ok(Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .body(Full::new(Bytes::from("Not Found")).boxed())
@@ -4027,6 +4111,89 @@ where
                 .header("content-type", "application/json")
                 .body(Full::new(Bytes::from(serde_json::to_vec(&err).unwrap())).boxed())
                 .unwrap()),
+        }
+    }
+
+    /// Admin-gated mesh view endpoint. Forwards the `authorization` header into
+    /// the gRPC request so the service's admin check runs, then returns JSON
+    /// (default) or an ASCII render (`?format=ascii`). `?validators_only=false`
+    /// includes non-validator peers (default is validators only).
+    async fn handle_mesh_view(
+        &self,
+        req: Request<hyper::body::Incoming>,
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        let query = req.uri().query().unwrap_or("").to_string();
+        let mut format = "json";
+        let mut validators_only = true;
+        let mut crawl = false;
+        let mut topics_param: Option<String> = None;
+        for pair in query.split('&') {
+            match pair.split_once('=') {
+                Some(("format", v)) => {
+                    if v == "ascii" {
+                        format = "ascii";
+                    }
+                }
+                Some(("validators_only", v)) => {
+                    validators_only = !(v == "false" || v == "0");
+                }
+                Some(("crawl", v)) => {
+                    crawl = !(v == "false" || v == "0");
+                }
+                Some(("topics", v)) => {
+                    topics_param = Some(v.to_string());
+                }
+                _ => {}
+            }
+        }
+        // Topics control the ASCII per-topic columns/matrices only (default
+        // consensus,mempool); the JSON always carries every topic.
+        let topics = crate::network::mesh::render::parse_topics(topics_param.as_deref());
+
+        let auth = req.headers().get("authorization").cloned();
+        let mut grpc_req = tonic::Request::new(proto::GetMeshViewRequest {
+            validators_only,
+            ttl: 0,
+            visited_peer_ids: vec![],
+        });
+        if let Some(auth) = auth {
+            if let Ok(s) = auth.to_str() {
+                if let Ok(v) = MetadataValue::from_str(s) {
+                    grpc_req.metadata_mut().insert("authorization", v);
+                }
+            }
+        }
+
+        // `?crawl=true` assembles the network-wide topology over the gossip port;
+        // otherwise return this node's local view.
+        if crawl {
+            match self.service.service.get_mesh_topology(grpc_req).await {
+                Ok(resp) => {
+                    let topo = resp.into_inner();
+                    if format == "ascii" {
+                        let body = crate::network::mesh::render::render_topology(&topo, &topics);
+                        Ok(text_plain_ok(body))
+                    } else {
+                        let json = crate::network::mesh::render::topology_json(&topo);
+                        Ok(json_ok(json))
+                    }
+                }
+                Err(status) => Ok(mesh_error_response(status)),
+            }
+        } else {
+            match self.service.service.get_mesh_view(grpc_req).await {
+                Ok(resp) => {
+                    let view = resp.into_inner();
+                    if format == "ascii" {
+                        let body = crate::network::mesh::render::render_mesh_view(&view, &topics);
+                        Ok(text_plain_ok(body))
+                    } else {
+                        let json = crate::network::mesh::render::mesh_view_json(&view);
+                        Ok(json_ok(json))
+                    }
+                }
+                Err(status) => Ok(mesh_error_response(status)),
+            }
         }
     }
 
