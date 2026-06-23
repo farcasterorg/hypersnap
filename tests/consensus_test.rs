@@ -434,6 +434,8 @@ impl NodeForTest {
 
         let service = MyHubService::new(
             "".to_string(),
+            "".to_string(),
+            vec![],
             node.block_stores.clone(),
             node.shard_stores.clone(),
             HashMap::new(),
