@@ -17,4 +17,11 @@ thiserror = "1.0"
 tokio = { version = "1.40.0", features = ["rt", "macros"] }
 rand = "0.8.5"
 sha2 = "0.10"
+blake3 = "1.4"
 alloy-primitives = "0.8.14"
+alloy-dyn-abi = { version = "0.8.15", features = ["eip712"] }
+alloy-signer = "0.8.0"
+alloy-signer-local = "0.8.0"
+
+[dev-dependencies]
+x25519-dalek = { version = "2", features = ["static_secrets"] }

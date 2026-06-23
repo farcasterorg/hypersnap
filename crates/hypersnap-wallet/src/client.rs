@@ -69,6 +69,28 @@ impl HypersnapClient {
         Ok(body["epoch"].as_u64().unwrap_or(0))
     }
 
+    /// Submit a snapchain user message (`CastAdd`, `LinkAdd`,
+    /// `ReactionAdd`, etc.) via `POST /v1/submitMessage`. Distinct
+    /// from `submit` which sends to the hyper endpoint.
+    pub async fn submit_snapchain_message(&self, msg: &proto::Message) -> Result<(), WalletError> {
+        use prost::Message as _;
+        let body = msg.encode_to_vec();
+        let resp = self
+            .http
+            .post(format!("{}/v1/submitMessage", self.base_url))
+            .header("content-type", "application/octet-stream")
+            .body(body)
+            .send()
+            .await?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            Err(WalletError::NodeError { status, body })
+        }
+    }
+
     pub async fn submit(&self, msg: &proto::HyperMessage) -> Result<(), WalletError> {
         let body = msg.encode_to_vec();
         let resp = self

@@ -4858,7 +4858,11 @@ dependencies = [
 name = "hypersnap-wallet"
 version = "0.1.0"
 dependencies = [
+ "alloy-dyn-abi",
  "alloy-primitives",
+ "alloy-signer",
+ "alloy-signer-local",
+ "blake3",
  "ed25519-dalek",
  "hex",
  "hypersnap-crypto",
@@ -4871,6 +4875,7 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 1.0.69",
  "tokio",
+ "x25519-dalek",
 ]
 
 [[package]]

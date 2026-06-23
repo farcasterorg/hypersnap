@@ -10,8 +10,20 @@
 //! heights are observed.
 
 /// Length of one hyper epoch, measured in snapchain anchor blocks.
-/// Per FIP-hyper-validator-selection §1: 432,000 snapchain blocks.
+///
+/// Per FIP-hyper-validator-selection §1: 432,000 snapchain blocks (≈ 5 days
+/// at 1s block time).
+///
+/// **Testnet override:** building with `--features short-epochs` substitutes a
+/// 1,440-block epoch (≈ 6 minutes at 250 ms block time), so an end-to-end
+/// epoch-transition / DKG-rotation cycle finishes in single-digit minutes.
+/// This flag exists for local integration tests and the scripted
+/// epoch-transition testnet runner; never enable it in a release build.
+#[cfg(not(feature = "short-epochs"))]
 pub const EPOCH_LENGTH: u64 = 432_000;
+
+#[cfg(feature = "short-epochs")]
+pub const EPOCH_LENGTH: u64 = 1_440;
 
 /// Number of epochs of buffer between registration and activation.
 /// Per FIP-hyper-validator-selection §1: registrations from epoch N-1 activate

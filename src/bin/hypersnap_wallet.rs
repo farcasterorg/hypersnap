@@ -106,11 +106,64 @@ enum Command {
         #[arg(long, default_value = "")]
         custody_signature_hex: String,
     },
+    /// Identical to `validator-register` but reads a raw 32-byte
+    /// secp256k1 custody secret from `--custody-key-file` and
+    /// auto-signs the EIP-712 ValidatorAuthorization payload.
+    /// Designed for use with the `setup_local_testnet
+    /// --seed-validator-fids` keys at `nodes/{i}/custody.key`.
+    ///
+    /// Provide the transport pubkey one of two ways:
+    /// - `--transport-pubkey-hex <64-char hex>` — supplies the
+    ///   announced X25519 pubkey directly.
+    /// - `--transport-secret-file <path>` — reads a raw 32-byte
+    ///   X25519 SECRET (matching the node's `transport_secret_path`
+    ///   on disk, e.g. `nodes/{i}/transport.key`), derives the public
+    ///   half via `TransportSecretKey::public_bytes()`, and uses it
+    ///   as the announced pubkey. This is the production-grade path
+    ///   — the same secret the node uses to open sealed round
+    ///   messages stays bound to the validator's registered identity.
+    ///
+    /// Exactly one of the two flags must be provided.
+    ValidatorRegisterWithCustody {
+        #[arg(long, default_value = "")]
+        transport_pubkey_hex: String,
+        /// Path to a raw 32-byte X25519 transport secret. Mutually
+        /// exclusive with `--transport-pubkey-hex`.
+        #[arg(long, default_value = "")]
+        transport_secret_file: String,
+        #[arg(long)]
+        validator_address_hex: String,
+        #[arg(long)]
+        fid: u64,
+        #[arg(long)]
+        epoch: u64,
+        /// Path to a file containing the raw 32-byte secp256k1
+        /// custody private key (NOT hex — exactly 32 bytes).
+        #[arg(long)]
+        custody_key_file: String,
+    },
     ValidatorDeregister {
         #[arg(long)]
         fid: u64,
         #[arg(long)]
         epoch: u64,
+    },
+    /// Submit a snapchain `CastAdd` user message via `POST
+    /// /v1/submitMessage`. The signing key (loaded from `--key-file`)
+    /// MUST match a `SignerAdd` event for `--fid` in the snapchain
+    /// on-chain state, otherwise the node rejects the message with
+    /// `InvalidSigner`. The local testnet seeds this via
+    /// `setup_local_testnet --seed-snapchain-state` — the validator's
+    /// ed25519 key is also registered as that FID's signer.
+    CastAdd {
+        #[arg(long)]
+        fid: u64,
+        #[arg(long)]
+        text: String,
+        /// Snapchain network the receiving node is running in.
+        /// Defaults to "devnet". Valid: "mainnet", "testnet", "devnet".
+        #[arg(long, default_value = "devnet")]
+        network: String,
     },
 }
 
@@ -295,11 +348,116 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             client.submit(&msg).await?;
             output(&serde_json::json!({"submitted": true, "type": "validator_register"}));
         }
+        Command::ValidatorRegisterWithCustody {
+            ref transport_pubkey_hex,
+            ref transport_secret_file,
+            ref validator_address_hex,
+            fid,
+            epoch,
+            ref custody_key_file,
+        } => {
+            let signer = load_signer(&cli)?;
+            // Resolve the transport pubkey: exactly one of the two
+            // flags must be set. The secret-file path derives the
+            // public half via the same X25519 wiring the node uses,
+            // keeping the announced pubkey bound to the secret that
+            // opens sealed round messages.
+            let transport: [u8; 32] = match (
+                !transport_pubkey_hex.is_empty(),
+                !transport_secret_file.is_empty(),
+            ) {
+                (true, true) => {
+                    return Err(
+                        "--transport-pubkey-hex and --transport-secret-file are mutually exclusive"
+                            .into(),
+                    );
+                }
+                (false, false) => {
+                    return Err(
+                        "exactly one of --transport-pubkey-hex / --transport-secret-file required"
+                            .into(),
+                    );
+                }
+                (true, false) => hex::decode(&transport_pubkey_hex)?
+                    .try_into()
+                    .map_err(|_| "transport_pubkey must be 32 bytes")?,
+                (false, true) => {
+                    let secret_bytes = std::fs::read(transport_secret_file)?;
+                    if secret_bytes.len() != 32 {
+                        return Err(format!(
+                            "transport-secret-file must contain exactly 32 raw bytes (got {})",
+                            secret_bytes.len()
+                        )
+                        .into());
+                    }
+                    let mut s = [0u8; 32];
+                    s.copy_from_slice(&secret_bytes);
+                    hypersnap_crypto::transport_encrypt::TransportSecretKey::from_bytes(s)
+                        .public_bytes()
+                }
+            };
+            let addr: [u8; 20] = hex::decode(&validator_address_hex)?
+                .try_into()
+                .map_err(|_| "validator_address must be 20 bytes")?;
+            let custody_bytes = std::fs::read(custody_key_file)?;
+            if custody_bytes.len() != 32 {
+                return Err(format!(
+                    "custody key file must contain exactly 32 raw bytes (got {})",
+                    custody_bytes.len()
+                )
+                .into());
+            }
+            let mut custody_secret = [0u8; 32];
+            custody_secret.copy_from_slice(&custody_bytes);
+            let msg = tx::validator::build_validator_register_with_custody(
+                &signer,
+                transport,
+                addr,
+                fid,
+                epoch,
+                &custody_secret,
+                Vec::new(),
+                Vec::new(),
+            )?;
+            client.submit(&msg).await?;
+            output(&serde_json::json!({
+                "submitted": true,
+                "type": "validator_register",
+                "auto_signed_custody": true,
+                "fid": fid,
+                "epoch": epoch,
+                "transport_pubkey_hex": format!("0x{}", hex::encode(transport)),
+            }));
+        }
         Command::ValidatorDeregister { fid, epoch } => {
             let signer = load_signer(&cli)?;
             let msg = tx::validator::build_validator_deregister(&signer, fid, epoch)?;
             client.submit(&msg).await?;
             output(&serde_json::json!({"submitted": true, "type": "validator_deregister"}));
+        }
+        Command::CastAdd {
+            fid,
+            ref text,
+            ref network,
+        } => {
+            let signer = load_signer(&cli)?;
+            let net = match network.to_ascii_lowercase().as_str() {
+                "mainnet" => hypersnap_proto::FarcasterNetwork::Mainnet,
+                "testnet" => hypersnap_proto::FarcasterNetwork::Testnet,
+                "devnet" => hypersnap_proto::FarcasterNetwork::Devnet,
+                other => return Err(format!("unknown --network: {other}").into()),
+            };
+            let ts = tx::cast::farcaster_now();
+            let msg = tx::cast::build_cast_add(fid, text, ts, net, &signer)?;
+            client.submit_snapchain_message(&msg).await?;
+            output(&serde_json::json!({
+                "submitted": true,
+                "type": "cast_add",
+                "fid": fid,
+                "text": text,
+                "hash_hex": format!("0x{}", hex::encode(&msg.hash)),
+                "timestamp": ts,
+            }));
         }
     }
     Ok(())

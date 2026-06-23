@@ -984,6 +984,47 @@ mod tests {
         assert_eq!(events[0].validator_key, e.validator_key);
     }
 
+    /// Round-trip equivalence: a `ValidatorRegister` message produced
+    /// by the wallet's `build_validator_register_with_custody` (which
+    /// constructs its own EIP-712 typed-data JSON) must pass
+    /// `verify_custody_signature` here on the node side. This pins the
+    /// wallet's duplicated typed-data definition to the on-node one;
+    /// any drift in either source causes this test to fail.
+    #[test]
+    fn wallet_custody_signed_register_verifies_on_node() {
+        use alloy_signer_local::PrivateKeySigner;
+        let validator_sk = ed25519_dalek::SigningKey::from_bytes(&[0xab; 32]);
+        let custody = PrivateKeySigner::random();
+        let custody_addr: [u8; 20] = custody.address().into();
+        let custody_secret: [u8; 32] = custody.to_bytes().into();
+
+        let transport = [0x55u8; 32];
+        let validator_addr = [0x66u8; 20];
+        let fid = 17;
+        let epoch = 4;
+
+        let msg = hypersnap_wallet::tx::validator::build_validator_register_with_custody(
+            &validator_sk,
+            transport,
+            validator_addr,
+            fid,
+            epoch,
+            &custody_secret,
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("wallet build");
+        let body = match msg.body {
+            Some(proto::hyper_message::Body::ValidatorEvent(b)) => b,
+            _ => panic!("expected ValidatorEvent body"),
+        };
+
+        // On-node verifier accepts the signature against the matching
+        // custody address — this is the gate that admits the message
+        // at the strict router path (F070 wiring).
+        verify_custody_signature(&body, &custody_addr).expect("on-node verify");
+    }
+
     #[test]
     fn validator_address_lookup_returns_latest_register_value() {
         // A register event with validator_address populated lands

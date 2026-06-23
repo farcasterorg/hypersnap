@@ -28,6 +28,14 @@ path = "src/lib.rs"
 name = "hypersnap"
 path = "src/main.rs"
 
+[features]
+default = []
+# Replaces `EPOCH_LENGTH` (432,000 blocks) with 1,440 blocks (~6 minutes at
+# 250ms block time). Used by `scripts/run_epoch_transition_testnet.sh` to
+# exercise the single→multi validator DKG rotation flow in single-digit
+# minutes. Never enable in a release build.
+short-epochs = []
+
 [dependencies]
 hypersnap-proto = { path = "proto" }
 hypersnap-crypto = { path = "crates/hypersnap-crypto" }
