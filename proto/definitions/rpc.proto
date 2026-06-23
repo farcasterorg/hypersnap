@@ -22,6 +22,11 @@ service HubService {
   rpc GetInfo(GetInfoRequest) returns (GetInfoResponse);
   rpc GetFids(FidsRequest) returns (FidsResponse);
   rpc GetConnectedPeers(GetConnectedPeersRequest) returns (GetConnectedPeersResponse);
+  // Mesh health & topology: this node's local view of the gossip mesh. Admin-gated.
+  rpc GetMeshView(GetMeshViewRequest) returns (MeshView);
+  // Network-wide topology: centralized crawl of connected validators over the
+  // gossip port, aggregating each validator's local mesh view. Admin-gated.
+  rpc GetMeshTopology(GetMeshViewRequest) returns (MeshTopology);
 
   // Events
   rpc Subscribe(SubscribeRequest) returns (stream HubEvent);
