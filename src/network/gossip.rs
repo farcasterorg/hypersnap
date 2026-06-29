@@ -1056,7 +1056,25 @@ impl SnapchainGossip {
             .gossipsub
             .publish(publish_topic, message)
         {
-            warn!("Failed to publish gossip message: {} ({:?})", e, topic);
+            // `InsufficientPeers` is the expected steady-state error
+            // for any single-signer / bootstrap / partition-recovery
+            // moment when no other validator has subscribed to the
+            // topic yet — e.g., epoch-0 with one DKLS signer,
+            // peers still mid-handshake, or the genesis node booting
+            // before nodes 2..N. `Duplicate` similarly fires on
+            // benign gossip re-sends (mesh fan-in). Both are noisy
+            // false positives at `warn`; demote so real publish
+            // failures (MessageTooLarge, queue exhaustion, sign
+            // errors) still surface above the bootstrap chatter.
+            use libp2p::gossipsub::PublishError as Pe;
+            match e {
+                Pe::InsufficientPeers | Pe::Duplicate => {
+                    debug!("Gossip publish skipped: {} ({:?})", e, topic);
+                }
+                _ => {
+                    warn!("Failed to publish gossip message: {} ({:?})", e, topic);
+                }
+            }
         }
     }
 

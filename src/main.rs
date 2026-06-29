@@ -549,7 +549,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"))
-        .add_directive("tantivy=warn".parse().unwrap());
+        .add_directive("tantivy=warn".parse().unwrap())
+        // Malachite emits WARN for every sync poll when the local
+        // node has no peer subscribed to the consensus topic — the
+        // expected steady state during single-signer / bootstrap /
+        // pre-handshake moments. The malachite consensus paths
+        // (`vote set`, `request sync from`) emit dozens of these per
+        // second on epoch 0 with one validator, drowning real WARN
+        // signal. Demote to `info` so they stay greppable for
+        // debugging via `RUST_LOG=…sync=debug` but don't clutter
+        // the default-WARN production view.
+        .add_directive("informalsystems_malachitebft_sync=info".parse().unwrap());
     match app_config.log_format.as_str() {
         "text" => tracing_subscriber::fmt().with_env_filter(env_filter).init(),
         "json" => tracing_subscriber::fmt()
@@ -1235,6 +1245,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 gossip_tx.clone(),
                 hyper_actor_tx_setter.clone(),
                 node.hyper_block_engine.clone(),
+                node.block_stores.block_event_store.clone(),
             )
             .await
             {
@@ -1364,6 +1375,7 @@ async fn build_hyper_handler(
     hyper_block_engine: Option<
         Arc<tokio::sync::Mutex<hypersnap::storage::store::block_engine::BlockEngine>>,
     >,
+    snapchain_block_event_store: hypersnap::storage::store::account::BlockEventStore,
 ) -> Result<hypersnap::hyper::http_handler::HyperHttpHandler, Box<dyn std::error::Error>> {
     use hypersnap::hyper::actor::{HyperActor, HyperActorClient};
     use hypersnap::hyper::config::HyperRuntimeFileConfig;
@@ -1588,15 +1600,26 @@ async fn build_hyper_handler(
         |item| tracing::info!(?item, "hyper actor non-network outbound"),
     ));
 
-    // Block production scheduler + DKG supervisor are spawned only on
-    // signing validators (operator identity fully configured). Read
-    // nodes skip both — they import blocks others produce and never
-    // participate in DKG.
-    if let (Some(validator_pubkey_hex), Some(local_share)) = (
-        file_cfg.operator_validator_pubkey_hex.clone(),
-        file_cfg.local_dkls_share_path.clone(),
-    ) {
-        let _ = local_share;
+    // Block production scheduler + DKG supervisor are spawned on any
+    // node with operator identity configured — not just nodes that
+    // bootstrap with a local DKLS share. A live-registered validator
+    // has no share at boot (the first share is produced by the DKG
+    // ceremony at the registration's activation epoch boundary).
+    // Without the supervisor spawned, that node never participates in
+    // the DKG, never receives a share, and never installs the
+    // rotated `group_address`. Subsequent blocks signed under the
+    // rotated key are then silently rejected at import-time via
+    // `ImportError::SignatureVerificationFailed`, leaving the node
+    // permanently stuck at the last pre-rotation hyperblock.
+    //
+    // Both the supervisor (`build_driver` → `LocalNotActive`) and the
+    // scheduler (`start_dkls_block_production` → no-share short
+    // circuit) handle the "this node has no share for the current
+    // epoch" state gracefully. So spawning them universally on
+    // operator-identity-configured nodes is the right default —
+    // they're a no-op until the first DKG admits this node, then
+    // they Just Work.
+    if let Some(validator_pubkey_hex) = file_cfg.operator_validator_pubkey_hex.clone() {
         let validator_key = match hex::decode(
             validator_pubkey_hex
                 .strip_prefix("0x")
@@ -1648,11 +1671,21 @@ async fn build_hyper_handler(
             // acquisitions and could disagree by a full epoch.
             let shared_anchor: Arc<Mutex<LatestAnchor>> =
                 Arc::new(Mutex::new(LatestAnchor::default()));
-            spawn_anchor_poller(
-                client.clone(),
+            // Anchor source: snapchain's `BlockEventStore` is the
+            // ground truth for snapchain block heights. The prior
+            // `spawn_anchor_poller` read the hyper actor's own
+            // `last_block_height`, which is the block number from the
+            // *previous hyperblock's anchor metadata* — self-referential
+            // and never advances past genesis (0). Reading the
+            // BlockEventStore directly gives the snapchain anchor
+            // height that's actually advancing, so the epoch boundary
+            // crossing (`anchor_block / EPOCH_LENGTH` rolls over)
+            // fires `EpochManager::observe_anchor` correctly.
+            tokio::spawn(BlockProductionScheduler::refresh_latest_anchor_loop(
+                Arc::new(snapchain_block_event_store.clone()),
                 shared_anchor.clone(),
                 Duration::from_secs(1),
-            );
+            ));
 
             // Periodic refresh of the proposer context (active set
             // + local key) so the scheduler's leader-rotation gate
@@ -1695,7 +1728,8 @@ async fn build_hyper_handler(
         );
     }
 
-    Ok(HyperHttpHandler::new(client, inbound_for_http))
+    Ok(HyperHttpHandler::new(client, inbound_for_http)
+        .with_devnet_admin_endpoints(app_config.hyper.devnet_admin_endpoints_enabled))
 }
 
 /// `HyperActorClient` only exposes an `ask` API; the scheduler +
@@ -1708,44 +1742,14 @@ fn actor_handles_inbound_for_scheduler(
     client.inbound_sender().clone()
 }
 
-/// Periodically poll the actor for the latest imported block and
-/// fan its `snapchain_anchor_*` metadata into the single shared
-/// `LatestAnchor` the scheduler and supervisor both read from.
-/// F004: collapsed from a two-mutex split (scheduler/supervisor)
-/// into one shared source so the two views can no longer drift
-/// between non-atomic writes.
-fn spawn_anchor_poller(
-    client: hypersnap::hyper::actor::HyperActorClient,
-    anchor: std::sync::Arc<tokio::sync::Mutex<hypersnap::hyper::scheduler::LatestAnchor>>,
-    interval: std::time::Duration,
-) {
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        ticker.tick().await;
-        loop {
-            ticker.tick().await;
-            let height = match client.last_block_height().await {
-                Ok(Some(h)) => h,
-                _ => continue,
-            };
-            let block = match client.get_block_by_height(height).await {
-                Ok(Some(b)) => b,
-                _ => continue,
-            };
-            let meta = match block.envelope.as_ref().and_then(|e| e.metadata.as_ref()) {
-                Some(m) => m,
-                None => continue,
-            };
-            let snapshot = hypersnap::hyper::scheduler::LatestAnchor {
-                block: meta.snapchain_anchor_block,
-                hash: meta.snapchain_anchor_hash.clone(),
-                timestamp: meta.snapchain_anchor_timestamp,
-            };
-            *anchor.lock().await = snapshot;
-        }
-    });
-}
+// Removed `spawn_anchor_poller`: it sourced the "latest anchor" from
+// the hyper actor's own `last_block_height` → previous hyperblock's
+// `snapchain_anchor_block` field, which is self-referential. Once
+// genesis sets that to 0 every subsequent block re-reads 0 and the
+// loop never advances. Replaced by
+// `BlockProductionScheduler::refresh_latest_anchor_loop` pulling
+// directly from the snapchain `BlockEventStore` (the real source of
+// snapchain block heights), wired in `build_hyper_handler`.
 
 /// Mirror `last_block_height` + `last_block_hash` into the
 /// scheduler's `ChainHead` so the next-height calculation tracks

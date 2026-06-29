@@ -49,7 +49,7 @@ cd "$(dirname "$0")/.."
 
 KEEP=false
 NUM_NODES=3
-TIMEOUT_SECS=600
+TIMEOUT_SECS=900
 for arg in "$@"; do
   case "$arg" in
     --keep) KEEP=true ;;
@@ -62,10 +62,21 @@ for arg in "$@"; do
   esac
 done
 
+# Prefer Docker Compose v2 (`docker compose`); fall back to the legacy
+# standalone `docker-compose` binary if that's what's installed.
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE="docker compose"
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE="docker-compose"
+else
+  echo "error: neither 'docker compose' nor 'docker-compose' is available" >&2
+  exit 2
+fi
+
 cleanup() {
   if [ "$KEEP" = false ]; then
     echo "[cleanup] Stopping containers..."
-    docker-compose -f docker-compose.hyper.yml down -v 2>/dev/null || true
+    $COMPOSE -f docker-compose.hyper.yml down -v 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
@@ -98,7 +109,8 @@ rm -rf nodes
   --bootstrap-share-count 1 \
   --seed-validator-fids \
   --seed-balances 1000000000 \
-  --seed-snapchain-state
+  --seed-snapchain-state \
+  --gossip-host-template "172.101.0.1{i}"
 
 # Generate an attacker identity that is NOT in the validator set and
 # NOT in any IdRegister event. We use it to demonstrate the four
@@ -124,19 +136,19 @@ echo "    Genesis group address: 0x${GENESIS_GROUP_ADDR_HEX}"
 # 3. Start the 3-node cluster.
 # ──────────────────────────────────────────────────────────────────────
 echo "[3/6] Starting 3-node cluster..."
-docker-compose -f docker-compose.hyper.yml up -d --build
+$COMPOSE -f docker-compose.hyper.yml up -d --build
 
 HEALTH_PORTS=(3483 3484 3485)
 echo "    Waiting for all nodes to be healthy (up to 120s each)..."
 MAX_WAIT=120
 for port in "${HEALTH_PORTS[@]}"; do
   waited=0
-  until curl -sf "http://127.0.0.1:$port/healthcheck" > /dev/null 2>&1; do
+  until curl -sf "http://127.0.0.1:$port/v1/info" > /dev/null 2>&1; do
     sleep 2
     waited=$((waited + 2))
     if [ $waited -ge $MAX_WAIT ]; then
       echo "    ERROR: node on port $port not healthy after ${MAX_WAIT}s"
-      docker-compose -f docker-compose.hyper.yml logs --tail=80
+      $COMPOSE -f docker-compose.hyper.yml logs --tail=80
       exit 1
     fi
   done
@@ -156,7 +168,7 @@ waited=0
 LAST_HEIGHT=0
 while [ $waited -lt 60 ]; do
   H_JSON=$(curl -sf "${HEAD_URL_1}/hyper/v1/head" 2>/dev/null || echo "{}")
-  H=$(echo "$H_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('height',0))" 2>/dev/null || echo 0)
+  H=$(echo "$H_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); h=d.get('height') or 0; print(h)" 2>/dev/null || echo 0)
   if [ "$H" -gt 0 ]; then
     LAST_HEIGHT="$H"
     echo "    Node 1 reports hyperblock height = $LAST_HEIGHT (epoch 0 active)."
@@ -167,7 +179,7 @@ while [ $waited -lt 60 ]; do
 done
 if [ "$LAST_HEIGHT" -eq 0 ]; then
   echo "    ERROR: no hyperblocks produced within 60s — genesis signer may not be signing"
-  docker-compose -f docker-compose.hyper.yml logs --tail=120 node1
+  $COMPOSE -f docker-compose.hyper.yml logs --tail=120 node1
   exit 1
 fi
 
@@ -215,8 +227,11 @@ for i in $(seq 2 "$NUM_NODES"); do
     exit 1
   fi
 
-  # Register at the CURRENT epoch (0). The registration activates
-  # for the NEXT epoch's active set per `EPOCH_BUFFER`.
+  # Register at the CURRENT epoch (0). Per FIP §1 (EPOCH_BUFFER=1),
+  # a message with registration_epoch=N-1 activates at epoch N+1 —
+  # so a registration submitted at epoch 0 activates at epoch 2.
+  # Step [5] therefore waits for epoch >= 2 (not 1) before [6]
+  # checks the grown active set.
   echo "    Submitting ValidatorRegister for fid=$i via node 1's RPC..."
   if ! ./target/release/hypersnap_wallet \
       --node-url "$HEAD_URL_1" \
@@ -237,30 +252,106 @@ done
 sleep 5
 
 # ──────────────────────────────────────────────────────────────────────
+# 4b1. Deregister flow: submit a Deregister event and confirm the
+#      runtime accepted it via `submission_status`. Verifying the
+#      active-set actually shrinks would require waiting 2 additional
+#      epoch boundaries (Deregister also subject to EPOCH_BUFFER), so
+#      we stop at admission verification — the on-chain effect is
+#      already covered by `validator_registry::tests`.
+# ──────────────────────────────────────────────────────────────────────
+echo "[4b1] Deregister round-trip via /submission_status..."
+DEREG_OUT=$(./target/release/hypersnap_wallet \
+    --node-url "$HEAD_URL_1" \
+    --key-file "nodes/3/validator.key" \
+    validator-deregister \
+    --fid 3 \
+    --epoch 0 2>&1) || true
+echo "$DEREG_OUT" | sed 's/^/    /'
+DEREG_HASH=$(echo "$DEREG_OUT" | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print((d.get('message_hash_hex') or '').lstrip('0x'))
+except Exception:
+    print('')
+" 2>/dev/null || echo "")
+if [ -z "$DEREG_HASH" ]; then
+  echo "    WARN: couldn't extract message_hash_hex from wallet output; deregister round-trip skipped"
+else
+  # Give the actor a moment to process the queued LocalSubmitMessage.
+  sleep 2
+  STATUS_JSON=$(curl -sf "${HEAD_URL_1}/hyper/v1/submission_status/${DEREG_HASH}" || echo "{}")
+  STATUS=$(echo "$STATUS_JSON" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+print(d.get('status', 'unknown'))
+" 2>/dev/null || echo "unknown")
+  case "$STATUS" in
+    accepted)
+      echo "    ✓ deregister admitted (submission_status=accepted, hash=${DEREG_HASH:0:16}…)"
+      ;;
+    rejected)
+      REASON=$(echo "$STATUS_JSON" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+print(d.get('reason', ''))
+" 2>/dev/null || echo "")
+      echo "    ✗ deregister rejected: $REASON"
+      exit 1
+      ;;
+    *)
+      echo "    WARN: deregister verdict still '$STATUS' after 2s — actor may be slow under load."
+      ;;
+  esac
+fi
+
+# ──────────────────────────────────────────────────────────────────────
 # 4c. Misbehaving-attacker harness. Each attempt is expected to be
 #     REJECTED at admission and to NOT appear in the validator
 #     registry. We submit four attacks; the script checks both:
 #       - the wallet sub-shell exits non-zero, AND
 #       - no extra entries land in epoch-1's active set.
 # ──────────────────────────────────────────────────────────────────────
-echo "[4c] Running misbehavior harness — every attempt must be rejected..."
+echo "[4c] Running misbehavior harness — verdicts checked against the active set at [6]..."
+echo "    (HTTP submit returns 202 before validation runs, so the wallet exit"
+echo "     code is meaningless here — we record each attack's validator_key and"
+echo "     check after the epoch flip whether it actually made it into the registry.)"
 
-# Helper: invoke the wallet and assert it FAILS. Prints a one-line
-# verdict whichever way it goes; only sets a global flag if a misbehavior
-# was unexpectedly admitted.
-ANY_MISBEHAVIOR_ADMITTED=0
-expect_rejection() {
-  local label="$1"
+# Captured attack records — each line is `tag\tvalidator_key_hex` (no 0x prefix).
+# Filled in by `submit_attack` and consumed at [6].
+ATTACK_RECORDS_FILE=/tmp/hypersnap-attack-records
+: > "$ATTACK_RECORDS_FILE"
+
+# submit_attack <tag> <wallet args...>
+# Runs the wallet, captures its JSON output, and appends a
+# `<tag>\t<validator_key_hex>` record to $ATTACK_RECORDS_FILE. The
+# verdict (admitted vs rejected) is checked at [6] against the
+# epoch-${TARGET_EPOCH} active set — the only honest signal.
+submit_attack() {
+  local tag="$1"
   shift
-  if "$@" > /tmp/attacker-out 2>&1; then
-    echo "    ✗ ATTACK ADMITTED (this is bad): $label"
-    cat /tmp/attacker-out | sed 's/^/        /'
-    ANY_MISBEHAVIOR_ADMITTED=1
-  else
-    local reason
-    reason=$(grep -oE 'error.*$|status.*$|reject.*$' /tmp/attacker-out | head -1 | tr -d '\n' || true)
-    echo "    ✓ rejected: $label ${reason:+— $reason}"
+  if ! "$@" > /tmp/attacker-out 2>&1; then
+    # The wallet itself errored before HTTP submit; this is a true
+    # client-side rejection (e.g., key file missing).
+    echo "    ⓘ submitted '$tag' — wallet exited non-zero (no HTTP send)"
+    return
   fi
+  # Parse `validator_key_hex` out of the JSON the wallet just printed.
+  local vk
+  vk=$(python3 -c "
+import json, sys
+try:
+    d = json.loads(open('/tmp/attacker-out').read())
+    print((d.get('validator_key_hex') or '').lstrip('0x'))
+except Exception:
+    print('')
+")
+  if [ -z "$vk" ]; then
+    echo "    ⚠ submitted '$tag' but couldn't parse validator_key_hex from wallet output"
+    return
+  fi
+  printf '%s\t%s\n' "$tag" "$vk" >> "$ATTACK_RECORDS_FILE"
+  echo "    ⓘ submitted '$tag' (vk=${vk:0:16}…) — verdict deferred to [6]"
 }
 
 # Attack (a) — impersonation: claim fid=2 (which the resolver maps to
@@ -268,7 +359,7 @@ expect_rejection() {
 # signature produced with the ATTACKER's custody secret. The on-node
 # `verify_custody_signature` recovers an address that does NOT match
 # the resolver's; admission MUST fail.
-expect_rejection "impersonate fid=2 with attacker custody key" \
+submit_attack "custody-impersonation fid=2 with attacker custody" \
   ./target/release/hypersnap_wallet \
     --node-url "$HEAD_URL_1" \
     --key-file "nodes/attacker/validator.key" \
@@ -283,7 +374,7 @@ expect_rejection "impersonate fid=2 with attacker custody key" \
 # reached. The lenient + strict paths both reject with
 # `EpochMismatch`. We register for fid=3 (which the attacker also has
 # no custody key for, but the epoch check fires first).
-expect_rejection "register at far-future epoch=99" \
+submit_attack "future-epoch=99 under fid=3" \
   ./target/release/hypersnap_wallet \
     --node-url "$HEAD_URL_1" \
     --key-file "nodes/attacker/validator.key" \
@@ -298,7 +389,7 @@ expect_rejection "register at far-future epoch=99" \
 # pick fid=99 (the testnet only seeded fids 1..NUM_NODES). The custody
 # resolver returns None and the strict path rejects with
 # `CustodyAddressUnknown`.
-expect_rejection "register fid=99 with no IdRegister on-chain" \
+submit_attack "non-existent fid=99 (no IdRegister)" \
   ./target/release/hypersnap_wallet \
     --node-url "$HEAD_URL_1" \
     --key-file "nodes/attacker/validator.key" \
@@ -310,22 +401,17 @@ expect_rejection "register fid=99 with no IdRegister on-chain" \
     --custody-key-file "nodes/attacker/custody.key"
 
 # Attack (d) — per-FID quota spam. `MAX_VALIDATORS_PER_FID = 3`. Try
-# to attach a 4th validator_key under FID 1 using node-1's real custody
-# key (we have it from `setup_local_testnet --seed-validator-fids`).
-# The first 3 registrations from FID 1 are already accounted for by:
-#   - the genesis bootstrap of node 1 (counted at validator-registry init)
-#   - it's possible step [4b] live-registered nodes 2/3 under their
-#     own FIDs, so fid=1 may still have headroom; we submit 4 fresh
-#     attacker-controlled keys and expect at least the 4th to be
-#     rejected with `PerFidQuotaExhausted`.
-echo "    Spamming 4 fresh validator_keys under fid=1 (quota=3); expect 4th to fail..."
-SPAM_OK=0
-SPAM_REJECTED=0
+# to attach 4 fresh validator_keys under FID 1 using node-1's real
+# custody key. The 4th should be rejected by the quota gate; the
+# first 3 may or may not be admitted depending on whether the
+# bootstrap validator counts (a known gap).
+echo "    Submitting 4 fresh validator_keys under fid=1 (quota=$((3)) per FID)..."
 for spam_i in 1 2 3 4; do
   # Fresh ed25519 key each iteration so per-validator_key dedup
   # doesn't short-circuit before the per-FID quota.
   dd if=/dev/urandom of=nodes/attacker/spam-${spam_i}.key bs=32 count=1 status=none
-  if ./target/release/hypersnap_wallet \
+  submit_attack "quota-spam #${spam_i} under fid=1" \
+    ./target/release/hypersnap_wallet \
        --node-url "$HEAD_URL_1" \
        --key-file "nodes/attacker/spam-${spam_i}.key" \
        validator-register-with-custody \
@@ -333,24 +419,8 @@ for spam_i in 1 2 3 4; do
        --validator-address-hex "$GENESIS_GROUP_ADDR_HEX" \
        --fid 1 \
        --epoch 0 \
-       --custody-key-file "nodes/1/custody.key" > /tmp/spam-out 2>&1; then
-    SPAM_OK=$((SPAM_OK + 1))
-  else
-    SPAM_REJECTED=$((SPAM_REJECTED + 1))
-  fi
+       --custody-key-file "nodes/1/custody.key"
 done
-if [ "$SPAM_REJECTED" -ge 1 ]; then
-  echo "    ✓ quota gate fired: $SPAM_OK admitted, $SPAM_REJECTED rejected (4 attempts)"
-else
-  echo "    ✗ quota gate did not fire: all 4 admitted"
-  ANY_MISBEHAVIOR_ADMITTED=1
-fi
-
-if [ "$ANY_MISBEHAVIOR_ADMITTED" -eq 1 ]; then
-  echo "    WARN: at least one misbehavior was accepted; the active-set check at"
-  echo "          step [6] will surface the divergence if any of these actually"
-  echo "          made it to the registry."
-fi
 
 # ──────────────────────────────────────────────────────────────────────
 # 4d. Regular user-message submission. Seed FIDs 1..NUM_NODES were
@@ -410,7 +480,7 @@ if [ "$ACTUAL_DELTA" -ge "$TRANSFER_AMOUNT" ]; then
 else
   echo "    ✗ no transfers were included (balance unchanged)."
   echo "      Check node 1's logs:"
-  docker-compose -f docker-compose.hyper.yml logs --tail=40 node1
+  $COMPOSE -f docker-compose.hyper.yml logs --tail=40 node1
 fi
 
 # ──────────────────────────────────────────────────────────────────────
@@ -508,101 +578,322 @@ SNAPCHAIN_BEFORE=$(snapshot_snapchain_heights)
 echo "$SNAPCHAIN_BEFORE" | sed 's/^/      /'
 
 # ──────────────────────────────────────────────────────────────────────
-# 5. Poll for the epoch-0 → epoch-1 transition.
+# 4f. Restart-safety: kill node 2 and bring it back up before the long
+#     epoch wait. Node 2 must rejoin gossip, catch up on missed
+#     hyper/snapchain blocks, and re-participate in the upcoming DKG
+#     ceremony so it ends up in the epoch-2 active set just like a
+#     never-restarted peer. The [5] poll and [6] convergence
+#     assertion both observe whether the restart was non-fatal.
 # ──────────────────────────────────────────────────────────────────────
-echo "[5/6] Polling for epoch 0 → 1 transition (timeout ${TIMEOUT_SECS}s)..."
+echo "[4f] Restart-safety: bouncing hyper-node2..."
+PRE_HEIGHT=$(curl -sf "${HEAD_URL_2}/hyper/v1/head" 2>/dev/null | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+print(d.get('height') or 0)
+" 2>/dev/null || echo 0)
+echo "    node2 hyperblock head pre-restart: $PRE_HEIGHT"
+$COMPOSE -f docker-compose.hyper.yml restart node2 > /dev/null
+# Healthcheck: wait until node2 responds on /v1/info again. Cap at 60s
+# — a longer outage would indicate a real boot failure, not just
+# slow startup.
+echo "    Waiting for node2 to come back online..."
+waited=0
+until curl -sf "http://127.0.0.1:3484/v1/info" > /dev/null 2>&1; do
+  sleep 2
+  waited=$((waited + 2))
+  if [ $waited -ge 60 ]; then
+    echo "    ERROR: node2 didn't come back within 60s after restart"
+    $COMPOSE -f docker-compose.hyper.yml logs --tail=80 node2
+    exit 1
+  fi
+done
+echo "    node2 healthy again after ${waited}s"
+
+# ──────────────────────────────────────────────────────────────────────
+# 5. Poll for epoch >= 2. Registrations submitted in [4b] have
+#    registration_epoch=0, which per EPOCH_BUFFER=1 activates them at
+#    epoch 2 (not epoch 1). We need to wait for two epoch boundaries
+#    before the active-set check at [6] can succeed.
+# ──────────────────────────────────────────────────────────────────────
+TARGET_EPOCH=2
+echo "[5/6] Polling for epoch 0 → ${TARGET_EPOCH} transition (timeout ${TIMEOUT_SECS}s)..."
 SLEEP_SECS=10
 elapsed=0
 NEW_EPOCH=0
 while [ $elapsed -lt "$TIMEOUT_SECS" ]; do
   EPOCH_JSON=$(curl -sf "${HEAD_URL_1}/hyper/v1/epoch" 2>/dev/null || echo "{}")
   E=$(echo "$EPOCH_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('epoch',0))" 2>/dev/null || echo 0)
-  if [ "$E" -ge 1 ]; then
+  if [ "$E" -ge "$TARGET_EPOCH" ]; then
     NEW_EPOCH="$E"
     echo "    Node 1 reports epoch = $E (transition complete)."
     break
   fi
   HEIGHT_JSON=$(curl -sf "${HEAD_URL_1}/hyper/v1/head" 2>/dev/null || echo "{}")
-  HEIGHT=$(echo "$HEIGHT_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('height',0))" 2>/dev/null || echo 0)
-  echo "    [t+${elapsed}s] still in epoch 0 (height=$HEIGHT) — waiting..."
+  HEIGHT=$(echo "$HEIGHT_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); h=d.get('height') or 0; print(h)" 2>/dev/null || echo 0)
+  echo "    [t+${elapsed}s] still in epoch $E (height=$HEIGHT) — waiting for $TARGET_EPOCH..."
   sleep $SLEEP_SECS
   elapsed=$((elapsed + SLEEP_SECS))
 done
-if [ "$NEW_EPOCH" -lt 1 ]; then
-  echo "    ERROR: epoch did not advance to 1 within ${TIMEOUT_SECS}s"
+if [ "$NEW_EPOCH" -lt "$TARGET_EPOCH" ]; then
+  echo "    ERROR: epoch did not advance to $TARGET_EPOCH within ${TIMEOUT_SECS}s"
   echo "    --- node1 tail ---"
-  docker-compose -f docker-compose.hyper.yml logs --tail=80 node1
+  $COMPOSE -f docker-compose.hyper.yml logs --tail=80 node1
   echo "    --- node2 tail ---"
-  docker-compose -f docker-compose.hyper.yml logs --tail=80 node2
+  $COMPOSE -f docker-compose.hyper.yml logs --tail=80 node2
   echo "    --- node3 tail ---"
-  docker-compose -f docker-compose.hyper.yml logs --tail=80 node3
+  $COMPOSE -f docker-compose.hyper.yml logs --tail=80 node3
   exit 1
 fi
 
 # ──────────────────────────────────────────────────────────────────────
-# 6. Verify the active set at epoch 1 still has 3 validators AND the
-#    epoch-1 group address has been rotated away from the genesis one.
+# 6. Verify the active set at epoch 2 has 3 validators AND the
+#    group address has been rotated away from the genesis one.
+#    Epoch 2 is when registrations from epoch 0 actually activate
+#    (EPOCH_BUFFER=1 → N-1=0 ⇒ activate at N+1=2).
 # ──────────────────────────────────────────────────────────────────────
-echo "[6/6] Verifying epoch-1 active set grew via live registration + DKG handover..."
+echo "[6/6] Verifying epoch-${TARGET_EPOCH} active set grew via live registration + DKG handover..."
 
 # Confirm epoch 0 active set was just 1 (sanity check on the bootstrap).
 EPOCH0_JSON=$(curl -sf "${HEAD_URL_1}/hyper/v1/epoch/0/active" || true)
 EPOCH0_COUNT=$(echo "$EPOCH0_JSON" | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
-print(len(d) if isinstance(d, (dict, list)) else 0)
+if isinstance(d, dict):
+    if 'validators' in d and isinstance(d['validators'], list):
+        print(len(d['validators']))
+    else:
+        print(len(d))
+elif isinstance(d, list):
+    print(len(d))
+else:
+    print(0)
 " 2>/dev/null || echo 0)
 echo "    Epoch-0 active set: $EPOCH0_COUNT validator(s) (expected 1 — bootstrap)"
 
-ACTIVE_JSON=$(curl -sf "${HEAD_URL_1}/hyper/v1/epoch/1/active" || true)
+ACTIVE_JSON=$(curl -sf "${HEAD_URL_1}/hyper/v1/epoch/${TARGET_EPOCH}/active" || true)
 if [ -z "$ACTIVE_JSON" ] || [ "$ACTIVE_JSON" = "null" ]; then
-  echo "    ERROR: /hyper/v1/epoch/1/active returned empty"
+  echo "    ERROR: /hyper/v1/epoch/${TARGET_EPOCH}/active returned empty"
   exit 1
 fi
 ACTIVE_COUNT=$(echo "$ACTIVE_JSON" | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
-# The response is either {vk_hex: {...}} or a list — handle both.
+# Response shapes: {'validators': [...]} (current production), or a
+# raw list, or a {vk_hex: {...}} map. Extract the validator count
+# from each case.
 if isinstance(d, dict):
-    print(len(d))
+    if 'validators' in d and isinstance(d['validators'], list):
+        print(len(d['validators']))
+    else:
+        print(len(d))
 elif isinstance(d, list):
     print(len(d))
 else:
     print(0)
 " 2>/dev/null || echo 0)
 if [ "$ACTIVE_COUNT" -lt "$NUM_NODES" ]; then
-  echo "    ERROR: epoch-1 active set has $ACTIVE_COUNT validator(s); expected $NUM_NODES"
+  echo "    ERROR: epoch-${TARGET_EPOCH} active set has $ACTIVE_COUNT validator(s); expected at least $NUM_NODES"
   echo "    The live ValidatorRegister submissions may not have been admitted —"
   echo "    inspect the wallet output above and node 1's logs."
   echo "    --- raw response ---"
   echo "$ACTIVE_JSON"
   echo "    --- node1 tail ---"
-  docker-compose -f docker-compose.hyper.yml logs --tail=80 node1
+  $COMPOSE -f docker-compose.hyper.yml logs --tail=80 node1
   exit 1
 fi
-echo "    Epoch-1 active set has $ACTIVE_COUNT validators (expected $NUM_NODES) ✓"
-echo "    Live registration grew the active set from $EPOCH0_COUNT (epoch 0) → $ACTIVE_COUNT (epoch 1)"
+echo "    Epoch-${TARGET_EPOCH} active set has $ACTIVE_COUNT validator(s) (≥ $NUM_NODES) ✓"
+
+# Per-attack verdicts from [4c]. For each recorded
+# (tag, validator_key) submitted during the misbehavior battery, check
+# whether that validator_key appears in the epoch-${TARGET_EPOCH}
+# active set. This is the only honest signal: the HTTP submit returns
+# 202 before validation, so the wallet's exit code can't tell us
+# whether the gates actually fired.
+echo "    Per-attack verdicts (validator_key in epoch-${TARGET_EPOCH} active set):"
+ACTIVE_VKS=$(echo "$ACTIVE_JSON" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+vs = d.get('validators', d) if isinstance(d, dict) else d
+if not isinstance(vs, list):
+    sys.exit(0)
+for entry in vs:
+    if isinstance(entry, dict):
+        vk = entry.get('validator_key') or entry.get('validator_key_hex') or ''
+        vk = vk.replace('0x', '')
+        if vk:
+            print(vk.lower())
+")
+
+attack_admitted_unexpected=0
+attack_admitted_expected_quota_only=0
+total_attacks=0
+spam_admitted=0
+spam_rejected=0
+if [ -s "$ATTACK_RECORDS_FILE" ]; then
+  while IFS=$'\t' read -r tag vk; do
+    total_attacks=$((total_attacks + 1))
+    if echo "$ACTIVE_VKS" | grep -qi "^${vk}$"; then
+      verdict="ADMITTED"
+      if [[ "$tag" == quota-spam* ]]; then
+        spam_admitted=$((spam_admitted + 1))
+        echo "      ⚠ $tag: $verdict (expected — known bootstrap/quota gap)"
+      else
+        attack_admitted_unexpected=$((attack_admitted_unexpected + 1))
+        echo "      ✗ $tag: $verdict (UNEXPECTED — gate failed to fire)"
+      fi
+    else
+      if [[ "$tag" == quota-spam* ]]; then
+        spam_rejected=$((spam_rejected + 1))
+        echo "      ✓ $tag: REJECTED (quota gate fired)"
+      else
+        echo "      ✓ $tag: REJECTED (gate fired)"
+      fi
+    fi
+  done < "$ATTACK_RECORDS_FILE"
+fi
+echo "    Summary: $total_attacks attack(s) submitted; $attack_admitted_unexpected unexpectedly admitted"
+echo "             spam: $spam_admitted admitted, $spam_rejected rejected"
+
+# Hard fail only if a non-quota attack made it through. The bootstrap-
+# quota gap is a known defect tracked separately.
+if [ "$attack_admitted_unexpected" -gt 0 ]; then
+  echo "    ERROR: $attack_admitted_unexpected misbehavior attack(s) bypassed the production gates."
+  echo "    Custody-sig / epoch-range / FID-existence gates are broken; re-audit F070."
+  exit 1
+fi
+
+# Quota cap: bootstrap not counted → up to MAX_VALIDATORS_PER_FID extras
+# admissible under fid=1 (4 spam attempts → 3 through, 4th rejected).
+# Active set should therefore be ≤ NUM_NODES + 3 in the worst case.
+MAX_EXPECTED=$((NUM_NODES + 3))
+if [ "$ACTIVE_COUNT" -gt "$MAX_EXPECTED" ]; then
+  echo "    ERROR: epoch-${TARGET_EPOCH} active set has $ACTIVE_COUNT validators; expected at most $MAX_EXPECTED"
+  echo "    A misbehavior gate beyond the known quota/bootstrap gap leaked."
+  exit 1
+fi
+if [ "$spam_admitted" -gt 0 ]; then
+  echo "    NOTE: $spam_admitted spam key(s) admitted via the bootstrap/quota gap"
+  echo "    (MAX_VALIDATORS_PER_FID does not currently count bootstrap entries)."
+  echo "    Real protocol bug — track separately."
+fi
+echo "    Live registration grew the active set from $EPOCH0_COUNT (epoch 0) → $ACTIVE_COUNT (epoch ${TARGET_EPOCH})"
+
+# Slashing sanity: in a normal honest run nothing should be slashed
+# BEFORE we inject equivocation evidence. Catches false-positive
+# slashings — e.g., a regression in the B5 fix that re-introduces
+# signer-index mis-attribution, or any overly-aggressive admission
+# that mis-fires `record_evidence`.
+for ep in 0 1 "$TARGET_EPOCH"; do
+  SLASHED_JSON=$(curl -sf "${HEAD_URL_1}/hyper/v1/epoch/${ep}/slashed" 2>/dev/null || echo "{}")
+  SLASHED_COUNT=$(echo "$SLASHED_JSON" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+if isinstance(d, dict):
+    arr = d.get('slashed', d.get('validator_keys') or [])
+    print(len(arr) if isinstance(arr, list) else 0)
+elif isinstance(d, list):
+    print(len(d))
+else:
+    print(0)
+" 2>/dev/null || echo 0)
+  if [ "$SLASHED_COUNT" -gt 0 ]; then
+    echo "    ERROR: epoch-$ep slashed set is non-empty ($SLASHED_COUNT entries) in honest run."
+    echo "    Either a slashing detection false-positive fired, or evidence was"
+    echo "    spuriously recorded. Inspect:"
+    echo "      $SLASHED_JSON"
+    exit 1
+  fi
+done
+echo "    Slashing sanity (pre-injection): epoch 0..${TARGET_EPOCH} all empty ✓"
+
+# Positive-case slashing E2E: inject equivocation evidence for node
+# 1 (the bootstrap signer, party_index=1 at epoch 0) and verify the
+# `record → slashed_validators_for_epoch → slashed set` chain
+# surfaces node 1's validator_key in `/epoch/0/slashed`. The wallet's
+# `inject-evidence` subcommand POSTs a `HyperWireEvidence` proto to
+# the devnet-only admin endpoint (gated on
+# `[hyper] devnet_admin_endpoints_enabled = true` — set by
+# setup_local_testnet). Signature verification is bypassed; this
+# exercises the slashing-application logic (which is what B5 fixed),
+# not the cryptographic equivocation detector (which is unit-tested
+# in `src/hyper/slashing.rs::tests`).
+echo "[6.1] Positive-case slashing E2E: inject equivocation for fid=1, party_index=1, epoch=0..."
+INJECT_OUT=$(./target/release/hypersnap_wallet \
+    --node-url "$HEAD_URL_1" \
+    --key-file "nodes/1/validator.key" \
+    inject-evidence \
+    --canonical-block-id 7777 \
+    --epoch 0 \
+    --signer-indices 1 2>&1) || true
+echo "$INJECT_OUT" | sed 's/^/    /'
+if ! echo "$INJECT_OUT" | grep -q '"submitted": true'; then
+  echo "    ERROR: inject-evidence wallet command did not report submitted=true."
+  echo "    Either the admin endpoint is disabled (check"
+  echo "    [hyper].devnet_admin_endpoints_enabled in nodes/1/hypersnap.toml)"
+  echo "    or the route handler returned an error."
+  exit 1
+fi
+
+# Give the actor a moment to process the inject_evidence query and
+# update the slashing store before we read back the slashed set.
+sleep 2
+
+SLASHED_JSON=$(curl -sf "${HEAD_URL_1}/hyper/v1/epoch/0/slashed" 2>/dev/null || echo "{}")
+NODE1_VK=$(grep -oE '^validator_key_hex = "[0-9a-f]+"' nodes/genesis.toml | head -1 | grep -oE '"[0-9a-f]+"' | tr -d '"')
+if [ -z "$NODE1_VK" ]; then
+  echo "    ERROR: couldn't read node 1's validator_key from nodes/genesis.toml"
+  exit 1
+fi
+SLASHED_HAS_NODE1=$(echo "$SLASHED_JSON" | python3 -c "
+import json, sys
+target = sys.argv[1].lower()
+d = json.load(sys.stdin)
+arr = d.get('validators', d.get('slashed', d if isinstance(d, list) else [])) or []
+hit = any((isinstance(v, str) and v.lower().lstrip('0x') == target) for v in arr)
+print('yes' if hit else 'no')
+" "$NODE1_VK" 2>/dev/null || echo "no")
+if [ "$SLASHED_HAS_NODE1" != "yes" ]; then
+  echo "    ERROR: epoch-0 slashed set does NOT contain node 1's validator_key."
+  echo "    The record_evidence → slashed_validators_for_epoch chain is broken."
+  echo "    Expected validator_key=${NODE1_VK:0:16}…"
+  echo "    Raw slashed response: $SLASHED_JSON"
+  exit 1
+fi
+echo "    ✓ post-injection: node 1's validator_key (${NODE1_VK:0:16}…) appears in /epoch/0/slashed"
+echo "    Positive-case slashing chain (record → slash → expose) verified end-to-end."
 
 # Pull the most recent hyperblock from each node and assert the
 # `signature.group_address` is NOT the genesis one. Once epoch-1 shares
 # are installed, every signed block carries the new derived address.
+# Reads the address directly from `/hyper/v1/head.signature.group_address`
+# (B3 fix: that field is now serialized).
 echo "    Querying current head group_address from each node..."
 ROTATED_OK=0
 for url in "$HEAD_URL_1" "$HEAD_URL_2" "$HEAD_URL_3"; do
   HEAD_JSON=$(curl -sf "${url}/hyper/v1/head" || echo "{}")
-  HEIGHT=$(echo "$HEAD_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('height',0))" 2>/dev/null || echo 0)
+  HEIGHT=$(echo "$HEAD_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); h=d.get('height') or 0; print(h)" 2>/dev/null || echo 0)
   if [ "$HEIGHT" -le 0 ]; then
     echo "      $url: no head yet, skipping"
     continue
   fi
-  BLOCK_JSON=$(curl -sf "${url}/hyper/v1/block/${HEIGHT}" || echo "{}")
-  GROUP_ADDR=$(echo "$BLOCK_JSON" | python3 -c "
+  GROUP_ADDR=$(echo "$HEAD_JSON" | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 sig = d.get('signature', {}) or {}
 addr = sig.get('group_address', '') or ''
-print(addr.lower().lstrip('0x'))
+print(addr.lower().lstrip('0x').replace('0x', ''))
 " 2>/dev/null || echo "")
+  # Fallback: if head doesn't expose the signature yet (older nodes),
+  # query the block endpoint and read its flat group_address field.
+  if [ -z "$GROUP_ADDR" ]; then
+    BLOCK_JSON=$(curl -sf "${url}/hyper/v1/block/${HEIGHT}" || echo "{}")
+    GROUP_ADDR=$(echo "$BLOCK_JSON" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+addr = d.get('group_address', '') or ''
+print(addr.lower().lstrip('0x').replace('0x', ''))
+" 2>/dev/null || echo "")
+  fi
   if [ -z "$GROUP_ADDR" ]; then
     echo "      $url: head=$HEIGHT but block has no group_address (still pre-epoch-1?)"
     continue
@@ -624,6 +915,43 @@ if [ "$ROTATED_OK" -lt 1 ]; then
   echo "    Epoch transition itself succeeded (epoch=$NEW_EPOCH, active=$ACTIVE_COUNT)."
   exit 1
 fi
+
+# Follower convergence: every node must be importing the post-rotation
+# blocks. Pre-fix (main.rs gated DKG supervisor on local share path),
+# non-bootstrap signers stalled at the last pre-rotation hyperblock
+# because they never installed the new group_address — every
+# subsequent block silently failed `ImportError::SignatureVerificationFailed`
+# at INFO level. This assertion catches a regression there fast.
+HEIGHTS=()
+for url in "$HEAD_URL_1" "$HEAD_URL_2" "$HEAD_URL_3"; do
+  HEAD_JSON=$(curl -sf "${url}/hyper/v1/head" || echo "{}")
+  H=$(echo "$HEAD_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); h=d.get('height') or 0; print(h)" 2>/dev/null || echo 0)
+  HEIGHTS+=("$H")
+done
+MAX_H=0
+MIN_H=999999999
+for h in "${HEIGHTS[@]}"; do
+  if [ "$h" -gt "$MAX_H" ]; then MAX_H="$h"; fi
+  if [ "$h" -lt "$MIN_H" ]; then MIN_H="$h"; fi
+done
+SPREAD=$((MAX_H - MIN_H))
+# Tolerance: allow up to 20 blocks of lag (~3s × 20 = 1 minute at the
+# 3s hyperblock cadence). Larger spread implies a real stall, not
+# normal gossip propagation lag.
+CONVERGE_TOLERANCE=20
+echo "    Follower convergence: heights=[${HEIGHTS[*]}] spread=$SPREAD (tolerance=$CONVERGE_TOLERANCE)"
+if [ "$SPREAD" -gt "$CONVERGE_TOLERANCE" ]; then
+  echo "    ERROR: hyperblock heads diverge by $SPREAD > $CONVERGE_TOLERANCE blocks."
+  echo "    A follower has stalled — most likely because the DKG supervisor"
+  echo "    isn't spawning on a node that lacks a bootstrap share, so it"
+  echo "    can't install the rotated group_address and silently rejects"
+  echo "    post-rotation blocks. See main.rs:1607 (operator-identity gate)."
+  for i in 0 1 2; do
+    echo "      node$((i+1)): hyperblock height ${HEIGHTS[$i]}"
+  done
+  exit 1
+fi
+echo "    All nodes within $CONVERGE_TOLERANCE blocks of head ✓"
 
 # Second snapchain snapshot + delta check. Both consensus layers
 # should have made progress across the same wall-clock window — proving
@@ -668,7 +996,7 @@ echo "============================================================"
 if [ "$KEEP" = true ]; then
   echo ""
   echo "Containers still running. Stop with:"
-  echo "  docker-compose -f docker-compose.hyper.yml down -v"
+  echo "  $COMPOSE -f docker-compose.hyper.yml down -v"
 else
   echo "Containers stopped."
 fi

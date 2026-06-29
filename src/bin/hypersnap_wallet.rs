@@ -148,6 +148,31 @@ enum Command {
         #[arg(long)]
         epoch: u64,
     },
+    /// Devnet-only: build two `HyperBlock`s that share the same
+    /// `canonical_block_id` but have different `hyper_state_root`,
+    /// wrap them into a `HyperWireEvidence`, and POST to
+    /// `POST /hyper/v1/admin/inject_evidence`. The receiving node
+    /// stores the evidence via `record_evidence` (bypassing the
+    /// gossip-path's `verify_evidence_signatures` step) so the runner
+    /// can exercise the positive-case slashing chain end-to-end.
+    /// REQUIRES the receiving node to have
+    /// `[hyper] devnet_admin_endpoints_enabled = true`; in production
+    /// the route returns 404.
+    InjectEvidence {
+        /// `canonical_block_id` for both forged blocks (the equivocation
+        /// claim — same height, different state root).
+        #[arg(long)]
+        canonical_block_id: u64,
+        /// Epoch tag on both blocks' signatures. Determines which
+        /// epoch's active set the evidence falls under.
+        #[arg(long)]
+        epoch: u64,
+        /// 1-based party indices to record as signers. For a single-
+        /// signer devnet (1-of-1 DKLS at epoch 0) pass `1`. For multi-
+        /// party, pass each signer index comma-separated.
+        #[arg(long, default_value = "1")]
+        signer_indices: String,
+    },
     /// Submit a snapchain `CastAdd` user message via `POST
     /// /v1/submitMessage`. The signing key (loaded from `--key-file`)
     /// MUST match a `SignerAdd` event for `--fid` in the snapchain
@@ -419,6 +444,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Vec::new(),
                 Vec::new(),
             )?;
+            let validator_pubkey = signer.verifying_key().to_bytes();
+            let message_hash = blake3::hash(&prost::Message::encode_to_vec(&msg))
+                .as_bytes()
+                .to_vec();
             client.submit(&msg).await?;
             output(&serde_json::json!({
                 "submitted": true,
@@ -427,13 +456,78 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "fid": fid,
                 "epoch": epoch,
                 "transport_pubkey_hex": format!("0x{}", hex::encode(transport)),
+                "validator_key_hex": format!("0x{}", hex::encode(validator_pubkey)),
+                "message_hash_hex": format!("0x{}", hex::encode(message_hash)),
             }));
         }
         Command::ValidatorDeregister { fid, epoch } => {
             let signer = load_signer(&cli)?;
             let msg = tx::validator::build_validator_deregister(&signer, fid, epoch)?;
+            let validator_pubkey = signer.verifying_key().to_bytes();
+            let message_hash = blake3::hash(&prost::Message::encode_to_vec(&msg))
+                .as_bytes()
+                .to_vec();
             client.submit(&msg).await?;
-            output(&serde_json::json!({"submitted": true, "type": "validator_deregister"}));
+            output(&serde_json::json!({
+                "submitted": true,
+                "type": "validator_deregister",
+                "fid": fid,
+                "epoch": epoch,
+                "validator_key_hex": format!("0x{}", hex::encode(validator_pubkey)),
+                "message_hash_hex": format!("0x{}", hex::encode(message_hash)),
+            }));
+        }
+        Command::InjectEvidence {
+            canonical_block_id,
+            epoch,
+            ref signer_indices,
+        } => {
+            let indices: Vec<u64> = signer_indices
+                .split(',')
+                .map(|s| s.trim().parse::<u64>())
+                .collect::<Result<_, _>>()
+                .map_err(|e| format!("bad --signer-indices: {e}"))?;
+            let make_block = |state_root_seed: u8| -> hypersnap_proto::HyperBlock {
+                hypersnap_proto::HyperBlock {
+                    envelope: Some(hypersnap_proto::HyperEnvelope {
+                        metadata: Some(hypersnap_proto::HyperBlockMetadata {
+                            canonical_block_id,
+                            parent_hash: vec![0u8; 32],
+                            hyper_state_root: vec![state_root_seed; 48],
+                            extra_rules_version: 0,
+                            retained_message_count: 0,
+                            missed_proposals: vec![],
+                            snapchain_anchor_block: 0,
+                            snapchain_anchor_hash: vec![],
+                            snapchain_range_start_block: 0,
+                            snapchain_range_root: vec![],
+                            snapchain_anchor_timestamp: 0,
+                        }),
+                        payload: vec![],
+                    }),
+                    signature: Some(hypersnap_proto::HyperBlockSignature {
+                        epoch,
+                        signer_indices: indices.clone(),
+                        // The admin endpoint bypasses signature
+                        // verification; group_address/ecdsa_signature
+                        // can stay empty for the test.
+                        group_address: vec![],
+                        ecdsa_signature: vec![],
+                    }),
+                }
+            };
+            let wire = hypersnap_proto::HyperWireEvidence {
+                block_a: Some(make_block(0xaa)),
+                block_b: Some(make_block(0xbb)),
+            };
+            client.admin_inject_evidence(&wire).await?;
+            output(&serde_json::json!({
+                "submitted": true,
+                "type": "admin_inject_evidence",
+                "canonical_block_id": canonical_block_id,
+                "epoch": epoch,
+                "signer_indices": indices,
+            }));
         }
         Command::CastAdd {
             fid,

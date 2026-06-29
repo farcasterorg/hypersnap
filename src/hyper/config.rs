@@ -246,6 +246,14 @@ pub struct BootstrapValidatorConfig {
     pub transport_pubkey_hex: String,
     /// 20-byte secp256k1 individual validator address (hex).
     pub validator_address_hex: String,
+    /// FID the bootstrap validator is registered under (must match the
+    /// IdRegister event for this validator on snapchain). Seeded into
+    /// the per-fid quota index at genesis so `MAX_VALIDATORS_PER_FID`
+    /// counts bootstrap entries. Defaults to `0` for legacy TOMLs;
+    /// `0` is treated as "skip quota seeding" so older configs keep
+    /// working but won't benefit from the gate.
+    #[serde(default)]
+    pub fid: u64,
 }
 
 fn default_mempool_capacity() -> usize {
@@ -598,6 +606,7 @@ impl GenesisFileConfig {
                 validator_key: hex::decode(&v.validator_key_hex)?,
                 transport_pubkey: hex::decode(&v.transport_pubkey_hex)?,
                 validator_address: alloy_primitives::Address::from_slice(&va_bytes),
+                fid: v.fid,
             });
         }
 

@@ -80,6 +80,14 @@ pub enum RoutingError {
     DaChallengeResponse(String),
     #[error("DA epoch seed rejected: {0}")]
     DaEpochSeed(String),
+    #[error("hyper-native onboard rejected: {0}")]
+    NativeOnboard(String),
+    #[error("hyper-native custody rotation rejected: {0}")]
+    NativeCustodyRotation(String),
+    #[error("onboarding stake lock rejected: {0}")]
+    OnboardingStakeLock(String),
+    #[error("onboarding stake release rejected: {0}")]
+    OnboardingStakeRelease(String),
     #[error(
         "validator-trust below floor for fid {fid}: have {available:.4}, need {needed:.4} ({reason})"
     )]
@@ -313,6 +321,27 @@ impl HyperRouter {
                 // (debits RewardStore balance, mints note in NoteStore).
                 RoutingError::UnsupportedMessageType(proto::HyperMessageType::Shield as i32),
             ),
+            proto::hyper_message::Body::NativeOnboard(_) => Err(
+                // FIP-hyper-native-onboarding — runtime intercepts (needs
+                // chain-tip access for anchor-block verification and the
+                // monotonic FID sequence counter).
+                RoutingError::UnsupportedMessageType(proto::HyperMessageType::NativeOnboard as i32),
+            ),
+            proto::hyper_message::Body::NativeCustodyRotation(_) => {
+                Err(RoutingError::UnsupportedMessageType(
+                    proto::HyperMessageType::NativeCustodyRotation as i32,
+                ))
+            }
+            proto::hyper_message::Body::OnboardingStakeLock(_) => {
+                Err(RoutingError::UnsupportedMessageType(
+                    proto::HyperMessageType::OnboardingStakeLock as i32,
+                ))
+            }
+            proto::hyper_message::Body::OnboardingStakeRelease(_) => {
+                Err(RoutingError::UnsupportedMessageType(
+                    proto::HyperMessageType::OnboardingStakeRelease as i32,
+                ))
+            }
         }
     }
 

@@ -14,6 +14,8 @@ use crate::hyper::runtime::HyperRuntime;
 pub enum GenesisError {
     #[error("bootstrap validators must be non-empty")]
     NoBootstrapValidators,
+    #[error("seeding bootstrap fid index failed: {0}")]
+    BootstrapIndexSeed(String),
 }
 
 /// Per-validator bootstrap material.
@@ -30,6 +32,14 @@ pub struct BootstrapValidator {
     /// post-migration DKLS23 group. Required at genesis since the
     /// initial group address is computed from these.
     pub validator_address: alloy_primitives::Address,
+    /// FID the bootstrap validator is registered under. Seeded at
+    /// `bootstrap_runtime` time into `HyperValidatorByFid` so that
+    /// `MAX_VALIDATORS_PER_FID` quota checks count the bootstrap
+    /// entry — without this the quota gate would let
+    /// `MAX_VALIDATORS_PER_FID` additional registrations slip in
+    /// under each bootstrap FID before firing (the active set
+    /// would top out at 1 bootstrap + 3 live per FID instead of 3).
+    pub fid: u64,
 }
 
 /// Genesis configuration: bootstrap validator set + a pre-computed
@@ -65,7 +75,7 @@ pub fn bootstrap_runtime(
 
     // Mirror the genesis validator set into the runtime so
     // `active_validators(epoch)` works without out-of-band wiring.
-    // The third tuple element here is unused (legacy slot from the
+    // The second tuple element is unused (legacy slot from the
     // BLS-era 3-tuple shape); we keep the type stable for now and
     // pass empty bytes.
     runtime.bootstrap_validators = config
@@ -76,9 +86,29 @@ pub fn bootstrap_runtime(
                 v.validator_key.clone(),
                 Vec::new(),
                 v.transport_pubkey.clone(),
+                v.fid,
             )
         })
         .collect();
+
+    // Seed the per-fid quota index so `MAX_VALIDATORS_PER_FID` checks
+    // count bootstrap validators. Without this, the quota gate sees
+    // `count_active_validators_for_fid(fid) == 0` at startup and lets
+    // an additional `MAX_VALIDATORS_PER_FID` registrations slip in
+    // under each bootstrap FID before firing.
+    for v in &config.bootstrap_validators {
+        if v.fid == 0 {
+            // Skip bookkeeping for legacy/test bootstraps that didn't
+            // carry a fid — they won't be counted by the quota gate,
+            // but they also won't accidentally collide with real fids
+            // (production setups always pass non-zero fids).
+            continue;
+        }
+        runtime
+            .validator_registry
+            .record_bootstrap_entry(v.fid, &v.validator_key)
+            .map_err(|e| GenesisError::BootstrapIndexSeed(e.to_string()))?;
+    }
 
     // Install genesis group address (every node needs it for verification).
     runtime.install_dkls_group_address(0, config.genesis_group_address);
@@ -134,6 +164,7 @@ mod tests {
             validator_key: vec![idx; 32],
             transport_pubkey: vec![idx; 32],
             validator_address: alloy_primitives::Address::repeat_byte(idx),
+            fid: idx as u64,
         }
     }
 

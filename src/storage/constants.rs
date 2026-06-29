@@ -383,6 +383,32 @@ pub enum RootPrefix {
     HyperVerificationByAddress = 35,
     HyperUserNameProofByName = 36,
     HyperLendStorageByRecipient = 37,
+
+    // FIP-hyper-native-onboarding storage.
+    /// Validator-assigned monotonic FID counter for hyper-native users.
+    /// Single-keyed; value is u64 BE = the *next* FID to issue. Initialized
+    /// lazily to `1u64 << 63` on first read. Bumped atomically inside the
+    /// onboarding apply batch so all verifying validators converge on the
+    /// same assignment.
+    HyperNativeFidSequence = 110,
+    /// One-FID-per-custody uniqueness index for hyper-native onboardings.
+    /// Distinct from `HyperCustodyToFid` (prefix 84), which indexes
+    /// on-chain id-register events and permits many FIDs per custody.
+    /// Key: `[111][custody_address 20B]`, value: `fid u64 BE`.
+    HyperNativeCustodyToFid = 111,
+    /// Per-FID custody-rotation nonce for hyper-native FIDs.
+    /// Monotonically incremented on each `HyperCustodyRotationBody`
+    /// apply. Single-keyed per FID. Key: `[112][fid BE u64]`,
+    /// value: `u64 BE`. Absent entry == 0.
+    HyperNativeRotationNonce = 112,
+    /// Replay-protection for stake-gated onboardings: each
+    /// `stake_lock_id` backs at most one onboarding.
+    /// Key: `[113][stake_lock_id 32B]`, value: `fid u64 BE`.
+    HyperNativeStakeBinding = 113,
+    /// FIP-hyper-native-onboarding §6.2 stake-lock state (sponsor
+    /// FID locks atoms backing a future onboarding). Key:
+    /// `[115][stake_lock_id 32B]`, value: encoded `OnboardingStakeLock`.
+    HyperOnboardingStakeLock = 115,
 }
 
 /** Copied from the JS code */

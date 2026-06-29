@@ -538,6 +538,31 @@ impl ValidatorRegistry {
     /// On Deregister: writes the event, removes the per-FID marker, and
     /// clears the FID lookup. No-op if the marker was never set
     /// (idempotent).
+    /// Seed the per-fid quota indexes for a bootstrap validator. Writes
+    /// the same `HyperValidatorByFid` + `HyperValidatorFidLookup`
+    /// markers that a real `ValidatorRegister` event would, but
+    /// without persisting a synthetic Register event (bootstrap
+    /// validators predate the on-chain registry by definition).
+    /// Called from `bootstrap_runtime` so subsequent live
+    /// registrations under the same FID see the bootstrap entry in
+    /// `count_active_validators_for_fid`.
+    pub fn record_bootstrap_entry(
+        &self,
+        fid: u64,
+        validator_key: &[u8],
+    ) -> Result<(), RegistryError> {
+        if fid == 0 {
+            return Ok(());
+        }
+        let by_fid = Self::make_validator_by_fid_key(fid, validator_key);
+        self.db.put(&by_fid, &[]).map_err(HubError::from)?;
+        let lookup = Self::make_validator_fid_lookup_key(validator_key);
+        self.db
+            .put(&lookup, &fid.to_be_bytes())
+            .map_err(HubError::from)?;
+        Ok(())
+    }
+
     pub fn record_event(
         &self,
         event: &proto::HyperValidatorEventBody,
@@ -674,11 +699,11 @@ impl ValidatorRegistry {
     pub fn compute_active_set(
         &self,
         epoch: u64,
-        bootstrap: &[(Vec<u8>, Vec<u8>, Vec<u8>)], // (validator_key, bls_pk, transport_pk)
+        bootstrap: &[(Vec<u8>, Vec<u8>, Vec<u8>, u64)], // (validator_key, bls_pk, transport_pk)
     ) -> Result<BTreeMap<Vec<u8>, (Vec<u8>, Vec<u8>)>, RegistryError> {
         let mut active: BTreeMap<Vec<u8>, (Vec<u8>, Vec<u8>)> = bootstrap
             .iter()
-            .map(|(vk, blspk, tpk)| (vk.clone(), (blspk.clone(), tpk.clone())))
+            .map(|(vk, blspk, tpk, _fid)| (vk.clone(), (blspk.clone(), tpk.clone())))
             .collect();
 
         // Active set at epoch N reflects events from epochs ≤ (N − EPOCH_BUFFER − 1).
@@ -824,7 +849,7 @@ impl ValidatorRegistry {
     pub fn compute_active_set_with_filter<F>(
         &self,
         epoch: u64,
-        bootstrap: &[(Vec<u8>, Vec<u8>, Vec<u8>)],
+        bootstrap: &[(Vec<u8>, Vec<u8>, Vec<u8>, u64)],
         is_auto_deregistered: F,
     ) -> Result<BTreeMap<Vec<u8>, (Vec<u8>, Vec<u8>)>, RegistryError>
     where
@@ -855,6 +880,51 @@ mod tests {
         let mut bytes = [0u8; 32];
         bytes[0] = seed;
         SigningKey::from_bytes(&bytes)
+    }
+
+    // B1 regression: bootstrap validators must count toward
+    // `MAX_VALIDATORS_PER_FID`. Pre-fix, `record_bootstrap_entry` didn't
+    // exist and `count_active_validators_for_fid` returned 0 for the
+    // bootstrap FID at startup — letting an attacker register
+    // `MAX_VALIDATORS_PER_FID` additional validator_keys under the
+    // bootstrap FID before the quota fired.
+    #[test]
+    fn bootstrap_entry_counts_toward_quota() {
+        let (registry, _dir) = make_registry();
+        // Seed two bootstrap validators under fid=1.
+        registry
+            .record_bootstrap_entry(1, &vec![0x11u8; 32])
+            .expect("record bootstrap 1");
+        registry
+            .record_bootstrap_entry(1, &vec![0x12u8; 32])
+            .expect("record bootstrap 2");
+        // Quota count must reflect both.
+        let count = registry.count_active_validators_for_fid(1).unwrap();
+        assert_eq!(
+            count, 2,
+            "bootstrap entries must be visible to `count_active_validators_for_fid`"
+        );
+        // fid_for_validator_key lookup must also resolve.
+        let fid = registry
+            .fid_for_validator_key(&vec![0x11u8; 32])
+            .unwrap()
+            .expect("fid lookup must find bootstrap entry");
+        assert_eq!(fid, 1);
+    }
+
+    /// Defensive: a bootstrap call with fid=0 must be a no-op (legacy
+    /// shape — pre-B1 configs that pass empty fids should not
+    /// accidentally poison the index with a zero-fid marker).
+    #[test]
+    fn bootstrap_entry_with_zero_fid_is_noop() {
+        let (registry, _dir) = make_registry();
+        registry
+            .record_bootstrap_entry(0, &vec![0x11u8; 32])
+            .expect("zero-fid is a no-op, not an error");
+        let count = registry.count_active_validators_for_fid(0).unwrap();
+        assert_eq!(count, 0, "zero-fid must not be indexed");
+        let lookup = registry.fid_for_validator_key(&vec![0x11u8; 32]).unwrap();
+        assert!(lookup.is_none(), "zero-fid must not appear in lookup");
     }
 
     fn random_signing_key() -> SigningKey {
@@ -1097,7 +1167,7 @@ mod tests {
     #[test]
     fn active_set_is_bootstrap_before_buffer() {
         let (reg, _dir) = make_registry();
-        let bootstrap = vec![(vec![1u8; 32], vec![1u8; 48], vec![1u8; 32])];
+        let bootstrap = vec![(vec![1u8; 32], vec![1u8; 48], vec![1u8; 32], 1u64)];
 
         // Register validator 2 at epoch 0. With EPOCH_BUFFER = 1, this becomes
         // active at epoch 2. At epoch 0 and 1 the active set is just bootstrap.
@@ -1115,7 +1185,7 @@ mod tests {
     #[test]
     fn active_set_includes_registration_after_buffer() {
         let (reg, _dir) = make_registry();
-        let bootstrap = vec![(vec![1u8; 32], vec![1u8; 48], vec![1u8; 32])];
+        let bootstrap = vec![(vec![1u8; 32], vec![1u8; 48], vec![1u8; 32], 1u64)];
 
         reg.record_event(&make_register_event(2, 0)).unwrap();
         // At epoch 2, events from epoch ≤ 0 take effect.
@@ -1127,7 +1197,7 @@ mod tests {
     #[test]
     fn deregister_removes_validator() {
         let (reg, _dir) = make_registry();
-        let bootstrap = vec![(vec![1u8; 32], vec![1u8; 48], vec![1u8; 32])];
+        let bootstrap = vec![(vec![1u8; 32], vec![1u8; 48], vec![1u8; 32], 1u64)];
 
         reg.record_event(&make_register_event(2, 0)).unwrap();
         reg.record_event(&make_deregister_event(2, 1)).unwrap();
@@ -1213,9 +1283,9 @@ mod tests {
     fn filtered_active_set_evicts_auto_deregistered_validators() {
         let (reg, _dir) = make_registry();
         let bootstrap = vec![
-            (vec![1u8; 32], vec![1u8; 48], vec![1u8; 32]),
-            (vec![2u8; 32], vec![2u8; 48], vec![2u8; 32]),
-            (vec![3u8; 32], vec![3u8; 48], vec![3u8; 32]),
+            (vec![1u8; 32], vec![1u8; 48], vec![1u8; 32], 1u64),
+            (vec![2u8; 32], vec![2u8; 48], vec![2u8; 32], 2u64),
+            (vec![3u8; 32], vec![3u8; 48], vec![3u8; 32], 3u64),
         ];
 
         // Predicate marks validator 2 as auto-deregistered.
@@ -1232,8 +1302,8 @@ mod tests {
     fn filtered_active_set_with_no_evictions_matches_unfiltered() {
         let (reg, _dir) = make_registry();
         let bootstrap = vec![
-            (vec![1u8; 32], vec![1u8; 48], vec![1u8; 32]),
-            (vec![2u8; 32], vec![2u8; 48], vec![2u8; 32]),
+            (vec![1u8; 32], vec![1u8; 48], vec![1u8; 32], 1u64),
+            (vec![2u8; 32], vec![2u8; 48], vec![2u8; 32], 2u64),
         ];
         let unfiltered = reg.compute_active_set(0, &bootstrap).unwrap();
         let filtered = reg
@@ -1245,7 +1315,7 @@ mod tests {
     #[test]
     fn registrations_apply_in_chronological_order() {
         let (reg, _dir) = make_registry();
-        let bootstrap: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::new();
+        let bootstrap: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, u64)> = Vec::new();
 
         // Register/deregister/re-register pattern across epochs.
         reg.record_event(&make_register_event(2, 0)).unwrap();

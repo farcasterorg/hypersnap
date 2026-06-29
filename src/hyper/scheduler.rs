@@ -581,8 +581,8 @@ mod tests {
         db.open().unwrap();
         let mut rng = OsRng;
         let srs = Arc::new(KzgSrs::random_unsafe(&mut rng, VERKLE_DOMAIN));
-        let bootstrap: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = (1u8..=3)
-            .map(|i| (vec![i; 32], vec![i; 48], vec![i; 32]))
+        let bootstrap: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, u64)> = (1u8..=3)
+            .map(|i| (vec![i; 32], vec![i; 48], vec![i; 32], i as u64))
             .collect();
         let cfg = HyperRuntimeConfig {
             db: Arc::new(db),

@@ -110,6 +110,20 @@ pub mod actor;
 /// bind chain_id via their typed-data domain.
 pub const DEFAULT_PROTOCOL_CHAIN_ID: u64 = 10;
 
+/// FIP-hyper-native-onboarding §2: hyper-native FIDs live in the
+/// disjoint high range with the top bit set. The single predicate
+/// `is_hyper_fid` is the dispatch point used wherever a per-FID code
+/// path needs to know which rail (hyper vs. snapchain) a message
+/// belongs to.
+pub const HYPER_FID_BASE: u64 = 1u64 << 63;
+
+/// `true` iff `fid` is a hyper-native FID (top bit set). Snapchain
+/// (on-chain-anchored) FIDs always return `false`.
+#[inline]
+pub const fn is_hyper_fid(fid: u64) -> bool {
+    fid >= HYPER_FID_BASE
+}
+
 pub mod app_usage_receipt;
 pub mod backfill;
 pub mod block_index;
@@ -144,6 +158,7 @@ pub mod lock_event;
 pub mod lock_tree;
 pub mod mempool;
 pub mod miniapp;
+pub mod native_onboard;
 pub mod network_loop;
 pub mod node_attestation;
 pub mod note_store;
@@ -259,6 +274,16 @@ pub struct HyperConfig {
     /// it, spawns the actor, and attaches it to the gossip layer.
     #[serde(default)]
     pub runtime_config_path: Option<String>,
+    /// Devnet-only: enables `POST /hyper/v1/admin/inject_evidence` so
+    /// tests can record pre-built `HyperWireEvidence` directly into
+    /// the slashing store, bypassing the normal gossip-import path's
+    /// signature verification. Required to exercise the
+    /// `record_evidence → slashed_validators_for_epoch → active-set
+    /// exclusion` chain end-to-end from a bash harness. MUST stay
+    /// `false` in production — anyone with HTTP access could
+    /// otherwise slash arbitrary validators.
+    #[serde(default)]
+    pub devnet_admin_endpoints_enabled: bool,
 }
 
 impl Default for HyperConfig {
@@ -268,6 +293,7 @@ impl Default for HyperConfig {
             retention_soft_cap: None,
             metrics_interval: Duration::from_secs(60),
             runtime_config_path: None,
+            devnet_admin_endpoints_enabled: false,
         }
     }
 }
@@ -549,6 +575,24 @@ impl From<HyperBlockMetadata> for proto::HyperBlockMetadata {
     }
 }
 
+impl From<proto::HyperEnvelope> for HyperEnvelope {
+    fn from(value: proto::HyperEnvelope) -> Self {
+        HyperEnvelope {
+            metadata: value.metadata.unwrap_or_default().into(),
+            payload: value.payload,
+        }
+    }
+}
+
+impl From<proto::HyperBlock> for HyperBlock {
+    fn from(value: proto::HyperBlock) -> Self {
+        HyperBlock {
+            envelope: value.envelope.unwrap_or_default().into(),
+            signature: value.signature.unwrap_or_default().into(),
+        }
+    }
+}
+
 impl From<proto::HyperBlockMetadata> for HyperBlockMetadata {
     fn from(value: proto::HyperBlockMetadata) -> Self {
         HyperBlockMetadata {
@@ -600,6 +644,7 @@ mod tests {
             retention_soft_cap: Some(42),
             metrics_interval: Duration::from_secs(10),
             runtime_config_path: None,
+            devnet_admin_endpoints_enabled: false,
         };
         assert!(cfg.can_start_pipeline());
         assert_eq!(cfg.retention_soft_cap(), Some(42));

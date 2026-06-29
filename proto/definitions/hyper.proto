@@ -175,6 +175,27 @@ enum HyperMessageType {
   // 300-399 reserved for trust-snapshot-update messages produced by the
   // in-protocol Proof-of-Quality scoring run (FIP §10.5).
   HYPER_MESSAGE_TYPE_TRUST_SNAPSHOT_UPDATE = 300;
+  // FIP-hyper-native-onboarding §13: validator-assigned FID creation
+  // entirely off-chain, gated by hashcash (PowSolution) or by a future
+  // native-token stake lock (StakeProof). FID is drawn from the disjoint
+  // high range (fid >= 2^63) and never enters snapchain consensus.
+  // 160-169 reserved for native onboarding.
+  HYPER_MESSAGE_TYPE_NATIVE_ONBOARD = 160;
+  // FIP-hyper-native-onboarding §4.3: rotate the custody EOA that
+  // controls a hyper-native FID. Signed EIP-712 by the *current*
+  // custody. Atomically swaps `HyperNativeCustodyToFid`. The new
+  // custody must not already hold a hyper-native FID.
+  HYPER_MESSAGE_TYPE_NATIVE_CUSTODY_ROTATION = 161;
+  // FIP-hyper-native-onboarding §6.2 Phase 2: a sponsor FID commits
+  // atoms of native hyper token to back a future onboarding. Creates
+  // an `OnboardingStakeLock` referenced by a future
+  // `HyperNativeOnboardBody.StakeProof`. Bound to a unique
+  // `stake_lock_id` so it can be consumed exactly once.
+  HYPER_MESSAGE_TYPE_ONBOARDING_STAKE_LOCK = 162;
+  // Release the sponsor's atoms after `lock_duration_blocks` elapse
+  // (or after the bound FID is slashed in a future Phase 3 path).
+  // Idempotent — releasing twice is a no-op.
+  HYPER_MESSAGE_TYPE_ONBOARDING_STAKE_RELEASE = 163;
 }
 
 // =====================================================================
@@ -1101,7 +1122,126 @@ message HyperMessage {
     DaEpochSeedBody da_epoch_seed = 24;
     FeeDepositBody fee_deposit = 25;
     ShieldBody shield = 26;
+    HyperNativeOnboardBody native_onboard = 27;
+    HyperCustodyRotationBody native_custody_rotation = 28;
+    OnboardingStakeLockBody onboarding_stake_lock = 29;
+    OnboardingStakeReleaseBody onboarding_stake_release = 30;
   }
+}
+
+// =====================================================================
+// FIP-hyper-native-onboarding: validator-assigned FID issuance gated by
+// hashcash (PowSolution) or future native-token stake (StakeProof).
+// =====================================================================
+
+// Hashcash proof-of-work solution. Validator recomputes
+// `H("hyper.onboard.pow:" || custody_address || anchor_block_hash || nonce)`
+// and requires the output to be < 2^256 / 2^difficulty_bits, AND
+// `difficulty_bits >= MIN_DIFFICULTY_BITS`. Greater difficulty grants
+// more storage units per §7.2.
+message PowSolution {
+  bytes nonce = 1;
+  uint32 difficulty_bits = 2;
+}
+
+// Future stake-backed gate. Phase 2: references an existing stake-lock
+// committed by the staker; phase-1 builds reject this variant with
+// `StakeGateNotYetEnabled`. Design semantics (lock_id derivation,
+// who-can-stake-for-whom, slashing) are deferred to a follow-up FIP.
+message StakeProof {
+  bytes stake_lock_id = 1;
+  uint64 amount_atoms = 2;
+  uint64 lock_duration_blocks = 3;
+}
+
+// FIP-hyper-native-onboarding §5: the onboarding request itself. The
+// proposer assigns the FID from the monotonic counter
+// `RootPrefix::HyperNativeFidSequence` at admission time; the message
+// does NOT carry the FID. Custody EIP-712-signs the typed payload
+// (`HypersnapNativeOnboard` domain) committing to anchor + gate_commitment.
+message HyperNativeOnboardBody {
+  // 20-byte Ethereum EOA custody address. Recovered from
+  // `custody_signature` over the EIP-712 typed payload below.
+  bytes custody_address = 1;
+  // 65-byte EIP-712 signature (r || s || v).
+  bytes custody_signature = 2;
+  // Hyper-block height at which the user constructed this message.
+  // Bounds replay-anchor age (see ONBOARD_ANCHOR_WINDOW).
+  uint64 anchor_block_height = 3;
+  // 32-byte hash of the hyper-block at anchor_block_height. Validators
+  // reject if the block at that height doesn't match.
+  bytes anchor_block_hash = 4;
+  // Gate proof: exactly one of pow or stake must be set.
+  oneof gate_proof {
+    PowSolution pow = 5;
+    StakeProof stake = 6;
+  }
+}
+
+// FIP-hyper-native-onboarding §4.3: rotate the custody EOA controlling
+// a hyper-native FID. EIP-712-signed by the *current* custody under
+// the `HypersnapNativeOnboard` domain, primary type
+// `HyperCustodyRotation`. The new custody must not already hold any
+// hyper-native FID (one-FID-per-custody invariant survives rotation).
+message HyperCustodyRotationBody {
+  // FID being rotated. Must be in the hyper-native range (>= 2^63)
+  // and currently mapped to `current_custody`.
+  uint64 fid = 1;
+  // Current custody address (20 bytes). Recovered from
+  // `current_custody_signature` over the EIP-712 typed payload.
+  bytes current_custody = 2;
+  // New custody address (20 bytes). MUST NOT already hold a
+  // hyper-native FID.
+  bytes new_custody = 3;
+  // Per-FID monotonic rotation nonce (anti-replay). The very first
+  // rotation for a FID must carry `nonce == 1`; each subsequent
+  // rotation must increment.
+  uint64 nonce = 4;
+  // 65-byte EIP-712 signature by `current_custody` over the typed
+  // payload `(fid, current_custody, new_custody, nonce)`.
+  bytes current_custody_signature = 5;
+}
+
+// FIP-hyper-native-onboarding §6.2 Phase 2: a sponsor FID commits
+// atoms of native hyper token to back a future hyper-native onboarding.
+// Funds are debited from the sponsor's `RewardStore` balance and held
+// in `HyperOnboardingStakeLock[stake_lock_id]`. The stake can be
+// released after `lock_duration_blocks` elapse from the current
+// hyper-chain tip OR consumed by a `HyperNativeOnboardBody.StakeProof`
+// referencing this `stake_lock_id`. Reuses `signer_pubkey`/`signature`
+// shape of TokenTransfer for signer-set authorization.
+message OnboardingStakeLockBody {
+  uint64 sponsor_fid = 1;
+  // Globally-unique 32-byte identifier. Convention: SHA-256 over
+  // `("hyper.onboarding.stake.lock:" || sponsor_fid_BE || nonce_BE)`.
+  // Validator deterministically recomputes and verifies.
+  bytes stake_lock_id = 2;
+  uint64 amount_atoms = 3;
+  // Number of hyper-blocks the stake is locked for after creation.
+  uint64 lock_duration_blocks = 4;
+  // Shared per-FID monotonic counter with TokenTransfer/TokenStake
+  // (RootPrefix::HyperTokenNonce).
+  uint64 nonce = 5;
+  bytes signer_pubkey = 6;
+  bytes signature = 7;
+}
+
+// Release a previously-locked onboarding stake back to the sponsor.
+// Valid only if either:
+//   (a) `lock_duration_blocks` have elapsed since the lock was created
+//       (current_hyper_chain_tip >= created_at + lock_duration_blocks),
+//       AND the lock has NOT been bound to a hyper-native FID via
+//       `HyperNativeStakeBinding`; OR
+//   (b) the bound FID does not exist (Phase 3 slashing path — left
+//       as `StakeReleaseNotPermitted` for now).
+// The release credits `amount_atoms` back to the sponsor's
+// `RewardStore` balance. Idempotent (re-release is a no-op).
+message OnboardingStakeReleaseBody {
+  uint64 sponsor_fid = 1;
+  bytes stake_lock_id = 2;
+  uint64 nonce = 3;
+  bytes signer_pubkey = 4;
+  bytes signature = 5;
 }
 
 // FIP-proof-of-quality §5 — top up the sender's fee-balance ledger.

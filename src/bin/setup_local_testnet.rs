@@ -160,6 +160,21 @@ struct Args {
     /// events (seeded into `.rocks/shard-{N}`).
     #[arg(long, default_value = "false")]
     seed_snapchain_state: bool,
+
+    /// Hostname pattern used to derive each node's gossip multiaddr. The
+    /// literal `{i}` is substituted with the 1-based node index. Default
+    /// `127.0.0.1` produces a loopback-only testnet (every node on the
+    /// same host process). For a docker-compose deployment use
+    /// `hyper-node{i}` so containers resolve each other via the compose
+    /// service-name DNS instead of loopback.
+    ///
+    /// When the pattern contains `{i}` (i.e. is not the literal default),
+    /// the local listen address is also bound to `0.0.0.0` instead of
+    /// the templated host, so each container listens on all its
+    /// interfaces and the peers' DNS-templated addresses can actually
+    /// connect.
+    #[arg(long, default_value = "127.0.0.1")]
+    gossip_host_template: String,
 }
 
 fn parse_duration(arg: &str) -> Result<Duration, String> {
@@ -222,13 +237,59 @@ async fn main() {
         let rpc_port = base_rpc_port + i;
         let http_port = base_http_port + i;
         let gossip_port = base_gossip_port + i;
-        let host = format!("127.0.0.1");
+        // Gossip multiaddrs: when a templated hostname is in use ({i}
+        // substitution active), bind the local listen address to
+        // 0.0.0.0 so the container is reachable from peers, and template
+        // the announce/bootstrap hosts to the peer's container-DNS name.
+        let templated = args.gossip_host_template.contains("{i}");
+        // RPC/HTTP bind: in templated (container) mode bind on 0.0.0.0 so
+        // docker-compose's port mappings (host:3483 → container:3483) can
+        // actually reach the listener. Loopback-bound listeners are
+        // unreachable from outside the container.
+        let host = if templated {
+            "0.0.0.0".to_string()
+        } else {
+            "127.0.0.1".to_string()
+        };
         let rpc_address = format!("{host}:{rpc_port}");
         let http_address = format!("{host}:{http_port}");
-        let gossip_multi_addr = format!("/ip4/{host}/udp/{gossip_port}/quic-v1");
+        let local_gossip_host = if templated {
+            "0.0.0.0".to_string()
+        } else {
+            args.gossip_host_template.clone()
+        };
+        let gossip_multi_addr = format!("/ip4/{local_gossip_host}/udp/{gossip_port}/quic-v1");
+        // In templated mode the listen address is 0.0.0.0 — peers can't dial
+        // that — so emit an explicit announce_address with this node's own
+        // DNS-templated host. In loopback mode leave it empty so the node's
+        // own fallback (config.address) is used.
+        let announce_gossip_addr = if templated {
+            let self_host = args.gossip_host_template.replace("{i}", &id.to_string());
+            let proto = if self_host.parse::<std::net::Ipv4Addr>().is_ok() {
+                "ip4"
+            } else {
+                "dns4"
+            };
+            format!("/{proto}/{self_host}/udp/{gossip_port}/quic-v1")
+        } else {
+            String::new()
+        };
+        let peer_addr = |peer_i: u32| -> String {
+            let peer_host = args
+                .gossip_host_template
+                .replace("{i}", &peer_i.to_string());
+            let peer_port = base_gossip_port + peer_i;
+            let multiaddr_proto = if peer_host.parse::<std::net::Ipv4Addr>().is_ok() {
+                "ip4"
+            } else {
+                // Compose service names / DNS hostnames must use /dns4/.
+                "dns4"
+            };
+            format!("/{multiaddr_proto}/{peer_host}/udp/{peer_port}/quic-v1")
+        };
         let other_nodes_addresses = (1..=num_nodes)
             .filter(|&x| x != id)
-            .map(|x| format!("/ip4/127.0.0.1/udp/{:?}/quic-v1", base_gossip_port + x))
+            .map(peer_addr)
             .collect::<Vec<String>>()
             .join(",");
 
@@ -288,6 +349,7 @@ use_tags={statsd_use_tags}
 
 [gossip]
 address="{gossip_multi_addr}"
+announce_address="{announce_gossip_addr}"
 bootstrap_peers = "{other_nodes_addresses}"
 
 [consensus]
@@ -399,12 +461,19 @@ aws_secret_access_key = "{aws_secret_access_key}"
         let mut bootstrap_entries = String::new();
         for i in 0..bootstrap_active_count {
             let validator_key_hex = &all_public_keys[i as usize];
+            // FID == 1-based node index; matches the IdRegister event
+            // seeded by `seed_validator_fids` and the operator identity
+            // wired into the runtime config. Seeded into the per-fid
+            // quota index at `bootstrap_runtime` so subsequent live
+            // registrations under the same FID count the bootstrap.
+            let fid = i + 1;
             bootstrap_entries.push_str(&format!(
                 r#"
 [[bootstrap_validators]]
 validator_key_hex = "{validator_key_hex}"
 transport_pubkey_hex = "{}"
 validator_address_hex = "0x{group_addr_hex}"
+fid = {fid}
 "#,
                 hex::encode([0u8; 32]),
             ));
@@ -416,17 +485,36 @@ validator_address_hex = "0x{group_addr_hex}"
         std::fs::write("nodes/genesis.toml", genesis_content.trim())
             .expect("Failed to write genesis.toml");
 
-        // Append [hyper] section to each node's config. Nodes that hold
-        // a genesis share get `local_dkls_share_path` +
-        // `local_dkls_share_party_index`; the rest get neither.
+        // Per-node hyper config lives in two files:
+        //   nodes/{i}/hypersnap.toml         — main TOML; the `[hyper]`
+        //                                       section is `HyperConfig`,
+        //                                       only `enabled` + `runtime_config_path`
+        //                                       are read here.
+        //   nodes/{i}/hyper-runtime.toml    — `HyperRuntimeFileConfig`,
+        //                                       holds the keys/genesis/shares.
+        // Main TOML's `[hyper]` is the gate `main.rs` checks before it
+        // even builds the hyper actor — without `runtime_config_path`
+        // it skips the whole pipeline and `/hyper/v1/*` 404s.
         for i in 1..=num_nodes {
-            let hyper_section = if i <= bootstrap_share_count {
+            // Operator identity (signing key + fid + validator pubkey) is the
+            // gate `main.rs` checks before spawning the block-production
+            // scheduler and DKG supervisor. Without all three set the node
+            // boots in read-node mode — `/hyper/v1/head` returns null
+            // because no hyperblocks are ever produced. Each node's
+            // identity matches the IdRegister event seeded above:
+            // fid=i, custody at `nodes/{i}/custody.key`, validator
+            // ed25519 pubkey = `all_public_keys[i-1]`.
+            let operator_pubkey_hex = &all_public_keys[(i - 1) as usize];
+            let operator_section = format!(
+                r#"operator_signer_secret_path = "nodes/{i}/validator.key"
+operator_fid = {i}
+operator_validator_pubkey_hex = "0x{operator_pubkey_hex}"
+"#,
+            );
+            let runtime_section = if i <= bootstrap_share_count {
                 let party_index = i;
                 format!(
-                    r#"
-
-[hyper]
-enabled = true
+                    r#"enabled = true
 allow_random_kzg_srs = true
 genesis_path = "nodes/genesis.toml"
 local_dkls_share_path = "nodes/{i}/epoch0.share"
@@ -434,25 +522,39 @@ local_dkls_share_party_index = {party_index}
 retro_vesting_on_protocol_epochs = 1
 auto_generate_transport_secret = true
 transport_secret_path = "nodes/{i}/transport.key"
-"#,
+{operator_section}"#,
                 )
             } else {
                 // No genesis share for this node. Hyper is still
                 // enabled so it joins the gossip mesh, observes blocks,
                 // and participates in the next epoch's DKG.
                 format!(
-                    r#"
-
-[hyper]
-enabled = true
+                    r#"enabled = true
 allow_random_kzg_srs = true
 genesis_path = "nodes/genesis.toml"
 retro_vesting_on_protocol_epochs = 1
 auto_generate_transport_secret = true
 transport_secret_path = "nodes/{i}/transport.key"
-"#,
+{operator_section}"#,
                 )
             };
+            let runtime_path = format!("nodes/{i}/hyper-runtime.toml");
+            std::fs::write(&runtime_path, runtime_section)
+                .expect("Failed to write hyper-runtime.toml");
+
+            let hyper_section = format!(
+                r#"
+
+[hyper]
+enabled = true
+runtime_config_path = "nodes/{i}/hyper-runtime.toml"
+# Devnet only: enables POST /hyper/v1/admin/inject_evidence so the
+# testnet runner can exercise the positive-case slashing chain.
+# Production builds MUST set this to false (it lets any HTTP client
+# slash arbitrary validators via record_evidence).
+devnet_admin_endpoints_enabled = true
+"#,
+            );
             let config_path = format!("nodes/{i}/hypersnap.toml");
             let mut content = std::fs::read_to_string(&config_path).unwrap();
             content.push_str(&hyper_section);
@@ -490,7 +592,16 @@ transport_secret_path = "nodes/{i}/transport.key"
         let seed_fids =
             args.seed_validator_fids || args.seed_balances > 0 || args.seed_snapchain_state;
         if seed_fids {
-            seed_validator_fids(num_nodes);
+            let validator_secrets: Vec<[u8; 32]> = keypairs
+                .iter()
+                .map(|k| {
+                    let bytes = k.as_ref();
+                    let mut out = [0u8; 32];
+                    out.copy_from_slice(&bytes[..32]);
+                    out
+                })
+                .collect();
+            seed_validator_fids(num_nodes, &validator_secrets);
         }
         if args.seed_balances > 0 {
             seed_validator_balances(num_nodes, args.seed_balances);
@@ -514,11 +625,14 @@ transport_secret_path = "nodes/{i}/transport.key"
 /// in every node's DB lets validators 2..N submit registration
 /// messages whose EIP-712 custody signatures actually verify, with no
 /// L1 dependency at all.
-fn seed_validator_fids(num_nodes: u32) {
+fn seed_validator_fids(num_nodes: u32, validator_secrets: &[[u8; 32]]) {
+    use ed25519_dalek::SigningKey as EdSigningKey;
     use hypersnap_crypto::transport_encrypt::TransportSecretKey;
     use rand::RngCore;
 
-    println!("Seeding {num_nodes} synthetic IdRegister event(s) into each node's hyper RocksDB...");
+    println!(
+        "Seeding {num_nodes} IdRegister + SignerAdd event(s) into each node's hyper RocksDB..."
+    );
 
     // 0. Pre-generate each node's X25519 transport secret and write it
     //    to `nodes/{i}/transport.key` (raw 32 bytes). The node's
@@ -576,15 +690,36 @@ fn seed_validator_fids(num_nodes: u32) {
         let mut batch = RocksDbTransactionBatch::new();
         for fid_minus_one in 0..num_nodes {
             let fid = (fid_minus_one + 1) as u64;
-            let event = events_factory::create_id_register_event(
+            let id_event = events_factory::create_id_register_event(
                 fid,
                 hypersnap::proto::IdRegisterEventType::Register,
                 custody_addrs[fid_minus_one as usize].to_vec(),
                 None,
             );
             store
-                .merge_onchain_event(event, &mut batch)
-                .expect("merge_onchain_event");
+                .merge_onchain_event(id_event, &mut batch)
+                .expect("merge_onchain_event IdRegister");
+
+            // SignerAdd for each FID's validator ed25519 pubkey. The
+            // hyper apply path (`apply_token_transfer`, `apply_fee_deposit`,
+            // etc.) calls `get_active_key` against the hyper DB to
+            // verify the message signer is registered for the FID.
+            // Without this event, every transfer fails with
+            // SignerNotAuthorized and the apply silently no-ops while
+            // the HTTP endpoint returns 202 — exactly what the testnet
+            // [4d] phase was hitting (transfers accepted, balance
+            // unchanged).
+            let signing_key = EdSigningKey::from_bytes(&validator_secrets[fid_minus_one as usize]);
+            let signer_event = events_factory::create_signer_event(
+                fid,
+                signing_key,
+                hypersnap::proto::SignerEventType::Add,
+                None,
+                None,
+            );
+            store
+                .merge_onchain_event(signer_event, &mut batch)
+                .expect("merge_onchain_event SignerAdd");
         }
         db.commit(batch).expect("commit seeded events");
         // `db` drops here → RocksDB closes, releasing the LOCK file so

@@ -109,6 +109,31 @@ impl HypersnapClient {
         }
     }
 
+    /// Devnet-only: POST a prost-encoded `HyperWireEvidence` body to
+    /// `/hyper/v1/admin/inject_evidence`. The route returns 404 if
+    /// the receiving node was built without
+    /// `[hyper] devnet_admin_endpoints_enabled = true`.
+    pub async fn admin_inject_evidence(
+        &self,
+        wire: &proto::HyperWireEvidence,
+    ) -> Result<(), WalletError> {
+        let body = wire.encode_to_vec();
+        let resp = self
+            .http
+            .post(format!("{}/hyper/v1/admin/inject_evidence", self.base_url))
+            .header("content-type", "application/octet-stream")
+            .body(body)
+            .send()
+            .await?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            let status = resp.status().as_u16();
+            let text = resp.text().await.unwrap_or_default();
+            Err(WalletError::NodeError { status, body: text })
+        }
+    }
+
     async fn check_status(&self, resp: &reqwest::Response) -> Result<(), WalletError> {
         if resp.status().is_success() {
             Ok(())

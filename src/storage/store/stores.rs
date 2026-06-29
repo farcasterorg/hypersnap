@@ -494,6 +494,13 @@ impl Stores {
     }
 
     pub fn get_storage_limits(&self, fid: u64) -> Result<StorageLimitsResponse, StoresError> {
+        // Note: hyper-native FIDs (fid >= 2^63) have no per-FID storage
+        // units — the hyper trie retains messages unbounded and
+        // per-message fees are enforced through `HyperFeeBalance`, not
+        // through StorageRegistry-style provisioning. They fall through
+        // to the snapchain lookup below, which returns zero units.
+        // Snapchain mempool already rejects hyper-FID UserMessages, so
+        // this RPC result is informational only for that range.
         let txn_batch = &mut RocksDbTransactionBatch::new();
         let mut limits = vec![];
         let purchased_slot = self

@@ -20,6 +20,7 @@ use crate::hyper::slashing::{
 use crate::hyper::HyperBlock;
 use crate::proto;
 use crate::utils::statsd_wrapper::StatsdClientWrapper;
+use prost::Message as _;
 use rand::rngs::OsRng;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
@@ -202,6 +203,27 @@ pub enum HyperActorQuery {
     IsNullifierSpent {
         nullifier: [u8; 32],
         reply: oneshot::Sender<bool>,
+    },
+    /// B2: verdict for a previously-submitted `LocalSubmitMessage`.
+    /// Returns `None` if the actor never saw the hash (either because
+    /// it predates the bounded LRU's start, was never submitted, or
+    /// has been evicted under load).
+    SubmissionStatus {
+        hash: [u8; 32],
+        reply: oneshot::Sender<Option<SubmissionVerdict>>,
+    },
+    /// Devnet-only: record a pre-built `ConflictingBlocksEvidence`
+    /// into the slashing store without going through the normal
+    /// gossip-import path. Used by the testnet runner to exercise the
+    /// positive-case slashing chain (record → slash → exclude) end-
+    /// to-end, since the bash harness can't produce real DKLS-signed
+    /// equivocating blocks. Gated at HTTP-route level by
+    /// `HyperConfig.devnet_admin_endpoints_enabled`; the actor accepts
+    /// the query unconditionally — the gate lives on the route, not
+    /// here, so a runtime-level test can still call it.
+    AdminInjectEvidence {
+        evidence: Box<crate::hyper::slashing::ConflictingBlocksEvidence>,
+        reply: oneshot::Sender<Result<(), String>>,
     },
     /// Verkle inclusion proof for a spent nullifier. Result encoded
     /// as the hex of `bincode::serialize(&VerkleProof)` so the wire
@@ -427,6 +449,16 @@ impl std::fmt::Debug for HyperActorQuery {
             Self::IsNullifierSpent { nullifier, .. } => f
                 .debug_struct("IsNullifierSpent")
                 .field("nullifier_prefix", &hex_prefix(nullifier))
+                .finish(),
+            Self::SubmissionStatus { hash, .. } => f
+                .debug_struct("SubmissionStatus")
+                .field("hash_prefix", &hex_prefix(hash))
+                .finish(),
+            Self::AdminInjectEvidence { evidence, .. } => f
+                .debug_struct("AdminInjectEvidence")
+                .field("canonical_block_id", &evidence.canonical_block_id)
+                .field("epoch_a", &evidence.epoch_a)
+                .field("epoch_b", &evidence.epoch_b)
                 .finish(),
             Self::NullifierInclusionProof { nullifier, .. } => f
                 .debug_struct("NullifierInclusionProof")
@@ -755,6 +787,36 @@ impl HyperActorClient {
             .await
     }
 
+    /// B2: returns the recorded verdict for a previously-submitted
+    /// message, or `None` if the actor has never seen the hash (never
+    /// submitted, evicted from the bounded LRU, or the message
+    /// predates this process). Used by the HTTP
+    /// `/hyper/v1/submission_status/<hash>` endpoint so clients can
+    /// learn whether their submission was accepted or rejected
+    /// without re-submitting.
+    pub async fn submission_status(
+        &self,
+        hash: [u8; 32],
+    ) -> Result<Option<SubmissionVerdict>, HyperActorClientError> {
+        self.ask(move |reply| HyperActorQuery::SubmissionStatus { hash, reply })
+            .await
+    }
+
+    /// Devnet-only: inject pre-built equivocation evidence into the
+    /// slashing store. See `HyperActorQuery::AdminInjectEvidence`. The
+    /// HTTP route that calls this is gated on
+    /// `HyperConfig.devnet_admin_endpoints_enabled`.
+    pub async fn admin_inject_evidence(
+        &self,
+        evidence: crate::hyper::slashing::ConflictingBlocksEvidence,
+    ) -> Result<Result<(), String>, HyperActorClientError> {
+        self.ask(move |reply| HyperActorQuery::AdminInjectEvidence {
+            evidence: Box::new(evidence),
+            reply,
+        })
+        .await
+    }
+
     /// Bincode-serialized verkle inclusion proof; `Ok(None)` if the
     /// nullifier hasn't been recorded.
     pub async fn nullifier_inclusion_proof(
@@ -1040,6 +1102,39 @@ pub struct HyperActor {
     /// lifetime, keyed on `(epoch, sorted block hashes)`. Short-
     /// circuits sig-verify on gossip replays.
     recent_evidence: std::collections::VecDeque<(u64, [u8; 32], [u8; 32])>,
+    /// B2: per-hash submission verdicts so HTTP clients can poll
+    /// `/hyper/v1/submission_status/<hash>` for the actual
+    /// `submit_message` result. The async POST path returns 202
+    /// before validation runs, so without this map clients have
+    /// no way to learn whether the gates accepted or rejected a
+    /// message.
+    ///
+    /// Bounded by `SUBMISSION_STATUS_CAP`; oldest entries are
+    /// evicted FIFO on insert to keep the map from growing
+    /// unboundedly under gossip-replay or attacker spam.
+    submission_status: std::collections::HashMap<[u8; 32], SubmissionVerdict>,
+    submission_status_order: std::collections::VecDeque<[u8; 32]>,
+}
+
+/// Bound for `HyperActor::submission_status` — enough to retain
+/// verdicts for the last ~1 minute of submit activity at the
+/// nominal mempool throughput; older entries fall off and queries
+/// for them return `Unknown`.
+pub const SUBMISSION_STATUS_CAP: usize = 1024;
+
+/// Verdict for a previously-submitted message, looked up by the
+/// blake3-32 content hash of the message body.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SubmissionVerdict {
+    /// `submit_message` returned `Ok`. For TokenTransfer / FeeDeposit
+    /// / RewardIssuance / etc., the apply succeeded against the
+    /// runtime stores. For ValidatorEvent, the strict-path
+    /// `validate_and_check_quota` + `record_event` succeeded.
+    Accepted,
+    /// `submit_message` returned `Err`. The reason mirrors the
+    /// `RoutingError` Display string so clients can surface why.
+    Rejected { reason: String },
 }
 
 const RECENT_EVIDENCE_CAP: usize = 256;
@@ -1157,6 +1252,10 @@ impl HyperActor {
             last_da_responded_epoch: None,
             last_da_seed_signed_for_epoch: None,
             recent_evidence: std::collections::VecDeque::with_capacity(RECENT_EVIDENCE_CAP),
+            submission_status: std::collections::HashMap::with_capacity(SUBMISSION_STATUS_CAP),
+            submission_status_order: std::collections::VecDeque::with_capacity(
+                SUBMISSION_STATUS_CAP,
+            ),
         };
         tokio::spawn(actor.run());
         HyperActorHandles {
@@ -1192,6 +1291,10 @@ impl HyperActor {
             last_da_responded_epoch: None,
             last_da_seed_signed_for_epoch: None,
             recent_evidence: std::collections::VecDeque::with_capacity(RECENT_EVIDENCE_CAP),
+            submission_status: std::collections::HashMap::with_capacity(SUBMISSION_STATUS_CAP),
+            submission_status_order: std::collections::VecDeque::with_capacity(
+                SUBMISSION_STATUS_CAP,
+            ),
         };
         for ev in events {
             in_tx.send(ev).await.unwrap();
@@ -1257,6 +1360,20 @@ impl HyperActor {
                 if let Err(e) = &res {
                     self.observe_routing_rejection(e);
                 }
+                // B2: record the verdict so HTTP clients polling
+                // `/hyper/v1/submission_status/<hash>` learn whether
+                // the submission was accepted or rejected. The POST
+                // endpoint returns 202 before this code runs, so
+                // without this side-channel the verdict is invisible
+                // to the submitter.
+                let msg_hash = blake3::hash(&msg.encode_to_vec()).as_bytes().to_owned();
+                let verdict = match &res {
+                    Ok(()) => SubmissionVerdict::Accepted,
+                    Err(e) => SubmissionVerdict::Rejected {
+                        reason: e.to_string(),
+                    },
+                };
+                self.record_submission_verdict(msg_hash, verdict);
                 res?;
                 let _ = self
                     .outbound
@@ -1716,6 +1833,17 @@ impl HyperActor {
                 let r = self.runtime.get_block_by_hash(&hash).ok().flatten();
                 let _ = reply.send(r);
             }
+            HyperActorQuery::SubmissionStatus { hash, reply } => {
+                let v = self.submission_status.get(&hash).cloned();
+                let _ = reply.send(v);
+            }
+            HyperActorQuery::AdminInjectEvidence { evidence, reply } => {
+                let r = self
+                    .runtime
+                    .record_evidence(&evidence)
+                    .map_err(|e| e.to_string());
+                let _ = reply.send(r);
+            }
             HyperActorQuery::IsNullifierSpent { nullifier, reply } => {
                 let _ = reply.send(self.runtime.is_nullifier_spent_in_tree(&nullifier));
             }
@@ -2014,6 +2142,24 @@ impl HyperActor {
     /// from the per-FID cap, the trust gate, custody-sig mismatch, or
     /// pure structural validation. Anything that isn't a
     /// `RoutingError::Registry(...)` is ignored.
+    /// Insert a verdict into the bounded LRU. If the cap is reached,
+    /// the oldest entry (FIFO by insertion order) is evicted to make
+    /// room. Duplicate inserts for the same hash (re-submitted message)
+    /// overwrite the previous verdict and do NOT shift the eviction
+    /// position — re-submission counts as activity but doesn't
+    /// re-extend the entry's lifetime.
+    fn record_submission_verdict(&mut self, hash: [u8; 32], verdict: SubmissionVerdict) {
+        if !self.submission_status.contains_key(&hash) {
+            if self.submission_status.len() >= SUBMISSION_STATUS_CAP {
+                if let Some(oldest) = self.submission_status_order.pop_front() {
+                    self.submission_status.remove(&oldest);
+                }
+            }
+            self.submission_status_order.push_back(hash);
+        }
+        self.submission_status.insert(hash, verdict);
+    }
+
     fn observe_routing_rejection(&self, err: &RoutingError) {
         use crate::hyper::validator_registry::RegistryError;
         let reason = match err {
@@ -2061,6 +2207,10 @@ impl HyperActor {
             Some(Body::FeeDeposit(_)) => "fee_deposit",
             Some(Body::ConfidentialLock(_)) => "confidential_lock",
             Some(Body::Shield(_)) => "shield",
+            Some(Body::NativeOnboard(_)) => "native_onboard",
+            Some(Body::NativeCustodyRotation(_)) => "native_custody_rotation",
+            Some(Body::OnboardingStakeLock(_)) => "onboarding_stake_lock",
+            Some(Body::OnboardingStakeRelease(_)) => "onboarding_stake_release",
             None => "none",
         };
         self.metric_count_tagged("hyper.message.inbound", 1, "kind", kind);
@@ -3532,7 +3682,7 @@ mod tests {
             // 32-byte values).
             let mut transport_pk = [0u8; 32];
             rand::Rng::fill(&mut OsRng, &mut transport_pk);
-            bootstrap.push((validator_key, Vec::new(), transport_pk.to_vec()));
+            bootstrap.push((validator_key, Vec::new(), transport_pk.to_vec(), 0));
         }
         runtime.bootstrap_validators = bootstrap;
     }
@@ -4291,8 +4441,8 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let db = crate::storage::db::RocksDB::new(dir.path().to_str().unwrap());
         db.open().unwrap();
-        let bootstrap: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = (1u8..=3)
-            .map(|i| (vec![i; 32], vec![i; 48], vec![i; 32]))
+        let bootstrap: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, u64)> = (1u8..=3)
+            .map(|i| (vec![i; 32], vec![i; 48], vec![i; 32], i as u64))
             .collect();
         let config = HyperRuntimeConfig {
             db: std::sync::Arc::new(db),
@@ -4344,8 +4494,8 @@ mod tests {
         let db = crate::storage::db::RocksDB::new(dir.path().to_str().unwrap());
         db.open().unwrap();
         // Bootstrap with 4 validators in deterministic key order.
-        let bootstrap: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = (1u8..=4)
-            .map(|i| (vec![i; 32], vec![i; 48], vec![i; 32]))
+        let bootstrap: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, u64)> = (1u8..=4)
+            .map(|i| (vec![i; 32], vec![i; 48], vec![i; 32], i as u64))
             .collect();
         let config = HyperRuntimeConfig {
             db: std::sync::Arc::new(db),
@@ -4367,8 +4517,15 @@ mod tests {
         let runtime = HyperRuntime::new(config);
 
         // Persist evidence at epoch 0 with signer indices [2, 4].
-        // BTreeMap iteration order over keys = vk(1..=4) sorted →
-        // index 2 is vk(2), index 4 is vk(4).
+        // Indices map through `committee_party_order` (keccak-permuted),
+        // not raw lexicographic key order — see B5 fix in
+        // `slashed_validators_for_epoch`. Compute the expected mapping
+        // from the same helper signing uses.
+        let active_keys: Vec<Vec<u8>> = bootstrap.iter().map(|(k, _, _, _)| k.clone()).collect();
+        let party_order =
+            crate::hyper::dkls_committee::committee_party_order(0, active_keys.iter());
+        let expected_idx2 = party_order[1].clone();
+        let expected_idx4 = party_order[3].clone();
         let mk = |state_root: u8| HyperBlock {
             envelope: HyperEnvelope {
                 metadata: HyperBlockMetadata {
@@ -4412,10 +4569,21 @@ mod tests {
 
         let slashed = client.slashed_validators(0).await.unwrap().unwrap();
         assert_eq!(slashed.len(), 2);
-        assert!(slashed.contains(&vec![2u8; 32]));
-        assert!(slashed.contains(&vec![4u8; 32]));
-        assert!(!slashed.contains(&vec![1u8; 32]));
-        assert!(!slashed.contains(&vec![3u8; 32]));
+        assert!(slashed.contains(&expected_idx2));
+        assert!(slashed.contains(&expected_idx4));
+        for (i, key) in active_keys.iter().enumerate() {
+            let idx1 = i + 1;
+            if idx1 == 2 || idx1 == 4 {
+                continue;
+            }
+            // Keys at non-signing party-order positions must not be slashed.
+            let key_at_party_pos = &party_order[i];
+            assert!(
+                !slashed.contains(key_at_party_pos),
+                "innocent key at party-order position {idx1} was slashed"
+            );
+            let _ = key;
+        }
 
         // No evidence at epoch 1 → empty.
         let none = client.slashed_validators(1).await.unwrap().unwrap();
@@ -4892,6 +5060,10 @@ mod tests {
             last_da_responded_epoch: None,
             last_da_seed_signed_for_epoch: None,
             recent_evidence: std::collections::VecDeque::with_capacity(RECENT_EVIDENCE_CAP),
+            submission_status: std::collections::HashMap::with_capacity(SUBMISSION_STATUS_CAP),
+            submission_status_order: std::collections::VecDeque::with_capacity(
+                SUBMISSION_STATUS_CAP,
+            ),
         };
         // First observation: anchor 0 (epoch 0) → just initialize.
         actor.maybe_trigger_scoring(0, 1_700_000_000).await;
@@ -4985,6 +5157,10 @@ mod tests {
             last_da_responded_epoch: None,
             last_da_seed_signed_for_epoch: None,
             recent_evidence: std::collections::VecDeque::with_capacity(RECENT_EVIDENCE_CAP),
+            submission_status: std::collections::HashMap::with_capacity(SUBMISSION_STATUS_CAP),
+            submission_status_order: std::collections::VecDeque::with_capacity(
+                SUBMISSION_STATUS_CAP,
+            ),
         };
 
         // No seed for epoch 5 yet → skip silently, watermark unchanged.
@@ -5110,6 +5286,10 @@ mod tests {
             last_da_responded_epoch: None,
             last_da_seed_signed_for_epoch: None,
             recent_evidence: std::collections::VecDeque::with_capacity(RECENT_EVIDENCE_CAP),
+            submission_status: std::collections::HashMap::with_capacity(SUBMISSION_STATUS_CAP),
+            submission_status_order: std::collections::VecDeque::with_capacity(
+                SUBMISSION_STATUS_CAP,
+            ),
         };
 
         // Sign + submit the seed for epoch 5.
@@ -5214,6 +5394,10 @@ mod tests {
             last_da_responded_epoch: None,
             last_da_seed_signed_for_epoch: None,
             recent_evidence: std::collections::VecDeque::with_capacity(RECENT_EVIDENCE_CAP),
+            submission_status: std::collections::HashMap::with_capacity(SUBMISSION_STATUS_CAP),
+            submission_status_order: std::collections::VecDeque::with_capacity(
+                SUBMISSION_STATUS_CAP,
+            ),
         };
 
         // Multi-party trigger — should populate pending_dkls_messages
@@ -5305,6 +5489,10 @@ mod tests {
             last_da_responded_epoch: None,
             last_da_seed_signed_for_epoch: None,
             recent_evidence: std::collections::VecDeque::with_capacity(RECENT_EVIDENCE_CAP),
+            submission_status: std::collections::HashMap::with_capacity(SUBMISSION_STATUS_CAP),
+            submission_status_order: std::collections::VecDeque::with_capacity(
+                SUBMISSION_STATUS_CAP,
+            ),
         };
 
         actor.maybe_sign_da_epoch_seed(EPOCH_LENGTH * 5).await;
@@ -5374,5 +5562,74 @@ mod tests {
             .filter(|o| matches!(o, HyperActorOutbound::EventError(_)))
             .count();
         assert_eq!(errors, 0, "scoring should have succeeded: {:?}", outbound);
+    }
+
+    // B2 regression: submission_status round-trip. A LocalSubmitMessage
+    // that the runtime rejects must result in a `Rejected{reason}`
+    // verdict observable via the `SubmissionStatus` query, keyed on the
+    // blake3-32 content hash of the message body. Unknown hashes return
+    // None.
+    #[tokio::test]
+    async fn submission_status_records_rejection_verdict() {
+        let mut rng = OsRng;
+        let srs = Arc::new(KzgSrs::random_unsafe(&mut rng, VERKLE_DOMAIN));
+        let (runtime, _dir) = make_runtime_with_srs(srs);
+        // A TokenTransfer with empty signer_pubkey fails
+        // `validate_token_transfer` → submit_message returns Err →
+        // verdict should be Rejected.
+        let bad_msg = proto::HyperMessage {
+            message_type: proto::HyperMessageType::TokenTransfer as i32,
+            body: Some(proto::hyper_message::Body::TokenTransfer(
+                proto::TokenTransferBody {
+                    sender_fid: 1,
+                    recipient_fid: 2,
+                    amount: 10,
+                    nonce: 0,
+                    signer_pubkey: vec![], // structurally invalid
+                    signature: vec![],
+                    memo: vec![],
+                },
+            )),
+        };
+        let bad_hash = *blake3::hash(&bad_msg.encode_to_vec()).as_bytes();
+
+        let handles = HyperActor::spawn(runtime, 16);
+        let client = HyperActorClient::new(handles.inbound.clone());
+
+        // Unknown hash before submit.
+        let v = client.submission_status([0xee; 32]).await.unwrap();
+        assert!(v.is_none(), "unseen hash must return None");
+
+        // Submit the bad message.
+        let _ = handles
+            .inbound
+            .send(HyperActorEvent::LocalSubmitMessage(bad_msg))
+            .await;
+        // Yield a few times so the actor drains the inbound.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+
+        // Verdict now visible.
+        let verdict = client
+            .submission_status(bad_hash)
+            .await
+            .unwrap()
+            .expect("verdict must be recorded after submit");
+        match verdict {
+            SubmissionVerdict::Rejected { reason } => {
+                assert!(
+                    !reason.is_empty(),
+                    "rejection must carry a non-empty reason"
+                );
+            }
+            v => panic!("expected Rejected, got {:?}", v),
+        }
+
+        handles
+            .inbound
+            .send(HyperActorEvent::Shutdown)
+            .await
+            .unwrap();
     }
 }

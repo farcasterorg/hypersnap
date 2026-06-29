@@ -38,11 +38,24 @@ use tokio::sync::mpsc;
 pub struct HyperHttpHandler {
     client: HyperActorClient,
     inbound: mpsc::Sender<HyperActorEvent>,
+    /// Devnet-only: enables `/hyper/v1/admin/*` routes. Sourced from
+    /// `HyperConfig.devnet_admin_endpoints_enabled`. MUST stay
+    /// false in production.
+    devnet_admin_endpoints_enabled: bool,
 }
 
 impl HyperHttpHandler {
     pub fn new(client: HyperActorClient, inbound: mpsc::Sender<HyperActorEvent>) -> Self {
-        Self { client, inbound }
+        Self {
+            client,
+            inbound,
+            devnet_admin_endpoints_enabled: false,
+        }
+    }
+
+    pub fn with_devnet_admin_endpoints(mut self, enabled: bool) -> Self {
+        self.devnet_admin_endpoints_enabled = enabled;
+        self
     }
 
     /// Whether this handler claims responsibility for a request. Used
@@ -140,6 +153,15 @@ impl HyperHttpHandler {
                 self.note_commitment_proof(hex).await
             }
             (&Method::POST, ["messages"]) => self.submit_message(body).await,
+            (&Method::GET, ["submission_status", hash_hex]) => {
+                self.submission_status(hash_hex).await
+            }
+            (&Method::POST, ["admin", "inject_evidence"]) => {
+                if !self.devnet_admin_endpoints_enabled {
+                    return Err(HandlerError::NotFound);
+                }
+                self.admin_inject_evidence(body).await
+            }
             (&Method::POST, ["validator", "register"]) => {
                 self.submit_validator_event(body, proto::HyperValidatorEventType::Register)
                     .await
@@ -160,14 +182,107 @@ impl HyperHttpHandler {
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, HandlerError> {
         let msg = proto::HyperMessage::decode(body.as_ref())
             .map_err(|e| HandlerError::BadRequest(format!("decode HyperMessage: {}", e)))?;
+        // B2: compute the same blake3-32 content hash the actor will
+        // key its verdict on, and echo it back so clients can poll
+        // `/hyper/v1/submission_status/<hash>`.
+        let hash_bytes = blake3::hash(&msg.encode_to_vec()).as_bytes().to_owned();
+        let hash_hex = format!("0x{}", hex::encode(hash_bytes));
         self.inbound
             .send(HyperActorEvent::LocalSubmitMessage(msg))
             .await
             .map_err(|_| HandlerError::Internal("actor inbound closed".into()))?;
         Ok(json_response(
             StatusCode::ACCEPTED,
-            &AcceptedResponse { accepted: true },
+            &AcceptedResponse {
+                accepted: true,
+                hash: Some(hash_hex),
+            },
         ))
+    }
+
+    async fn admin_inject_evidence(
+        &self,
+        body: Bytes,
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, HandlerError> {
+        // Decode the wire form (two HyperBlocks) and reconstruct a
+        // `ConflictingBlocksEvidence`. We don't run
+        // `verify_evidence_signatures` here — that's the whole point
+        // of the admin path: exercise the record→slash chain with
+        // synthetic blocks that don't carry valid DKLS sigs. The
+        // route is gated on `devnet_admin_endpoints_enabled` upstream
+        // so this is locked off in production.
+        let wire = proto::HyperWireEvidence::decode(body.as_ref())
+            .map_err(|e| HandlerError::BadRequest(format!("decode HyperWireEvidence: {}", e)))?;
+        let block_a_proto = wire
+            .block_a
+            .ok_or_else(|| HandlerError::BadRequest("block_a missing".into()))?;
+        let block_b_proto = wire
+            .block_b
+            .ok_or_else(|| HandlerError::BadRequest("block_b missing".into()))?;
+        // Reconstruct in-memory blocks. The slashing_store keys evidence
+        // on (canonical_block_id, block_a_hash, block_b_hash) so we
+        // need the same hashing path the gossip-import side uses.
+        use crate::hyper::HyperBlock;
+        let block_a: HyperBlock = block_a_proto.clone().into();
+        let block_b: HyperBlock = block_b_proto.clone().into();
+        if block_a.envelope.metadata.canonical_block_id
+            != block_b.envelope.metadata.canonical_block_id
+        {
+            return Err(HandlerError::BadRequest(
+                "block_a.canonical_block_id != block_b.canonical_block_id".into(),
+            ));
+        }
+        let evidence = crate::hyper::slashing::ConflictingBlocksEvidence {
+            epoch_a: block_a.signature.epoch,
+            epoch_b: block_b.signature.epoch,
+            canonical_block_id: block_a.envelope.metadata.canonical_block_id,
+            block_a_hash: crate::hyper::chain::hyper_block_hash(&block_a),
+            block_b_hash: crate::hyper::chain::hyper_block_hash(&block_b),
+            block_a: Box::new(block_a),
+            block_b: Box::new(block_b),
+        };
+        let inner = self
+            .client
+            .admin_inject_evidence(evidence)
+            .await
+            .map_err(client_err)?;
+        match inner {
+            Ok(()) => Ok(json_response(
+                StatusCode::OK,
+                &AcceptedResponse {
+                    accepted: true,
+                    hash: None,
+                },
+            )),
+            Err(e) => Err(HandlerError::Internal(format!("record_evidence: {}", e))),
+        }
+    }
+
+    async fn submission_status(
+        &self,
+        hash_hex: &str,
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, HandlerError> {
+        let raw = hash_hex.strip_prefix("0x").unwrap_or(hash_hex);
+        let bytes =
+            hex::decode(raw).map_err(|e| HandlerError::BadRequest(format!("hash hex: {}", e)))?;
+        if bytes.len() != 32 {
+            return Err(HandlerError::BadRequest(
+                "hash must be exactly 32 bytes (blake3 of message body)".to_string(),
+            ));
+        }
+        let mut h = [0u8; 32];
+        h.copy_from_slice(&bytes);
+        let verdict = self.client.submission_status(h).await.map_err(client_err)?;
+        let resp = match verdict {
+            Some(crate::hyper::actor::SubmissionVerdict::Accepted) => {
+                SubmissionStatusResponse::Accepted
+            }
+            Some(crate::hyper::actor::SubmissionVerdict::Rejected { reason }) => {
+                SubmissionStatusResponse::Rejected { reason }
+            }
+            None => SubmissionStatusResponse::Unknown,
+        };
+        Ok(json_response(StatusCode::OK, &resp))
     }
 
     /// Wrap a JSON-encoded ValidatorEventInput into a HyperValidatorEventBody
@@ -255,24 +370,47 @@ impl HyperHttpHandler {
             libp2p_peer_id,
         };
         let msg = crate::hyper::router::HyperRouter::outbound_validator_register(event);
+        let hash_bytes = blake3::hash(&msg.encode_to_vec()).as_bytes().to_owned();
+        let hash_hex = format!("0x{}", hex::encode(hash_bytes));
         self.inbound
             .send(HyperActorEvent::LocalSubmitMessage(msg))
             .await
             .map_err(|_| HandlerError::Internal("actor inbound closed".into()))?;
         Ok(json_response(
             StatusCode::ACCEPTED,
-            &AcceptedResponse { accepted: true },
+            &AcceptedResponse {
+                accepted: true,
+                hash: Some(hash_hex),
+            },
         ))
     }
 
     async fn head(&self) -> Result<Response<BoxBody<Bytes, Infallible>>, HandlerError> {
         let height = self.client.last_block_height().await.map_err(client_err)?;
         let hash = self.client.last_block_hash().await.map_err(client_err)?;
+        // B3: fetch the head block (if any) so we can surface the
+        // signature.group_address. Scripts that watch DKG rotation
+        // (`scripts/run_epoch_transition_testnet.sh` step [6]) poll
+        // this field — without it they have to fall back to per-epoch
+        // endpoints. Lookup misses (no block at height) just omit the
+        // signature field; the response stays a valid head probe.
+        let signature = if let Some(h) = height {
+            match self.client.get_block_by_height(h).await {
+                Ok(Some(block)) => block.signature.as_ref().map(|sig| HeadSignatureInfo {
+                    epoch: sig.epoch,
+                    group_address: format!("0x{}", hex::encode(&sig.group_address)),
+                }),
+                _ => None,
+            }
+        } else {
+            None
+        };
         Ok(json_response(
             StatusCode::OK,
             &HeadResponse {
                 height,
                 hash: hash.map(|h| hex(&h)),
+                signature,
             },
         ))
     }
@@ -1056,6 +1194,23 @@ struct ErrorBody {
 struct HeadResponse {
     height: Option<u64>,
     hash: Option<String>,
+    /// B3: signature info for the head hyperblock. Surfaces the
+    /// 20-byte secp256k1 `group_address` the head block was signed
+    /// under, so callers can observe DKG rotation (post-epoch-1 the
+    /// address differs from the genesis address). Absent in the JSON
+    /// when the head is the genesis block or no block has been
+    /// imported yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signature: Option<HeadSignatureInfo>,
+}
+
+#[derive(Serialize)]
+struct HeadSignatureInfo {
+    /// Epoch the signature was produced under.
+    epoch: u64,
+    /// 20-byte secp256k1 group address, hex-encoded with `0x` prefix.
+    /// Empty/zero for the genesis bootstrap entry (no signed block yet).
+    group_address: String,
 }
 
 #[derive(Serialize)]
@@ -1077,6 +1232,13 @@ struct BlockSummary {
     retained_message_count: u64,
     epoch: u64,
     signer_indices: Vec<u64>,
+    /// B3: 20-byte secp256k1 group address the block was signed
+    /// under, hex-encoded with `0x` prefix. The signature wraps this
+    /// + signer_indices into a flat `signature: { ... }` object on
+    /// the wire so DKG-rotation watchers (and the testnet runner)
+    /// can read `signature.group_address` directly.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    group_address: String,
 }
 
 #[derive(Serialize)]
@@ -1131,6 +1293,33 @@ struct InclusionProofResponse {
 #[derive(Serialize)]
 struct AcceptedResponse {
     accepted: bool,
+    /// blake3-32 content hash of the submitted message, hex-encoded
+    /// with a `0x` prefix. Clients poll
+    /// `GET /hyper/v1/submission_status/<hash>` with this value to
+    /// learn whether the message was accepted or rejected by the
+    /// runtime — the POST itself returns 202 before validation runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hash: Option<String>,
+}
+
+/// Response shape for GET /hyper/v1/submission_status/<hash>. Encodes
+/// the bounded LRU verdict in `SubmissionVerdict`. `status: "unknown"`
+/// is used when the actor has never seen the hash (never submitted,
+/// or evicted from the bounded LRU under load).
+#[derive(Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum SubmissionStatusResponse {
+    /// `submit_message` returned Ok.
+    Accepted,
+    /// `submit_message` returned Err. `reason` mirrors the
+    /// `RoutingError` Display string.
+    Rejected { reason: String },
+    /// Actor has no record of this hash. Either the message was
+    /// never submitted, or its verdict was evicted from the bounded
+    /// LRU. Clients can treat this as "ask again later" only if the
+    /// submission was just made — otherwise it's a permanent
+    /// negative answer.
+    Unknown,
 }
 
 /// JSON shape for POST /hyper/v1/validator/{register,deregister}.
@@ -1383,6 +1572,11 @@ fn block_summary_proto(b: &crate::proto::HyperBlock) -> BlockSummary {
     let env = b.envelope.clone().unwrap_or_default();
     let meta = env.metadata.unwrap_or_default();
     let sig = b.signature.clone().unwrap_or_default();
+    let group_address = if sig.group_address.is_empty() {
+        String::new()
+    } else {
+        format!("0x{}", hex::encode(&sig.group_address))
+    };
     BlockSummary {
         canonical_block_id: meta.canonical_block_id,
         parent_hash: hex(&meta.parent_hash),
@@ -1391,6 +1585,7 @@ fn block_summary_proto(b: &crate::proto::HyperBlock) -> BlockSummary {
         retained_message_count: meta.retained_message_count,
         epoch: sig.epoch,
         signer_indices: sig.signer_indices,
+        group_address,
     }
 }
 
@@ -1407,7 +1602,7 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    fn make_runtime(bootstrap: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>) -> (HyperRuntime, TempDir) {
+    fn make_runtime(bootstrap: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, u64)>) -> (HyperRuntime, TempDir) {
         let dir = TempDir::new().unwrap();
         let db = RocksDB::new(dir.path().to_str().unwrap());
         db.open().unwrap();
@@ -1559,8 +1754,8 @@ mod tests {
 
     #[tokio::test]
     async fn active_set_endpoint_returns_bootstrap() {
-        let bootstrap: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = (1u8..=2)
-            .map(|i| (vec![i; 32], vec![i; 48], vec![i; 32]))
+        let bootstrap: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, u64)> = (1u8..=2)
+            .map(|i| (vec![i; 32], vec![i; 48], vec![i; 32], i as u64))
             .collect();
         let (runtime, _dir) = make_runtime(bootstrap);
         let handles = HyperActor::spawn(runtime, 4);
@@ -1974,8 +2169,8 @@ mod tests {
 
     #[tokio::test]
     async fn status_endpoint_returns_combined_view() {
-        let bootstrap: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = (1u8..=3)
-            .map(|i| (vec![i; 32], vec![i; 48], vec![i; 32]))
+        let bootstrap: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, u64)> = (1u8..=3)
+            .map(|i| (vec![i; 32], vec![i; 48], vec![i; 32], i as u64))
             .collect();
         let (runtime, _dir) = make_runtime(bootstrap);
         let handles = HyperActor::spawn(runtime, 4);

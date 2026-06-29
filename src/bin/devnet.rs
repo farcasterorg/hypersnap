@@ -54,6 +54,7 @@ fn make_runtime(dir: &TempDir) -> (HyperRuntime, hypersnap_crypto::dkls_threshol
             validator_key: vk.clone(),
             transport_pubkey: vec![0u8; 32],
             validator_address: dkg.group_address,
+            fid: 1,
         }],
         genesis_group_address: dkg.group_address,
         local_dkls_party: Some((0, Box::new(dkg.parties[0].clone()))),

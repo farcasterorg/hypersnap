@@ -131,10 +131,13 @@ pub struct HyperRuntimeConfig {
     pub srs: Arc<KzgSrs>,
     pub mempool_capacity: usize,
     pub score_weights: ScoreWeights,
-    /// Genesis validator set: `(validator_key, bls_pubkey, transport_pubkey)`
-    /// per validator. Empty for tests / single-validator devnets that
+    /// Genesis validator set: `(validator_key, bls_pubkey, transport_pubkey, fid)`
+    /// per validator. The `fid` is seeded into the per-fid quota index
+    /// at `bootstrap_runtime` so `MAX_VALIDATORS_PER_FID` counts bootstrap
+    /// entries; pass `0` for legacy/test setups that don't care about
+    /// quota accounting. Empty for tests / single-validator devnets that
     /// install the active set directly through `install_local_dkg_share`.
-    pub bootstrap_validators: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>,
+    pub bootstrap_validators: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, u64)>,
     /// Per-epoch reward issuance cap (legacy aggregate). Applied as a
     /// global ceiling across all markets; useful as a belt-and-
     /// suspenders limit even when per-market caps are configured.
@@ -240,7 +243,7 @@ pub struct HyperRuntime {
     /// FIP §13.5 DKLS gossip E2EE: local X25519 transport secret
     /// for decrypting P2P-addressed DKLS round messages.
     pub local_transport_secret: hypersnap_crypto::transport_encrypt::TransportSecretKey,
-    pub bootstrap_validators: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>,
+    pub bootstrap_validators: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, u64)>,
     pub max_reward_per_epoch: Option<u128>,
     pub max_reward_per_epoch_per_market: std::collections::HashMap<i32, u128>,
     pub cutover_snapchain_block: u64,
@@ -332,6 +335,30 @@ pub struct DklsEpochState {
     /// The value the bridge contract verifies against and the
     /// post-migration `validator_registry` keys validator events on.
     pub group_address: alloy_primitives::Address,
+}
+
+/// `AnchorBlockHashProvider` adapter that reads from a `HyperRuntime`'s
+/// chain tracker + block index. Used by hyper-native onboarding to
+/// verify the user's `(anchor_block_height, anchor_block_hash)` pair.
+struct HyperRuntimeAnchor<'a> {
+    runtime: &'a HyperRuntime,
+}
+
+impl<'a> HyperRuntimeAnchor<'a> {
+    fn new(runtime: &'a HyperRuntime) -> Self {
+        Self { runtime }
+    }
+}
+
+impl<'a> crate::hyper::native_onboard::AnchorBlockHashProvider for HyperRuntimeAnchor<'a> {
+    fn hyper_block_hash_at_height(&self, height: u64) -> Option<[u8; 32]> {
+        let block = self.runtime.get_block_by_height(height).ok().flatten()?;
+        let typed: crate::hyper::HyperBlock = block.into();
+        Some(crate::hyper::chain::hyper_block_hash(&typed))
+    }
+    fn current_hyper_block_height(&self) -> u64 {
+        self.runtime.chain.last_height.unwrap_or(0)
+    }
 }
 
 impl HyperRuntime {
@@ -776,6 +803,157 @@ impl HyperRuntime {
 
         self.reward_store
             .apply_fee_deposit(body.sender_fid, body.amount, body.nonce)
+    }
+
+    /// FIP-hyper-native-onboarding §6.2: sponsor locks atoms in a
+    /// stake lock that a future hyper-native onboarding can consume
+    /// via its `StakeProof` gate. Three-stage gate matching other
+    /// FID-keyed token messages:
+    ///   1. Ed25519 signature over canonical payload.
+    ///   2. Signer-set authorization for `sponsor_fid`.
+    ///   3. Nonce + balance check (shares HyperTokenNonce stream).
+    ///
+    /// On success: debits `amount_atoms` from sponsor's RewardStore
+    /// balance, writes `HyperOnboardingStakeLock[stake_lock_id]`,
+    /// bumps nonce.
+    pub fn apply_onboarding_stake_lock(
+        &mut self,
+        body: &proto::OnboardingStakeLockBody,
+    ) -> Result<(), RewardError> {
+        // Ed25519 signature.
+        let payload = crate::hyper::native_onboard::onboarding_stake_lock_signing_payload(
+            body,
+            self.protocol_chain_id,
+        );
+        crate::hyper::native_onboard::verify_ed25519(
+            &payload,
+            &body.signer_pubkey,
+            &body.signature,
+        )
+        .map_err(|e| RewardError::Custom(format!("stake-lock sig: {}", e)))?;
+
+        // Signer-set authorization.
+        self.require_active_signer(body.sponsor_fid, &body.signer_pubkey)?;
+
+        // Nonce check (shared HyperTokenNonce stream).
+        let current_nonce = self.reward_store.nonce_of(body.sponsor_fid)?;
+        let expected = current_nonce.saturating_add(1);
+        if body.nonce != expected {
+            return Err(RewardError::NonceMismatch {
+                fid: body.sponsor_fid,
+                expected,
+                got: body.nonce,
+            });
+        }
+
+        // Balance check.
+        let bal = self.reward_store.balance_of(body.sponsor_fid)?;
+        if bal < body.amount_atoms {
+            return Err(RewardError::InsufficientBalance {
+                fid: body.sponsor_fid,
+                available: bal,
+                needed: body.amount_atoms,
+            });
+        }
+
+        // Admit lock (verifies derivation, no-duplicate, etc.).
+        let current_block = self.chain.last_height.unwrap_or(0);
+        crate::hyper::native_onboard::admit_onboarding_stake_lock(&self.db, body, current_block)
+            .map_err(|e| RewardError::Custom(format!("stake-lock admit: {}", e)))?;
+
+        // Debit balance + bump nonce atomically.
+        let new_bal = bal - body.amount_atoms;
+        let mut batch = self.db.txn();
+        let bal_key = {
+            let mut k = Vec::with_capacity(9);
+            k.push(crate::storage::constants::RootPrefix::HyperRewardBalance as u8);
+            k.extend_from_slice(&body.sponsor_fid.to_be_bytes());
+            k
+        };
+        batch.put(bal_key, new_bal.to_be_bytes().to_vec());
+        let nonce_key = {
+            let mut k = Vec::with_capacity(9);
+            k.push(crate::storage::constants::RootPrefix::HyperTokenNonce as u8);
+            k.extend_from_slice(&body.sponsor_fid.to_be_bytes());
+            k
+        };
+        batch.put(nonce_key, body.nonce.to_be_bytes().to_vec());
+        self.db
+            .commit(batch)
+            .map_err(crate::core::error::HubError::from)?;
+        Ok(())
+    }
+
+    /// FIP-hyper-native-onboarding §6.2: release a matured stake
+    /// lock back to the sponsor. Idempotent — re-release of an
+    /// already-released lock is a no-op (no nonce bump, no balance
+    /// change). Gate-shape mirrors `apply_onboarding_stake_lock`.
+    pub fn apply_onboarding_stake_release(
+        &mut self,
+        body: &proto::OnboardingStakeReleaseBody,
+    ) -> Result<(), RewardError> {
+        let payload = crate::hyper::native_onboard::onboarding_stake_release_signing_payload(
+            body,
+            self.protocol_chain_id,
+        );
+        crate::hyper::native_onboard::verify_ed25519(
+            &payload,
+            &body.signer_pubkey,
+            &body.signature,
+        )
+        .map_err(|e| RewardError::Custom(format!("stake-release sig: {}", e)))?;
+
+        self.require_active_signer(body.sponsor_fid, &body.signer_pubkey)?;
+
+        let current_block = self.chain.last_height.unwrap_or(0);
+        let (sponsor, amount) = crate::hyper::native_onboard::admit_onboarding_stake_release(
+            &self.db,
+            body,
+            current_block,
+        )
+        .map_err(|e| RewardError::Custom(format!("stake-release admit: {}", e)))?;
+
+        if amount == 0 {
+            // No-op (already released or never existed). Nonce intentionally
+            // not bumped — the body is replayable but produces no effect.
+            return Ok(());
+        }
+
+        // Nonce check before crediting back.
+        let current_nonce = self.reward_store.nonce_of(body.sponsor_fid)?;
+        let expected = current_nonce.saturating_add(1);
+        if body.nonce != expected {
+            return Err(RewardError::NonceMismatch {
+                fid: body.sponsor_fid,
+                expected,
+                got: body.nonce,
+            });
+        }
+
+        let bal = self.reward_store.balance_of(sponsor)?;
+        let new_bal = bal
+            .checked_add(amount)
+            .ok_or(RewardError::BalanceOverflow { fid: sponsor })?;
+
+        let mut batch = self.db.txn();
+        let bal_key = {
+            let mut k = Vec::with_capacity(9);
+            k.push(crate::storage::constants::RootPrefix::HyperRewardBalance as u8);
+            k.extend_from_slice(&sponsor.to_be_bytes());
+            k
+        };
+        batch.put(bal_key, new_bal.to_be_bytes().to_vec());
+        let nonce_key = {
+            let mut k = Vec::with_capacity(9);
+            k.push(crate::storage::constants::RootPrefix::HyperTokenNonce as u8);
+            k.extend_from_slice(&sponsor.to_be_bytes());
+            k
+        };
+        batch.put(nonce_key, body.nonce.to_be_bytes().to_vec());
+        self.db
+            .commit(batch)
+            .map_err(crate::core::error::HubError::from)?;
+        Ok(())
     }
 
     /// Shield: move atoms from the transparent FID balance into the
@@ -3874,6 +4052,45 @@ impl HyperRuntime {
                 .map_err(|e| RoutingError::DaEpochSeed(e.to_string()))?;
             return Ok(());
         }
+        // FIP-hyper-native-onboarding: validator-assigned FID issuance
+        // gated by hashcash (POW) or by a native-token stake lock.
+        if let Some(proto::hyper_message::Body::NativeOnboard(ref body)) = msg.body {
+            let current_block = self.chain.last_height.unwrap_or(0);
+            let anchor = HyperRuntimeAnchor::new(self);
+            crate::hyper::native_onboard::apply_onboarding(
+                &self.db,
+                body,
+                &anchor,
+                self.protocol_chain_id,
+                current_block,
+            )
+            .map_err(|e| RoutingError::NativeOnboard(e.to_string()))?;
+            return Ok(());
+        }
+        // FIP §4.3 custody rotation for hyper-native FIDs.
+        if let Some(proto::hyper_message::Body::NativeCustodyRotation(ref body)) = msg.body {
+            crate::hyper::native_onboard::apply_custody_rotation(
+                &self.db,
+                body,
+                self.protocol_chain_id,
+            )
+            .map_err(|e| RoutingError::NativeCustodyRotation(e.to_string()))?;
+            return Ok(());
+        }
+        // FIP §6.2 Phase 2: sponsor locks atoms to back a future
+        // hyper-native onboarding. Debit sponsor's RewardStore,
+        // write `HyperOnboardingStakeLock` record.
+        if let Some(proto::hyper_message::Body::OnboardingStakeLock(ref body)) = msg.body {
+            self.apply_onboarding_stake_lock(body)
+                .map_err(|e| RoutingError::OnboardingStakeLock(e.to_string()))?;
+            return Ok(());
+        }
+        // FIP §6.2 stake release: refund sponsor after maturity.
+        if let Some(proto::hyper_message::Body::OnboardingStakeRelease(ref body)) = msg.body {
+            self.apply_onboarding_stake_release(body)
+                .map_err(|e| RoutingError::OnboardingStakeRelease(e.to_string()))?;
+            return Ok(());
+        }
         // Validator trust-score gate: pre-check before the router
         // delegates to validator_registry. Only applies to Register
         // events; Deregister + other variants pass through
@@ -4022,7 +4239,7 @@ impl HyperRuntime {
     pub fn get_active_validators(
         &self,
         epoch: u64,
-        bootstrap: &[(Vec<u8>, Vec<u8>, Vec<u8>)],
+        bootstrap: &[(Vec<u8>, Vec<u8>, Vec<u8>, u64)],
     ) -> Result<
         std::collections::BTreeMap<Vec<u8>, (Vec<u8>, Vec<u8>)>,
         crate::hyper::validator_registry::RegistryError,
@@ -4074,7 +4291,7 @@ impl HyperRuntime {
     pub fn get_active_validators_filtered(
         &self,
         epoch: u64,
-        bootstrap: &[(Vec<u8>, Vec<u8>, Vec<u8>)],
+        bootstrap: &[(Vec<u8>, Vec<u8>, Vec<u8>, u64)],
     ) -> Result<
         std::collections::BTreeMap<Vec<u8>, (Vec<u8>, Vec<u8>)>,
         crate::hyper::validator_registry::RegistryError,
@@ -4102,7 +4319,7 @@ impl HyperRuntime {
     pub fn get_active_validators_enforced(
         &self,
         epoch: u64,
-        bootstrap: &[(Vec<u8>, Vec<u8>, Vec<u8>)],
+        bootstrap: &[(Vec<u8>, Vec<u8>, Vec<u8>, u64)],
     ) -> Result<std::collections::BTreeMap<Vec<u8>, (Vec<u8>, Vec<u8>)>, EnforcedActiveSetError>
     {
         let prev = match epoch.checked_sub(1) {
@@ -4160,7 +4377,7 @@ impl HyperRuntime {
     pub fn validators_below_trust_floor(
         &self,
         epoch: u64,
-        bootstrap: &[(Vec<u8>, Vec<u8>, Vec<u8>)],
+        bootstrap: &[(Vec<u8>, Vec<u8>, Vec<u8>, u64)],
     ) -> Result<Vec<(u64, Vec<u8>, f64)>, EnforcedActiveSetError> {
         if self.min_validator_trust_score <= 0.0 {
             return Ok(Vec::new());
@@ -4283,6 +4500,13 @@ impl HyperRuntime {
             // pattern is the correct trade against a transient
             // single-epoch capture turning into a permanent
             // network-wide liveness kill.
+            // B5 fix (audit-suite revalidation of 58fa604): signer_indices
+            // are assigned by the keccak-permuted `committee_party_order`,
+            // not raw lexicographic key order. Resolving them via plain
+            // `active_set_at_epoch.keys()` slashes the wrong validator
+            // (innocent lexicographic-slot occupant) while the real
+            // equivocator escapes. Use the same permuted ordering signing
+            // used so slashing attributes to the actual signer.
             let resolve_signers =
                 |block: &proto::HyperBlock| -> std::collections::BTreeSet<Vec<u8>> {
                     let mut out = std::collections::BTreeSet::new();
@@ -4294,14 +4518,17 @@ impl HyperRuntime {
                         // through `get_active_validators_enforced`.
                         return out;
                     }
-                    let keys: Vec<&Vec<u8>> = active_set_at_epoch.keys().collect();
+                    let keys = crate::hyper::dkls_committee::committee_party_order(
+                        epoch,
+                        active_set_at_epoch.keys(),
+                    );
                     for idx in &sig.signer_indices {
                         if *idx == 0 {
                             continue;
                         }
                         let pos = (*idx as usize).saturating_sub(1);
                         if let Some(vk) = keys.get(pos) {
-                            out.insert((*vk).clone());
+                            out.insert(vk.clone());
                         }
                     }
                     out
@@ -5578,7 +5805,7 @@ mod tests {
     #[test]
     fn active_validators_with_only_bootstrap() {
         let (rt, _dir) = make_runtime();
-        let bootstrap = vec![(vec![1u8; 32], vec![1u8; 48], vec![1u8; 32])];
+        let bootstrap = vec![(vec![1u8; 32], vec![1u8; 48], vec![1u8; 32], 1u64)];
         let active = rt.get_active_validators(0, &bootstrap).unwrap();
         assert_eq!(active.len(), 1);
         assert!(active.contains_key(&vec![1u8; 32]));
@@ -5590,8 +5817,8 @@ mod tests {
 
         let (mut rt, _dir) = make_runtime();
         let bootstrap = vec![
-            (vec![1u8; 32], vec![1u8; 48], vec![1u8; 32]),
-            (vec![2u8; 32], vec![2u8; 48], vec![2u8; 32]),
+            (vec![1u8; 32], vec![1u8; 48], vec![1u8; 32], 1u64),
+            (vec![2u8; 32], vec![2u8; 48], vec![2u8; 32], 2u64),
         ];
 
         // Drive validator 1 past the auto-deregister threshold at epoch 0.
@@ -5617,7 +5844,7 @@ mod tests {
     fn filtered_active_set_at_epoch_zero_matches_unfiltered() {
         // No prior epoch to consult for misses, so the filter is a no-op.
         let (mut rt, _dir) = make_runtime();
-        let bootstrap = vec![(vec![1u8; 32], vec![1u8; 48], vec![1u8; 32])];
+        let bootstrap = vec![(vec![1u8; 32], vec![1u8; 48], vec![1u8; 32], 1u64)];
         // Even with misses recorded, filter should not apply at epoch 0.
         for _ in 0..200 {
             rt.score_tracker
@@ -7064,8 +7291,8 @@ mod tests {
         rt.trust_store.set(8, 0.2).unwrap();
         // Bootstrap with both validators.
         let bootstrap = vec![
-            (vk7.clone(), vec![0u8; 48], vec![0u8; 32]),
-            (vk8.clone(), vec![0u8; 48], vec![0u8; 32]),
+            (vk7.clone(), vec![0u8; 48], vec![0u8; 32], 7u64),
+            (vk8.clone(), vec![0u8; 48], vec![0u8; 32], 8u64),
         ];
         let active = rt.get_active_validators_enforced(1, &bootstrap).unwrap();
         // FID 7's validator key present, FID 8's excluded.
@@ -7162,7 +7389,7 @@ mod tests {
 
     fn f002_run_enforced_on_small_stack(
         rt: HyperRuntime,
-        bootstrap: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>,
+        bootstrap: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, u64)>,
         epoch: u64,
     ) -> Result<(), ()> {
         let handle = std::thread::Builder::new()
@@ -7183,8 +7410,8 @@ mod tests {
         let vk1 = vec![0x11u8; 32];
         let vk2 = vec![0x22u8; 32];
         let bootstrap = vec![
-            (vk1.clone(), vec![0u8; 48], vec![0u8; 32]),
-            (vk2.clone(), vec![0u8; 48], vec![0u8; 32]),
+            (vk1.clone(), vec![0u8; 48], vec![0u8; 32], 1u64),
+            (vk2.clone(), vec![0u8; 48], vec![0u8; 32], 2u64),
         ];
 
         // BENIGN control: same-epoch evidence. Must return.
@@ -7214,6 +7441,53 @@ mod tests {
                  in get_active_validators_enforced — chain-halt DoS still live"
             );
         }
+    }
+
+    // B5 (audit-suite revalidation of 58fa604): signer_indices in a
+    // HyperBlock are DKLS party indices, assigned at signing time via
+    // `committee_party_order` — a keccak-permutation of the active set,
+    // not lexicographic order. Pre-fix `slashed_validators_for_epoch`
+    // resolved indices through raw `active_set.keys()`, slashing the
+    // validator at the *lexicographic* slot (innocent) while the real
+    // equivocator at the *party-order* slot escaped. This test pins the
+    // fix: with a 5-key set chosen so the two orderings diverge at some
+    // index, the slash must land on the true party-order signer.
+    #[test]
+    fn slashing_resolves_signer_index_via_committee_party_order() {
+        use crate::hyper::dkls_committee::committee_party_order;
+        let epoch: u64 = 7;
+        let mut active_set: std::collections::BTreeMap<Vec<u8>, (Vec<u8>, Vec<u8>)> =
+            std::collections::BTreeMap::new();
+        for b in 1u8..=5 {
+            active_set.insert(vec![b; 32], (vec![0u8; 48], vec![0u8; 32]));
+        }
+        let lex_keys: Vec<Vec<u8>> = active_set.keys().cloned().collect();
+        let party_order = committee_party_order(epoch, active_set.keys());
+        let idx = (1..=lex_keys.len())
+            .find(|&i| lex_keys[i - 1] != party_order[i - 1])
+            .expect("keccak party-order must permute a 5-key set vs lexicographic");
+
+        let (rt, _dir) = make_runtime();
+        let ev = f002_evidence(
+            epoch,
+            epoch,
+            100,
+            0xaa,
+            0xbb,
+            vec![idx as u64],
+            vec![idx as u64],
+        );
+        rt.record_evidence(&ev).expect("record same-epoch evidence");
+        let slashed = rt
+            .slashed_validators_for_epoch(epoch, &active_set)
+            .expect("resolve slashed set");
+
+        let true_signer = party_order[idx - 1].clone();
+        assert!(
+            slashed.contains(&true_signer),
+            "B5: the equivocator holding party index {idx} must be slashed; \
+             resolver must use committee_party_order, not lexicographic .keys()"
+        );
     }
 
     /// When `min_validator_trust_score == 0.0` the gate is
