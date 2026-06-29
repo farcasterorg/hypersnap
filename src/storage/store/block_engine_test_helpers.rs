@@ -97,6 +97,7 @@ pub fn default_block() -> Block {
 }
 
 pub fn state_change_to_block(block_number: u64, change: &BlockStateChange) -> Block {
+    use prost::Message;
     let mut block = default_block();
 
     block.header.as_mut().unwrap().state_root = change.new_state_root.clone();
@@ -108,6 +109,9 @@ pub fn state_change_to_block(block_number: u64, change: &BlockStateChange) -> Bl
     block.header.as_mut().unwrap().timestamp = change.timestamp.clone().into();
     block.transactions = change.transactions.clone();
     block.events = change.events.clone();
+    // F012: bind hash to blake3(header) so the read-validator accepts.
+    let header_bytes = block.header.as_ref().unwrap().encode_to_vec();
+    block.hash = blake3::hash(&header_bytes).as_bytes().to_vec();
     block
 }
 

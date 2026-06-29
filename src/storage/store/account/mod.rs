@@ -32,6 +32,7 @@ mod key_last_used_at_store;
 mod key_nonce_store;
 mod name_registry_events;
 mod reaction_store;
+pub mod signer_auth_index;
 mod storage_lend_store;
 mod user_data_store;
 mod username_proof_store;

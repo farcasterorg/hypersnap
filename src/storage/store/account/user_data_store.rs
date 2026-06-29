@@ -95,9 +95,25 @@ impl StoreDef for UserDataStoreDef {
             }
         };
 
+        let fid = message.data.as_ref().unwrap().fid;
+        // FIP-hyper-native-onboarding §10: hyper-native FIDs (fid >=
+        // 2^63) have no canonical username system in Phase 1. Hard-
+        // reject USERNAME UserData for them rather than silently
+        // accepting an unverifiable value.
+        if crate::hyper::is_hyper_fid(fid)
+            && user_data_body.r#type == proto::UserDataType::Username as i32
+        {
+            return Err(HubError {
+                code: "bad_request.validation_failure".to_string(),
+                message:
+                    "USERNAME UserData is not supported for hyper-native FIDs (no fname registry)"
+                        .to_string(),
+            });
+        }
+
         let key = Self::make_user_data_adds_key_with_prefix(
             ctx.root_prefix(RootPrefix::User),
-            message.data.as_ref().unwrap().fid,
+            fid,
             user_data_body.r#type,
         );
         Ok(key)

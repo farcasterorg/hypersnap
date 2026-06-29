@@ -46,6 +46,27 @@ use tracing::{debug, error, info, warn};
 const DEFAULT_GOSSIP_HOST: &str = "127.0.0.1";
 const MAX_GOSSIP_MESSAGE_SIZE: usize = 1024 * 1024 * 10; // 10 mb
 
+// F019: per-variant tighter ceilings applied inside
+// `map_gossip_bytes_to_system_message`. The global 10 MB cap above is
+// libp2p's transport-level guard; these are the application-level
+// caps that match the natural max size of each topic. Anything
+// larger is a Sybil-flood / amplification vector and is dropped at
+// ingress.
+const MAX_HYPER_WIRE_BYTES: usize = 512 * 1024; // 512 KB — DKLS round msgs + evidence frames
+const MAX_MEMPOOL_MESSAGE_BYTES: usize = 256 * 1024;
+const MAX_CONTACT_INFO_BYTES: usize = 4 * 1024;
+const MAX_STATUS_BYTES: usize = 4 * 1024;
+const MAX_CONSENSUS_BYTES: usize = 64 * 1024;
+
+/// F022 fix: per-variant size cap on `FullProposal` and `DecidedValue`
+/// gossip frames. Pre-fix these paths were bounded only by the libp2p
+/// transport ceiling (10 MB) — letting a single attacker frame allocate
+/// tens of megabytes of decoded state inside the actor. Sized to fit a
+/// fully-loaded honest block (proposer parts + commits + carried
+/// payload) with comfortable headroom.
+const MAX_FULL_PROPOSAL_BYTES: usize = 2 * 1024 * 1024; // 2 MB
+const MAX_DECIDED_VALUE_BYTES: usize = 2 * 1024 * 1024;
+
 pub(crate) const CONSENSUS_TOPIC: &str = "consensus";
 pub(crate) const MEMPOOL_TOPIC: &str = "mempool";
 const DECIDED_VALUES: &str = "decided-values";
@@ -183,6 +204,10 @@ pub enum GossipEvent<Ctx: SnapchainContext> {
     BroadcastFullProposal(proto::FullProposal),
     BroadcastMempoolMessage(MempoolMessage),
     BroadcastHyperEnvelope(HyperEnvelope),
+    /// Publish a `HyperWireMessage` (block / message / DKG) on its target
+    /// hyper topic. The actor → gossip pump emits these; the gossip task
+    /// translates them to `gossipsub.publish` calls.
+    BroadcastHyperWire(&'static str, proto::HyperWireMessage),
     BroadcastStatus(sync::Status<SnapchainValidatorContext>),
     SyncRequest(
         MalachitePeerId,
@@ -215,6 +240,9 @@ pub enum GossipTopic {
     ReadNodePeerStatuses,
     Mempool,
     Hyper,
+    /// Versioned hyper-protocol topic. Carries the topic name verbatim so
+    /// the dispatcher can publish without a separate constant.
+    HyperWire(&'static str),
     SyncRequest(MalachitePeerId, oneshot::Sender<OutboundRequestId>),
     SyncReply(InboundRequestId),
 }
@@ -234,6 +262,20 @@ pub struct SnapchainGossip {
     pub tx: mpsc::Sender<GossipEvent<SnapchainValidatorContext>>,
     rx: mpsc::Receiver<GossipEvent<SnapchainValidatorContext>>,
     system_tx: Option<Sender<SystemMessage>>,
+    /// When wired by the operator, every decoded `HyperWireMessage` from
+    /// the hyper gossip topics is forwarded here. The receiver — typically
+    /// a `HyperActor` — owns the runtime and applies the events.
+    ///
+    /// Wrapped in `Arc<OnceLock<_>>` so the operator can wire the actor
+    /// AFTER the gossip task has been spawned (early-spawn boot order):
+    /// the spawned loop reads via `.get()` (lock-free, no `&mut`
+    /// needed), and the caller — which retains its own clone of the
+    /// Arc — calls `.set()` once the hyper actor's inbound channel
+    /// exists. Before set, this is `None`-equivalent and hyper-topic
+    /// frames are dropped, which is the desired behavior when the
+    /// node hasn't yet finished hyper initialization.
+    pub(crate) hyper_actor_tx:
+        Arc<std::sync::OnceLock<mpsc::Sender<crate::hyper::actor::HyperActorEvent>>>,
     sync_channels: HashMap<InboundRequestId, sync::ResponseChannel>,
     read_node: bool,
     enable_autodiscovery: bool,
@@ -354,6 +396,23 @@ impl SnapchainGossip {
                     gossipsub::MessageAuthenticity::Signed(key.clone()),
                     gossipsub_config,
                 )?;
+
+                // F017 fix: enable libp2p gossipsub peer scoring with
+                // the default thresholds. Without this a Sybil-poisoned
+                // mesh has no eviction path; misbehaving peers (slow,
+                // duplicate-flooding, invalid-message-rate) keep their
+                // mesh slots indefinitely. The defaults conservative
+                // enough to use without per-topic tuning while still
+                // exercising the scoring + greylist machinery.
+                let peer_score_params = gossipsub::PeerScoreParams::default();
+                let peer_score_thresholds = gossipsub::PeerScoreThresholds::default();
+                if let Err(e) = gossipsub.with_peer_score(peer_score_params, peer_score_thresholds)
+                {
+                    warn!(
+                        error = %e,
+                        "gossipsub: with_peer_score failed; mesh runs with no scoring"
+                    );
+                }
 
                 for peer_id in config.direct_peers() {
                     info!(peer_id = peer_id.to_string(), "Adding direct peer");
@@ -489,6 +548,7 @@ impl SnapchainGossip {
             peers: BTreeMap::new(),
             capabilities,
             hyper_enabled,
+            hyper_actor_tx: Arc::new(std::sync::OnceLock::new()),
             direct_peers,
             local_topics,
             boot_resub_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -501,6 +561,41 @@ impl SnapchainGossip {
             validator_peers: HashSet::new(),
         })
     }
+
+    /// Subscribe the swarm to the hyper gossip topics. MUST be called
+    /// before `start()` (the spawned loop owns the swarm and can't be
+    /// mutated externally). The hyper actor inbound channel is wired
+    /// separately via [`Self::hyper_actor_tx_handle`] so the caller
+    /// can populate it AFTER the gossip task is spawned — preserving
+    /// the early-spawn boot order (R4 audit fix: keepalives flow
+    /// during heavy RocksDB shard init).
+    pub fn subscribe_hyper_topics(&mut self, validator: bool) {
+        let topics: &[&str] = if validator {
+            crate::hyper::topics::all_validator_topics()
+        } else {
+            crate::hyper::topics::all_observer_topics()
+        };
+        for t in topics {
+            let topic = gossipsub::IdentTopic::new(*t);
+            if let Err(e) = self.swarm.behaviour_mut().gossipsub.subscribe(&topic) {
+                warn!("Failed to subscribe to hyper topic {}: {:?}", t, e);
+            }
+        }
+    }
+
+    /// Clone of the shared cell holding the hyper actor's inbound
+    /// channel. The caller `set`s it once the actor has been spawned
+    /// (typically inside `build_hyper_handler`). Before set, hyper
+    /// inbound frames are dropped — a deliberate no-op while hyper
+    /// initialization is still in progress.
+    pub fn hyper_actor_tx_handle(
+        &self,
+    ) -> Arc<std::sync::OnceLock<mpsc::Sender<crate::hyper::actor::HyperActorEvent>>> {
+        self.hyper_actor_tx.clone()
+    }
+
+    // Outbound publish is done through `tx`'s `BroadcastHyperWire` event;
+    // see `crate::hyper::network_loop::run_outbound_pump`.
 
     /// Handle to the per-peer gossip metrics. Cloned by `main` so the
     /// cumulative counters can be registered into the shared Prometheus
@@ -804,7 +899,12 @@ impl SnapchainGossip {
                             let maybe_sender = self.system_tx.as_ref().cloned();
                             if let Some(system_tx) = maybe_sender {
                                 let data = message.data.clone();
-                                if let Some(system_message) = self.map_gossip_bytes_to_system_message(peer_id, data) {
+                                // F018: capture the gossipsub
+                                // originator (author who signed the
+                                // frame) so the DKLS ingress path uses
+                                // it instead of the forwarding neighbor.
+                                let originator = message.source;
+                                if let Some(system_message) = self.map_gossip_bytes_to_system_message(peer_id, data, originator) {
                                     if let Err(e) = system_tx.send(system_message).await {
                                         warn!("Failed to send system block message: {}", e);
                                     }
@@ -921,6 +1021,7 @@ impl SnapchainGossip {
                                 GossipTopic::ReadNodePeerStatuses => self.publish(encoded_message.clone(), READ_NODE_PEER_STATUSES),
                                 GossipTopic::Mempool => self.publish(encoded_message.clone(), MEMPOOL_TOPIC),
                                 GossipTopic::Hyper => self.publish(encoded_message.clone(), HYPER_TOPIC),
+                                GossipTopic::HyperWire(topic) => self.publish(encoded_message.clone(), topic),
                                 GossipTopic::SyncRequest(peer_id, reply_tx) => {
                                     let peer = peer_id.to_libp2p();
                                     let request_id = self.swarm.behaviour_mut().rpc.send_request(peer, Bytes::from(encoded_message.clone()));
@@ -955,12 +1056,36 @@ impl SnapchainGossip {
             .gossipsub
             .publish(publish_topic, message)
         {
-            warn!("Failed to publish gossip message: {} ({:?})", e, topic);
+            // `InsufficientPeers` is the expected steady-state error
+            // for any single-signer / bootstrap / partition-recovery
+            // moment when no other validator has subscribed to the
+            // topic yet — e.g., epoch-0 with one DKLS signer,
+            // peers still mid-handshake, or the genesis node booting
+            // before nodes 2..N. `Duplicate` similarly fires on
+            // benign gossip re-sends (mesh fan-in). Both are noisy
+            // false positives at `warn`; demote so real publish
+            // failures (MessageTooLarge, queue exhaustion, sign
+            // errors) still surface above the bootstrap chatter.
+            use libp2p::gossipsub::PublishError as Pe;
+            match e {
+                Pe::InsufficientPeers | Pe::Duplicate => {
+                    debug!("Gossip publish skipped: {} ({:?})", e, topic);
+                }
+                _ => {
+                    warn!("Failed to publish gossip message: {} ({:?})", e, topic);
+                }
+            }
         }
     }
 
     pub fn handle_contact_info(&mut self, contact_info: ContactInfo, peer_id: PeerId) {
-        // TODO(aditi): We might want to persist peers and reconnect to them on restart
+        // F021: peer-controlled body. Two hardening rules:
+        //   1. The inner `peer_id` byte-string must parse — log + drop
+        //      on failure instead of `.unwrap()` panicking.
+        //   2. The libp2p `peer_id` of the sender must match the inner
+        //      `peer_id` claim. Without this binding any connected
+        //      peer can flood-dial a read node with attacker
+        //      multiaddrs (eclipse).
         if contact_info.body.is_none() {
             warn!("Received empty contact info from peer: {}", peer_id);
             return;
@@ -972,7 +1097,29 @@ impl SnapchainGossip {
             "Received contact info from peer"
         );
 
-        let contact_peer_id = PeerId::from_bytes(&contact_info_body.peer_id).unwrap();
+        let contact_peer_id = match PeerId::from_bytes(&contact_info_body.peer_id) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(
+                    peer_id = peer_id.to_string(),
+                    error = %e,
+                    "Dropping contact info: inner peer_id failed to parse"
+                );
+                return;
+            }
+        };
+
+        // The inner peer_id must match the libp2p sender — otherwise
+        // any peer could announce attacker-controlled multiaddrs on
+        // behalf of arbitrary other peer_ids.
+        if contact_peer_id != peer_id {
+            warn!(
+                sender = peer_id.to_string(),
+                claimed = contact_peer_id.to_string(),
+                "Dropping contact info: inner peer_id does not match libp2p sender"
+            );
+            return;
+        }
 
         self.peers
             .insert(contact_peer_id, contact_info_body.clone());
@@ -1020,10 +1167,28 @@ impl SnapchainGossip {
         &mut self,
         peer_id: PeerId,
         gossip_message: Vec<u8>,
+        // F018: gossipsub originator (message.source). `None` if
+        // gossipsub is configured without author signing (shouldn't
+        // be, but defensively handled). Used by the DKLS ingress
+        // path as the authoritative sender identity instead of
+        // `propagation_source` (which is just the forwarding
+        // neighbor in a multi-hop mesh).
+        originator: Option<PeerId>,
     ) -> Option<SystemMessage> {
         match proto::GossipMessage::decode(gossip_message.as_slice()) {
             Ok(gossip_message) => match gossip_message.gossip_message {
                 Some(gossip_message::GossipMessage::ContactInfoMessage(contact_info)) => {
+                    // F019: cap per-variant bytes far below the
+                    // transport-level 10 MB ceiling.
+                    if contact_info.encoded_len() > MAX_CONTACT_INFO_BYTES {
+                        warn!(
+                            peer_id = peer_id.to_string(),
+                            len = contact_info.encoded_len(),
+                            cap = MAX_CONTACT_INFO_BYTES,
+                            "Dropping oversized ContactInfo"
+                        );
+                        return None;
+                    }
                     self.handle_contact_info(contact_info, peer_id);
                     None
                 }
@@ -1034,6 +1199,17 @@ impl SnapchainGossip {
                         None => None,
                         Some(read_node_message) => match read_node_message {
                             read_node_message::ReadNodeMessage::DecidedValue(decided_value) => {
+                                // F022 fix: per-variant size cap on
+                                // DecidedValue ingress.
+                                if decided_value.encoded_len() > MAX_DECIDED_VALUE_BYTES {
+                                    warn!(
+                                        peer_id = peer_id.to_string(),
+                                        len = decided_value.encoded_len(),
+                                        cap = MAX_DECIDED_VALUE_BYTES,
+                                        "Dropping oversized DecidedValue"
+                                    );
+                                    return None;
+                                }
                                 Some(SystemMessage::DecidedValueForReadNode(decided_value))
                             }
                         },
@@ -1041,7 +1217,42 @@ impl SnapchainGossip {
                 }
 
                 Some(proto::gossip_message::GossipMessage::FullProposal(full_proposal)) => {
-                    let height = full_proposal.height();
+                    // F022 fix: per-variant size cap. Without this the
+                    // FullProposal path was bounded only by the 10 MB
+                    // libp2p ceiling — a memory-amplification DoS.
+                    if full_proposal.encoded_len() > MAX_FULL_PROPOSAL_BYTES {
+                        warn!(
+                            peer_id = peer_id.to_string(),
+                            len = full_proposal.encoded_len(),
+                            cap = MAX_FULL_PROPOSAL_BYTES,
+                            "Dropping oversized FullProposal"
+                        );
+                        return None;
+                    }
+                    // F013 fix: `FullProposal::height()` unwrapped a
+                    // peer-controlled `Option<Height>` BEFORE the
+                    // shard-id guard, so any subscribed peer could crash
+                    // every node by sending a height-less FullProposal
+                    // frame. Validate `height` (and `round`) before
+                    // using them.
+                    let Some(height) = full_proposal.height.clone() else {
+                        warn!(
+                            peer_id = peer_id.to_string(),
+                            "Dropping FullProposal with missing height"
+                        );
+                        return None;
+                    };
+                    if full_proposal.round < 0 {
+                        // `FullProposal::round()` (proto/src/lib.rs) calls
+                        // `Round::new(self.round.try_into().unwrap())`
+                        // which panics on negative values. Drop here.
+                        warn!(
+                            peer_id = peer_id.to_string(),
+                            round = full_proposal.round,
+                            "Dropping FullProposal with negative round"
+                        );
+                        return None;
+                    }
                     debug!(
                         "Received block with height {} from peer: {}",
                         height, peer_id
@@ -1062,6 +1273,15 @@ impl SnapchainGossip {
                     Some(SystemMessage::MalachiteNetwork(shard, event))
                 }
                 Some(proto::gossip_message::GossipMessage::Consensus(signed_consensus_msg)) => {
+                    if signed_consensus_msg.encoded_len() > MAX_CONSENSUS_BYTES {
+                        warn!(
+                            peer_id = peer_id.to_string(),
+                            len = signed_consensus_msg.encoded_len(),
+                            cap = MAX_CONSENSUS_BYTES,
+                            "Dropping oversized Consensus message"
+                        );
+                        return None;
+                    }
                     let malachite_peer_id = MalachitePeerId::from_libp2p(&peer_id);
                     let bytes = Bytes::from(signed_consensus_msg.encode_to_vec());
                     let event = MalachiteNetworkEvent::Message(
@@ -1078,6 +1298,15 @@ impl SnapchainGossip {
                     Some(SystemMessage::MalachiteNetwork(shard, event))
                 }
                 Some(proto::gossip_message::GossipMessage::Status(status)) => {
+                    if status.encoded_len() > MAX_STATUS_BYTES {
+                        warn!(
+                            peer_id = peer_id.to_string(),
+                            len = status.encoded_len(),
+                            cap = MAX_STATUS_BYTES,
+                            "Dropping oversized Status message"
+                        );
+                        return None;
+                    }
                     let encoded = status.encode_to_vec();
                     let Some(height) = status.height else {
                         warn!(
@@ -1102,7 +1331,62 @@ impl SnapchainGossip {
                     );
                     None
                 }
+                Some(proto::gossip_message::GossipMessage::HyperWire(wire)) => {
+                    if wire.encoded_len() > MAX_HYPER_WIRE_BYTES {
+                        warn!(
+                            peer_id = peer_id.to_string(),
+                            len = wire.encoded_len(),
+                            cap = MAX_HYPER_WIRE_BYTES,
+                            "Dropping oversized HyperWire message"
+                        );
+                        return None;
+                    }
+                    if let Some(tx) = self.hyper_actor_tx.get() {
+                        // F018: pass the gossipsub ORIGINATOR
+                        // (message.source), not the forwarding
+                        // neighbor (propagation_source). In a
+                        // multi-hop mesh, propagation_source is
+                        // just the relay; the originator is the
+                        // actual author who signed the gossipsub
+                        // frame. Fallback to propagation_source
+                        // only if gossipsub author signing is off
+                        // (shouldn't happen in production).
+                        let sender_bytes = originator.unwrap_or(peer_id).to_bytes();
+                        match crate::hyper::gossip_adapter::wire_to_event_with_source(
+                            wire,
+                            Some(sender_bytes),
+                        ) {
+                            Ok(event) => {
+                                if let Err(e) = tx.try_send(event) {
+                                    warn!(
+                                        "Hyper actor channel full / closed; dropping event: {}",
+                                        e
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to decode HyperWireMessage: {}", e);
+                            }
+                        }
+                    } else {
+                        warn!(
+                            "Received HyperWireMessage but no actor attached (peer {})",
+                            peer_id
+                        );
+                    }
+                    // Hyper events ride a dedicated channel, not SystemMessage.
+                    None
+                }
                 Some(proto::gossip_message::GossipMessage::MempoolMessage(message)) => {
+                    if message.encoded_len() > MAX_MEMPOOL_MESSAGE_BYTES {
+                        warn!(
+                            peer_id = peer_id.to_string(),
+                            len = message.encoded_len(),
+                            cap = MAX_MEMPOOL_MESSAGE_BYTES,
+                            "Dropping oversized MempoolMessage"
+                        );
+                        return None;
+                    }
                     if let Some(mempool_message_proto) = message.mempool_message {
                         let mempool_message = match mempool_message_proto {
                             proto::mempool_message::MempoolMessage::UserMessage(message) => {
@@ -1263,6 +1547,16 @@ impl SnapchainGossip {
             Some(GossipEvent::BroadcastHyperEnvelope(envelope)) => self
                 .encode_hyper_envelope(envelope)
                 .map(|bytes| (vec![GossipTopic::Hyper], bytes)),
+            Some(GossipEvent::BroadcastHyperWire(topic, wire)) => {
+                if !self.hyper_enabled {
+                    warn!("Hyper wire broadcast requested but node is not hyper-enabled");
+                    return None;
+                }
+                let outer = proto::GossipMessage {
+                    gossip_message: Some(proto::gossip_message::GossipMessage::HyperWire(wire)),
+                };
+                Some((vec![GossipTopic::HyperWire(topic)], outer.encode_to_vec()))
+            }
             Some(GossipEvent::SyncRequest(peer_id, request, reply_tx)) => {
                 let encoded = snapchain_codec.encode(&request);
                 match encoded {

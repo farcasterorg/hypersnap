@@ -777,6 +777,18 @@ impl Mempool {
         message: &MempoolMessage,
         at_admission: bool,
     ) -> Result<(), HubError> {
+        // FIP-hyper-native-onboarding §9.1: hyper-native FIDs (fid >= 2^63)
+        // belong on the hyper gossip topic and the hyper trie, never on
+        // snapchain gossip / snapchain mempool. Drop them here so they
+        // can't pollute snapchain block proposals with messages
+        // snapchain-only peers cannot interpret.
+        if let MempoolMessage::UserMessage(user_msg) = message {
+            if crate::hyper::is_hyper_fid(user_msg.fid()) {
+                return Err(HubError::validation_failure(
+                    "hyper-native FID (fid >= 2^63) message arrived on snapchain mempool — must use hyper gossip topic",
+                ));
+            }
+        }
         // Pre-feature admission gate for KEY_ADD / KEY_REMOVE.
         if let MempoolMessage::UserMessage(user_msg) = message {
             let msg_type = user_msg.msg_type();

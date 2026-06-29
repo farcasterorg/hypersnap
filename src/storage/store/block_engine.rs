@@ -248,6 +248,18 @@ impl BlockEngine {
             })
     }
 
+    /// Trie keys beginning with `prefix`.
+    pub fn trie_values_with_prefix(
+        &mut self,
+        ctx: &merkle_trie::Context,
+        prefix: &[u8],
+    ) -> Vec<Vec<u8>> {
+        self.stores
+            .trie
+            .get_all_values(ctx, &self.db, prefix)
+            .unwrap_or_default()
+    }
+
     fn set_height(&self, version: &EngineVersion, height: Height) {
         if version.is_enabled(ProtocolFeature::EventIdBugFix) {
             self.stores
@@ -945,11 +957,16 @@ impl BlockEngine {
                     panic!("State change commit failed: {}", err);
                 }
                 Ok(()) => {
-                    self.db.commit(txn).unwrap();
-                    let result = self.stores.block_store.put_block(block);
-                    if result.is_err() {
-                        error!("Failed to store block: {:?}", result.err());
+                    // F033: stage the block header write on the same
+                    // batch as the state mutations so both commit
+                    // atomically. A crash between previously-separate
+                    // commits could leave the trie at height H and
+                    // the header at H-1, diverging the chain on
+                    // restart.
+                    if let Err(e) = self.stores.block_store.stage_block(&mut txn, block) {
+                        error!("Failed to stage block write: {}", e);
                     }
+                    self.db.commit(txn).unwrap();
                     self.stores.trie.reload(&self.db).unwrap();
                     self.metrics
                         .publish_transaction_counts(&block.transactions, ProposalSource::Commit);

@@ -8,7 +8,7 @@ use crate::proto::{full_proposal, Commits, FullProposal, ShardHash};
 use crate::storage::store::node_local_state::LocalStateStore;
 use crate::utils::statsd_wrapper::StatsdClientWrapper;
 use informalsystems_malachitebft_core_consensus::ProposedValue;
-use informalsystems_malachitebft_core_types::{Round, ValidatorSet};
+use informalsystems_malachitebft_core_types::{Round, ValidatorSet, Validity};
 use libp2p::identity::ed25519::PublicKey;
 use std::cmp::PartialEq;
 use std::time::Duration;
@@ -52,14 +52,30 @@ pub struct StoredValidatorSet {
 
 impl StoredValidatorSet {
     pub fn new(shard_id: SnapchainShard, config: &ValidatorSetConfig) -> Self {
+        let bls_keys = &config.validator_bls_public_keys;
+        if !bls_keys.is_empty() && bls_keys.len() != config.validator_public_keys.len() {
+            panic!(
+                "validator_bls_public_keys length ({}) must match validator_public_keys length ({})",
+                bls_keys.len(),
+                config.validator_public_keys.len()
+            );
+        }
+
         let mut validators = SnapchainValidatorSet::new(vec![]);
-        for address in &config.validator_public_keys {
-            let validator = SnapchainValidator::new(
+        for (i, address) in config.validator_public_keys.iter().enumerate() {
+            let mut validator = SnapchainValidator::new(
                 shard_id,
                 PublicKey::try_from_bytes(&hex::decode(address).unwrap()).unwrap(),
                 None,
                 config.effective_at,
             );
+            if let Some(bls_hex) = bls_keys.get(i) {
+                let bls_bytes =
+                    hex::decode(bls_hex).expect("validator_bls_public_keys must be valid hex");
+                hypersnap_crypto::bls::BlsPublicKey::from_bytes(&bls_bytes)
+                    .expect("validator_bls_public_keys must decode as BLS12-381 G1 points");
+                validator = validator.with_bls_public_key(bls_bytes);
+            }
             validators.add(validator);
         }
 
@@ -264,13 +280,38 @@ impl ShardValidator {
     ) -> ProposedValue<SnapchainValidatorContext> {
         let value = full_proposal.shard_hash();
         self.proposal_source = proposal_source;
-        if self.shard_id.shard_id() != full_proposal.shard_id().unwrap() {
+        // F002: `FullProposal::shard_id()` returns `Err` when the
+        // proposal's `height` field is `None` (a peer-reachable
+        // condition). Reject the proposal as Invalid instead of
+        // panicking on the unwrap.
+        let proposal_shard = match full_proposal.shard_id() {
+            Ok(s) => s,
+            Err(_) => {
+                warn!("Received proposal with missing height/shard_id; dropping");
+                return ProposedValue {
+                    height: full_proposal.height(),
+                    round: full_proposal.round(),
+                    valid_round: Round::Nil,
+                    proposer: full_proposal.proposer_address(),
+                    value,
+                    validity: Validity::Invalid,
+                };
+            }
+        };
+        if self.shard_id.shard_id() != proposal_shard {
             warn!(
-                "Received proposal for shard {} on shard {}",
-                full_proposal.shard_id().unwrap(),
+                "Received proposal for shard {} on shard {}; dropping",
+                proposal_shard,
                 self.shard_id.shard_id()
             );
-            panic!("Received proposal for wrong shard");
+            return ProposedValue {
+                height: full_proposal.height(),
+                round: full_proposal.round(),
+                valid_round: Round::Nil,
+                proposer: full_proposal.proposer_address(),
+                value,
+                validity: Validity::Invalid,
+            };
         }
         let validity = if let Some(block_proposer) = &mut self.block_proposer {
             block_proposer.add_proposed_value(full_proposal)
@@ -332,5 +373,91 @@ impl ShardValidator {
         } else {
             panic!("No proposer set");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hypersnap_crypto::bls::BlsPrivateKey;
+    use libp2p::identity::ed25519::Keypair;
+    use rand::rngs::OsRng;
+
+    fn ed25519_hex() -> String {
+        hex::encode(Keypair::generate().public().to_bytes())
+    }
+
+    #[test]
+    fn validator_set_without_bls_keys_loads() {
+        let config = ValidatorSetConfig {
+            effective_at: 0,
+            validator_public_keys: vec![ed25519_hex(), ed25519_hex()],
+            validator_bls_public_keys: vec![],
+            shard_ids: vec![1],
+        };
+        let stored = StoredValidatorSet::new(SnapchainShard::new(1), &config);
+        assert_eq!(stored.validators.validators.len(), 2);
+        for v in &stored.validators.validators {
+            assert!(v.bls_public_key.is_none());
+        }
+    }
+
+    #[test]
+    fn validator_set_with_bls_keys_loads() {
+        let mut rng = OsRng;
+        let bls_pks: Vec<_> = (0..3)
+            .map(|_| BlsPrivateKey::generate(&mut rng).public_key())
+            .collect();
+
+        let config = ValidatorSetConfig {
+            effective_at: 0,
+            validator_public_keys: vec![ed25519_hex(), ed25519_hex(), ed25519_hex()],
+            validator_bls_public_keys: bls_pks
+                .iter()
+                .map(|pk| hex::encode(pk.to_bytes()))
+                .collect(),
+            shard_ids: vec![1],
+        };
+        let stored = StoredValidatorSet::new(SnapchainShard::new(1), &config);
+        assert_eq!(stored.validators.validators.len(), 3);
+        for (i, v) in stored.validators.validators.iter().enumerate() {
+            // The validator set sorts internally, so we look up by matching bytes.
+            let bls = v.bls_public_key.as_ref().expect("BLS pubkey should be set");
+            let expected_bytes = bls_pks
+                .iter()
+                .find(|pk| pk.to_bytes().to_vec() == *bls)
+                .map(|pk| pk.to_bytes().to_vec());
+            assert!(
+                expected_bytes.is_some(),
+                "validator {} has unexpected BLS key",
+                i
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "validator_bls_public_keys length")]
+    fn mismatched_lengths_panic() {
+        let mut rng = OsRng;
+        let bls_pk = BlsPrivateKey::generate(&mut rng).public_key();
+        let config = ValidatorSetConfig {
+            effective_at: 0,
+            validator_public_keys: vec![ed25519_hex(), ed25519_hex()],
+            validator_bls_public_keys: vec![hex::encode(bls_pk.to_bytes())],
+            shard_ids: vec![1],
+        };
+        let _ = StoredValidatorSet::new(SnapchainShard::new(1), &config);
+    }
+
+    #[test]
+    #[should_panic(expected = "BLS12-381 G1")]
+    fn invalid_bls_bytes_panic() {
+        let config = ValidatorSetConfig {
+            effective_at: 0,
+            validator_public_keys: vec![ed25519_hex()],
+            validator_bls_public_keys: vec![hex::encode([0xffu8; 48])],
+            shard_ids: vec![1],
+        };
+        let _ = StoredValidatorSet::new(SnapchainShard::new(1), &config);
     }
 }

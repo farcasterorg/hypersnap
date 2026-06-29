@@ -182,10 +182,17 @@ impl proto::FullProposal {
         }
     }
 
+    /// Panics if `height` is missing — callers receiving peer-controlled
+    /// `FullProposal` frames MUST validate `self.height.is_some()` before
+    /// calling. The gossip ingress path does this (see F013); all
+    /// remaining callers are post-validation (block-proposed, signed,
+    /// produced locally), where `height` is invariantly populated.
     pub fn height(&self) -> proto::Height {
         self.height.clone().unwrap()
     }
 
+    /// Same contract as `height`: caller must have rejected
+    /// peer-controlled values with negative `round` before this point.
     pub fn round(&self) -> informalsystems_malachitebft_core_types::Round {
         informalsystems_malachitebft_core_types::Round::new(self.round.try_into().unwrap())
     }

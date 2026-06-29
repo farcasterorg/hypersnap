@@ -138,6 +138,28 @@ impl NotificationWebhookHandler {
             }
         };
 
+        // F158: enforce a per-envelope nullifier keyed on
+        // `(fid, blake3(signing_input))`. Hash the JFS-canonical
+        // `payload_bytes` (the bytes the signer actually signed),
+        // NOT the raw HTTP body — raw JSON has whitespace/key-order
+        // variance that would let an attacker re-encode the same
+        // payload with different framing and bypass the nullifier.
+        // Cross-deployment replay (different hypersnap instance,
+        // different chain-id) is an upstream Farcaster spec gap:
+        // the signed payload contains no domain binding. Documented
+        // as out-of-scope until the spec adds `app_id` + `domain`
+        // to the wire format.
+        let payload_hash: [u8; 32] = *blake3::hash(&verified.payload_bytes).as_bytes();
+        if let Err(e) = self
+            .store
+            .claim_envelope(&app_id, verified.fid, &payload_hash)
+        {
+            return error_response(
+                StatusCode::CONFLICT,
+                &format!("envelope replay rejected: {e}"),
+            );
+        }
+
         if let Err(e) = self.apply(&app_id, verified.fid, kind, &payload).await {
             return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e);
         }
@@ -202,14 +224,17 @@ impl NotificationWebhookHandler {
 }
 
 async fn read_body(body: hyper::body::Incoming) -> Result<Bytes, String> {
-    let collected = body
+    // F030 fix: cap via `Limited` BEFORE buffering. The previous
+    // post-hoc size check at line 210 ran after the whole body was
+    // already in memory, so a 10 GB anonymous POST still OOMed the
+    // process before the check could fire.
+    use http_body_util::{BodyExt, Limited};
+    let limited = Limited::new(body, MAX_BODY_BYTES);
+    let collected = limited
         .collect()
         .await
-        .map_err(|e| format!("failed to read body: {e}"))?
+        .map_err(|e| format!("body too large or read error: {e}"))?
         .to_bytes();
-    if collected.len() > MAX_BODY_BYTES {
-        return Err(format!("body exceeds {} bytes", MAX_BODY_BYTES));
-    }
     Ok(collected)
 }
 

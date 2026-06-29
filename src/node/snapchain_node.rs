@@ -174,22 +174,12 @@ impl SnapchainNode {
             consensus_actors.insert(shard_id, consensus_actor.unwrap());
         }
 
-        // Now create the block validator
-        let block_shard = SnapchainShard::new(0);
-
-        // We might want to use different keys for the block shard so signatures are different and cannot be accidentally used in the wrong shard
-        let trie = MerkleTrie::new().unwrap();
-        let block_db =
-            RocksDB::open_shard_db_with_cache(rocksdb_dir.as_str(), 0, block_cache.clone());
-        let engine = BlockEngine::new(
-            trie,
-            statsd_client.clone(),
-            block_db,
-            config.max_messages_per_block,
-            Some(messages_request_tx.clone()),
-            network,
-        );
-        let block_stores = engine.stores();
+        // Block validator setup. The block engine + `block_stores` were
+        // created above (before the per-shard loop, so the loop can use
+        // `block_stores` for heartbeat reconciliation). RocksDB's
+        // process-level fcntl LOCK forbids re-opening shard-0 in the same
+        // process, so we reuse the engine created earlier rather than
+        // opening a fresh handle here.
         let hyper_block_engine = if let Some(ref hyper_dir) = hyper_db_dir {
             let hyper_trie = MerkleTrie::new().unwrap();
             let hyper_block_db =

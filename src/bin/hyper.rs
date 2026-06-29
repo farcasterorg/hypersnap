@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
+use hypersnap::hyper::{HyperDiffReport, CAPABILITY_HYPER};
 use serde_json;
-use snapchain::hyper::{HyperDiffReport, CAPABILITY_HYPER};
 
 #[derive(Parser)]
 #[command(name = "snapchain-hyper", about = "Hyper pipeline utilities")]

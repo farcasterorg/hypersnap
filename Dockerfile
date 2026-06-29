@@ -32,10 +32,12 @@ EOF
 # which isn't ideal.
 COPY Cargo.lock Cargo.toml ./
 COPY proto ./proto
+COPY crates ./crates
 COPY src ./src
 
 ENV RUST_BACKTRACE=full
-RUN cargo build --release --bins
+ARG CARGO_FEATURES=""
+RUN cargo build --release --bins ${CARGO_FEATURES:+--features "$CARGO_FEATURES"}
 
 ## Pre-generate some configurations we can use
 # TOOD: consider doing something different here

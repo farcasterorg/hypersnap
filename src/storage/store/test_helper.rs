@@ -366,6 +366,7 @@ pub fn state_change_to_shard_chunk(
     block_number: u64,
     change: &ShardStateChange,
 ) -> ShardChunk {
+    use prost::Message;
     let mut chunk = default_shard_chunk();
 
     chunk.header.as_mut().unwrap().shard_root = change.new_state_root.clone();
@@ -375,6 +376,10 @@ pub fn state_change_to_shard_chunk(
     });
     chunk.header.as_mut().unwrap().timestamp = change.timestamp.clone().into();
     chunk.transactions = change.transactions.clone();
+    // F012: re-derive hash from finalized header so the read-validator's
+    // `validate_block_hash_matches_header` accepts the chunk.
+    let header_bytes = chunk.header.as_ref().unwrap().encode_to_vec();
+    chunk.hash = blake3::hash(&header_bytes).as_bytes().to_vec();
     chunk
 }
 

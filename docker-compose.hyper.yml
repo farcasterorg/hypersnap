@@ -1,0 +1,80 @@
+x-common: &common
+  build:
+    context: .
+    dockerfile: Dockerfile
+    args:
+      # Mirror the host build so EPOCH_LENGTH inside the container is the
+      # 1,440-block testnet value (~6 min at 250ms block time), matching
+      # what scripts/run_epoch_transition_testnet.sh polls for. Without
+      # this the containerized nodes carry the production 432,000-block
+      # epoch and the 0→1 epoch flip the script waits on never fires.
+      CARGO_FEATURES: short-epochs
+  restart: unless-stopped
+
+services:
+  node1:
+    <<: *common
+    container_name: hyper-node1
+    command: ["--config-path", "./nodes/1/hypersnap.toml"]
+    # Bind-mount only — the host-side ./nodes/N/.rocks already carries
+    # the seeded snapchain on-chain state (IdRegister/StorageRent/SignerAdd
+    # via `setup_local_testnet --seed-snapchain-state`) plus the hyper
+    # custody/transport/validator keys. Layering a named volume on top of
+    # /app/nodes/N/.rocks would mask that seeded state with a fresh empty
+    # volume.
+    volumes:
+      - ./nodes:/app/nodes
+    ports:
+      - "3483:3483"
+      - "3383:3383"
+    networks:
+      hyper-net:
+        ipv4_address: 172.101.0.11
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3483/v1/info"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  node2:
+    <<: *common
+    container_name: hyper-node2
+    command: ["--config-path", "./nodes/2/hypersnap.toml"]
+    volumes:
+      - ./nodes:/app/nodes
+    ports:
+      - "3484:3484"
+      - "3384:3384"
+    networks:
+      hyper-net:
+        ipv4_address: 172.101.0.12
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3484/v1/info"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  node3:
+    <<: *common
+    container_name: hyper-node3
+    command: ["--config-path", "./nodes/3/hypersnap.toml"]
+    volumes:
+      - ./nodes:/app/nodes
+    ports:
+      - "3485:3485"
+      - "3385:3385"
+    networks:
+      hyper-net:
+        ipv4_address: 172.101.0.13
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3485/v1/info"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+networks:
+  hyper-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.101.0.0/24

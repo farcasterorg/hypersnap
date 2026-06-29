@@ -1,4 +1,4 @@
-//! Farcaster API compatibility layer for Snapchain.
+//! Farcaster API compatibility layer for Hypersnap.
 //!
 //! This module provides optional indexing infrastructure to support Farcaster v2 API endpoints.
 //! All features are opt-in via configuration and have zero overhead when disabled.

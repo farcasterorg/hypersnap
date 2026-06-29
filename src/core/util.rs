@@ -217,6 +217,7 @@ mod tests {
         let cfg = ValidatorSetConfig {
             effective_at: 0,
             validator_public_keys: vec![],
+            validator_bls_public_keys: vec![],
             shard_ids: vec![0],
         };
         let stored = StoredValidatorSet::new(SnapchainShard::new(0), &cfg);
@@ -251,6 +252,7 @@ mod tests {
         let cfg = ValidatorSetConfig {
             effective_at: 0,
             validator_public_keys: vec![],
+            validator_bls_public_keys: vec![],
             shard_ids: vec![0],
         };
         let stored = StoredValidatorSet::new(SnapchainShard::new(0), &cfg);
@@ -278,6 +280,7 @@ mod tests {
         let cfg = ValidatorSetConfig {
             effective_at: 0,
             validator_public_keys: vec![],
+            validator_bls_public_keys: vec![],
             shard_ids: vec![0],
         };
         let stored = StoredValidatorSet::new(SnapchainShard::new(0), &cfg);

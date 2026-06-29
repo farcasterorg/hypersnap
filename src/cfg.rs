@@ -129,8 +129,13 @@ impl Default for Config {
             mempool: mempool::mempool::Config::default(),
             rpc_auth: "".to_string(),
             admin_rpc_auth: "".to_string(),
-            rpc_address: format!("0.0.0.0:{}", DEFAULT_RPC_PORT),
-            http_address: format!("0.0.0.0:{}", DEFAULT_HTTP_PORT),
+            // Bind gRPC + HTTP RPC to localhost by default (audit
+            // residual #2): gRPC auth ships off-by-default, so the
+            // safest out-of-the-box posture is loopback-only. Operators
+            // exposing these ports publicly must opt in via config
+            // (typically behind a reverse proxy or mTLS).
+            rpc_address: format!("127.0.0.1:{}", DEFAULT_RPC_PORT),
+            http_address: format!("127.0.0.1:{}", DEFAULT_HTTP_PORT),
             rocksdb_dir: ".rocks".to_string(),
             clear_db: false,
             hyper: hyper::HyperConfig::default(),

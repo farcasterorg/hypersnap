@@ -1,6 +1,6 @@
 use base64::prelude::*;
 use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::header::HeaderValue;
 use hyper::{body::Bytes, Method};
 use hyper::{HeaderMap, Request, Response, StatusCode};
@@ -25,6 +25,25 @@ use crate::proto::{
     reaction_request, reactions_by_target_request, GetConnectedPeersRequest, Protocol,
 };
 use crate::storage::store::account::message_decode;
+
+/// Maximum request body size accepted at the HTTP ingress layer.
+/// Buffering caps prevent an anonymous public-internet POST of a
+/// multi-GB body from OOM-killing the node. Set to 4 MiB — well
+/// above any legitimate single-message or bulk-submit payload while
+/// remaining well below process memory pressure.
+const MAX_HTTP_BODY_BYTES: usize = 4 * 1024 * 1024;
+
+/// Read a request body with a transport-level cap. Wraps the body
+/// in `Limited` so the read errors out as soon as the cap is
+/// exceeded — no more buffering past the limit.
+async fn read_limited_body(body: hyper::body::Incoming) -> Result<Bytes, String> {
+    let limited = Limited::new(body, MAX_HTTP_BODY_BYTES);
+    let collected = limited
+        .collect()
+        .await
+        .map_err(|e| format!("body too large or read error: {e}"))?;
+    Ok(collected.to_bytes())
+}
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Config {
@@ -3711,6 +3730,14 @@ where
 pub struct Router<Service: HubService> {
     service: Arc<HubHttpServiceImpl<Service>>,
     api_handler: Option<ApiHttpHandler>,
+    hyper_handler: Option<crate::hyper::http_handler::HyperHttpHandler>,
+    /// F031: per-request rate limiter. When set, every request
+    /// (not just the initial TCP accept) is gated by the limiter
+    /// before any work. Keeps keep-alive pipelining bounded.
+    rate_limiter: Option<(
+        std::sync::Arc<crate::network::rate_limit::IpRateLimiter>,
+        std::net::IpAddr,
+    )>,
 }
 
 impl<Service> Router<Service>
@@ -3721,7 +3748,22 @@ where
         Self {
             service: Arc::new(service),
             api_handler: None,
+            hyper_handler: None,
+            rate_limiter: None,
         }
+    }
+
+    /// F031: attach a per-request rate limiter for this peer IP. The
+    /// limiter is consulted at the top of every `handle()` call, not
+    /// just at TCP accept — so keep-alive/pipelined requests on a
+    /// single connection are also bounded.
+    pub fn with_rate_limiter(
+        mut self,
+        limiter: std::sync::Arc<crate::network::rate_limit::IpRateLimiter>,
+        peer_ip: std::net::IpAddr,
+    ) -> Self {
+        self.rate_limiter = Some((limiter, peer_ip));
+        self
     }
 
     /// Set the API handler for v2 API endpoints.
@@ -3730,11 +3772,31 @@ where
         self
     }
 
+    /// Attach the hyper-protocol HTTP handler (`/hyper/v1/*`).
+    /// Operator constructs it from the spawned `HyperActor`'s handles.
+    pub fn with_hyper_handler(
+        mut self,
+        handler: crate::hyper::http_handler::HyperHttpHandler,
+    ) -> Self {
+        self.hyper_handler = Some(handler);
+        self
+    }
+
     pub async fn handle(
         &self,
         req: Request<hyper::body::Incoming>,
         config: &Config,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        // F031: per-request rate check. Gates keep-alive and
+        // pipelined requests, not just TCP accepts.
+        if let Some((ref limiter, peer_ip)) = self.rate_limiter {
+            if !limiter.allow(peer_ip) {
+                return Ok(Response::builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .body(Full::new(Bytes::from_static(b"rate limit exceeded")).boxed())
+                    .unwrap());
+            }
+        }
         // CORS preflight short-circuit. Browsers send `OPTIONS` before
         // any cross-origin POST with a non-simple `Content-Type`
         // (e.g. `application/json`) or any custom header like
@@ -3780,6 +3842,31 @@ where
         if let Some(ref handler) = self.api_handler {
             if handler.can_handle(req.method(), path) {
                 let mut response = handler.handle(req).await?;
+                response.headers_mut().append(
+                    "Access-Control-Allow-Origin",
+                    HeaderValue::from_str(&config.cors_origin).unwrap(),
+                );
+                return Ok(response);
+            }
+        }
+
+        // Hyper-protocol routes: `/hyper/v1/*`. Short-circuit before the
+        // legacy router so paths like `/hyper/v1/head` don't get
+        // misinterpreted as the legacy hub API.
+        if let Some(ref hyper_handler) = self.hyper_handler {
+            if hyper_handler.can_handle(req.method(), path) {
+                let method = req.method().clone();
+                let path = path.to_string();
+                let body = match read_limited_body(req.into_body()).await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return Ok(Response::builder()
+                            .status(StatusCode::PAYLOAD_TOO_LARGE)
+                            .body(http_body_util::Full::new(Bytes::from(e)).boxed())
+                            .unwrap());
+                    }
+                };
+                let mut response = hyper_handler.handle(&method, &path, body).await;
                 response.headers_mut().append(
                     "Access-Control-Allow-Origin",
                     HeaderValue::from_str(&config.cors_origin).unwrap(),
@@ -4290,14 +4377,14 @@ where
     ) -> Result<proto::SubmitBulkMessagesRequest, Response<Bytes>> {
         use prost::Message;
 
-        let body_bytes = req.collect().await.map_err(|e| {
+        let body_bytes = read_limited_body(req.into_body()).await.map_err(|e| {
             Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Bytes::from(format!("Internal server error: {}", e)))
+                .status(StatusCode::PAYLOAD_TOO_LARGE)
+                .body(Bytes::from(e))
                 .unwrap()
         })?;
 
-        proto::SubmitBulkMessagesRequest::decode(body_bytes.to_bytes()).map_err(|e| {
+        proto::SubmitBulkMessagesRequest::decode(body_bytes).map_err(|e| {
             Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .body(Bytes::from(format!("Invalid protobuf data: {}", e)))
@@ -4310,18 +4397,17 @@ where
         req: Request<hyper::body::Incoming>,
     ) -> Result<proto::Message, Response<Bytes>> {
         // For POST/PUT requests, parse body
-        let body_bytes = req.collect().await;
-        if body_bytes.is_err() {
-            return Err(Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Bytes::from(format!(
-                    "Internal server error: {}",
-                    body_bytes.unwrap_err().to_string()
-                )))
-                .unwrap());
-        }
+        let body_bytes = match read_limited_body(req.into_body()).await {
+            Ok(b) => b,
+            Err(e) => {
+                return Err(Response::builder()
+                    .status(StatusCode::PAYLOAD_TOO_LARGE)
+                    .body(Bytes::from(e))
+                    .unwrap());
+            }
+        };
 
-        match message_decode(&body_bytes.unwrap().to_bytes().slice(..)) {
+        match message_decode(&body_bytes.slice(..)) {
             Ok(parsed) => Ok(parsed),
             Err(e) => Err(Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -4345,13 +4431,19 @@ where
             });
         }
 
-        // For POST/PUT requests, parse body
-        let body_bytes = req.collect().await;
+        // For POST/PUT requests, parse body. F030 fix: cap the
+        // body via `http_body_util::Limited` so we reject an
+        // unbounded payload BEFORE buffering the whole thing in
+        // memory. Without this, an anonymous POST of a 10 GB body
+        // OOMs the node before any application-level checks run.
+        const MAX_HTTP_BODY_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
+        let limited = Limited::new(req, MAX_HTTP_BODY_BYTES);
+        let body_bytes = limited.collect().await;
         if body_bytes.is_err() {
             return Err(Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .status(StatusCode::PAYLOAD_TOO_LARGE)
                 .body(Bytes::from(format!(
-                    "Internal server error: {}",
+                    "Body exceeds {MAX_HTTP_BODY_BYTES} bytes or read failed: {}",
                     body_bytes.unwrap_err().to_string()
                 )))
                 .unwrap());

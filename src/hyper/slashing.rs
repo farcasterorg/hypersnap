@@ -1,0 +1,259 @@
+//! Slashing evidence detection.
+//!
+//! Evidence currently tracked: **conflicting blocks at the same height**.
+//! Two distinct blocks at `canonical_block_id == H`, both with valid
+//! threshold signatures from the same epoch's group key, but with
+//! different state roots, prove that the epoch's signers are misbehaving
+//! (collectively or via a malicious proposer).
+//!
+//! Detection is observational — anyone can produce evidence by collecting
+//! two conflicting blocks. Penalty enforcement happens at the next epoch
+//! boundary by the active set, not in this module.
+
+use crate::hyper::chain::hyper_block_content_hash;
+use crate::hyper::HyperBlock;
+use alloy_primitives::Address;
+
+#[derive(Clone, Debug)]
+pub struct ConflictingBlocksEvidence {
+    /// F026: blocks may carry different epoch tags (cross-epoch
+    /// equivocation). Each block is verified against its own epoch's
+    /// group key in `verify_evidence_signatures`.
+    pub epoch_a: u64,
+    pub epoch_b: u64,
+    pub canonical_block_id: u64,
+    pub block_a_hash: [u8; 32],
+    pub block_b_hash: [u8; 32],
+    pub block_a: Box<HyperBlock>,
+    pub block_b: Box<HyperBlock>,
+}
+
+#[derive(thiserror::Error, Debug, PartialEq)]
+pub enum EvidenceError {
+    #[error("blocks are at different heights ({a} vs {b}); not a conflict")]
+    DifferentHeights { a: u64, b: u64 },
+    #[error("blocks are byte-identical; no conflict")]
+    SameBlock,
+    #[error("no group key known for evidence epoch {epoch}")]
+    UnknownEpochGroupKey { epoch: u64 },
+    #[error("block {which} threshold signature invalid for evidence epoch")]
+    InvalidSignature { which: char },
+}
+
+/// Detect a conflicting-blocks slashing condition.
+///
+/// Returns `Ok(evidence)` if the two blocks form a valid conflict;
+/// `Err` if they don't.
+/// F026: accepts cross-epoch conflicts. A validator holding shares
+/// for two consecutive epochs can sign conflicting blocks at the
+/// same `canonical_block_id` with different epoch tags. Without
+/// accepting this case, `DifferentEpochs` drops the evidence and
+/// the equivocator evades slashing.
+pub fn detect_conflicting_blocks(
+    a: &HyperBlock,
+    b: &HyperBlock,
+) -> Result<ConflictingBlocksEvidence, EvidenceError> {
+    let h_a = a.envelope.metadata.canonical_block_id;
+    let h_b = b.envelope.metadata.canonical_block_id;
+    if h_a != h_b {
+        return Err(EvidenceError::DifferentHeights { a: h_a, b: h_b });
+    }
+
+    // F009 fix: compare content (signing-payload-equivalent) hashes,
+    // NOT `hyper_block_hash` which mixes in the threshold signature.
+    // Two valid threshold sigs over byte-identical block content
+    // (e.g., a sign-ceremony retry where a different aggregator picked
+    // a different partial-sig set) hash identically here — the
+    // predicate must NOT flag that as a conflict.
+    let hash_a = hyper_block_content_hash(a);
+    let hash_b = hyper_block_content_hash(b);
+    if hash_a == hash_b {
+        return Err(EvidenceError::SameBlock);
+    }
+
+    Ok(ConflictingBlocksEvidence {
+        epoch_a: a.signature.epoch,
+        epoch_b: b.signature.epoch,
+        canonical_block_id: h_a,
+        block_a_hash: hash_a,
+        block_b_hash: hash_b,
+        block_a: Box::new(a.clone()),
+        block_b: Box::new(b.clone()),
+    })
+}
+
+/// Verify both evidence blocks carry valid threshold signatures
+/// against `group_address` (the epoch's group key resolved by the
+/// caller). Without this check, any peer can publish two unsigned
+/// blocks naming arbitrary `signer_indices` and slash arbitrary
+/// validators at the next epoch boundary — the persisted record
+/// drives `slashed_validators_for_epoch`.
+/// F026: verify each evidence block against its OWN epoch's group
+/// key. Cross-epoch equivocation (same `canonical_block_id`, different
+/// epoch tags) is a valid slashing condition, so we resolve the
+/// group address per-block, not per-evidence.
+pub fn verify_evidence_signatures(
+    ev: &ConflictingBlocksEvidence,
+    resolve_group_address: impl Fn(u64) -> Option<Address>,
+) -> Result<(), EvidenceError> {
+    for (which, block) in [('a', ev.block_a.as_ref()), ('b', ev.block_b.as_ref())] {
+        let epoch = block.signature.epoch;
+        let group_address =
+            resolve_group_address(epoch).ok_or(EvidenceError::UnknownEpochGroupKey { epoch })?;
+        let expected = crate::hyper::sig_verify::ExpectedGroupKey::ecdsa_only(&group_address);
+        let payload = block
+            .envelope
+            .metadata
+            .signing_payload(block.signature.epoch, &block.signature.signer_indices);
+        crate::hyper::sig_verify::verify_hyperblock_signature(
+            &payload,
+            &block.signature.ecdsa_signature,
+            &block.signature.group_address,
+            &expected,
+        )
+        .map_err(|_| EvidenceError::InvalidSignature { which })?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hyper::{HyperBlockMetadata, HyperBlockSignature, HyperEnvelope};
+
+    fn make_block(height: u64, epoch: u64, state_root: Vec<u8>) -> HyperBlock {
+        HyperBlock {
+            envelope: HyperEnvelope {
+                metadata: HyperBlockMetadata {
+                    canonical_block_id: height,
+                    parent_hash: vec![0u8; 32],
+                    hyper_state_root: state_root,
+                    extra_rules_version: 0,
+                    retained_message_count: 0,
+                    missed_proposals: vec![],
+                    snapchain_anchor_block: 0,
+                    snapchain_anchor_hash: vec![],
+                    snapchain_range_start_block: 0,
+                    snapchain_range_root: vec![],
+                    snapchain_anchor_timestamp: 0,
+                },
+                payload: vec![],
+            },
+            signature: HyperBlockSignature {
+                epoch,
+                signer_indices: vec![1, 2, 3],
+                group_address: Vec::new(),
+                ecdsa_signature: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn detects_conflicting_state_roots_at_same_height() {
+        let a = make_block(10, 5, vec![0xaa; 48]);
+        let b = make_block(10, 5, vec![0xbb; 48]);
+        let evidence = detect_conflicting_blocks(&a, &b).unwrap();
+        assert_eq!(evidence.epoch_a, 5);
+        assert_eq!(evidence.canonical_block_id, 10);
+        assert_ne!(evidence.block_a_hash, evidence.block_b_hash);
+    }
+
+    #[test]
+    fn rejects_different_heights() {
+        let a = make_block(10, 5, vec![0xaa; 48]);
+        let b = make_block(11, 5, vec![0xbb; 48]);
+        assert!(matches!(
+            detect_conflicting_blocks(&a, &b),
+            Err(EvidenceError::DifferentHeights { a: 10, b: 11 })
+        ));
+    }
+
+    /// F026: cross-epoch blocks at the same height are now accepted
+    /// as valid evidence (previously dropped by DifferentEpochs).
+    #[test]
+    fn accepts_cross_epoch_conflicts() {
+        let a = make_block(10, 5, vec![0xaa; 48]);
+        let b = make_block(10, 6, vec![0xbb; 48]);
+        let ev = detect_conflicting_blocks(&a, &b).expect("cross-epoch conflict is valid evidence");
+        assert_eq!(ev.epoch_a, 5);
+        assert_eq!(ev.epoch_b, 6);
+        assert_eq!(ev.canonical_block_id, 10);
+    }
+
+    #[test]
+    fn rejects_identical_blocks() {
+        let a = make_block(10, 5, vec![0xaa; 48]);
+        let b = a.clone();
+        assert!(matches!(
+            detect_conflicting_blocks(&a, &b),
+            Err(EvidenceError::SameBlock)
+        ));
+    }
+
+    #[test]
+    fn detects_conflict_on_different_metadata_field() {
+        // Even with the same state root, blocks differing in any other
+        // metadata field (parent_hash, retained_message_count, etc.) at
+        // the same height + epoch are a conflict.
+        let mut a = make_block(10, 5, vec![0xaa; 48]);
+        let mut b = make_block(10, 5, vec![0xaa; 48]);
+        a.envelope.metadata.parent_hash = vec![0x11; 32];
+        b.envelope.metadata.parent_hash = vec![0x22; 32];
+        let evidence = detect_conflicting_blocks(&a, &b).unwrap();
+        assert_eq!(evidence.epoch_a, 5);
+        assert_ne!(evidence.block_a_hash, evidence.block_b_hash);
+    }
+
+    /// F009 regression: two valid threshold signatures over byte-
+    /// identical block content (e.g. a sign-ceremony retry) must NOT
+    /// be flagged as a conflict. Pre-fix `hyper_block_hash` mixed in
+    /// the ECDSA signature, so identical content with different sigs
+    /// hashed differently and triggered slashing.
+    #[test]
+    fn identical_content_distinct_signatures_is_not_a_conflict() {
+        let mut a = make_block(10, 5, vec![0xaa; 48]);
+        let mut b = make_block(10, 5, vec![0xaa; 48]);
+        a.signature.ecdsa_signature = vec![0x11; 65];
+        b.signature.ecdsa_signature = vec![0x22; 65];
+        // Same `group_address` too — only the sig bytes differ.
+        a.signature.group_address = vec![0xcc; 20];
+        b.signature.group_address = vec![0xcc; 20];
+        assert!(matches!(
+            detect_conflicting_blocks(&a, &b),
+            Err(EvidenceError::SameBlock)
+        ));
+    }
+
+    /// F009 regression: distinct signer-index sets DO count as
+    /// distinct content — the signing payload binds signer_indices.
+    /// Same block content with disjoint signer sets is legitimate
+    /// evidence of conflicting signer subsets.
+    #[test]
+    fn same_content_different_signer_sets_is_a_conflict() {
+        let mut a = make_block(10, 5, vec![0xaa; 48]);
+        let mut b = make_block(10, 5, vec![0xaa; 48]);
+        a.signature.signer_indices = vec![1, 2, 3];
+        b.signature.signer_indices = vec![1, 4, 5];
+        let ev = detect_conflicting_blocks(&a, &b)
+            .expect("different signer sets produce distinct content hashes");
+        assert_ne!(ev.block_a_hash, ev.block_b_hash);
+    }
+
+    #[test]
+    fn evidence_round_trip_preserves_blocks() {
+        let a = make_block(10, 5, vec![0xaa; 48]);
+        let b = make_block(10, 5, vec![0xbb; 48]);
+        let ev = detect_conflicting_blocks(&a, &b).unwrap();
+        // The evidence holds the original blocks for re-verification.
+        assert_eq!(ev.block_a.envelope.metadata.canonical_block_id, 10);
+        assert_eq!(ev.block_b.envelope.metadata.canonical_block_id, 10);
+        assert_eq!(
+            ev.block_a.envelope.metadata.hyper_state_root,
+            vec![0xaa; 48]
+        );
+        assert_eq!(
+            ev.block_b.envelope.metadata.hyper_state_root,
+            vec![0xbb; 48]
+        );
+    }
+}

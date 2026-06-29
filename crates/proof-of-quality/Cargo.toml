@@ -1,0 +1,13 @@
+[package]
+name = "proof-of-quality"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+description = "Deterministic in-protocol scoring for hypersnap: EigenTrust + sustained-mutual-engagement growth, ports the retro_rewards_finalize formula to a per-validator computation that runs at every epoch boundary"
+
+[dependencies]
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+twox-hash = "1.6"
+
+[dev-dependencies]

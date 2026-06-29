@@ -1,33 +1,33 @@
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
+use hypersnap::connectors::fname::FnameRequest;
+use hypersnap::connectors::onchain_events::{ChainClients, OnchainEventsRequest};
+use hypersnap::consensus::consensus::SystemMessage;
+use hypersnap::core::types::SnapchainValidatorContext;
+use hypersnap::hyper as snapchain_hyper;
+use hypersnap::mempool::block_receiver::BlockReceiver;
+use hypersnap::mempool::mempool::{Mempool, MempoolRequest, ReadNodeMempool};
+use hypersnap::mempool::routing;
+use hypersnap::network::admin_server::MyAdminService;
+use hypersnap::network::gossip::{GossipEvent, SnapchainGossip};
+use hypersnap::network::http_server::HubHttpServiceImpl;
+use hypersnap::network::replication::{self, ReplicationServer, Replicator};
+use hypersnap::network::server::MyHubService;
+use hypersnap::node::snapchain_node::SnapchainNode;
+use hypersnap::node::snapchain_read_node::SnapchainReadNode;
+use hypersnap::proto::admin_service_server::AdminServiceServer;
+use hypersnap::proto::hub_service_server::HubServiceServer;
+use hypersnap::proto::replication_service_server::ReplicationServiceServer;
+use hypersnap::storage::db::snapshot::{download_snapshots, BootstrapMethod};
+use hypersnap::storage::db::RocksDB;
+use hypersnap::storage::store::block_engine::BlockStores;
+use hypersnap::storage::store::engine::{PostCommitMessage, Senders};
+use hypersnap::storage::store::node_local_state::{self, LocalStateStore};
+use hypersnap::storage::store::stores::Stores;
+use hypersnap::utils::statsd_wrapper::StatsdClientWrapper;
 use informalsystems_malachitebft_metrics::{Metrics, SharedRegistry};
 use libp2p::PeerId;
-use snapchain::connectors::fname::FnameRequest;
-use snapchain::connectors::onchain_events::{ChainClients, OnchainEventsRequest};
-use snapchain::consensus::consensus::SystemMessage;
-use snapchain::core::types::SnapchainValidatorContext;
-use snapchain::hyper as snapchain_hyper;
-use snapchain::mempool::block_receiver::BlockReceiver;
-use snapchain::mempool::mempool::{Mempool, MempoolRequest, ReadNodeMempool};
-use snapchain::mempool::routing;
-use snapchain::network::admin_server::MyAdminService;
-use snapchain::network::gossip::{GossipEvent, SnapchainGossip};
-use snapchain::network::http_server::HubHttpServiceImpl;
-use snapchain::network::replication::{self, ReplicationServer, Replicator};
-use snapchain::network::server::MyHubService;
-use snapchain::node::snapchain_node::SnapchainNode;
-use snapchain::node::snapchain_read_node::SnapchainReadNode;
-use snapchain::proto::admin_service_server::AdminServiceServer;
-use snapchain::proto::hub_service_server::HubServiceServer;
-use snapchain::proto::replication_service_server::ReplicationServiceServer;
-use snapchain::storage::db::snapshot::{download_snapshots, BootstrapMethod};
-use snapchain::storage::db::RocksDB;
-use snapchain::storage::store::block_engine::BlockStores;
-use snapchain::storage::store::engine::{PostCommitMessage, Senders};
-use snapchain::storage::store::node_local_state::{self, LocalStateStore};
-use snapchain::storage::store::stores::Stores;
-use snapchain::utils::statsd_wrapper::StatsdClientWrapper;
 use snapchain_hyper::CAPABILITY_HYPER;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
@@ -47,7 +47,7 @@ use tracing_subscriber::EnvFilter;
 const VERSION: Option<&str> = option_env!("CARGO_PKG_VERSION");
 
 async fn start_servers(
-    app_config: &snapchain::cfg::Config,
+    app_config: &hypersnap::cfg::Config,
     gossip_tx: mpsc::Sender<GossipEvent<SnapchainValidatorContext>>,
     local_peer_id: PeerId,
     mempool_tx: mpsc::Sender<MempoolRequest>,
@@ -61,8 +61,15 @@ async fn start_servers(
     chain_clients: ChainClients,
     replicator: Option<Arc<replication::replicator::Replicator>>,
     local_state_store: LocalStateStore,
-    api_handler: Option<snapchain::api::ApiHttpHandler>,
-    api_system_search_indexer: Option<Arc<snapchain::api::SearchIndexer>>,
+    api_handler: Option<hypersnap::api::ApiHttpHandler>,
+    api_system_search_indexer: Option<Arc<hypersnap::api::SearchIndexer>>,
+    // R4 + main-merge: hyper handler is now built in the caller
+    // BEFORE the gossip spawn (so QUIC keepalives flow during heavy
+    // RocksDB init and the hyper actor wires through a
+    // post-spawn-settable `OnceLock`). `None` means the node runs
+    // without hyper handlers (read nodes, or validators with hyper
+    // disabled in config).
+    hyper_handler: Option<hypersnap::hyper::http_handler::HyperHttpHandler>,
 ) {
     let grpc_addr = app_config.rpc_address.clone();
     let grpc_socket_addr: SocketAddr = grpc_addr.parse().unwrap();
@@ -86,7 +93,7 @@ async fn start_servers(
         .map(|(&id, s)| {
             (
                 id,
-                s.with_state_context(snapchain::hyper::StateContext::Hyper),
+                s.with_state_context(hypersnap::hyper::StateContext::Hyper),
             )
         })
         .collect();
@@ -97,7 +104,7 @@ async fn start_servers(
         let backfill_shard_stores = shard_stores.clone();
         let backfill_hyper_stores = hyper_shard_stores.clone();
         tokio::spawn(async move {
-            snapchain::hyper::backfill::run_hyper_backfill(
+            hypersnap::hyper::backfill::run_hyper_backfill(
                 &backfill_db,
                 &backfill_shard_stores,
                 &backfill_hyper_stores,
@@ -106,10 +113,10 @@ async fn start_servers(
         });
     }
 
-    let fname_lookup: Option<Arc<dyn snapchain::connectors::fname::FnameTransferLookup>> =
+    let fname_lookup: Option<Arc<dyn hypersnap::connectors::fname::FnameTransferLookup>> =
         if !app_config.fnames.disable && !app_config.fnames.url.is_empty() {
             Some(Arc::new(
-                snapchain::connectors::fname::HttpFnameTransferLookup::new(
+                hypersnap::connectors::fname::HttpFnameTransferLookup::new(
                     app_config.fnames.url.clone(),
                 ),
             ))
@@ -169,7 +176,7 @@ async fn start_servers(
     // Wire late-bound API handlers that depend on the hub service
     if let Some(ref handler) = api_handler {
         if app_config.api.conversations.enabled {
-            let conv = Arc::new(snapchain::api::ConversationService::new(
+            let conv = Arc::new(hypersnap::api::ConversationService::new(
                 app_config.api.conversations.clone(),
                 api_service.clone(),
             ));
@@ -177,7 +184,7 @@ async fn start_servers(
         }
         if app_config.api.feeds.enabled {
             let social_graph = if app_config.api.social_graph.enabled {
-                Some(Arc::new(snapchain::api::SocialGraphIndexer::new(
+                Some(Arc::new(hypersnap::api::SocialGraphIndexer::new(
                     app_config.api.social_graph.clone(),
                     block_stores.db.clone(),
                 )))
@@ -185,14 +192,14 @@ async fn start_servers(
                 None
             };
             let metrics = if app_config.api.metrics.enabled {
-                Some(Arc::new(snapchain::api::MetricsIndexer::new(
+                Some(Arc::new(hypersnap::api::MetricsIndexer::new(
                     app_config.api.metrics.clone(),
                     block_stores.db.clone(),
                 )))
             } else {
                 None
             };
-            let feeds = Arc::new(snapchain::api::FeedService::new(
+            let feeds = Arc::new(hypersnap::api::FeedService::new(
                 app_config.api.feeds.clone(),
                 social_graph,
                 metrics,
@@ -206,21 +213,21 @@ async fn start_servers(
         }
         // Wire user hydrator for populating User objects in API responses
         let social_graph_for_hydrator = if app_config.api.social_graph.enabled {
-            Some(Arc::new(snapchain::api::SocialGraphIndexer::new(
+            Some(Arc::new(hypersnap::api::SocialGraphIndexer::new(
                 app_config.api.social_graph.clone(),
                 block_stores.db.clone(),
             )))
         } else {
             None
         };
-        let hydrator = Arc::new(snapchain::api::HubUserHydrator::new(
+        let hydrator = Arc::new(hypersnap::api::HubUserHydrator::new(
             api_service.clone(),
             social_graph_for_hydrator,
         ));
         // Hold a CustodyAddressLookup view of the hydrator before erasing
         // it as `dyn UserHydrator`, so the webhook auth verifier can reuse
         // the same hub-service-backed lookup path.
-        let custody_lookup: Arc<dyn snapchain::api::webhooks::CustodyAddressLookup> =
+        let custody_lookup: Arc<dyn hypersnap::api::webhooks::CustodyAddressLookup> =
             hydrator.clone();
         handler.set_user_hydrator(hydrator);
 
@@ -233,7 +240,7 @@ async fn start_servers(
         // webhook.create can't be replayed as app.create.
         let shared_auth = if app_config.api.webhooks.enabled || app_config.api.notifications.enabled
         {
-            Some(snapchain::api::webhooks::WebhookAuthVerifier::new(
+            Some(hypersnap::api::webhooks::WebhookAuthVerifier::new(
                 custody_lookup.clone(),
                 app_config.api.webhooks.signed_at_window_secs,
             ))
@@ -243,10 +250,10 @@ async fn start_servers(
 
         // Optional: webhook management API.
         if app_config.api.webhooks.enabled {
-            let store = Arc::new(snapchain::api::webhooks::WebhookStore::new(
+            let store = Arc::new(hypersnap::api::webhooks::WebhookStore::new(
                 block_stores.db.clone(),
             ));
-            let webhook_handler = snapchain::api::webhooks::WebhookManagementHandler::new(
+            let webhook_handler = hypersnap::api::webhooks::WebhookManagementHandler::new(
                 app_config.api.webhooks.clone(),
                 store,
                 shared_auth.clone().expect("shared_auth built above"),
@@ -281,7 +288,32 @@ async fn start_servers(
 
     tokio::spawn(async move {
         info!(grpc_addr = grpc_addr, "GrpcService listening",);
-        let mut server = Server::builder().add_service(HubServiceServer::from_arc(grpc_service));
+        // F031: per-IP rate limit on gRPC. Create a rate-limited
+        // wrapper service so every RPC (not just connection) is
+        // gated. The interceptor extracts the peer socket address
+        // from tonic's ConnectInfo and checks the shared limiter.
+        let grpc_rate_limiter =
+            std::sync::Arc::new(hypersnap::network::rate_limit::IpRateLimiter::new(
+                120,
+                std::time::Duration::from_secs(60),
+            ));
+        let grpc_rl = grpc_rate_limiter.clone();
+        let rate_limit_interceptor =
+            move |req: tonic::Request<()>| -> Result<tonic::Request<()>, tonic::Status> {
+                if let Some(addr) = req.remote_addr() {
+                    if !grpc_rl.allow(addr.ip()) {
+                        return Err(tonic::Status::resource_exhausted("rate limit exceeded"));
+                    }
+                }
+                Ok(req)
+            };
+        let grpc_svc = tonic::codegen::InterceptedService::new(
+            HubServiceServer::from_arc(grpc_service),
+            rate_limit_interceptor,
+        );
+        let mut server = Server::builder()
+            .concurrency_limit_per_connection(64)
+            .add_service(grpc_svc);
 
         if admin_service.enabled() {
             let admin_service = AdminServiceServer::new(admin_service);
@@ -308,6 +340,12 @@ async fn start_servers(
 
     let http_shutdown_tx = shutdown_tx.clone();
     let http_server_config = app_config.http_server.clone();
+    // Filled in after the gossip layer + hyper actor are constructed
+    // (see further down). Until then, /hyper/v1/* routes 404.
+    let hyper_handler_slot: std::sync::Arc<
+        tokio::sync::RwLock<Option<hypersnap::hyper::http_handler::HyperHttpHandler>>,
+    > = std::sync::Arc::new(tokio::sync::RwLock::new(None));
+    let hyper_handler_slot_for_http = hyper_handler_slot.clone();
     tokio::spawn(async move {
         let listener = TcpListener::bind(http_socket_addr).await.unwrap();
         info!(http_addr = http_addr, "HttpService listening",);
@@ -315,18 +353,48 @@ async fn start_servers(
         let http_service = HubHttpServiceImpl {
             service: service.clone(),
         };
+        // F031 fix: per-IP token-bucket rate limit on HTTP accept.
+        // No new deps; minimal in-process limiter keyed by source
+        // address. The CONFIGURABLE knobs are baked at compile time
+        // here (60 req/min/IP); a future patch can plumb these from
+        // `http_server_config` if operators need to tune.
+        let rate_limiter = std::sync::Arc::new(hypersnap::network::rate_limit::IpRateLimiter::new(
+            /* max_per_window = */ 60,
+            /* window = */ std::time::Duration::from_secs(60),
+        ));
         loop {
             match listener.accept().await {
-                Ok((stream, _)) => {
+                Ok((stream, peer_addr)) => {
+                    if !rate_limiter.allow(peer_addr.ip()) {
+                        // Refuse the connection without serving — the
+                        // peer either retries (rate-limited normal
+                        // client) or stops (flood).
+                        tracing::debug!(
+                            peer = %peer_addr,
+                            "rate limit: refusing HTTP accept"
+                        );
+                        drop(stream);
+                        continue;
+                    }
                     let io = TokioIo::new(stream);
                     let http_server_config = http_server_config.clone();
                     let service_clone = http_service.clone();
                     let api = api_handler.clone();
+                    let hyper_h = hyper_handler_slot_for_http.read().await.clone();
+                    // F031: clone the rate limiter + capture the peer
+                    // IP so each request on this connection is checked,
+                    // not just the accept.
+                    let rl = rate_limiter.clone();
+                    let peer_ip = peer_addr.ip();
                     tokio::spawn(async move {
                         let mut router =
-                            snapchain::network::http_server::Router::new(service_clone);
+                            hypersnap::network::http_server::Router::new(service_clone)
+                                .with_rate_limiter(rl, peer_ip);
                         if let Some(handler) = api {
                             router = router.with_api_handler(handler);
+                        }
+                        if let Some(handler) = hyper_h {
+                            router = router.with_hyper_handler(handler);
                         }
                         if let Err(err) = http1::Builder::new()
                             .serve_connection(
@@ -348,10 +416,24 @@ async fn start_servers(
 
         http_shutdown_tx.send(()).await.ok();
     });
+
+    // FIP hyper: handler is built upstream (before the gossip
+    // spawn) so the actor's inbound channel can be installed into
+    // gossip's `OnceLock` cell while the swarm still has a live
+    // `&mut`. Here we just publish the pre-built handler into the
+    // slot the HTTP loop reads from, if hyper is configured.
+    if let Some(h) = hyper_handler {
+        *hyper_handler_slot.write().await = Some(h);
+        info!("Hyper actor + HTTP handler attached");
+    }
+
+    // R4 audit fix: the gossip task was already spawned by the caller
+    // BEFORE node creation, so QUIC keepalives flow during heavy
+    // RocksDB shard init. Nothing to do here.
 }
 
 async fn schedule_background_jobs(
-    app_config: &snapchain::cfg::Config,
+    app_config: &hypersnap::cfg::Config,
     shard_stores: HashMap<u32, Stores>,
     block_stores: BlockStores,
     sync_complete_rx: watch::Receiver<bool>,
@@ -362,7 +444,7 @@ async fn schedule_background_jobs(
     if app_config.read_node {
         if let Some(block_retention) = app_config.pruning.block_retention {
             let schedule = "0 0 10 * * *"; // 10am UTC every day
-            let job = snapchain::jobs::block_pruning::block_pruning_job(
+            let job = hypersnap::jobs::block_pruning::block_pruning_job(
                 schedule,
                 block_retention,
                 block_stores.clone(),
@@ -379,7 +461,7 @@ async fn schedule_background_jobs(
         .event_pruning_schedule
         .as_deref()
         .unwrap_or("0 0 0 * * *"); // default: midnight UTC every day
-    let event_pruning_job = snapchain::jobs::event_pruning::event_pruning_job(
+    let event_pruning_job = hypersnap::jobs::event_pruning::event_pruning_job(
         event_pruning_schedule,
         app_config.pruning.event_retention,
         shard_stores.clone(),
@@ -393,7 +475,7 @@ async fn schedule_background_jobs(
     jobs.push(event_pruning_job);
 
     if app_config.snapshot.snapshot_upload_enabled() {
-        let snapshot_upload_job = snapchain::jobs::snapshot_upload::snapshot_upload_job(
+        let snapshot_upload_job = hypersnap::jobs::snapshot_upload::snapshot_upload_job(
             "0 0 5 * * *", // 5 AM UTC every day
             app_config.snapshot.clone(),
             app_config.fc_network,
@@ -418,7 +500,7 @@ fn is_dir_empty(path: &str) -> std::io::Result<bool> {
 }
 
 fn create_replicator(
-    app_config: &snapchain::cfg::Config,
+    app_config: &hypersnap::cfg::Config,
     shard_stores: HashMap<u32, Stores>,
     statsd_client: StatsdClientWrapper,
 ) -> Result<Arc<replication::Replicator>, Box<dyn Error>> {
@@ -457,7 +539,7 @@ fn create_replicator(
 async fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().collect();
 
-    let app_config = match snapchain::cfg::load_and_merge_config(args) {
+    let app_config = match hypersnap::cfg::load_and_merge_config(args) {
         Ok(config) => config,
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -467,7 +549,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"))
-        .add_directive("tantivy=warn".parse().unwrap());
+        .add_directive("tantivy=warn".parse().unwrap())
+        // Malachite emits WARN for every sync poll when the local
+        // node has no peer subscribed to the consensus topic — the
+        // expected steady state during single-signer / bootstrap /
+        // pre-handshake moments. The malachite consensus paths
+        // (`vote set`, `request sync from`) emit dozens of these per
+        // second on epoch 0 with one validator, drowning real WARN
+        // signal. Demote to `info` so they stay greppable for
+        // debugging via `RUST_LOG=…sync=debug` but don't clutter
+        // the default-WARN production view.
+        .add_directive("informalsystems_malachitebft_sync=info".parse().unwrap());
     match app_config.log_format.as_str() {
         "text" => tracing_subscriber::fmt().with_env_filter(env_filter).init(),
         "json" => tracing_subscriber::fmt()
@@ -529,10 +621,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if db_is_empty {
         match app_config.snapshot.bootstrap_method {
             BootstrapMethod::Replicate => {
-                use rustls::crypto::{self, ring};
-                use snapchain::bootstrap::replication::service::{
+                use hypersnap::bootstrap::replication::service::{
                     ReplicatorBootstrap, WorkUnitResponse,
                 };
+                use rustls::crypto::{self, ring};
                 use tokio::time::{sleep, Duration};
 
                 // Initialize SSL for rustls
@@ -627,7 +719,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut gossip = gossip_result?;
     // Validator PeerIds permitted to query the mesh-diagnostics behaviour;
     // the gossip responder answers only these peers (fail-closed otherwise).
-    let validator_peers: HashSet<_> = snapchain::network::mesh::view::build_validator_peer_ids(
+    let validator_peers: HashSet<_> = hypersnap::network::mesh::view::build_validator_peer_ids(
         app_config.consensus.latest_validator_public_keys().iter(),
     )
     .into_keys()
@@ -651,6 +743,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // moved into the spawned task, so we can register the counters into the
     // shared Prometheus registry below.
     let gossip_metrics = gossip.metrics();
+
+    // R4 audit fix + main-merge: subscribe gossip to the hyper
+    // topics and capture the `OnceLock` setter for the hyper actor's
+    // inbound channel BEFORE the spawn — the swarm and actor-cell
+    // mutations both need a live `&mut`. The actor itself is wired
+    // post-node-creation via `build_hyper_handler` (which `.set()`s
+    // the OnceLock); until then, hyper-topic frames are dropped.
+    let hyper_actor_tx_setter = gossip.hyper_actor_tx_handle();
+    if app_config.hyper.enabled && app_config.hyper.runtime_config_path.is_some() {
+        gossip.subscribe_hyper_topics(!app_config.read_node);
+    }
 
     // Spawn gossip early — before node creation — so the QUIC keep-alive and
     // gossipsub control loop runs during the potentially heavy RocksDB shard
@@ -765,21 +868,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .map(|(&id, s)| {
                 (
                     id,
-                    s.with_state_context(snapchain::hyper::StateContext::Hyper),
+                    s.with_state_context(hypersnap::hyper::StateContext::Hyper),
                 )
             })
             .collect();
 
         // Initialize API indexing system if enabled
         let api_system = {
-            let hub_event_senders: Vec<(u32, broadcast::Sender<snapchain::proto::HubEvent>)> = node
+            let hub_event_senders: Vec<(u32, broadcast::Sender<hypersnap::proto::HubEvent>)> = node
                 .shard_senders
                 .iter()
                 .map(|(shard_id, senders)| (*shard_id, senders.events_tx.clone()))
                 .collect();
-            let api_chain_client: Option<Arc<dyn snapchain::connectors::onchain_events::ChainAPI>> =
+            let api_chain_client: Option<Arc<dyn hypersnap::connectors::onchain_events::ChainAPI>> =
                 if !app_config.l1_rpc_url.is_empty() {
-                    snapchain::connectors::onchain_events::RealL1Client::new(
+                    hypersnap::connectors::onchain_events::RealL1Client::new(
                         app_config.l1_rpc_url.clone(),
                         None,
                     )
@@ -788,7 +891,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 } else {
                     None
                 };
-            snapchain::api::initialize(
+            hypersnap::api::initialize(
                 &app_config.api,
                 node.block_stores.db.clone(),
                 hub_event_senders,
@@ -823,6 +926,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             local_state_store.clone(),
             api_handler,
             api_search_indexer,
+            // SnapchainReadNode doesn't host a hyper block engine
+            // (read nodes don't participate in DA-PoW consensus)
+            // and is not wired with a hyper handler.
+            None,
         )
         .await;
 
@@ -944,7 +1051,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tokio::spawn(async move { mempool.run().await });
 
         if !app_config.fnames.disable {
-            let mut fetcher = snapchain::connectors::fname::Fetcher::new(
+            let mut fetcher = hypersnap::connectors::fname::Fetcher::new(
                 app_config.fnames.clone(),
                 mempool_tx.clone(),
                 statsd_client.clone(),
@@ -959,7 +1066,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
         if !app_config.onchain_events.rpc_url.is_empty() {
             let mut onchain_events_subscriber =
-                snapchain::connectors::onchain_events::Subscriber::new(
+                hypersnap::connectors::onchain_events::Subscriber::new(
                     &app_config.onchain_events,
                     node_local_state::Chain::Optimism,
                     mempool_tx.clone(),
@@ -980,7 +1087,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
         if !app_config.base_onchain_events.rpc_url.is_empty() {
             let mut onchain_events_subscriber =
-                snapchain::connectors::onchain_events::Subscriber::new(
+                hypersnap::connectors::onchain_events::Subscriber::new(
                     &app_config.base_onchain_events,
                     node_local_state::Chain::Base,
                     mempool_tx.clone(),
@@ -1083,21 +1190,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .map(|(&id, s)| {
                 (
                     id,
-                    s.with_state_context(snapchain::hyper::StateContext::Hyper),
+                    s.with_state_context(hypersnap::hyper::StateContext::Hyper),
                 )
             })
             .collect();
 
         // Initialize API indexing system if enabled
         let api_system = {
-            let hub_event_senders: Vec<(u32, broadcast::Sender<snapchain::proto::HubEvent>)> = node
+            let hub_event_senders: Vec<(u32, broadcast::Sender<hypersnap::proto::HubEvent>)> = node
                 .shard_senders
                 .iter()
                 .map(|(shard_id, senders)| (*shard_id, senders.events_tx.clone()))
                 .collect();
-            let api_chain_client: Option<Arc<dyn snapchain::connectors::onchain_events::ChainAPI>> =
+            let api_chain_client: Option<Arc<dyn hypersnap::connectors::onchain_events::ChainAPI>> =
                 if !app_config.l1_rpc_url.is_empty() {
-                    snapchain::connectors::onchain_events::RealL1Client::new(
+                    hypersnap::connectors::onchain_events::RealL1Client::new(
                         app_config.l1_rpc_url.clone(),
                         None,
                     )
@@ -1106,7 +1213,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 } else {
                     None
                 };
-            snapchain::api::initialize(
+            hypersnap::api::initialize(
                 &app_config.api,
                 node.block_stores.db.clone(),
                 hub_event_senders,
@@ -1123,6 +1230,34 @@ async fn main() -> Result<(), Box<dyn Error>> {
             h
         });
         let api_search_indexer = api_system.as_ref().and_then(|s| s.search_indexer.clone());
+
+        // R4 + main-merge: build the hyper handler here (after the
+        // node — needs its hyper_block_engine — but before
+        // `start_servers`). The pre-spawn `subscribe_hyper_topics`
+        // already happened upstream of the gossip spawn; this call
+        // populates the `OnceLock` so inbound hyper frames start
+        // routing to the actor as soon as the actor is up.
+        let hyper_handler = if app_config.hyper.enabled
+            && app_config.hyper.runtime_config_path.is_some()
+        {
+            match build_hyper_handler(
+                &app_config,
+                gossip_tx.clone(),
+                hyper_actor_tx_setter.clone(),
+                node.hyper_block_engine.clone(),
+                node.block_stores.block_event_store.clone(),
+            )
+            .await
+            {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    error!(error = ?e, "Failed to start hyper actor; node continues without hyper handlers");
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         start_servers(
             &app_config,
@@ -1141,6 +1276,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             local_state_store.clone(),
             api_handler,
             api_search_indexer,
+            hyper_handler,
         )
         .await;
 
@@ -1162,7 +1298,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 );
                 let timestamp = chrono::Utc::now().timestamp_millis();
                 dbs.iter().for_each(|(shard_id, db)| {
-                    snapchain::storage::db::backup::backup_db(
+                    hypersnap::storage::db::backup::backup_db(
                         db.clone(),
                         &app_config.snapshot.backup_dir,
                         *shard_id,
@@ -1228,4 +1364,412 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         }
     }
+}
+
+async fn build_hyper_handler(
+    app_config: &hypersnap::cfg::Config,
+    gossip_tx: mpsc::Sender<hypersnap::network::gossip::GossipEvent<SnapchainValidatorContext>>,
+    hyper_actor_tx_setter: Arc<
+        std::sync::OnceLock<mpsc::Sender<hypersnap::hyper::actor::HyperActorEvent>>,
+    >,
+    hyper_block_engine: Option<
+        Arc<tokio::sync::Mutex<hypersnap::storage::store::block_engine::BlockEngine>>,
+    >,
+    snapchain_block_event_store: hypersnap::storage::store::account::BlockEventStore,
+) -> Result<hypersnap::hyper::http_handler::HyperHttpHandler, Box<dyn std::error::Error>> {
+    use hypersnap::hyper::actor::{HyperActor, HyperActorClient};
+    use hypersnap::hyper::config::HyperRuntimeFileConfig;
+    use hypersnap::hyper::http_handler::HyperHttpHandler;
+    use hypersnap::hyper::network_loop::run_outbound_pump;
+    use hypersnap::storage::db::RocksDB;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    let toml_path = app_config
+        .hyper
+        .runtime_config_path
+        .as_ref()
+        .ok_or("runtime_config_path missing")?;
+    let text = std::fs::read_to_string(Path::new(toml_path))?;
+    let file_cfg: HyperRuntimeFileConfig = toml::from_str(&text)?;
+
+    // Hyper gets its own DB at <rocksdb_dir>/hyper. Single-process so
+    // we open it directly here.
+    let hyper_db_dir = format!("{}/hyper", app_config.rocksdb_dir);
+    let db = RocksDB::new(&hyper_db_dir);
+    db.open()?;
+    let db = Arc::new(db);
+
+    let mut runtime = file_cfg.build_runtime(db)?;
+    // FIP §5d: install the production trie-existence verifier so
+    // DA challenge responses must reference a real key in the
+    // hyper merkle trie. Only installed when the hyper block
+    // engine is wired (i.e. hyper mode is active); without it,
+    // the apply path falls back to accepting responses on the
+    // strength of the prefix + signature + binding gates alone.
+    if let Some(engine) = hyper_block_engine.clone() {
+        let lookup = std::sync::Arc::new(
+            hypersnap::hyper::da_trie_lookup_prod::BlockEngineDaTrieLookup::new(engine),
+        );
+        runtime = runtime.with_da_trie_lookup(lookup);
+    }
+
+    // Optional hyper-side IdRegistry Recover-event watcher. Spawned
+    // before the actor takes ownership of the runtime so we can clone
+    // the store handle (Arc<RocksDB>-backed; cheap).
+    let cutover_snapchain_block = runtime.cutover_snapchain_block;
+    let recovery_store = runtime.recovery_store.clone();
+    let watcher_cfg = hypersnap::hyper::recovery_watcher::RecoveryWatcherConfig {
+        rpc_url: file_cfg.recovery_watcher.rpc_url.clone(),
+        start_block: file_cfg.recovery_watcher.start_block,
+        poll_interval: std::time::Duration::from_secs(file_cfg.recovery_watcher.poll_interval_secs),
+        block_batch: file_cfg.recovery_watcher.block_batch,
+        finality_confirmations: file_cfg.recovery_watcher.finality_confirmations,
+    };
+    if !watcher_cfg.rpc_url.is_empty() {
+        tokio::spawn(async move {
+            if let Err(e) =
+                hypersnap::hyper::recovery_watcher::run(watcher_cfg, recovery_store).await
+            {
+                tracing::error!("recovery watcher task exited with error: {}", e);
+            }
+        });
+        tracing::info!("recovery watcher spawned");
+    }
+
+    // FIP §13.6 inbound bridge: spawn one `bridge_burn_watcher`
+    // task per configured destination chain. Each watcher
+    // observes `HypersnapBridge.Burned` events on its RPC,
+    // waits for finality, and persists into the shared
+    // `BridgeBurnStore` for the threshold-signing flow.
+    let bridge_burn_store = runtime.bridge_burn_store.clone();
+    for entry in file_cfg.bridge_burn_watchers.clone() {
+        let store_clone = bridge_burn_store.clone();
+        match entry.into_runtime_config() {
+            Ok(rt_cfg) => {
+                if !rt_cfg.rpc_url.is_empty() {
+                    let chain_id = rt_cfg.source_chain_id;
+                    tokio::spawn(async move {
+                        if let Err(e) =
+                            hypersnap::hyper::bridge_burn_watcher::run(rt_cfg, store_clone).await
+                        {
+                            tracing::error!(
+                                "bridge burn watcher (chain {}) exited with error: {}",
+                                chain_id,
+                                e
+                            );
+                        }
+                    });
+                    tracing::info!("bridge burn watcher spawned for chain {}", chain_id);
+                }
+            }
+            Err(e) => {
+                tracing::error!("invalid bridge burn watcher config: {}", e);
+            }
+        }
+    }
+
+    let da_response_producer: Option<Arc<dyn hypersnap::hyper::da_pow_driver::DaResponseProducer>> =
+        match (
+            hyper_block_engine.clone(),
+            file_cfg.operator_signer_secret_path.as_ref(),
+            file_cfg.operator_fid,
+        ) {
+            (Some(engine), Some(secret_path), Some(fid)) => match std::fs::read(secret_path) {
+                Ok(bytes) if bytes.len() == 32 => {
+                    let mut sk_bytes = [0u8; 32];
+                    sk_bytes.copy_from_slice(&bytes);
+                    let signer_sk = ed25519_dalek::SigningKey::from_bytes(&sk_bytes);
+                    let signer_pk = signer_sk.verifying_key().to_bytes();
+                    let validator_pubkey = match file_cfg.operator_validator_pubkey_hex.as_ref() {
+                        Some(hex_str) => {
+                            let trimmed = hex_str.strip_prefix("0x").unwrap_or(hex_str.as_str());
+                            match hex::decode(trimmed) {
+                                Ok(v) if v.len() == 32 => v,
+                                Ok(v) => {
+                                    tracing::error!(
+                                        len = v.len(),
+                                        "operator_validator_pubkey_hex must decode to 32 bytes; DA driver disabled"
+                                    );
+                                    Vec::new()
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        error = %e,
+                                        "operator_validator_pubkey_hex failed to parse; DA driver disabled"
+                                    );
+                                    Vec::new()
+                                }
+                            }
+                        }
+                        None => signer_pk.to_vec(),
+                    };
+                    if validator_pubkey.len() == 32 {
+                        let chain_id = hypersnap::hyper::DEFAULT_PROTOCOL_CHAIN_ID;
+                        let initial_fid_count = runtime.count_registered_fids().max(1);
+                        tracing::info!(
+                            fid_count = initial_fid_count,
+                            "DA-PoW challenge space: {} registered FIDs",
+                            initial_fid_count
+                        );
+                        let fid_count_db = runtime.db.clone();
+                        let fid_count_fn = Box::new(move || -> u64 {
+                            use hypersnap::storage::store::account::{
+                                OnchainEventStore, StoreEventHandler,
+                            };
+                            let handler = StoreEventHandler::new_no_persist();
+                            let onchain = OnchainEventStore::new(fid_count_db.clone(), handler);
+                            let mut count = 0u64;
+                            let mut next: Option<Vec<u8>> = None;
+                            loop {
+                                let opts = hypersnap::storage::db::PageOptions {
+                                    page_size: Some(10_000),
+                                    page_token: next.clone(),
+                                    reverse: false,
+                                };
+                                match onchain.get_fids(&opts) {
+                                    Ok((fids, token)) => {
+                                        count += fids.len() as u64;
+                                        if let Some(t) = token {
+                                            next = Some(t);
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            count.max(1)
+                        });
+                        let producer = hypersnap::hyper::da_response_producer_prod::BlockEngineDaResponseProducer::new(
+                            engine,
+                            signer_sk,
+                            validator_pubkey,
+                            fid,
+                            chain_id,
+                            fid_count_fn,
+                        );
+                        tracing::info!(operator_fid = fid, "DA-PoW driver wired");
+                        Some(Arc::new(producer)
+                            as Arc<
+                                dyn hypersnap::hyper::da_pow_driver::DaResponseProducer,
+                            >)
+                    } else {
+                        None
+                    }
+                }
+                Ok(bytes) => {
+                    tracing::error!(
+                        len = bytes.len(),
+                        "operator_signer_secret_path must be exactly 32 bytes; DA driver disabled"
+                    );
+                    None
+                }
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "failed to read operator_signer_secret_path; DA driver disabled"
+                    );
+                    None
+                }
+            },
+            _ => None,
+        };
+    let actor_handles = HyperActor::spawn_full(runtime, 1024, None, da_response_producer);
+    let inbound_for_client = actor_handles.inbound.clone();
+    let inbound_for_gossip = actor_handles.inbound.clone();
+    let inbound_for_http = actor_handles.inbound;
+    let client = HyperActorClient::new(inbound_for_client);
+
+    // Inbound: gossip → actor. R4 audit fix preserved: the gossip
+    // task has already been spawned in the caller (before heavy
+    // RocksDB shard init). Topic subscription happened pre-spawn via
+    // `subscribe_hyper_topics`; here we just write the actor inbound
+    // channel into the shared `OnceLock` the spawned loop reads
+    // from. If something already set it (shouldn't happen), the
+    // `.set()` returns `Err` which we ignore — there can only be
+    // one hyper actor per node.
+    let _ = hyper_actor_tx_setter.set(inbound_for_gossip);
+
+    // Outbound: actor → gossip publish channel. The pump task lives
+    // until the actor closes; we detach the JoinHandle since the node
+    // supervisor shuts down on a different signal path.
+    tokio::spawn(run_outbound_pump(
+        actor_handles.outbound,
+        gossip_tx.clone(),
+        |item| tracing::info!(?item, "hyper actor non-network outbound"),
+    ));
+
+    // Block production scheduler + DKG supervisor are spawned on any
+    // node with operator identity configured — not just nodes that
+    // bootstrap with a local DKLS share. A live-registered validator
+    // has no share at boot (the first share is produced by the DKG
+    // ceremony at the registration's activation epoch boundary).
+    // Without the supervisor spawned, that node never participates in
+    // the DKG, never receives a share, and never installs the
+    // rotated `group_address`. Subsequent blocks signed under the
+    // rotated key are then silently rejected at import-time via
+    // `ImportError::SignatureVerificationFailed`, leaving the node
+    // permanently stuck at the last pre-rotation hyperblock.
+    //
+    // Both the supervisor (`build_driver` → `LocalNotActive`) and the
+    // scheduler (`start_dkls_block_production` → no-share short
+    // circuit) handle the "this node has no share for the current
+    // epoch" state gracefully. So spawning them universally on
+    // operator-identity-configured nodes is the right default —
+    // they're a no-op until the first DKG admits this node, then
+    // they Just Work.
+    if let Some(validator_pubkey_hex) = file_cfg.operator_validator_pubkey_hex.clone() {
+        let validator_key = match hex::decode(
+            validator_pubkey_hex
+                .strip_prefix("0x")
+                .unwrap_or(&validator_pubkey_hex),
+        ) {
+            Ok(v) if v.len() == 32 => v,
+            _ => {
+                tracing::warn!(
+                    "operator_validator_pubkey_hex did not decode to 32 bytes; \
+                     scheduler + DKG supervisor disabled"
+                );
+                Vec::new()
+            }
+        };
+        if !validator_key.is_empty() {
+            use hypersnap::hyper::scheduler::{BlockProductionScheduler, LatestAnchor};
+            use std::sync::Arc;
+            use std::time::Duration;
+            use tokio::sync::Mutex;
+
+            // Conservative defaults; operators can re-tune via config
+            // fields if/when those land.
+            let block_time = Duration::from_secs(3);
+            let extra_rules_version = 0u32;
+            let supervisor_tick = Duration::from_secs(5);
+            let supervisor_lead_blocks = hypersnap::hyper::epoch::EPOCH_LENGTH / 10;
+            // F028 fix: the production reconstruction threshold is
+            // derived per-epoch from the active-set size in
+            // `dkls_supervisor::build_driver` via `bft_safe_threshold`
+            // (`floor(2n/3) + 1`). This static value is only consulted
+            // on the single-validator devnet path where `share_count
+            // == 1`; for any `share_count > 1` it is ignored.
+            let dkls_threshold = 1u8;
+
+            let scheduler = BlockProductionScheduler::new(
+                actor_handles_inbound_for_scheduler(&client),
+                block_time,
+                extra_rules_version,
+            );
+            let head_handle = scheduler.head_handle();
+            let ctx_handle = scheduler.proposer_ctx_handle();
+
+            // Shared "latest snapchain anchor" — scheduler uses the
+            // full struct, supervisor only needs the block number.
+            // F004: a single shared `LatestAnchor` source. The
+            // scheduler reads the full struct; the supervisor reads
+            // `.block` from the same mutex. Eliminates the prior
+            // window where the two were updated in separate lock
+            // acquisitions and could disagree by a full epoch.
+            let shared_anchor: Arc<Mutex<LatestAnchor>> =
+                Arc::new(Mutex::new(LatestAnchor::default()));
+            // Anchor source: snapchain's `BlockEventStore` is the
+            // ground truth for snapchain block heights. The prior
+            // `spawn_anchor_poller` read the hyper actor's own
+            // `last_block_height`, which is the block number from the
+            // *previous hyperblock's anchor metadata* — self-referential
+            // and never advances past genesis (0). Reading the
+            // BlockEventStore directly gives the snapchain anchor
+            // height that's actually advancing, so the epoch boundary
+            // crossing (`anchor_block / EPOCH_LENGTH` rolls over)
+            // fires `EpochManager::observe_anchor` correctly.
+            tokio::spawn(BlockProductionScheduler::refresh_latest_anchor_loop(
+                Arc::new(snapchain_block_event_store.clone()),
+                shared_anchor.clone(),
+                Duration::from_secs(1),
+            ));
+
+            // Periodic refresh of the proposer context (active set
+            // + local key) so the scheduler's leader-rotation gate
+            // sees the right validators each epoch.
+            tokio::spawn(BlockProductionScheduler::refresh_proposer_context_loop(
+                ctx_handle,
+                client.clone(),
+                validator_key.clone(),
+                shared_anchor.clone(),
+                Duration::from_secs(5),
+                cutover_snapchain_block,
+            ));
+
+            // Periodic poll of `last_block_height` → ChainHead so the
+            // scheduler's next-height calculation tracks blocks
+            // imported from peers.
+            spawn_chain_head_poller(client.clone(), head_handle, block_time / 4);
+
+            tokio::spawn(scheduler.run());
+
+            tokio::spawn(hypersnap::hyper::dkls_supervisor::run(
+                hypersnap::hyper::dkls_supervisor::DklsSupervisorInputs {
+                    local_validator_key: validator_key,
+                    threshold: dkls_threshold,
+                    latest_anchor: shared_anchor,
+                    tick_interval: supervisor_tick,
+                    start_lead_blocks: supervisor_lead_blocks,
+                    cutover_block: cutover_snapchain_block,
+                },
+                actor_handles_inbound_for_scheduler(&client),
+                client.clone(),
+            ));
+
+            tracing::info!("hyper scheduler + DKG supervisor spawned");
+        }
+    } else {
+        tracing::info!(
+            "hyper scheduler + DKG supervisor not spawned (operator identity not configured); \
+             running as read node"
+        );
+    }
+
+    Ok(HyperHttpHandler::new(client, inbound_for_http)
+        .with_devnet_admin_endpoints(app_config.hyper.devnet_admin_endpoints_enabled))
+}
+
+/// `HyperActorClient` only exposes an `ask` API; the scheduler +
+/// supervisor need the raw inbound `mpsc::Sender` to enqueue
+/// `ProduceBlockDkls` / `StartDkls` / `AdvanceDkls`. The client
+/// internally holds a sender clone — we reach in via a known field.
+fn actor_handles_inbound_for_scheduler(
+    client: &hypersnap::hyper::actor::HyperActorClient,
+) -> tokio::sync::mpsc::Sender<hypersnap::hyper::actor::HyperActorEvent> {
+    client.inbound_sender().clone()
+}
+
+// Removed `spawn_anchor_poller`: it sourced the "latest anchor" from
+// the hyper actor's own `last_block_height` → previous hyperblock's
+// `snapchain_anchor_block` field, which is self-referential. Once
+// genesis sets that to 0 every subsequent block re-reads 0 and the
+// loop never advances. Replaced by
+// `BlockProductionScheduler::refresh_latest_anchor_loop` pulling
+// directly from the snapchain `BlockEventStore` (the real source of
+// snapchain block heights), wired in `build_hyper_handler`.
+
+/// Mirror `last_block_height` + `last_block_hash` into the
+/// scheduler's `ChainHead` so the next-height calculation tracks
+/// peer-imported blocks (not just blocks the local actor produced).
+fn spawn_chain_head_poller(
+    client: hypersnap::hyper::actor::HyperActorClient,
+    head: std::sync::Arc<tokio::sync::Mutex<hypersnap::hyper::scheduler::ChainHead>>,
+    interval: std::time::Duration,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let height = client.last_block_height().await.ok().flatten();
+            let hash = client.last_block_hash().await.ok().flatten();
+            let mut g = head.lock().await;
+            g.height = height;
+            g.parent_hash = hash.map(|h| h.to_vec()).unwrap_or_default();
+        }
+    });
 }

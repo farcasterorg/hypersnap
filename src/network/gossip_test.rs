@@ -606,6 +606,12 @@ fn test_hyper_envelope() -> HyperEnvelope {
             hyper_state_root: vec![4, 5, 6],
             extra_rules_version: 1,
             retained_message_count: 10,
+            missed_proposals: vec![],
+            snapchain_anchor_block: 0,
+            snapchain_anchor_hash: vec![],
+            snapchain_range_start_block: 0,
+            snapchain_range_root: vec![],
+            snapchain_anchor_timestamp: 0,
         },
         payload: vec![7, 8, 9],
     }
@@ -698,6 +704,6 @@ async fn test_hyper_envelope_messages_are_ignored_on_receive() {
     .encode_to_vec();
 
     assert!(gossip
-        .map_gossip_bytes_to_system_message(PeerId::random(), bytes)
+        .map_gossip_bytes_to_system_message(PeerId::random(), bytes, None)
         .is_none());
 }

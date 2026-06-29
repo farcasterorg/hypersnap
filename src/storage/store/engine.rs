@@ -115,6 +115,17 @@ pub enum MessageValidationError {
 
     #[error("block event missing body")]
     BlockEventMissingBody,
+
+    /// FIP-proof-of-quality §4 fee gate: the sender's hyper fee balance
+    /// is below the trust×uniqueness-discounted cost of this message.
+    /// Returned at merge time before any store mutation. The sender
+    /// must top up via `HYPER_MESSAGE_TYPE_FEE_DEPOSIT` and retry.
+    #[error("hyper fee balance insufficient for fid {fid}: have {available}, need {needed}")]
+    HyperFeeInsufficient {
+        fid: u64,
+        available: u64,
+        needed: u64,
+    },
 }
 
 pub struct MergedReplicatorMessage {
@@ -1220,6 +1231,8 @@ impl ShardEngine {
             EngineVersion::version_for(&FarcasterTime::new(data.timestamp as u64), self.network);
         let gasless_enabled = version.is_enabled(ProtocolFeature::GaslessSigners);
 
+        let fee_charger = crate::hyper::fee_charger::FeeCharger::new(self.db.clone());
+
         let event = match mt {
             MessageType::CastAdd | MessageType::CastRemove => vec![self
                 .stores
@@ -1289,6 +1302,38 @@ impl ShardEngine {
                 ));
             }
         };
+        // FIP-proof-of-quality §4 fee gate. Runs AFTER the
+        // type-specific merge so duplicate / structurally-invalid
+        // messages surface their natural error rather than
+        // `HyperFeeInsufficient`. The fee gate only fires for
+        // messages that would actually merge successfully; failed
+        // merges have already returned above without state mutation.
+        match fee_charger.stage_fee(msg, txn_batch) {
+            Ok(_) => {}
+            Err(crate::hyper::fee_charger::FeeChargeError::Reward(
+                crate::hyper::rewards::RewardError::InsufficientBalance {
+                    fid,
+                    available,
+                    needed,
+                },
+            )) => {
+                return Err(MessageValidationError::HyperFeeInsufficient {
+                    fid,
+                    available,
+                    needed,
+                });
+            }
+            Err(e) => {
+                return Err(MessageValidationError::StoreError(
+                    crate::core::error::HubError::invalid_internal_state(&e.to_string()),
+                ));
+            }
+        }
+        // Now that the merge + fee gate both succeeded, stage the
+        // CastAdd fingerprint on the SAME txn_batch so it commits
+        // atomically — see comment on stage_insert for why this MUST
+        // NOT be a direct db.put.
+        let _ = fee_charger.record_fingerprint_if_cast(msg, txn_batch);
         let elapsed = now.elapsed();
         self.metrics
             .time_with_shard("merge_message_time_us", elapsed.as_micros() as u64);
@@ -1790,19 +1835,25 @@ impl ShardEngine {
         _ = self.emit_commit_metrics(&shard_chunk, &events);
 
         let now = std::time::Instant::now();
+        // F033: stage the shard-chunk write on the same RocksDB batch
+        // as the state mutations so trie/messages + chunk + header
+        // all commit atomically. A crash between separate commits
+        // could leave the trie at height H with the header still at
+        // H-1, producing on-restart consensus divergence and
+        // polluting bootstrap snapshots downstream.
+        if let Err(e) = self
+            .stores
+            .shard_store
+            .stage_shard_chunk(&mut txn, shard_chunk)
+        {
+            error!("Unable to stage shard chunk write: {}", e);
+        }
         self.db.commit(txn).unwrap();
         for mut event in events {
             event.timestamp = header.timestamp;
             let _ = self.senders.events_tx.send(event);
         }
         self.stores.trie.reload(&self.db).unwrap();
-
-        match self.stores.shard_store.put_shard_chunk(shard_chunk) {
-            Err(err) => {
-                error!("Unable to write shard chunk to store {}", err)
-            }
-            Ok(()) => {}
-        }
         let elapsed = now.elapsed();
         self.metrics
             .time_with_shard("commit_time", elapsed.as_millis() as u64);
