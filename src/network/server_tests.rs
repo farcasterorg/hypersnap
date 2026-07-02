@@ -2334,7 +2334,11 @@ mod tests {
         let verification_store = &stores.get(&1u32).unwrap().verification_store;
         let mut txn = RocksDbTransactionBatch::new();
         verification_store
-            .merge(&verification_add, &mut txn)
+            .merge(
+                &verification_add,
+                &mut txn,
+                &test_helper::default_merge_ctx(),
+            )
             .unwrap();
         verification_store.db().commit(txn).unwrap();
 
@@ -2430,7 +2434,11 @@ mod tests {
         let mut txn = RocksDbTransactionBatch::new();
         stores
             .verification_store
-            .merge(&verification_add, &mut txn)
+            .merge(
+                &verification_add,
+                &mut txn,
+                &test_helper::default_merge_ctx(),
+            )
             .unwrap();
         stores.verification_store.db().commit(txn).unwrap();
 
@@ -2486,7 +2494,11 @@ mod tests {
         let mut txn = RocksDbTransactionBatch::new();
         stores
             .verification_store
-            .merge(&verification_add, &mut txn)
+            .merge(
+                &verification_add,
+                &mut txn,
+                &test_helper::default_merge_ctx(),
+            )
             .unwrap();
         stores.verification_store.db().commit(txn).unwrap();
 
@@ -2582,7 +2594,7 @@ mod tests {
         let mut txn = RocksDbTransactionBatch::new();
         shard2_stores
             .cast_store
-            .merge(&mention_cast, &mut txn)
+            .merge(&mention_cast, &mut txn, &test_helper::default_merge_ctx())
             .unwrap();
         shard2_stores.db.commit(txn).unwrap();
 
@@ -2635,7 +2647,7 @@ mod tests {
         let mut txn = RocksDbTransactionBatch::new();
         shard1_stores
             .cast_store
-            .merge(&author_cast, &mut txn)
+            .merge(&author_cast, &mut txn, &test_helper::default_merge_ctx())
             .unwrap();
         shard1_stores.db.commit(txn).unwrap();
 
@@ -2654,7 +2666,7 @@ mod tests {
         let mut txn = RocksDbTransactionBatch::new();
         shard2_stores
             .reaction_store
-            .merge(&reaction, &mut txn)
+            .merge(&reaction, &mut txn, &test_helper::default_merge_ctx())
             .unwrap();
         shard2_stores.db.commit(txn).unwrap();
 
@@ -2705,7 +2717,10 @@ mod tests {
         );
         let shard2_stores = stores.get(&2u32).unwrap();
         let mut txn = RocksDbTransactionBatch::new();
-        shard2_stores.link_store.merge(&follow, &mut txn).unwrap();
+        shard2_stores
+            .link_store
+            .merge(&follow, &mut txn, &test_helper::default_merge_ctx())
+            .unwrap();
         shard2_stores.db.commit(txn).unwrap();
 
         let (messages, _cursor) = service
@@ -2741,7 +2756,10 @@ mod tests {
         let cast = messages_factory::casts::create_cast_add(fid, "my cast", None, None);
         let shard1_stores = stores.get(&1u32).unwrap();
         let mut txn = RocksDbTransactionBatch::new();
-        shard1_stores.cast_store.merge(&cast, &mut txn).unwrap();
+        shard1_stores
+            .cast_store
+            .merge(&cast, &mut txn, &test_helper::default_merge_ctx())
+            .unwrap();
         shard1_stores.db.commit(txn).unwrap();
 
         let self_reaction = messages_factory::reactions::create_reaction_add(
@@ -2757,7 +2775,7 @@ mod tests {
         let mut txn = RocksDbTransactionBatch::new();
         shard1_stores
             .reaction_store
-            .merge(&self_reaction, &mut txn)
+            .merge(&self_reaction, &mut txn, &test_helper::default_merge_ctx())
             .unwrap();
         shard1_stores.db.commit(txn).unwrap();
 
@@ -2833,7 +2851,10 @@ mod tests {
         let shard2_stores = stores.get(&2u32).unwrap();
         for msg in &[mention1, mention2, mention3] {
             let mut txn = RocksDbTransactionBatch::new();
-            shard2_stores.cast_store.merge(msg, &mut txn).unwrap();
+            shard2_stores
+                .cast_store
+                .merge(msg, &mut txn, &test_helper::default_merge_ctx())
+                .unwrap();
             shard2_stores.db.commit(txn).unwrap();
         }
 
@@ -2899,7 +2920,10 @@ mod tests {
                 None,
             );
             let mut txn = RocksDbTransactionBatch::new();
-            shard2_stores.cast_store.merge(&cast, &mut txn).unwrap();
+            shard2_stores
+                .cast_store
+                .merge(&cast, &mut txn, &test_helper::default_merge_ctx())
+                .unwrap();
             shard2_stores.db.commit(txn).unwrap();
         }
 
@@ -2950,7 +2974,10 @@ mod tests {
                 None,
             );
             let mut txn = RocksDbTransactionBatch::new();
-            shard2_stores.cast_store.merge(&cast, &mut txn).unwrap();
+            shard2_stores
+                .cast_store
+                .merge(&cast, &mut txn, &test_helper::default_merge_ctx())
+                .unwrap();
             shard2_stores.db.commit(txn).unwrap();
         }
 
@@ -3047,7 +3074,7 @@ mod tests {
         let mut txn = RocksDbTransactionBatch::new();
         shard1_stores
             .cast_store
-            .merge(&target_cast, &mut txn)
+            .merge(&target_cast, &mut txn, &test_helper::default_merge_ctx())
             .unwrap();
         shard1_stores.db.commit(txn).unwrap();
 
@@ -3064,7 +3091,7 @@ mod tests {
         let mut txn = RocksDbTransactionBatch::new();
         shard2_stores
             .cast_store
-            .merge(&reply_cast, &mut txn)
+            .merge(&reply_cast, &mut txn, &test_helper::default_merge_ctx())
             .unwrap();
         shard2_stores.db.commit(txn).unwrap();
 
@@ -3119,7 +3146,7 @@ mod tests {
         let mut txn = RocksDbTransactionBatch::new();
         shard1_stores
             .cast_store
-            .merge(&target_cast, &mut txn)
+            .merge(&target_cast, &mut txn, &test_helper::default_merge_ctx())
             .unwrap();
         shard1_stores.db.commit(txn).unwrap();
 
@@ -3135,7 +3162,7 @@ mod tests {
         let mut txn = RocksDbTransactionBatch::new();
         shard1_stores
             .cast_store
-            .merge(&self_reply, &mut txn)
+            .merge(&self_reply, &mut txn, &test_helper::default_merge_ctx())
             .unwrap();
         shard1_stores.db.commit(txn).unwrap();
 

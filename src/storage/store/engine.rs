@@ -17,7 +17,7 @@ use crate::proto::{
 };
 use crate::storage::db::{PageOptions, RocksDB, RocksDbTransactionBatch};
 use crate::storage::store::account::{
-    BlockEventStorageError, CastStore, MessagesPage, StorageLendStore, StoreOptions,
+    BlockEventStorageError, CastStore, MergeContext, MessagesPage, StorageLendStore, StoreOptions,
     VerificationStore,
 };
 use crate::storage::store::engine_metrics::Metrics;
@@ -1219,44 +1219,47 @@ impl ShardEngine {
         let version =
             EngineVersion::version_for(&FarcasterTime::new(data.timestamp as u64), self.network);
         let gasless_enabled = version.is_enabled(ProtocolFeature::GaslessSigners);
+        // Version-gated merge decisions (e.g. type-scoped link compaction under
+        // ProtocolFeature::BlockLinks) are made inside each store's StoreDef from this context.
+        let ctx = MergeContext { version };
 
         let event = match mt {
             MessageType::CastAdd | MessageType::CastRemove => vec![self
                 .stores
                 .cast_store
-                .merge(msg, txn_batch)
+                .merge(msg, txn_batch, &ctx)
                 .map_err(|e| MessageValidationError::StoreError(e))?],
             MessageType::LinkAdd | MessageType::LinkRemove | MessageType::LinkCompactState => {
                 vec![self
                     .stores
                     .link_store
-                    .merge(msg, txn_batch)
+                    .merge(msg, txn_batch, &ctx)
                     .map_err(|e| MessageValidationError::StoreError(e))?]
             }
             MessageType::ReactionAdd | MessageType::ReactionRemove => vec![self
                 .stores
                 .reaction_store
-                .merge(msg, txn_batch)
+                .merge(msg, txn_batch, &ctx)
                 .map_err(|e| MessageValidationError::StoreError(e))?],
             MessageType::UserDataAdd => vec![self
                 .stores
                 .user_data_store
-                .merge(msg, txn_batch)
+                .merge(msg, txn_batch, &ctx)
                 .map_err(|e| MessageValidationError::StoreError(e))?],
             MessageType::VerificationAddEthAddress | MessageType::VerificationRemove => vec![self
                 .stores
                 .verification_store
-                .merge(msg, txn_batch)
+                .merge(msg, txn_batch, &ctx)
                 .map_err(|e| MessageValidationError::StoreError(e))?],
             MessageType::UsernameProof => {
                 let store = &self.stores.username_proof_store;
                 vec![store
-                    .merge(msg, txn_batch)
+                    .merge(msg, txn_batch, &ctx)
                     .map_err(|e| MessageValidationError::StoreError(e))?]
             }
             MessageType::LendStorage => {
                 let store = &self.stores.storage_lend_store;
-                StorageLendStore::merge(store, msg, txn_batch)
+                StorageLendStore::merge(store, msg, txn_batch, &ctx)
                     .map_err(|e| MessageValidationError::StoreError(e))?
             }
             MessageType::KeyAdd if gasless_enabled => {
@@ -1309,25 +1312,38 @@ impl ShardEngine {
                 Ok(mt) => mt,
                 Err(_) => return,
             };
+            // Same version derivation as merge_message so the hyper shadow stores make the
+            // same version-gated merge decisions as the canonical stores.
+            let version = EngineVersion::version_for(
+                &FarcasterTime::new(data.timestamp as u64),
+                self.network,
+            );
+            let ctx = MergeContext { version };
             let result = match mt {
                 MessageType::CastAdd | MessageType::CastRemove => {
-                    hyper.cast_store.merge(msg, txn_batch).map(|_| ())
+                    hyper.cast_store.merge(msg, txn_batch, &ctx).map(|_| ())
                 }
                 MessageType::LinkAdd | MessageType::LinkRemove | MessageType::LinkCompactState => {
-                    hyper.link_store.merge(msg, txn_batch).map(|_| ())
+                    hyper.link_store.merge(msg, txn_batch, &ctx).map(|_| ())
                 }
                 MessageType::ReactionAdd | MessageType::ReactionRemove => {
-                    hyper.reaction_store.merge(msg, txn_batch).map(|_| ())
+                    hyper.reaction_store.merge(msg, txn_batch, &ctx).map(|_| ())
                 }
-                MessageType::UserDataAdd => hyper.user_data_store.merge(msg, txn_batch).map(|_| ()),
-                MessageType::VerificationAddEthAddress | MessageType::VerificationRemove => {
-                    hyper.verification_store.merge(msg, txn_batch).map(|_| ())
-                }
-                MessageType::UsernameProof => {
-                    hyper.username_proof_store.merge(msg, txn_batch).map(|_| ())
-                }
+                MessageType::UserDataAdd => hyper
+                    .user_data_store
+                    .merge(msg, txn_batch, &ctx)
+                    .map(|_| ()),
+                MessageType::VerificationAddEthAddress | MessageType::VerificationRemove => hyper
+                    .verification_store
+                    .merge(msg, txn_batch, &ctx)
+                    .map(|_| ()),
+                MessageType::UsernameProof => hyper
+                    .username_proof_store
+                    .merge(msg, txn_batch, &ctx)
+                    .map(|_| ()),
                 MessageType::LendStorage => {
-                    StorageLendStore::merge(&hyper.storage_lend_store, msg, txn_batch).map(|_| ())
+                    StorageLendStore::merge(&hyper.storage_lend_store, msg, txn_batch, &ctx)
+                        .map(|_| ())
                 }
                 _ => Ok(()),
             };

@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use super::super::super::test_helper::FID_FOR_TEST;
+    use super::super::super::test_helper::{default_merge_ctx, FID_FOR_TEST};
     use crate::hyper::StateContext;
     use crate::proto::cast_add_body::Parent;
     use crate::proto::reaction_body::Target;
@@ -73,7 +73,7 @@ mod tests {
         err_message: String,
     ) {
         let mut txn = RocksDbTransactionBatch::new();
-        let result = store.merge(&message, &mut txn);
+        let result = store.merge(&message, &mut txn, &default_merge_ctx());
         assert!(result.is_err());
         let error = result.unwrap_err();
         assert_eq!(error.code, err_code);
@@ -87,7 +87,9 @@ mod tests {
         deleted_messages: Vec<message::Message>,
     ) {
         let mut txn = RocksDbTransactionBatch::new();
-        let result = store.merge(message, &mut txn).unwrap();
+        let result = store
+            .merge(message, &mut txn, &default_merge_ctx())
+            .unwrap();
         assert_eq!(result.r#type(), HubEventType::MergeMessage);
         match &result.body {
             Some(hub_event::Body::MergeMessageBody(body)) => {
@@ -110,7 +112,9 @@ mod tests {
         let mut events = Vec::new();
 
         for message in messages {
-            let result = store.merge(message, &mut txn).unwrap();
+            let result = store
+                .merge(message, &mut txn, &default_merge_ctx())
+                .unwrap();
             events.push(result.clone());
             assert_eq!(result.r#type(), HubEventType::MergeMessage);
             match &result.body {
@@ -1285,7 +1289,9 @@ mod tests {
         );
 
         let mut txn1 = RocksDbTransactionBatch::new();
-        let _result1 = store.merge(&cast_remove_earlier, &mut txn1).unwrap();
+        let _result1 = store
+            .merge(&cast_remove_earlier, &mut txn1, &default_merge_ctx())
+            .unwrap();
         db.commit(txn1).unwrap();
 
         merge_message_failure(
@@ -1713,8 +1719,12 @@ mod tests {
         // Dual-write: merge all messages into both stores (same txn batch)
         let mut txn = RocksDbTransactionBatch::new();
         for msg in &messages {
-            legacy_store.merge(msg, &mut txn).unwrap();
-            hyper_store.merge(msg, &mut txn).unwrap();
+            legacy_store
+                .merge(msg, &mut txn, &default_merge_ctx())
+                .unwrap();
+            hyper_store
+                .merge(msg, &mut txn, &default_merge_ctx())
+                .unwrap();
         }
         db.commit(txn).unwrap();
 
@@ -1824,7 +1834,9 @@ mod tests {
         // Process on snapchain-only node
         let mut sc_txn = RocksDbTransactionBatch::new();
         for msg in &messages {
-            sc_store.merge(msg, &mut sc_txn).unwrap();
+            sc_store
+                .merge(msg, &mut sc_txn, &default_merge_ctx())
+                .unwrap();
         }
         let sc_pruned = sc_store
             .prune_messages(FID_FOR_TEST, 5, 2, &mut sc_txn)
@@ -1834,8 +1846,12 @@ mod tests {
         // Process on hypersnap node (dual-write)
         let mut hy_txn = RocksDbTransactionBatch::new();
         for msg in &messages {
-            hy_legacy.merge(msg, &mut hy_txn).unwrap();
-            hy_hyper.merge(msg, &mut hy_txn).unwrap();
+            hy_legacy
+                .merge(msg, &mut hy_txn, &default_merge_ctx())
+                .unwrap();
+            hy_hyper
+                .merge(msg, &mut hy_txn, &default_merge_ctx())
+                .unwrap();
         }
         // Only prune Legacy, not Hyper
         let hy_pruned = hy_legacy
@@ -1909,7 +1925,9 @@ mod tests {
         );
 
         let mut txn = RocksDbTransactionBatch::new();
-        hyper_store.merge(&msg, &mut txn).unwrap();
+        hyper_store
+            .merge(&msg, &mut txn, &default_merge_ctx())
+            .unwrap();
         db.commit(txn).unwrap();
 
         // Scan the Legacy User prefix — should find nothing
