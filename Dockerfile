@@ -68,6 +68,7 @@ COPY --from=builder \
   /usr/src/app/target/release/setup_local_testnet \
   /usr/src/app/target/release/submit_message \
   /usr/src/app/target/release/perftest \
+  /usr/src/app/target/release/repair_block_event \
   /app/
 
 ENV RUSTFLAGS="-Awarnings"

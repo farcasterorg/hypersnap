@@ -690,6 +690,39 @@ impl ShardEngine {
                     .message
                     .as_ref()
                     .ok_or(MessageValidationError::BlockEventMissingBody)?;
+                let msg_type = message.msg_type();
+                // Per-msg-type feature gating for shard-0-hosted user messages. Any future
+                // shard-0 feature whose merges propagate via a `MergeMessage` BlockEvent
+                // should add its gate here, not at the call site — the call site
+                // unconditionally invokes `handle_block_event` so this match is the single
+                // place that knows which feature owns which message type. Returning
+                // `InvalidMessageType` mirrors `validate_user_message`'s response to the
+                // analogous live-admission case, so a pre-feature replay surfaces a `warn!`
+                // through the caller's error arm and a downgraded validator never silently
+                // merges into a store the rest of the code can't reason about.
+                let feature_gate = match msg_type {
+                    MessageType::LendStorage => Some(ProtocolFeature::StorageLending),
+                    MessageType::KeyAdd | MessageType::KeyRemove => {
+                        Some(ProtocolFeature::GaslessSigners)
+                    }
+                    _ => None,
+                };
+                if let Some(feature) = feature_gate {
+                    let block_ts = block_event.block_timestamp();
+                    let version =
+                        EngineVersion::version_for(&FarcasterTime::new(block_ts), self.network);
+                    if !version.is_enabled(feature) {
+                        warn!(
+                            msg_type = msg_type.into_u8(),
+                            seqnum = block_event.seqnum(),
+                            block_timestamp = block_ts,
+                            "Skipping BlockEvent replay: feature not yet active for block timestamp"
+                        );
+                        return Err(
+                            MessageValidationError::InvalidMessageType(msg_type as i32).into()
+                        );
+                    }
+                }
                 let hub_events = self.merge_message(&message, txn_batch)?;
                 self.merge_message_hyper(&message, txn_batch);
                 for event in &hub_events {
@@ -882,25 +915,26 @@ impl ShardEngine {
                             last_block_event_seqnum += 1;
                         }
 
-                        if version.is_enabled(ProtocolFeature::StorageLending) {
-                            // process storage lend messages from block events
-                            match self.handle_block_event(trie_ctx, block_event, txn_batch) {
-                                Ok(hub_events) => {
-                                    info!(
-                                        num_hub_events = hub_events.len(),
-                                        seqnum = block_event.seqnum(),
-                                        fid = snapchain_txn.fid,
-                                        "Merged block event"
-                                    );
-                                    events.extend(hub_events)
-                                }
-                                Err(err) => {
-                                    warn!(
-                                        fid = snapchain_txn.fid,
-                                        "Error merging block event {}",
-                                        err.to_string()
-                                    );
-                                }
+                        // Per-feature gating lives inside `handle_block_event` (one match arm
+                        // per shard-0-hosted user-message type). The call site stays
+                        // feature-agnostic — adding a new shard-0 feature only edits the
+                        // dispatch function, not this site.
+                        match self.handle_block_event(trie_ctx, block_event, txn_batch) {
+                            Ok(hub_events) => {
+                                info!(
+                                    num_hub_events = hub_events.len(),
+                                    seqnum = block_event.seqnum(),
+                                    fid = snapchain_txn.fid,
+                                    "Merged block event"
+                                );
+                                events.extend(hub_events)
+                            }
+                            Err(err) => {
+                                warn!(
+                                    fid = snapchain_txn.fid,
+                                    "Error merging block event {}",
+                                    err.to_string()
+                                );
                             }
                         }
                     } else {

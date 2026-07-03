@@ -80,12 +80,20 @@ pub mod events_factory {
     }
 
     pub fn create_merge_message_event(message: proto::Message, seqnum: u64) -> BlockEvent {
+        create_merge_message_event_with_timestamp(message, seqnum, 0)
+    }
+
+    pub fn create_merge_message_event_with_timestamp(
+        message: proto::Message,
+        seqnum: u64,
+        block_timestamp: u64,
+    ) -> BlockEvent {
         let data = BlockEventData {
             seqnum,
             r#type: BlockEventType::MergeMessage as i32,
             block_number: 0,
             event_index: 0,
-            block_timestamp: 0,
+            block_timestamp,
             body: Some(message::block_event_data::Body::MergeMessageEventBody(
                 MergeMessageEventBody {
                     message: Some(message),
