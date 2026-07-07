@@ -37,6 +37,8 @@ pub enum ImportError {
     SignatureVerificationFailed,
     #[error("transfer validation: {0}")]
     TransferValidation(String),
+    #[error("onboarding validation: {0}")]
+    OnboardValidation(String),
     #[error("state root in metadata does not match recomputed verkle root")]
     StateRootMismatch,
     #[error(transparent)]
@@ -119,6 +121,7 @@ pub fn import_hyper_block_chain_aware(
     mempool: &mut HyperMempool,
     locks_in_block: &[proto::HyperLockEvent],
     transfers_in_block: &[proto::HyperTransferTx],
+    onboards_in_block: &[proto::HyperNativeOnboardBody],
     chain: &mut ChainTracker,
 ) -> Result<(), ImportError> {
     // 0. Pre-import: chain continuity check (parent_hash + height).
@@ -132,6 +135,7 @@ pub fn import_hyper_block_chain_aware(
         mempool,
         locks_in_block,
         transfers_in_block,
+        onboards_in_block,
     )?;
 
     // 6. Advance the chain tracker.
@@ -149,6 +153,7 @@ pub fn import_hyper_block_with_index(
     mempool: &mut HyperMempool,
     locks_in_block: &[proto::HyperLockEvent],
     transfers_in_block: &[proto::HyperTransferTx],
+    onboards_in_block: &[proto::HyperNativeOnboardBody],
     chain: &mut ChainTracker,
     index: &HyperBlockIndex,
 ) -> Result<(), ImportError> {
@@ -159,6 +164,7 @@ pub fn import_hyper_block_with_index(
         mempool,
         locks_in_block,
         transfers_in_block,
+        onboards_in_block,
         chain,
     )?;
     index.record(block)?;
@@ -168,6 +174,7 @@ pub fn import_hyper_block_with_index(
         block.envelope.metadata.canonical_block_id,
         locks_in_block.to_vec(),
         transfers_in_block.to_vec(),
+        onboards_in_block.to_vec(),
     )?;
     Ok(())
 }
@@ -188,6 +195,7 @@ pub fn import_hyper_block_with_scoring(
     mempool: &mut HyperMempool,
     locks_in_block: &[proto::HyperLockEvent],
     transfers_in_block: &[proto::HyperTransferTx],
+    onboards_in_block: &[proto::HyperNativeOnboardBody],
     score_tracker: &ValidatorScoreTracker,
     active_validator_keys_by_index: &[Vec<u8>],
     proposer_index: u64,
@@ -199,6 +207,7 @@ pub fn import_hyper_block_with_scoring(
         mempool,
         locks_in_block,
         transfers_in_block,
+        onboards_in_block,
     )?;
 
     // After successful import, credit proposer + signers.
@@ -242,6 +251,7 @@ pub fn import_hyper_block(
     mempool: &mut HyperMempool,
     locks_in_block: &[proto::HyperLockEvent],
     transfers_in_block: &[proto::HyperTransferTx],
+    onboards_in_block: &[proto::HyperNativeOnboardBody],
 ) -> Result<(), ImportError> {
     let payload = block
         .envelope
@@ -273,7 +283,15 @@ pub fn import_hyper_block(
     }
 
     // 3. Apply ALL state transitions via the same builder the proposer used.
-    let mut messages: Vec<PendingMessage> = Vec::with_capacity(transfers_in_block.len());
+    // ONBD-1: onboardings are applied in block-canonical order (before
+    // transfers, matching the producer's `produce_envelope` order) so every
+    // node assigns the identical custody→FID bindings; the resulting identity
+    // state is folded into the verkle root and covered by the root check below.
+    let mut messages: Vec<PendingMessage> =
+        Vec::with_capacity(onboards_in_block.len() + transfers_in_block.len());
+    for onboard in onboards_in_block {
+        messages.push(PendingMessage::Onboard(onboard.clone()));
+    }
     for tx in transfers_in_block {
         messages.push(PendingMessage::Transfer(tx.clone()));
     }
@@ -314,6 +332,9 @@ pub fn import_hyper_block(
         if let Some(first_input) = tx.inputs.first() {
             mempool.forget_transfer(&first_input.nullifier);
         }
+    }
+    for onboard in onboards_in_block {
+        mempool.forget_onboard(&onboard.custody_address);
     }
 
     Ok(())

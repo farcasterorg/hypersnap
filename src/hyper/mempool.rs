@@ -27,6 +27,8 @@ pub enum MempoolError {
     DuplicateLockId,
     #[error("duplicate transfer (nullifier already pending)")]
     DuplicateNullifier,
+    #[error("duplicate onboarding (custody already pending)")]
+    DuplicateOnboard,
 }
 
 /// Sortable identifier so the mempool can deduplicate and order messages.
@@ -45,6 +47,11 @@ pub struct HyperMempool {
     /// natural order (lock_ids and nullifiers compared lexicographically).
     locks: BTreeMap<Vec<u8>, proto::HyperLockEvent>,
     transfers: BTreeMap<Vec<u8>, proto::HyperTransferTx>,
+    /// ONBD-1: pending native onboardings, keyed by custody address so the
+    /// mempool holds at most one per custody and iterates in a deterministic
+    /// order. FIDs are NOT assigned here — assignment happens at `import_block`
+    /// in block-canonical order so every node derives the same custody→FID map.
+    onboards: BTreeMap<Vec<u8>, proto::HyperNativeOnboardBody>,
     /// All nullifiers across pending transfers — used to reject overlapping
     /// double-spend attempts within a single mempool view.
     pending_nullifiers: BTreeSet<Vec<u8>>,
@@ -58,6 +65,7 @@ pub struct HyperMempool {
 enum MempoolKey {
     Lock(Vec<u8>),
     Transfer(Vec<u8>),
+    Onboard(Vec<u8>),
 }
 
 impl Default for HyperMempool {
@@ -75,6 +83,7 @@ impl HyperMempool {
         Self {
             locks: BTreeMap::new(),
             transfers: BTreeMap::new(),
+            onboards: BTreeMap::new(),
             pending_nullifiers: BTreeSet::new(),
             insertion_order: std::collections::VecDeque::new(),
             capacity,
@@ -93,8 +102,12 @@ impl HyperMempool {
         self.transfers.len()
     }
 
+    pub fn onboard_count(&self) -> usize {
+        self.onboards.len()
+    }
+
     pub fn total_count(&self) -> usize {
-        self.locks.len() + self.transfers.len()
+        self.locks.len() + self.transfers.len() + self.onboards.len()
     }
 
     /// Evict the oldest entry if at capacity. Called before each insertion.
@@ -110,6 +123,9 @@ impl HyperMempool {
                             self.pending_nullifiers.remove(&input.nullifier);
                         }
                     }
+                }
+                Some(MempoolKey::Onboard(custody)) => {
+                    self.onboards.remove(&custody);
                 }
                 None => break,
             }
@@ -170,8 +186,44 @@ impl HyperMempool {
         Ok(())
     }
 
+    /// Admit a native onboarding to the mempool. Structural + gate validation
+    /// (POW/stake, EIP-712 signature, anchor) is performed by the caller
+    /// (`HyperRuntime::submit_message`) before this call; here we only dedupe
+    /// by custody so a custody can have at most one pending onboarding. The FID
+    /// is deliberately NOT assigned here.
+    pub fn submit_onboard(
+        &mut self,
+        body: proto::HyperNativeOnboardBody,
+    ) -> Result<(), MempoolError> {
+        let key = body.custody_address.clone();
+        if self.onboards.contains_key(&key) {
+            return Err(MempoolError::DuplicateOnboard);
+        }
+        self.evict_if_full();
+        self.insertion_order
+            .push_back(MempoolKey::Onboard(key.clone()));
+        self.onboards.insert(key, body);
+        Ok(())
+    }
+
     pub fn locks(&self) -> impl Iterator<Item = &proto::HyperLockEvent> {
         self.locks.values()
+    }
+
+    pub fn onboards(&self) -> impl Iterator<Item = &proto::HyperNativeOnboardBody> {
+        self.onboards.values()
+    }
+
+    /// Drop a specific onboarding by custody (e.g. it landed in a peer's block
+    /// we've now imported).
+    pub fn forget_onboard(&mut self, custody: &[u8]) -> bool {
+        if self.onboards.remove(custody).is_some() {
+            self.insertion_order
+                .retain(|k| !matches!(k, MempoolKey::Onboard(c) if c.as_slice() == custody));
+            true
+        } else {
+            false
+        }
     }
 
     pub fn transfers(&self) -> impl Iterator<Item = &proto::HyperTransferTx> {
@@ -180,12 +232,19 @@ impl HyperMempool {
 
     /// Remove and return all pending messages, leaving the mempool empty.
     /// The proposer calls this when assembling the next hyperblock.
-    pub fn drain(&mut self) -> (Vec<proto::HyperLockEvent>, Vec<proto::HyperTransferTx>) {
+    pub fn drain(
+        &mut self,
+    ) -> (
+        Vec<proto::HyperLockEvent>,
+        Vec<proto::HyperTransferTx>,
+        Vec<proto::HyperNativeOnboardBody>,
+    ) {
         let locks: Vec<_> = std::mem::take(&mut self.locks).into_values().collect();
         let transfers: Vec<_> = std::mem::take(&mut self.transfers).into_values().collect();
+        let onboards: Vec<_> = std::mem::take(&mut self.onboards).into_values().collect();
         self.pending_nullifiers.clear();
         self.insertion_order.clear();
-        (locks, transfers)
+        (locks, transfers, onboards)
     }
 
     /// Drop a specific lock if it's no longer needed (e.g. it was included
@@ -329,9 +388,10 @@ mod tests {
         mp.submit_lock(sample_lock(2)).unwrap();
         mp.submit_transfer(sample_transfer(3)).unwrap();
 
-        let (locks, transfers) = mp.drain();
+        let (locks, transfers, onboards) = mp.drain();
         assert_eq!(locks.len(), 2);
         assert_eq!(transfers.len(), 1);
+        assert_eq!(onboards.len(), 0);
         assert_eq!(mp.total_count(), 0);
     }
 

@@ -390,7 +390,7 @@ impl HyperRuntime {
         let mut tree = VerkleTree::new(config.srs);
         if let Some((tip_height, _)) = block_index.latest_height_and_hash().ok().flatten() {
             for h in 0..=tip_height {
-                if let Ok((locks, transfers)) = block_index.get_messages(h) {
+                if let Ok((locks, transfers, onboards)) = block_index.get_messages(h) {
                     // F035 fix: the transparent-lock path is gated off
                     // in `import_hyper_block`, so any stored block from
                     // a previous build version may still carry locks.
@@ -403,7 +403,12 @@ impl HyperRuntime {
                             "skipping transparent locks during verkle replay (F035-disabled path)"
                         );
                     }
-                    let mut messages = Vec::with_capacity(transfers.len());
+                    // ONBD-1: replay onboardings first (matching import order)
+                    // so the in-root identity state is reconstructed identically.
+                    let mut messages = Vec::with_capacity(onboards.len() + transfers.len());
+                    for o in onboards {
+                        messages.push(crate::hyper::builder::PendingMessage::Onboard(o));
+                    }
                     for t in transfers {
                         messages.push(crate::hyper::builder::PendingMessage::Transfer(t));
                     }
@@ -856,14 +861,20 @@ impl HyperRuntime {
             });
         }
 
-        // Admit lock (verifies derivation, no-duplicate, etc.).
+        // ONBD-3: stage the lock write, balance debit, and nonce bump into a
+        // single batch committed once. Admit only validates + stages the lock
+        // record now (no separate commit), so a crash can't leave a durable
+        // lock with no matching debit.
         let current_block = self.chain.last_height.unwrap_or(0);
-        crate::hyper::native_onboard::admit_onboarding_stake_lock(&self.db, body, current_block)
-            .map_err(|e| RewardError::Custom(format!("stake-lock admit: {}", e)))?;
-
-        // Debit balance + bump nonce atomically.
         let new_bal = bal - body.amount_atoms;
         let mut batch = self.db.txn();
+        crate::hyper::native_onboard::admit_onboarding_stake_lock(
+            &self.db,
+            body,
+            current_block,
+            &mut batch,
+        )
+        .map_err(|e| RewardError::Custom(format!("stake-lock admit: {}", e)))?;
         let bal_key = {
             let mut k = Vec::with_capacity(9);
             k.push(crate::storage::constants::RootPrefix::HyperRewardBalance as u8);
@@ -905,21 +916,30 @@ impl HyperRuntime {
 
         self.require_active_signer(body.sponsor_fid, &body.signer_pubkey)?;
 
+        // ONBD-2: stage the lock deletion into a batch that is only committed
+        // AFTER the nonce check passes, together with the balance credit-back
+        // and nonce bump. If the nonce is stale (routine on the shared
+        // `HyperTokenNonce` stream) the batch is dropped uncommitted and the
+        // lock survives — the sponsor's staked atoms are never burned.
         let current_block = self.chain.last_height.unwrap_or(0);
+        let mut batch = self.db.txn();
         let (sponsor, amount) = crate::hyper::native_onboard::admit_onboarding_stake_release(
             &self.db,
             body,
             current_block,
+            &mut batch,
         )
         .map_err(|e| RewardError::Custom(format!("stake-release admit: {}", e)))?;
 
         if amount == 0 {
-            // No-op (already released or never existed). Nonce intentionally
-            // not bumped — the body is replayable but produces no effect.
+            // No-op (already released or never existed). Batch is dropped
+            // uncommitted; nonce intentionally not bumped — the body is
+            // replayable but produces no effect.
             return Ok(());
         }
 
-        // Nonce check before crediting back.
+        // Nonce check BEFORE any commit. On mismatch the batch (with the staged
+        // lock delete) is dropped without committing.
         let current_nonce = self.reward_store.nonce_of(body.sponsor_fid)?;
         let expected = current_nonce.saturating_add(1);
         if body.nonce != expected {
@@ -935,7 +955,6 @@ impl HyperRuntime {
             .checked_add(amount)
             .ok_or(RewardError::BalanceOverflow { fid: sponsor })?;
 
-        let mut batch = self.db.txn();
         let bal_key = {
             let mut k = Vec::with_capacity(9);
             k.push(crate::storage::constants::RootPrefix::HyperRewardBalance as u8);
@@ -4055,16 +4074,35 @@ impl HyperRuntime {
         // FIP-hyper-native-onboarding: validator-assigned FID issuance
         // gated by hashcash (POW) or by a native-token stake lock.
         if let Some(proto::hyper_message::Body::NativeOnboard(ref body)) = msg.body {
-            let current_block = self.chain.last_height.unwrap_or(0);
-            let anchor = HyperRuntimeAnchor::new(self);
-            crate::hyper::native_onboard::apply_onboarding(
-                &self.db,
-                body,
-                &anchor,
-                self.protocol_chain_id,
-                current_block,
-            )
-            .map_err(|e| RoutingError::NativeOnboard(e.to_string()))?;
+            // ONBD-1: do NOT assign a FID or mutate identity state at
+            // gossip-ingestion time — that produced per-node, arrival-order
+            // divergence. Validate (anchor/POW/stake/signature) and enqueue;
+            // the FID is assigned deterministically at `import_block` in
+            // block-canonical order, folded into the verkle root. Optimistic
+            // duplicate rejection against the mirror keeps the mempool clean;
+            // the authoritative uniqueness check is the in-tree `ever` marker.
+            {
+                let anchor = HyperRuntimeAnchor::new(self);
+                let (custody, _pow) = crate::hyper::native_onboard::validate_onboarding(
+                    body,
+                    &anchor,
+                    self.protocol_chain_id,
+                )
+                .map_err(|e| RoutingError::NativeOnboard(e.to_string()))?;
+                if let Some(existing) =
+                    crate::hyper::native_onboard::lookup_custody_fid(&self.db, &custody)
+                        .map_err(|e| RoutingError::NativeOnboard(e.to_string()))?
+                {
+                    return Err(RoutingError::NativeOnboard(format!(
+                        "custody 0x{} already onboarded (fid {})",
+                        hex::encode(custody),
+                        existing
+                    )));
+                }
+            }
+            self.mempool
+                .submit_onboard(body.clone())
+                .map_err(|e| RoutingError::NativeOnboard(e.to_string()))?;
             return Ok(());
         }
         // FIP §4.3 custody rotation for hyper-native FIDs.
@@ -4188,7 +4226,13 @@ impl HyperRuntime {
 
     /// Drain pending messages and produce them as a `(locks, transfers)` pair
     /// for the proposer to assemble into a block.
-    pub fn drain_pending(&mut self) -> (Vec<proto::HyperLockEvent>, Vec<proto::HyperTransferTx>) {
+    pub fn drain_pending(
+        &mut self,
+    ) -> (
+        Vec<proto::HyperLockEvent>,
+        Vec<proto::HyperTransferTx>,
+        Vec<proto::HyperNativeOnboardBody>,
+    ) {
         self.mempool.drain()
     }
 
@@ -4777,10 +4821,34 @@ impl HyperRuntime {
         block: &crate::hyper::HyperBlock,
         locks_in_block: &[crate::proto::HyperLockEvent],
         transfers_in_block: &[crate::proto::HyperTransferTx],
+        onboards_in_block: &[crate::proto::HyperNativeOnboardBody],
     ) -> Result<[u8; 32], crate::hyper::importer::ImportError> {
         let dkls_addr = self
             .dkls_group_address_for_epoch(block.signature.epoch)
             .ok_or(crate::hyper::importer::ImportError::SignatureVerificationFailed)?;
+
+        // ONBD-1: re-validate every onboarding in the block before applying,
+        // defending against a malicious proposer who included one off-mempool.
+        // This is deterministic at import: nodes import blocks in order, so at
+        // the moment of importing this block every node's hyper tip is the same
+        // (parent height), making the anchor-freshness check agree network-wide
+        // (also closes ONBD-8's gossip-time tip nondeterminism).
+        {
+            let anchor = HyperRuntimeAnchor::new(self);
+            for (i, body) in onboards_in_block.iter().enumerate() {
+                crate::hyper::native_onboard::validate_onboarding(
+                    body,
+                    &anchor,
+                    self.protocol_chain_id,
+                )
+                .map_err(|e| {
+                    crate::hyper::importer::ImportError::OnboardValidation(format!(
+                        "onboard[{}]: {}",
+                        i, e
+                    ))
+                })?;
+            }
+        }
 
         // Re-run the strong validation on every transfer in the
         // block before any state change. The mempool admission gate
@@ -4844,9 +4912,30 @@ impl HyperRuntime {
             &mut self.mempool,
             locks_in_block,
             transfers_in_block,
+            onboards_in_block,
             &mut self.chain,
             &self.block_index,
         )?;
+
+        // ONBD-1: sync the RocksDB query mirror from the now-authoritative
+        // verkle tree. The tree holds the consensus-committed custody→FID
+        // assignment (folded into the root); the mirror keeps the existing
+        // readers (`lookup_custody_fid`, `next_hyper_fid`, rotation, HTTP)
+        // working without each read touching the tree. Idempotent: a repeat
+        // custody's FID is already assigned in the tree and re-written identically.
+        if !onboards_in_block.is_empty() {
+            crate::hyper::native_onboard::sync_onboarding_mirror_from_tree(
+                &self.db,
+                &self.tree,
+                onboards_in_block,
+            )
+            .map_err(|e| {
+                crate::hyper::importer::ImportError::OnboardValidation(format!(
+                    "mirror sync: {}",
+                    e
+                ))
+            })?;
+        }
 
         // Post-apply: sync the note store so the next block's
         // validations resolve owner pubkeys for the new outputs +
@@ -4917,6 +5006,7 @@ impl HyperRuntime {
             crate::hyper::HyperEnvelope,
             Vec<crate::proto::HyperLockEvent>,
             Vec<crate::proto::HyperTransferTx>,
+            Vec<crate::proto::HyperNativeOnboardBody>,
         ),
         crate::hyper::builder::BuilderError,
     > {
@@ -4942,6 +5032,7 @@ impl HyperRuntime {
             crate::hyper::HyperEnvelope,
             Vec<crate::proto::HyperLockEvent>,
             Vec<crate::proto::HyperTransferTx>,
+            Vec<crate::proto::HyperNativeOnboardBody>,
         ),
         crate::hyper::builder::BuilderError,
     > {
@@ -4983,11 +5074,17 @@ impl HyperRuntime {
             crate::hyper::HyperEnvelope,
             Vec<crate::proto::HyperLockEvent>,
             Vec<crate::proto::HyperTransferTx>,
+            Vec<crate::proto::HyperNativeOnboardBody>,
         ),
         crate::hyper::builder::BuilderError,
     > {
-        let (locks, transfers) = self.mempool.drain();
-        let mut messages = Vec::with_capacity(locks.len() + transfers.len());
+        let (locks, transfers, onboards) = self.mempool.drain();
+        let mut messages = Vec::with_capacity(onboards.len() + locks.len() + transfers.len());
+        // ONBD-1: onboardings first, matching the import-side apply order so
+        // producer and importer derive the identical verkle root.
+        for o in &onboards {
+            messages.push(crate::hyper::builder::PendingMessage::Onboard(o.clone()));
+        }
         for l in &locks {
             messages.push(crate::hyper::builder::PendingMessage::Lock(l.clone()));
         }
@@ -5018,7 +5115,7 @@ impl HyperRuntime {
                 );
             }
         }
-        Ok((envelope, locks, transfers))
+        Ok((envelope, locks, transfers, onboards))
     }
 
     /// F018 fix: drop DKLS23 share material for every epoch strictly
@@ -5169,10 +5266,11 @@ impl HyperRuntime {
             crate::hyper::HyperBlock,
             Vec<crate::proto::HyperLockEvent>,
             Vec<crate::proto::HyperTransferTx>,
+            Vec<crate::proto::HyperNativeOnboardBody>,
         ),
         RuntimeProduceError,
     > {
-        let (envelope, locks, transfers) = self
+        let (envelope, locks, transfers, onboards) = self
             .produce_envelope_with_full_anchor(
                 canonical_block_id,
                 parent_hash,
@@ -5209,7 +5307,7 @@ impl HyperRuntime {
                 // an ECDSA-shaped block ignores these.
             },
         };
-        Ok((block, locks, transfers))
+        Ok((block, locks, transfers, onboards))
     }
 
     /// Attach a finalized DKLS23 threshold ECDSA signature to a
@@ -5247,10 +5345,11 @@ impl HyperRuntime {
             crate::hyper::HyperBlock,
             Vec<crate::proto::HyperLockEvent>,
             Vec<crate::proto::HyperTransferTx>,
+            Vec<crate::proto::HyperNativeOnboardBody>,
         ),
         RuntimeProduceError,
     > {
-        let (mut block, locks, transfers) = self.produce_unsigned_block_dkls(
+        let (mut block, locks, transfers, onboards) = self.produce_unsigned_block_dkls(
             canonical_block_id,
             parent_hash,
             extra_rules_version,
@@ -5287,7 +5386,7 @@ impl HyperRuntime {
         let signature = hypersnap_crypto::dkls_sign::run_local_dkls_sign(&share.party, digest)
             .map_err(RuntimeProduceError::DklsSign)?;
         Self::attach_dkls_signature(&mut block, &committee, &signature);
-        Ok((block, locks, transfers))
+        Ok((block, locks, transfers, onboards))
     }
 }
 
@@ -5465,10 +5564,10 @@ mod tests {
             let mut rt = HyperRuntime::new(cfg);
             rt.install_local_dkls_share(0, 1, dkg.parties[0].clone(), dkg.group_address);
 
-            let (block0, _, _) = rt
+            let (block0, _, _, _) = rt
                 .produce_signed_block_dkls_local(0, vec![], 0, 0, vec![], 0)
                 .unwrap();
-            rt.import_block(&block0, &[], &[]).unwrap()
+            rt.import_block(&block0, &[], &[], &[]).unwrap()
         };
 
         // Phase 2: simulated restart — fresh runtime over same DB.
@@ -5494,7 +5593,7 @@ mod tests {
         assert_eq!(rt.last_block_hash(), Some(block0_hash));
         rt.install_local_dkls_share(0, 1, dkg.parties[0].clone(), dkg.group_address);
 
-        let (block1, _, _) = rt
+        let (block1, _, _, _) = rt
             .produce_signed_block_dkls_local(1, block0_hash.to_vec(), 0, 0, vec![], 0)
             .unwrap();
 
@@ -5523,8 +5622,8 @@ mod tests {
 
         let stored_block0 = rt.get_block_by_height(0).unwrap().unwrap();
         let block0 = decode_proto_block(stored_block0).unwrap();
-        peer.import_block(&block0, &[], &[]).unwrap();
-        peer.import_block(&block1, &[], &[])
+        peer.import_block(&block0, &[], &[], &[]).unwrap();
+        peer.import_block(&block1, &[], &[], &[])
             .expect("block 1 should import cleanly across restart");
     }
 
@@ -5775,7 +5874,7 @@ mod tests {
         // `submit_message_accepts_properly_authenticated_transfer`).
         let (mut rt, _dir) = make_runtime();
         assert_eq!(rt.pending_count(), 0);
-        let (locks, transfers) = rt.drain_pending();
+        let (locks, transfers, _onboards) = rt.drain_pending();
         assert_eq!(locks.len(), 0);
         assert_eq!(transfers.len(), 0);
         assert_eq!(rt.pending_count(), 0);
@@ -5888,7 +5987,7 @@ mod tests {
             hypersnap_crypto::dkls_threshold::run_honest_dkg(1, 1, [0xaa; 32]).expect("1-of-1 DKG");
         rt.install_local_dkls_share(0, 1, dkg.parties[0].clone(), dkg.group_address);
 
-        let (block, _locks, _transfers) = rt
+        let (block, _locks, _transfers, _) = rt
             .produce_signed_block_dkls_local(1, vec![0u8; 32], 0, 0, vec![], 0)
             .expect("produce + sign");
 
@@ -5944,7 +6043,7 @@ mod tests {
         let current = rt.epoch_resolver.current_epoch();
         rt.install_local_dkls_share(current, 1, dkg.parties[0].clone(), dkg.group_address);
 
-        let (block, _locks, _transfers) = rt
+        let (block, _locks, _transfers, _) = rt
             .produce_unsigned_block_dkls(7, vec![0u8; 32], 0, 0, vec![], 0)
             .expect("produce unsigned");
         assert!(block.signature.ecdsa_signature.is_empty());
@@ -6092,7 +6191,7 @@ mod tests {
     #[test]
     fn produce_envelope_with_no_pending_messages() {
         let (mut rt, _dir) = make_runtime();
-        let (env, locks, transfers) = rt.produce_envelope(1, vec![], 0).unwrap();
+        let (env, locks, transfers, _) = rt.produce_envelope(1, vec![], 0).unwrap();
         assert_eq!(env.metadata.canonical_block_id, 1);
         assert_eq!(env.metadata.retained_message_count, 0);
         assert_eq!(env.metadata.hyper_state_root.len(), 48);
@@ -6107,7 +6206,7 @@ mod tests {
         // envelope (no messages, no panics, retained count = 0).
         let (mut rt, _dir) = make_runtime();
         assert_eq!(rt.pending_count(), 0);
-        let (env, locks, transfers) = rt.produce_envelope(5, vec![0u8; 32], 0).unwrap();
+        let (env, locks, transfers, _) = rt.produce_envelope(5, vec![0u8; 32], 0).unwrap();
         assert_eq!(env.metadata.retained_message_count, 0);
         assert!(locks.is_empty());
         assert!(transfers.is_empty());
@@ -6124,8 +6223,8 @@ mod tests {
         // confidential path. For now we assert the trivial
         // determinism: two consecutive empty envelopes match.
         let (mut rt, _dir) = make_runtime();
-        let (env_a, _, _) = rt.produce_envelope(0, vec![], 0).unwrap();
-        let (env_b, _, _) = rt.produce_envelope(1, vec![0u8; 32], 0).unwrap();
+        let (env_a, _, _, _) = rt.produce_envelope(0, vec![], 0).unwrap();
+        let (env_b, _, _, _) = rt.produce_envelope(1, vec![0u8; 32], 0).unwrap();
         // Different parent_hash → different envelope hashes, but
         // the underlying state root must be the same (no state
         // mutated between calls).

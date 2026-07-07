@@ -111,11 +111,13 @@ impl HyperBlockIndex {
         height: u64,
         locks: Vec<proto::HyperLockEvent>,
         transfers: Vec<proto::HyperTransferTx>,
+        onboards: Vec<proto::HyperNativeOnboardBody>,
     ) -> Result<(), IndexError> {
         let wire = proto::HyperWireBlock {
             block: None, // already stored under HyperBlockByHeight
             locks,
             transfers,
+            onboards,
         };
         let bytes = wire.encode_to_vec();
         let mut k = Vec::with_capacity(9);
@@ -131,16 +133,23 @@ impl HyperBlockIndex {
     pub fn get_messages(
         &self,
         height: u64,
-    ) -> Result<(Vec<proto::HyperLockEvent>, Vec<proto::HyperTransferTx>), IndexError> {
+    ) -> Result<
+        (
+            Vec<proto::HyperLockEvent>,
+            Vec<proto::HyperTransferTx>,
+            Vec<proto::HyperNativeOnboardBody>,
+        ),
+        IndexError,
+    > {
         let mut k = Vec::with_capacity(9);
         k.push(RootPrefix::HyperBlockMessages as u8);
         k.extend_from_slice(&height.to_be_bytes());
         match self.db.get(&k).map_err(HubError::from)? {
             Some(bytes) => {
                 let wire = proto::HyperWireBlock::decode(bytes.as_slice())?;
-                Ok((wire.locks, wire.transfers))
+                Ok((wire.locks, wire.transfers, wire.onboards))
             }
-            None => Ok((Vec::new(), Vec::new())),
+            None => Ok((Vec::new(), Vec::new(), Vec::new())),
         }
     }
 

@@ -155,6 +155,7 @@ mod tests {
                 block: dummy_block(),
                 locks: vec![],
                 transfers: vec![],
+                onboards: vec![],
             })
             .await
             .unwrap();

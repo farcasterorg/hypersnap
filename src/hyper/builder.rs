@@ -30,6 +30,85 @@ use hypersnap_crypto::verkle::VerkleTree;
 const KEY_DOMAIN_LOCK: u8 = 0x01;
 const KEY_DOMAIN_NULLIFIER: u8 = 0x02;
 const KEY_DOMAIN_NOTE_COMMITMENT: u8 = 0x03;
+// ONBD-1: native-onboarding identity state folded into the verkle root so it
+// is covered by the threshold-signed `hyper_state_root`. Any divergence in
+// custody→FID assignment between honest nodes then produces a root mismatch
+// (the block fails to import → halt) instead of a silent identity fork.
+const KEY_DOMAIN_ONBOARD_SEQ: u8 = 0x04; // global next-FID counter
+const KEY_DOMAIN_ONBOARD_CUSTODY: u8 = 0x05; // custody → assigned FID
+const KEY_DOMAIN_ONBOARD_EVER: u8 = 0x06; // custody → 1 (permanent; ONBD-4 replay guard)
+const KEY_DOMAIN_ONBOARD_STAKE_BINDING: u8 = 0x07; // stake_lock_id → FID
+
+fn onboard_padded_key(domain: u8, id: &[u8]) -> Vec<u8> {
+    let mut k = Vec::with_capacity(33);
+    k.push(domain);
+    k.extend_from_slice(&id[..id.len().min(32)]);
+    while k.len() < 33 {
+        k.push(0);
+    }
+    k
+}
+
+pub fn onboard_seq_verkle_key() -> Vec<u8> {
+    onboard_padded_key(KEY_DOMAIN_ONBOARD_SEQ, &[])
+}
+pub fn onboard_custody_verkle_key(custody: &[u8]) -> Vec<u8> {
+    onboard_padded_key(KEY_DOMAIN_ONBOARD_CUSTODY, custody)
+}
+pub fn onboard_ever_verkle_key(custody: &[u8]) -> Vec<u8> {
+    onboard_padded_key(KEY_DOMAIN_ONBOARD_EVER, custody)
+}
+pub fn onboard_stake_binding_verkle_key(lock_id: &[u8]) -> Vec<u8> {
+    onboard_padded_key(KEY_DOMAIN_ONBOARD_STAKE_BINDING, lock_id)
+}
+
+fn read_onboard_seq(tree: &VerkleTree) -> u64 {
+    match tree.get(&onboard_seq_verkle_key()) {
+        Some(b) if b.len() == 8 => {
+            let mut be = [0u8; 8];
+            be.copy_from_slice(b);
+            u64::from_be_bytes(be)
+        }
+        // Absent = never issued: start at the base. (A wrong-length value can
+        // only arise from a corrupt/hostile tree, which would already have
+        // diverged the root; treat as base to keep this infallible.)
+        _ => crate::hyper::HYPER_FID_BASE,
+    }
+}
+
+/// Apply one native onboarding to the verkle tree, assigning the FID from the
+/// in-tree sequence counter. Returns `Some((custody, fid))` on a fresh
+/// assignment, or `None` if this custody was already onboarded (idempotent —
+/// this is what makes the producer's produce-then-import double-apply safe, and
+/// what makes a rotate-then-replay a no-op via the permanent `ever` marker).
+///
+/// Deterministic in block-canonical order: every node applying the same ordered
+/// onboarding list against the same prior tree derives the identical FID.
+pub fn apply_onboard_to_tree(
+    tree: &mut VerkleTree,
+    body: &proto::HyperNativeOnboardBody,
+) -> Option<(Vec<u8>, u64)> {
+    let custody = body.custody_address.clone();
+    let ever_key = onboard_ever_verkle_key(&custody);
+    if tree.get(&ever_key).is_some() {
+        return None; // already onboarded (idempotent + ONBD-4 replay guard)
+    }
+    let fid = read_onboard_seq(tree);
+    let next = fid.saturating_add(1);
+    tree.insert(
+        &onboard_custody_verkle_key(&custody),
+        fid.to_be_bytes().to_vec(),
+    );
+    tree.insert(&onboard_seq_verkle_key(), next.to_be_bytes().to_vec());
+    tree.insert(&ever_key, vec![1u8]);
+    if let Some(proto::hyper_native_onboard_body::GateProof::Stake(stake)) = &body.gate_proof {
+        tree.insert(
+            &onboard_stake_binding_verkle_key(&stake.stake_lock_id),
+            fid.to_be_bytes().to_vec(),
+        );
+    }
+    Some((custody, fid))
+}
 
 fn nullifier_verkle_key(nullifier_bytes: &[u8; 32]) -> Vec<u8> {
     let mut k = Vec::with_capacity(33);
@@ -85,6 +164,9 @@ pub enum BuilderError {
 #[derive(Clone, Debug)]
 pub enum PendingMessage {
     Lock(proto::HyperLockEvent),
+    // ONBD-1: native onboarding. Assigns the FID from the in-tree sequence in
+    // block-canonical order and folds the identity state into the verkle root.
+    Onboard(proto::HyperNativeOnboardBody),
     // Transfers don't directly modify the verkle tree in the lock-only bridge
     // path — they update the note set + nullifier set in derived RocksDB
     // indices. They're included here for completeness but produce no verkle
@@ -114,6 +196,13 @@ impl<'a> HyperBlockBuilder<'a> {
         match msg {
             PendingMessage::Lock(event) => {
                 insert_lock_into_tree(self.tree, event)?;
+                Ok(())
+            }
+            PendingMessage::Onboard(body) => {
+                // Idempotent: a repeat custody is a no-op, so the producer's
+                // produce-then-import double-apply is safe. The RocksDB query
+                // mirror is written by the importer, not here.
+                apply_onboard_to_tree(self.tree, body);
                 Ok(())
             }
             PendingMessage::Transfer(tx_proto) => {

@@ -44,12 +44,38 @@ use std::sync::Arc;
 /// are rejected.
 pub const ONBOARD_ANCHOR_WINDOW: u64 = 1024;
 
-/// Initial minimum difficulty for the POW gate. Calibrated for ~30s of
-/// single-core CPU work on a contemporary x86 core; revise during
-/// testnet calibration. Validator-set tunable via governance, not
-/// adaptive in Phase 1. POW above the floor is permitted but grants
-/// nothing — the gate proves "this onboarding cost work," nothing more.
-pub const MIN_DIFFICULTY_BITS: u32 = 22;
+/// ONBD-6: the stake-backed onboarding gate is a Phase-2 feature (§11.4).
+/// It ships disabled in production: the module documented it as
+/// `StakeGateNotYetEnabled`, but the code was fully live, which (a) exposed a
+/// pre-ecrecover CPU-DoS on the stake arm (no cheap cost-proof precedes the
+/// secp256k1 recover, unlike the POW arm) and (b) made the stake accounting
+/// paths reachable at launch. Disabling it rejects the stake arm cheaply,
+/// before any signature recovery. Tests still exercise the stake path.
+#[cfg(not(test))]
+pub const STAKE_GATE_ENABLED: bool = false;
+#[cfg(test)]
+pub const STAKE_GATE_ENABLED: bool = true;
+
+/// Initial minimum difficulty for the POW gate, in leading-zero bits.
+///
+/// ONBD-5: the previous value (22 bits ≈ 4.2M SHA-256) was mis-described as
+/// "~30s single-core." That is wrong by orders of magnitude: SHA-256 is
+/// ASIC/SHA-NI-friendly, so 22 bits is ~7–14 ms on a modern core with SHA-NI
+/// and microseconds on a GPU/ASIC — effectively no sybil cost. Raising the
+/// production floor to 30 bits (~1.07e9 hashes) puts a commodity SHA-NI core
+/// at ~2–4 s per FID and a single GPU in the tens of ms; it is a *soft* gate,
+/// not a hard sybil barrier. A SHA-256 PoW is inherently ASIC-dominated, so
+/// the durable fix is a memory-hard function (Argon2id / scrypt) and/or the
+/// stake gate as the real Phase-2 barrier — tracked separately. Validator-set
+/// tunable via governance; not adaptive in Phase 1. POW above the floor is
+/// permitted but grants nothing.
+///
+/// Tests solve real POW at this floor, so under `cfg(test)` it drops to a
+/// trivially-solvable value — the production consensus floor is 30.
+#[cfg(not(test))]
+pub const MIN_DIFFICULTY_BITS: u32 = 30;
+#[cfg(test)]
+pub const MIN_DIFFICULTY_BITS: u32 = 12;
 
 /// Minimum stake amount accepted by an onboarding StakeProof. Smaller
 /// stakes are rejected at admission to bound abuse. Bound stake is
@@ -111,6 +137,8 @@ pub enum OnboardError {
     },
     #[error("gate_proof missing — exactly one of pow or stake must be set")]
     MissingGateProof,
+    #[error("stake gate not yet enabled (Phase 2)")]
+    StakeGateNotYetEnabled,
     #[error("POW difficulty {got} below floor {needed}")]
     PowDifficultyTooLow { got: u32, needed: u32 },
     #[error("POW solution fails target: hash {hash_hex} not below 2^256/2^{difficulty_bits}")]
@@ -173,12 +201,20 @@ pub fn next_hyper_fid(db: &Arc<RocksDB>) -> Result<u64, OnboardError> {
         .get(&fid_sequence_key())
         .map_err(|e| OnboardError::Storage(e.to_string()))?
     {
-        Some(bytes) if bytes.len() == 8 => {
+        // ONBD-7: fail closed on a present-but-wrong-length value. Writers
+        // always emit 8 bytes, so a wrong length means corruption; silently
+        // resetting to HYPER_FID_BASE would re-issue already-assigned FIDs.
+        Some(bytes) if bytes.len() != 8 => Err(OnboardError::Storage(format!(
+            "corrupt HyperNativeFidSequence: expected 8 bytes, got {}",
+            bytes.len()
+        ))),
+        Some(bytes) => {
             let mut be = [0u8; 8];
             be.copy_from_slice(&bytes);
             Ok(u64::from_be_bytes(be))
         }
-        _ => Ok(HYPER_FID_BASE),
+        // Absent = never initialized: lazily start at the base.
+        None => Ok(HYPER_FID_BASE),
     }
 }
 
@@ -190,15 +226,20 @@ pub fn lookup_custody_fid(
     let v = db
         .get(&custody_to_fid_key(custody))
         .map_err(|e| OnboardError::Storage(e.to_string()))?;
-    Ok(v.and_then(|bytes| {
-        if bytes.len() == 8 {
+    match v {
+        None => Ok(None),
+        Some(bytes) if bytes.len() == 8 => {
             let mut be = [0u8; 8];
             be.copy_from_slice(&bytes);
-            Some(u64::from_be_bytes(be))
-        } else {
-            None
+            Ok(Some(u64::from_be_bytes(be)))
         }
-    }))
+        // ONBD-7: fail closed — a present-but-wrong-length binding is corrupt;
+        // treating it as "not onboarded" would allow a duplicate FID mint.
+        Some(bytes) => Err(OnboardError::Storage(format!(
+            "corrupt HyperNativeCustodyToFid: expected 8 bytes, got {}",
+            bytes.len()
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -419,6 +460,43 @@ fn verify_anchor(
 // Validation + apply
 // ---------------------------------------------------------------------------
 
+/// ONBD-1: after `import_block` has folded the block's onboardings into the
+/// verkle tree (the authoritative, in-root state), mirror the resulting
+/// custody→FID assignments and global sequence into the RocksDB index that the
+/// existing readers (`lookup_custody_fid`, `next_hyper_fid`, custody rotation,
+/// HTTP queries) consult. The tree is the source of truth; this keeps those
+/// readers correct without each one reaching into the tree. Idempotent.
+pub fn sync_onboarding_mirror_from_tree(
+    db: &Arc<RocksDB>,
+    tree: &hypersnap_crypto::verkle::VerkleTree,
+    onboards: &[proto::HyperNativeOnboardBody],
+) -> Result<(), OnboardError> {
+    let mut batch = RocksDbTransactionBatch::new();
+    if let Some(seq) = tree.get(&crate::hyper::builder::onboard_seq_verkle_key()) {
+        batch.put(fid_sequence_key(), seq.to_vec());
+    }
+    for body in onboards {
+        let custody = &body.custody_address;
+        if let Some(fid_bytes) =
+            tree.get(&crate::hyper::builder::onboard_custody_verkle_key(custody))
+        {
+            batch.put(custody_to_fid_key(custody), fid_bytes.to_vec());
+            if let Some(proto::hyper_native_onboard_body::GateProof::Stake(stake)) =
+                &body.gate_proof
+            {
+                if let Some(fid_bytes) = tree.get(
+                    &crate::hyper::builder::onboard_stake_binding_verkle_key(&stake.stake_lock_id),
+                ) {
+                    batch.put(stake_binding_key(&stake.stake_lock_id), fid_bytes.to_vec());
+                }
+            }
+        }
+    }
+    db.commit(batch)
+        .map_err(|e| OnboardError::Storage(e.to_string()))?;
+    Ok(())
+}
+
 /// Outcome of a successful onboarding admission. The validator-
 /// assigned FID is the entire issued state — hyper-native FIDs have
 /// no per-FID storage units, no fee credit, no recurring quota.
@@ -459,6 +537,13 @@ pub fn validate_onboarding(
             (commitment, h)
         }
         Some(proto::hyper_native_onboard_body::GateProof::Stake(stake)) => {
+            // ONBD-6: reject the stake arm cheaply BEFORE the ecrecover below
+            // when the Phase-2 stake gate is disabled. This is the first thing
+            // the stake arm does, so a flood of stake-arm onboardings can no
+            // longer force a secp256k1 recovery per message.
+            if !STAKE_GATE_ENABLED {
+                return Err(OnboardError::StakeGateNotYetEnabled);
+            }
             // Phase 2: stake-backed gate. The actual stake-lock
             // verification (existence, parameter match, not-already-
             // bound) happens in `apply_onboarding` where it has DB
@@ -641,20 +726,25 @@ impl From<CustodyRotationError> for HubError {
 /// Per-FID rotation nonce, single-keyed under
 /// `HyperNativeRotationNonce`. Returns 0 if absent (FID has never
 /// rotated custody).
-pub fn read_rotation_nonce(db: &Arc<RocksDB>, fid: u64) -> u64 {
-    db.get(&rotation_nonce_key(fid))
-        .ok()
-        .flatten()
-        .and_then(|bytes| {
-            if bytes.len() == 8 {
-                let mut be = [0u8; 8];
-                be.copy_from_slice(&bytes);
-                Some(u64::from_be_bytes(be))
-            } else {
-                None
-            }
-        })
-        .unwrap_or(0)
+pub fn read_rotation_nonce(db: &Arc<RocksDB>, fid: u64) -> Result<u64, OnboardError> {
+    // ONBD-7: fail closed. Previously this swallowed both DB errors and
+    // wrong-length values into 0, which would silently rewind the rotation
+    // nonce and let a previously-used rotation body replay.
+    match db
+        .get(&rotation_nonce_key(fid))
+        .map_err(|e| OnboardError::Storage(e.to_string()))?
+    {
+        None => Ok(0),
+        Some(bytes) if bytes.len() == 8 => {
+            let mut be = [0u8; 8];
+            be.copy_from_slice(&bytes);
+            Ok(u64::from_be_bytes(be))
+        }
+        Some(bytes) => Err(OnboardError::Storage(format!(
+            "corrupt HyperNativeRotationNonce: expected 8 bytes, got {}",
+            bytes.len()
+        ))),
+    }
 }
 
 fn rotation_typed_data(
@@ -744,7 +834,9 @@ pub fn apply_custody_rotation(
     }
 
     // Nonce check.
-    let expected_nonce = read_rotation_nonce(db, body.fid).saturating_add(1);
+    let expected_nonce = read_rotation_nonce(db, body.fid)
+        .map_err(|e| CustodyRotationError::Storage(e.to_string()))?
+        .saturating_add(1);
     if body.nonce != expected_nonce {
         return Err(CustodyRotationError::NonceMismatch {
             fid: body.fid,
@@ -973,7 +1065,12 @@ pub fn admit_onboarding_stake_lock(
     db: &Arc<RocksDB>,
     body: &proto::OnboardingStakeLockBody,
     current_block: u64,
+    batch: &mut RocksDbTransactionBatch,
 ) -> Result<OnboardingStakeLock, OnboardingStakeError> {
+    // ONBD-3: this only *stages* the lock write into the caller's batch and
+    // never commits. The runtime commits the lock record, the balance debit,
+    // and the nonce bump in a single atomic batch, so a crash between them can
+    // no longer leave a durable lock with no matching debit (free-mint).
     if body.stake_lock_id.len() != 32 {
         return Err(OnboardingStakeError::BadLockIdLength(
             body.stake_lock_id.len(),
@@ -1007,23 +1104,30 @@ pub fn admit_onboarding_stake_lock(
         lock_duration_blocks: body.lock_duration_blocks,
         created_at_block: current_block,
     };
-    let mut batch = RocksDbTransactionBatch::new();
     batch.put(
         onboarding_stake_lock_key(&body.stake_lock_id),
         lock.encode(),
     );
-    db.commit(batch)
-        .map_err(|e| OnboardingStakeError::Storage(e.to_string()))?;
     Ok(lock)
 }
 
-/// Verify release preconditions and remove the lock record. Returns
-/// the `(sponsor_fid, amount_atoms)` that the caller (runtime) must
-/// credit back to the sponsor's `RewardStore`.
+/// Verify release preconditions and *stage* the lock-record deletion into the
+/// caller's batch. Returns the `(sponsor_fid, amount_atoms)` that the caller
+/// (runtime) must credit back to the sponsor's `RewardStore`, or `(0, 0)` for
+/// the idempotent no-op (nothing staged).
+///
+/// ONBD-2: this must NOT commit. All validation happens here, but the
+/// destructive `delete(lock)` only lands in the caller's batch alongside the
+/// balance credit-back and nonce bump, committed once. If the caller's
+/// subsequent nonce check fails, the batch is dropped uncommitted and the lock
+/// survives — no burn. Previously the delete was committed here, before the
+/// runtime's fallible nonce check, so a stale nonce (routine on the shared
+/// `HyperTokenNonce` stream) permanently burned the sponsor's staked atoms.
 pub fn admit_onboarding_stake_release(
     db: &Arc<RocksDB>,
     body: &proto::OnboardingStakeReleaseBody,
     current_block: u64,
+    batch: &mut RocksDbTransactionBatch,
 ) -> Result<(u64, u64), OnboardingStakeError> {
     if body.stake_lock_id.len() != 32 {
         return Err(OnboardingStakeError::BadLockIdLength(
@@ -1061,10 +1165,7 @@ pub fn admit_onboarding_stake_release(
             duration: lock.lock_duration_blocks,
         });
     }
-    let mut batch = RocksDbTransactionBatch::new();
     batch.delete(onboarding_stake_lock_key(&body.stake_lock_id));
-    db.commit(batch)
-        .map_err(|e| OnboardingStakeError::Storage(e.to_string()))?;
     Ok((lock.sponsor_fid, lock.amount_atoms))
 }
 
@@ -1100,6 +1201,33 @@ mod tests {
         let db = RocksDB::new(dir.path().to_str().unwrap());
         db.open().unwrap();
         (Arc::new(db), dir)
+    }
+
+    // Test helpers that stage + commit in one batch, replicating the pre-ONBD-2/3
+    // commit-immediately semantics for setup. The production runtime instead
+    // folds these stages into a single batch with the balance/nonce writes.
+    fn admit_lock_committed(
+        db: &Arc<RocksDB>,
+        body: &proto::OnboardingStakeLockBody,
+        current_block: u64,
+    ) -> Result<OnboardingStakeLock, OnboardingStakeError> {
+        let mut batch = RocksDbTransactionBatch::new();
+        let lock = admit_onboarding_stake_lock(db, body, current_block, &mut batch)?;
+        db.commit(batch)
+            .map_err(|e| OnboardingStakeError::Storage(e.to_string()))?;
+        Ok(lock)
+    }
+
+    fn admit_release_committed(
+        db: &Arc<RocksDB>,
+        body: &proto::OnboardingStakeReleaseBody,
+        current_block: u64,
+    ) -> Result<(u64, u64), OnboardingStakeError> {
+        let mut batch = RocksDbTransactionBatch::new();
+        let res = admit_onboarding_stake_release(db, body, current_block, &mut batch)?;
+        db.commit(batch)
+            .map_err(|e| OnboardingStakeError::Storage(e.to_string()))?;
+        Ok(res)
     }
 
     fn solve_pow(custody: &[u8; 20], anchor_hash: &[u8; 32], bits: u32) -> Vec<u8> {
@@ -1361,7 +1489,7 @@ mod tests {
             signer_pubkey: vec![],
             signature: vec![],
         };
-        admit_onboarding_stake_lock(&db, &lock_body, 2).unwrap();
+        admit_lock_committed(&db, &lock_body, 2).unwrap();
 
         // User onboards using the stake lock.
         let (body, _custody) =
@@ -1387,7 +1515,7 @@ mod tests {
             signer_pubkey: vec![],
             signature: vec![],
         };
-        admit_onboarding_stake_lock(&db, &lock_body, 10).unwrap();
+        admit_lock_committed(&db, &lock_body, 10).unwrap();
 
         let release_body = proto::OnboardingStakeReleaseBody {
             sponsor_fid,
@@ -1398,16 +1526,16 @@ mod tests {
         };
 
         // Not yet matured.
-        let err = admit_onboarding_stake_release(&db, &release_body, 50).unwrap_err();
+        let err = admit_release_committed(&db, &release_body, 50).unwrap_err();
         assert!(matches!(err, OnboardingStakeError::NotYetMatured { .. }));
 
         // At maturity, refund returned.
-        let (sponsor, amount) = admit_onboarding_stake_release(&db, &release_body, 200).unwrap();
+        let (sponsor, amount) = admit_release_committed(&db, &release_body, 200).unwrap();
         assert_eq!(sponsor, sponsor_fid);
         assert_eq!(amount, 5_000_000_000);
 
         // Idempotent: second release is a no-op.
-        let (sponsor, amount) = admit_onboarding_stake_release(&db, &release_body, 300).unwrap();
+        let (sponsor, amount) = admit_release_committed(&db, &release_body, 300).unwrap();
         assert_eq!((sponsor, amount), (0, 0));
     }
 
@@ -1425,7 +1553,7 @@ mod tests {
             signer_pubkey: vec![],
             signature: vec![],
         };
-        admit_onboarding_stake_lock(&db, &lock_body, 0).unwrap();
+        admit_lock_committed(&db, &lock_body, 0).unwrap();
 
         // Manually mark the lock as bound (as apply_onboarding would).
         let mut batch = RocksDbTransactionBatch::new();
@@ -1442,7 +1570,7 @@ mod tests {
             signer_pubkey: vec![],
             signature: vec![],
         };
-        let err = admit_onboarding_stake_release(&db, &release_body, 1000).unwrap_err();
+        let err = admit_release_committed(&db, &release_body, 1000).unwrap_err();
         assert!(matches!(err, OnboardingStakeError::AlreadyBound(_)));
     }
 
@@ -1487,7 +1615,7 @@ mod tests {
         assert_eq!(lookup_custody_fid(&db, &custody_a).unwrap(), None);
         assert_eq!(lookup_custody_fid(&db, &custody_b).unwrap(), Some(fid));
         // Rotation nonce bumped.
-        assert_eq!(read_rotation_nonce(&db, fid), 1);
+        assert_eq!(read_rotation_nonce(&db, fid).unwrap(), 1);
     }
 
     #[test]
@@ -1549,11 +1677,11 @@ mod tests {
     fn rotation_nonce_persists_under_dedicated_prefix() {
         let (db, _dir) = make_db();
         let fid = HYPER_FID_BASE + 7;
-        assert_eq!(read_rotation_nonce(&db, fid), 0);
+        assert_eq!(read_rotation_nonce(&db, fid).unwrap(), 0);
         let mut batch = RocksDbTransactionBatch::new();
         batch.put(rotation_nonce_key(fid), 42u64.to_be_bytes().to_vec());
         db.commit(batch).unwrap();
-        assert_eq!(read_rotation_nonce(&db, fid), 42);
+        assert_eq!(read_rotation_nonce(&db, fid).unwrap(), 42);
     }
 
     #[test]

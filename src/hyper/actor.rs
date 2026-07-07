@@ -47,6 +47,7 @@ pub enum HyperActorEvent {
         block: HyperBlock,
         locks: Vec<proto::HyperLockEvent>,
         transfers: Vec<proto::HyperTransferTx>,
+        onboards: Vec<proto::HyperNativeOnboardBody>,
     },
     /// Tick from the block-production scheduler — propose a block at this
     /// height with the given `parent_hash`. The actor signs and emits the
@@ -630,6 +631,7 @@ pub enum HyperActorOutbound {
         block: HyperBlock,
         locks: Vec<proto::HyperLockEvent>,
         transfers: Vec<proto::HyperTransferTx>,
+        onboards: Vec<proto::HyperNativeOnboardBody>,
     },
     /// A locally-originated hyper message (lock/transfer/validator
     /// event/reward issuance) that should be gossiped on
@@ -1173,6 +1175,7 @@ struct PendingDklsBlock {
     block: HyperBlock,
     locks: Vec<proto::HyperLockEvent>,
     transfers: Vec<proto::HyperTransferTx>,
+    onboards: Vec<proto::HyperNativeOnboardBody>,
     /// 1-based committee party indices in canonical sorted order.
     /// Recorded so `attach_dkls_signature` can populate the
     /// `signer_indices` field.
@@ -1385,10 +1388,12 @@ impl HyperActor {
                 block,
                 locks,
                 transfers,
+                onboards,
             } => {
                 let anchor_block = block.envelope.metadata.snapchain_anchor_block;
                 let anchor_ts = block.envelope.metadata.snapchain_anchor_timestamp;
-                self.runtime.import_block(&block, &locks, &transfers)?;
+                self.runtime
+                    .import_block(&block, &locks, &transfers, &onboards)?;
                 self.metric_count("hyper.blocks.imported", 1);
                 self.maybe_trigger_scoring(anchor_block, anchor_ts).await;
                 // Sign the seed before producing responses so the
@@ -2863,7 +2868,7 @@ impl HyperActor {
         snapchain_anchor_hash: Vec<u8>,
         snapchain_anchor_timestamp: u64,
     ) -> Result<(), HyperActorError> {
-        let (block, locks, transfers) = self.runtime.produce_unsigned_block_dkls(
+        let (block, locks, transfers, onboards) = self.runtime.produce_unsigned_block_dkls(
             height,
             parent_hash.clone(),
             extra_rules_version,
@@ -2935,6 +2940,7 @@ impl HyperActor {
                 block,
                 locks,
                 transfers,
+                onboards,
                 committee,
             },
         );
@@ -3004,10 +3010,13 @@ impl HyperActor {
             let send_block = block.clone();
             let send_locks = pending.locks.clone();
             let send_transfers = pending.transfers.clone();
-            if let Err(e) = self
-                .runtime
-                .import_block(&block, &pending.locks, &pending.transfers)
-            {
+            let send_onboards = pending.onboards.clone();
+            if let Err(e) = self.runtime.import_block(
+                &block,
+                &pending.locks,
+                &pending.transfers,
+                &pending.onboards,
+            ) {
                 let _ = self
                     .outbound
                     .send(HyperActorOutbound::EventError(HyperActorError::Import(e)))
@@ -3020,6 +3029,7 @@ impl HyperActor {
                         block: send_block,
                         locks: send_locks,
                         transfers: send_transfers,
+                        onboards: send_onboards,
                     })
                     .await;
                 self.maybe_trigger_scoring(anchor_block, anchor_ts).await;
@@ -4302,6 +4312,7 @@ mod tests {
                 block,
                 locks: vec![],
                 transfers: vec![],
+                onboards: vec![],
             }],
         )
         .await;

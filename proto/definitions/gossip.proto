@@ -49,6 +49,11 @@ message HyperWireBlock {
   HyperBlock block = 1;
   repeated HyperLockEvent locks = 2;
   repeated HyperTransferTx transfers = 3;
+  // ONBD-1: native-onboarding bodies included in this block, in
+  // block-canonical order. Importers assign FIDs deterministically from this
+  // ordered list so every node derives the identical custody→FID binding; the
+  // resulting onboarding state is folded into the verkle `hyper_state_root`.
+  repeated HyperNativeOnboardBody onboards = 4;
 }
 
 message HyperWireDkg {

@@ -552,6 +552,7 @@ mod tests {
             block,
             locks: vec![],
             transfers: vec![],
+            onboards: vec![],
         })
         .await
         .unwrap();
