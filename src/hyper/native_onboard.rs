@@ -477,10 +477,11 @@ pub fn sync_onboarding_mirror_from_tree(
     }
     for body in onboards {
         let custody = &body.custody_address;
-        if let Some(fid_bytes) =
-            tree.get(&crate::hyper::builder::onboard_custody_verkle_key(custody))
-        {
-            batch.put(custody_to_fid_key(custody), fid_bytes.to_vec());
+        // Tombstone-aware (ONBD-10): a rotated-away custody has an empty tree
+        // value; `read_onboard_custody_fid` returns None for it, so a replayed
+        // onboard for a revoked custody does NOT resurrect its mirror binding.
+        if let Some(fid) = crate::hyper::builder::read_onboard_custody_fid(tree, custody) {
+            batch.put(custody_to_fid_key(custody), fid.to_be_bytes().to_vec());
             if let Some(proto::hyper_native_onboard_body::GateProof::Stake(stake)) =
                 &body.gate_proof
             {
@@ -781,11 +782,15 @@ fn rotation_typed_data(
     })
 }
 
-pub fn apply_custody_rotation(
-    db: &Arc<RocksDB>,
+/// ONBD-9: structural + EIP-712 signature validation for a custody rotation.
+/// Deterministic and state-independent, so it is run at submit (admission gate)
+/// and re-run at import (malicious-proposer defense). The state-dependent checks
+/// (current holds FID, new unbound, nonce) live in
+/// `builder::apply_rotation_to_tree`, applied in block order under the root.
+pub fn validate_custody_rotation(
     body: &proto::HyperCustodyRotationBody,
     chain_id: u64,
-) -> Result<(), CustodyRotationError> {
+) -> Result<([u8; 20], [u8; 20]), CustodyRotationError> {
     if !crate::hyper::is_hyper_fid(body.fid) {
         return Err(CustodyRotationError::NotHyperNative(body.fid));
     }
@@ -809,43 +814,8 @@ pub fn apply_custody_rotation(
     let mut new = [0u8; 20];
     new.copy_from_slice(&body.new_custody);
 
-    // Verify current custody currently holds this FID.
-    let held_by_current = lookup_custody_fid(db, &current)
-        .map_err(|e| CustodyRotationError::Storage(e.to_string()))?;
-    match held_by_current {
-        Some(held) if held == body.fid => {}
-        other => {
-            return Err(CustodyRotationError::CurrentCustodyMismatch {
-                fid: body.fid,
-                custody_hex: format!("0x{}", hex::encode(current)),
-                holder: other,
-            });
-        }
-    }
-
-    // Verify new custody doesn't already hold a hyper-native FID.
-    if let Some(existing) =
-        lookup_custody_fid(db, &new).map_err(|e| CustodyRotationError::Storage(e.to_string()))?
-    {
-        return Err(CustodyRotationError::NewCustodyAlreadyOnboarded {
-            custody_hex: format!("0x{}", hex::encode(new)),
-            existing,
-        });
-    }
-
-    // Nonce check.
-    let expected_nonce = read_rotation_nonce(db, body.fid)
-        .map_err(|e| CustodyRotationError::Storage(e.to_string()))?
-        .saturating_add(1);
-    if body.nonce != expected_nonce {
-        return Err(CustodyRotationError::NonceMismatch {
-            fid: body.fid,
-            expected: expected_nonce,
-            got: body.nonce,
-        });
-    }
-
-    // EIP-712 signature recovery.
+    // EIP-712 signature recovery: the current custody must have signed
+    // (fid, current, new, nonce, chainId).
     let typed = rotation_typed_data(chain_id, body.fid, &current, &new, body.nonce);
     let typed_data: TypedData = serde_json::from_value(typed)
         .map_err(|e| CustodyRotationError::TypedDataConstruction(e.to_string()))?;
@@ -863,17 +833,48 @@ pub fn apply_custody_rotation(
     if recovered.as_slice() != current {
         return Err(CustodyRotationError::InvalidSignature);
     }
+    Ok((current, new))
+}
 
-    // Atomic: delete old custody index entry, write new, bump nonce.
+/// ONBD-9/10: mirror the tree's post-rotation custody bindings + nonce into the
+/// RocksDB query index for each rotation in an imported block. Reflects the
+/// authoritative tree (tombstone → delete from mirror), so a later replayed
+/// onboard for a revoked custody can no longer resurrect its binding.
+pub fn sync_rotation_mirror_from_tree(
+    db: &Arc<RocksDB>,
+    tree: &hypersnap_crypto::verkle::VerkleTree,
+    rotations: &[proto::HyperCustodyRotationBody],
+) -> Result<(), OnboardError> {
     let mut batch = RocksDbTransactionBatch::new();
-    batch.delete(custody_to_fid_key(&current));
-    batch.put(custody_to_fid_key(&new), body.fid.to_be_bytes().to_vec());
-    batch.put(
-        rotation_nonce_key(body.fid),
-        body.nonce.to_be_bytes().to_vec(),
-    );
+    for body in rotations {
+        if body.current_custody.len() != 20 || body.new_custody.len() != 20 {
+            continue;
+        }
+        match crate::hyper::builder::read_onboard_custody_fid(tree, &body.current_custody) {
+            Some(fid) => batch.put(
+                custody_to_fid_key(&body.current_custody),
+                fid.to_be_bytes().to_vec(),
+            ),
+            None => batch.delete(custody_to_fid_key(&body.current_custody)),
+        }
+        if let Some(fid) = crate::hyper::builder::read_onboard_custody_fid(tree, &body.new_custody)
+        {
+            batch.put(
+                custody_to_fid_key(&body.new_custody),
+                fid.to_be_bytes().to_vec(),
+            );
+        }
+        if let Some(nonce) = tree
+            .get(&crate::hyper::builder::onboard_rotation_nonce_verkle_key(
+                body.fid,
+            ))
+            .filter(|b| b.len() == 8)
+        {
+            batch.put(rotation_nonce_key(body.fid), nonce.to_vec());
+        }
+    }
     db.commit(batch)
-        .map_err(|e| CustodyRotationError::Storage(e.to_string()))?;
+        .map_err(|e| OnboardError::Storage(e.to_string()))?;
     Ok(())
 }
 
@@ -1595,82 +1596,224 @@ mod tests {
         }
     }
 
+    fn make_tree() -> hypersnap_crypto::verkle::VerkleTree {
+        let mut rng = rand::rngs::OsRng;
+        let srs = Arc::new(hypersnap_crypto::kzg::KzgSrs::random_unsafe(
+            &mut rng,
+            hypersnap_crypto::kzg_lagrange::VERKLE_DOMAIN,
+        ));
+        hypersnap_crypto::verkle::VerkleTree::new(srs)
+    }
+
+    // Seed a custody→FID binding directly into the tree (as an onboarding would).
+    fn seed_tree_binding(
+        tree: &mut hypersnap_crypto::verkle::VerkleTree,
+        custody: &[u8],
+        fid: u64,
+    ) {
+        tree.insert(
+            &crate::hyper::builder::onboard_custody_verkle_key(custody),
+            fid.to_be_bytes().to_vec(),
+        );
+        tree.insert(
+            &crate::hyper::builder::onboard_ever_verkle_key(custody),
+            vec![1u8],
+        );
+    }
+
     #[test]
     fn custody_rotation_round_trip() {
+        // ONBD-9: rotation is now an in-tree, root-covered transition. Validate
+        // (sig) then apply to the tree, then mirror-sync, then assert the mirror.
         let (db, _dir) = make_db();
-        // Seed: pretend FID HYPER_FID_BASE is onboarded under custody A.
+        let mut tree = make_tree();
         let signer_a = PrivateKeySigner::random();
         let custody_a: [u8; 20] = signer_a.address().into();
         let signer_b = PrivateKeySigner::random();
         let custody_b: [u8; 20] = signer_b.address().into();
         let fid = HYPER_FID_BASE;
-        let mut batch = RocksDbTransactionBatch::new();
-        batch.put(custody_to_fid_key(&custody_a), fid.to_be_bytes().to_vec());
-        db.commit(batch).unwrap();
+        seed_tree_binding(&mut tree, &custody_a, fid);
 
         let rot = build_rotation(10, fid, &signer_a, custody_b, 1);
-        apply_custody_rotation(&db, &rot, 10).unwrap();
+        validate_custody_rotation(&rot, 10).unwrap();
+        assert!(crate::hyper::builder::apply_rotation_to_tree(
+            &mut tree, &rot
+        ));
+        sync_rotation_mirror_from_tree(&db, &tree, std::slice::from_ref(&rot)).unwrap();
 
-        // Index swapped.
+        // Index swapped in the tree (tombstone-aware) and mirror.
+        assert_eq!(
+            crate::hyper::builder::read_onboard_custody_fid(&tree, &custody_a),
+            None
+        );
+        assert_eq!(
+            crate::hyper::builder::read_onboard_custody_fid(&tree, &custody_b),
+            Some(fid)
+        );
         assert_eq!(lookup_custody_fid(&db, &custody_a).unwrap(), None);
         assert_eq!(lookup_custody_fid(&db, &custody_b).unwrap(), Some(fid));
-        // Rotation nonce bumped.
         assert_eq!(read_rotation_nonce(&db, fid).unwrap(), 1);
     }
 
     #[test]
     fn custody_rotation_rejects_unknown_current_custody() {
-        let (db, _dir) = make_db();
-        // No prior onboarding seeded.
+        // Signature is valid, but current custody holds no FID in the tree → the
+        // in-tree apply is a deterministic no-op.
+        let mut tree = make_tree();
         let signer_a = PrivateKeySigner::random();
         let signer_b = PrivateKeySigner::random();
         let fid = HYPER_FID_BASE;
         let rot = build_rotation(10, fid, &signer_a, signer_b.address().into(), 1);
-        let err = apply_custody_rotation(&db, &rot, 10).unwrap_err();
-        assert!(matches!(
-            err,
-            CustodyRotationError::CurrentCustodyMismatch { .. }
+        validate_custody_rotation(&rot, 10).unwrap();
+        assert!(!crate::hyper::builder::apply_rotation_to_tree(
+            &mut tree, &rot
         ));
     }
 
     #[test]
     fn custody_rotation_rejects_already_held_new_custody() {
-        let (db, _dir) = make_db();
-        // FID A under custody A; FID B under custody B. Rotate A → B; reject.
+        let mut tree = make_tree();
         let signer_a = PrivateKeySigner::random();
         let custody_a: [u8; 20] = signer_a.address().into();
         let signer_b = PrivateKeySigner::random();
         let custody_b: [u8; 20] = signer_b.address().into();
-        let fid_a = HYPER_FID_BASE;
-        let fid_b = HYPER_FID_BASE + 1;
-        let mut batch = RocksDbTransactionBatch::new();
-        batch.put(custody_to_fid_key(&custody_a), fid_a.to_be_bytes().to_vec());
-        batch.put(custody_to_fid_key(&custody_b), fid_b.to_be_bytes().to_vec());
-        db.commit(batch).unwrap();
+        seed_tree_binding(&mut tree, &custody_a, HYPER_FID_BASE);
+        seed_tree_binding(&mut tree, &custody_b, HYPER_FID_BASE + 1);
 
-        let rot = build_rotation(10, fid_a, &signer_a, custody_b, 1);
-        let err = apply_custody_rotation(&db, &rot, 10).unwrap_err();
-        assert!(matches!(
-            err,
-            CustodyRotationError::NewCustodyAlreadyOnboarded { .. }
+        let rot = build_rotation(10, HYPER_FID_BASE, &signer_a, custody_b, 1);
+        validate_custody_rotation(&rot, 10).unwrap();
+        // New custody already bound → no-op.
+        assert!(!crate::hyper::builder::apply_rotation_to_tree(
+            &mut tree, &rot
         ));
     }
 
     #[test]
     fn custody_rotation_requires_monotonic_nonce() {
-        let (db, _dir) = make_db();
+        let mut tree = make_tree();
         let signer_a = PrivateKeySigner::random();
         let custody_a: [u8; 20] = signer_a.address().into();
         let fid = HYPER_FID_BASE;
-        let mut batch = RocksDbTransactionBatch::new();
-        batch.put(custody_to_fid_key(&custody_a), fid.to_be_bytes().to_vec());
-        db.commit(batch).unwrap();
+        seed_tree_binding(&mut tree, &custody_a, fid);
 
         let signer_b = PrivateKeySigner::random();
-        // Wrong nonce: 0 instead of 1.
+        // Wrong nonce: 0 instead of the required 1 → no-op.
         let rot = build_rotation(10, fid, &signer_a, signer_b.address().into(), 0);
-        let err = apply_custody_rotation(&db, &rot, 10).unwrap_err();
-        assert!(matches!(err, CustodyRotationError::NonceMismatch { .. }));
+        validate_custody_rotation(&rot, 10).unwrap();
+        assert!(!crate::hyper::builder::apply_rotation_to_tree(
+            &mut tree, &rot
+        ));
+    }
+
+    // Build a POW onboarding body while keeping the custody signer (needed to
+    // later sign a rotation from that custody).
+    fn onboard_body_with_signer(
+        chain_id: u64,
+        anchor_height: u64,
+        anchor_hash: [u8; 32],
+    ) -> (proto::HyperNativeOnboardBody, PrivateKeySigner, [u8; 20]) {
+        let signer = PrivateKeySigner::random();
+        let custody: [u8; 20] = signer.address().into();
+        let nonce = solve_pow(&custody, &anchor_hash, MIN_DIFFICULTY_BITS);
+        let gate_commitment = pow_gate_commitment(&nonce, MIN_DIFFICULTY_BITS);
+        let typed = build_typed_data(
+            chain_id,
+            &custody,
+            anchor_height,
+            &anchor_hash,
+            &gate_commitment,
+        );
+        let prehash = eip712_prehash(typed).unwrap();
+        let sig = signer.sign_hash_sync(&B256::from(prehash)).unwrap();
+        let body = proto::HyperNativeOnboardBody {
+            custody_address: custody.to_vec(),
+            custody_signature: sig.as_bytes().to_vec(),
+            anchor_block_height: anchor_height,
+            anchor_block_hash: anchor_hash.to_vec(),
+            gate_proof: Some(proto::hyper_native_onboard_body::GateProof::Pow(
+                proto::PowSolution {
+                    nonce,
+                    difficulty_bits: MIN_DIFFICULTY_BITS,
+                },
+            )),
+        };
+        (body, signer, custody)
+    }
+
+    // Apply the full rotation flow (validate + in-tree apply + mirror sync).
+    fn rotate_full(
+        db: &Arc<RocksDB>,
+        tree: &mut hypersnap_crypto::verkle::VerkleTree,
+        rot: &proto::HyperCustodyRotationBody,
+        chain_id: u64,
+    ) {
+        validate_custody_rotation(rot, chain_id).unwrap();
+        crate::hyper::builder::apply_rotation_to_tree(tree, rot);
+        sync_rotation_mirror_from_tree(db, tree, std::slice::from_ref(rot)).unwrap();
+    }
+
+    // ONBD-4 (ported, green): rotate-then-replay via the in-tree path mints no
+    // second FID — the permanent `ever` marker makes the replay a no-op.
+    #[test]
+    fn onbd4_rotate_then_replay_via_tree_mints_no_second_fid() {
+        let (db, _dir) = make_db();
+        let mut tree = make_tree();
+        let chain_id = 10u64;
+        let (body, signer_a, _custody_a) = onboard_body_with_signer(chain_id, 100, [0x5au8; 32]);
+        let fid_x = crate::hyper::builder::apply_onboard_to_tree(&mut tree, &body)
+            .expect("fresh onboard assigns a FID")
+            .1;
+        assert!(is_hyper_fid(fid_x));
+
+        let signer_b = PrivateKeySigner::random();
+        let custody_b: [u8; 20] = signer_b.address().into();
+        let rot = build_rotation(chain_id, fid_x, &signer_a, custody_b, 1);
+        rotate_full(&db, &mut tree, &rot, chain_id);
+
+        let replay = crate::hyper::builder::apply_onboard_to_tree(&mut tree, &body);
+        assert!(
+            replay.is_none(),
+            "ONBD-4: rotate-then-replay must not mint a second FID (got {:?})",
+            replay
+        );
+    }
+
+    // ONBD-10 (ported, now green): after A rotates its FID to B, replaying A's
+    // onboard must NOT resurrect A's binding. Rotation tombstones the tree
+    // binding and the mirror sync reflects the tombstone, so A stays revoked.
+    #[test]
+    fn onboard_replay_must_not_resurrect_rotated_away_custody_binding() {
+        let (db, _dir) = make_db();
+        let mut tree = make_tree();
+        let chain_id = 10u64;
+        let (body, signer_a, custody_a) = onboard_body_with_signer(chain_id, 100, [0x5au8; 32]);
+
+        let fid_x = crate::hyper::builder::apply_onboard_to_tree(&mut tree, &body)
+            .expect("fresh onboard")
+            .1;
+        sync_onboarding_mirror_from_tree(&db, &tree, std::slice::from_ref(&body)).unwrap();
+
+        let signer_b = PrivateKeySigner::random();
+        let custody_b: [u8; 20] = signer_b.address().into();
+        let rot = build_rotation(chain_id, fid_x, &signer_a, custody_b, 1);
+        rotate_full(&db, &mut tree, &rot, chain_id);
+        assert_eq!(
+            lookup_custody_fid(&db, &custody_a).unwrap(),
+            None,
+            "precondition: rotation revoked custody A"
+        );
+
+        // Replay A's onboard body: no new FID (ever marker), and the mirror sync
+        // reads the tombstoned tree binding → does not resurrect A.
+        let noop = crate::hyper::builder::apply_onboard_to_tree(&mut tree, &body);
+        assert!(noop.is_none(), "replay mints no new FID (ONBD-4 holds)");
+        sync_onboarding_mirror_from_tree(&db, &tree, std::slice::from_ref(&body)).unwrap();
+
+        assert_eq!(
+            lookup_custody_fid(&db, &custody_a).unwrap(),
+            None,
+            "ONBD-10: onboard replay must not resurrect rotated-away custody A"
+        );
     }
 
     #[test]

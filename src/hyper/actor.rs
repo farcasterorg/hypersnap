@@ -48,6 +48,7 @@ pub enum HyperActorEvent {
         locks: Vec<proto::HyperLockEvent>,
         transfers: Vec<proto::HyperTransferTx>,
         onboards: Vec<proto::HyperNativeOnboardBody>,
+        rotations: Vec<proto::HyperCustodyRotationBody>,
     },
     /// Tick from the block-production scheduler — propose a block at this
     /// height with the given `parent_hash`. The actor signs and emits the
@@ -632,6 +633,7 @@ pub enum HyperActorOutbound {
         locks: Vec<proto::HyperLockEvent>,
         transfers: Vec<proto::HyperTransferTx>,
         onboards: Vec<proto::HyperNativeOnboardBody>,
+        rotations: Vec<proto::HyperCustodyRotationBody>,
     },
     /// A locally-originated hyper message (lock/transfer/validator
     /// event/reward issuance) that should be gossiped on
@@ -1176,6 +1178,7 @@ struct PendingDklsBlock {
     locks: Vec<proto::HyperLockEvent>,
     transfers: Vec<proto::HyperTransferTx>,
     onboards: Vec<proto::HyperNativeOnboardBody>,
+    rotations: Vec<proto::HyperCustodyRotationBody>,
     /// 1-based committee party indices in canonical sorted order.
     /// Recorded so `attach_dkls_signature` can populate the
     /// `signer_indices` field.
@@ -1389,11 +1392,12 @@ impl HyperActor {
                 locks,
                 transfers,
                 onboards,
+                rotations,
             } => {
                 let anchor_block = block.envelope.metadata.snapchain_anchor_block;
                 let anchor_ts = block.envelope.metadata.snapchain_anchor_timestamp;
                 self.runtime
-                    .import_block(&block, &locks, &transfers, &onboards)?;
+                    .import_block(&block, &locks, &transfers, &onboards, &rotations)?;
                 self.metric_count("hyper.blocks.imported", 1);
                 self.maybe_trigger_scoring(anchor_block, anchor_ts).await;
                 // Sign the seed before producing responses so the
@@ -2868,14 +2872,15 @@ impl HyperActor {
         snapchain_anchor_hash: Vec<u8>,
         snapchain_anchor_timestamp: u64,
     ) -> Result<(), HyperActorError> {
-        let (block, locks, transfers, onboards) = self.runtime.produce_unsigned_block_dkls(
-            height,
-            parent_hash.clone(),
-            extra_rules_version,
-            snapchain_anchor_block,
-            snapchain_anchor_hash,
-            snapchain_anchor_timestamp,
-        )?;
+        let (block, locks, transfers, onboards, rotations) =
+            self.runtime.produce_unsigned_block_dkls(
+                height,
+                parent_hash.clone(),
+                extra_rules_version,
+                snapchain_anchor_block,
+                snapchain_anchor_hash,
+                snapchain_anchor_timestamp,
+            )?;
         let epoch = block.signature.epoch;
         let Some(share) = self.runtime.dkls_share_for_epoch(epoch) else {
             // No local share — we can't sign; treat as no-op.
@@ -2941,6 +2946,7 @@ impl HyperActor {
                 locks,
                 transfers,
                 onboards,
+                rotations,
                 committee,
             },
         );
@@ -3011,11 +3017,13 @@ impl HyperActor {
             let send_locks = pending.locks.clone();
             let send_transfers = pending.transfers.clone();
             let send_onboards = pending.onboards.clone();
+            let send_rotations = pending.rotations.clone();
             if let Err(e) = self.runtime.import_block(
                 &block,
                 &pending.locks,
                 &pending.transfers,
                 &pending.onboards,
+                &pending.rotations,
             ) {
                 let _ = self
                     .outbound
@@ -3030,6 +3038,7 @@ impl HyperActor {
                         locks: send_locks,
                         transfers: send_transfers,
                         onboards: send_onboards,
+                        rotations: send_rotations,
                     })
                     .await;
                 self.maybe_trigger_scoring(anchor_block, anchor_ts).await;
@@ -4313,6 +4322,7 @@ mod tests {
                 locks: vec![],
                 transfers: vec![],
                 onboards: vec![],
+                rotations: vec![],
             }],
         )
         .await;

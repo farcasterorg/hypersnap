@@ -38,6 +38,11 @@ const KEY_DOMAIN_ONBOARD_SEQ: u8 = 0x04; // global next-FID counter
 const KEY_DOMAIN_ONBOARD_CUSTODY: u8 = 0x05; // custody → assigned FID
 const KEY_DOMAIN_ONBOARD_EVER: u8 = 0x06; // custody → 1 (permanent; ONBD-4 replay guard)
 const KEY_DOMAIN_ONBOARD_STAKE_BINDING: u8 = 0x07; // stake_lock_id → FID
+const KEY_DOMAIN_ONBOARD_ROTATION_NONCE: u8 = 0x08; // fid → rotation nonce (ONBD-9)
+
+pub fn onboard_rotation_nonce_verkle_key(fid: u64) -> Vec<u8> {
+    onboard_padded_key(KEY_DOMAIN_ONBOARD_ROTATION_NONCE, &fid.to_be_bytes())
+}
 
 fn onboard_padded_key(domain: u8, id: &[u8]) -> Vec<u8> {
     let mut k = Vec::with_capacity(33);
@@ -60,6 +65,75 @@ pub fn onboard_ever_verkle_key(custody: &[u8]) -> Vec<u8> {
 }
 pub fn onboard_stake_binding_verkle_key(lock_id: &[u8]) -> Vec<u8> {
     onboard_padded_key(KEY_DOMAIN_ONBOARD_STAKE_BINDING, lock_id)
+}
+
+/// Tombstone-aware read of a custody→FID binding from the tree. A rotation
+/// tombstones the old custody by writing an empty value (the verkle tree has no
+/// delete), so an 8-byte value means "bound", and absent-or-empty means
+/// "not bound" (ONBD-10: this is what stops a replayed onboard from
+/// resurrecting a rotated-away binding).
+pub fn read_onboard_custody_fid(tree: &VerkleTree, custody: &[u8]) -> Option<u64> {
+    match tree.get(&onboard_custody_verkle_key(custody)) {
+        Some(b) if b.len() == 8 => {
+            let mut be = [0u8; 8];
+            be.copy_from_slice(b);
+            Some(u64::from_be_bytes(be))
+        }
+        _ => None,
+    }
+}
+
+fn read_onboard_rotation_nonce(tree: &VerkleTree, fid: u64) -> u64 {
+    match tree.get(&onboard_rotation_nonce_verkle_key(fid)) {
+        Some(b) if b.len() == 8 => {
+            let mut be = [0u8; 8];
+            be.copy_from_slice(b);
+            u64::from_be_bytes(be)
+        }
+        _ => 0,
+    }
+}
+
+/// Apply a custody rotation to the verkle tree as a block-ordered, root-covered
+/// state transition (ONBD-9). Returns `true` if applied, `false` if it was a
+/// deterministic no-op (stale nonce / current no longer holds the FID / new
+/// already bound) — every node sees the same tree state at import of a given
+/// block, so the applied/skipped decision is identical network-wide (no fork).
+/// Structural + signature validation is the caller's job (submit + import).
+pub fn apply_rotation_to_tree(
+    tree: &mut VerkleTree,
+    body: &proto::HyperCustodyRotationBody,
+) -> bool {
+    if body.current_custody.len() != 20 || body.new_custody.len() != 20 {
+        return false;
+    }
+    // Current must hold this FID (tombstone-aware); new must be unbound.
+    if read_onboard_custody_fid(tree, &body.current_custody) != Some(body.fid) {
+        return false;
+    }
+    if read_onboard_custody_fid(tree, &body.new_custody).is_some() {
+        return false;
+    }
+    if body.nonce != read_onboard_rotation_nonce(tree, body.fid).saturating_add(1) {
+        return false;
+    }
+    // Tombstone the old binding (revocation), bind the new custody, mark the new
+    // custody permanently onboarded so it can't mint a second FID, and advance
+    // the rotation nonce — all under the signed root.
+    tree.insert(
+        &onboard_custody_verkle_key(&body.current_custody),
+        Vec::new(),
+    );
+    tree.insert(
+        &onboard_custody_verkle_key(&body.new_custody),
+        body.fid.to_be_bytes().to_vec(),
+    );
+    tree.insert(&onboard_ever_verkle_key(&body.new_custody), vec![1u8]);
+    tree.insert(
+        &onboard_rotation_nonce_verkle_key(body.fid),
+        body.nonce.to_be_bytes().to_vec(),
+    );
+    true
 }
 
 fn read_onboard_seq(tree: &VerkleTree) -> u64 {
@@ -167,6 +241,9 @@ pub enum PendingMessage {
     // ONBD-1: native onboarding. Assigns the FID from the in-tree sequence in
     // block-canonical order and folds the identity state into the verkle root.
     Onboard(proto::HyperNativeOnboardBody),
+    // ONBD-9: custody rotation, folded into the verkle root as a block-ordered
+    // transition (revokes the old custody, binds the new one).
+    Rotation(proto::HyperCustodyRotationBody),
     // Transfers don't directly modify the verkle tree in the lock-only bridge
     // path — they update the note set + nullifier set in derived RocksDB
     // indices. They're included here for completeness but produce no verkle
@@ -199,10 +276,15 @@ impl<'a> HyperBlockBuilder<'a> {
                 Ok(())
             }
             PendingMessage::Onboard(body) => {
-                // Idempotent: a repeat custody is a no-op, so the producer's
-                // produce-then-import double-apply is safe. The RocksDB query
+                // Idempotent: a repeat custody is a no-op. The RocksDB query
                 // mirror is written by the importer, not here.
                 apply_onboard_to_tree(self.tree, body);
+                Ok(())
+            }
+            PendingMessage::Rotation(body) => {
+                // Deterministic no-op on stale/invalid; the mirror is updated by
+                // the importer to reflect (not resurrect) the rotation.
+                apply_rotation_to_tree(self.tree, body);
                 Ok(())
             }
             PendingMessage::Transfer(tx_proto) => {

@@ -75,6 +75,7 @@ pub fn wire_to_event_with_source(
                 locks: b.locks,
                 transfers: b.transfers,
                 onboards: b.onboards,
+                rotations: b.rotations,
             })
         }
         proto::hyper_wire_message::Body::Message(m) => Ok(HyperActorEvent::InboundMessage(m)),
@@ -116,6 +117,7 @@ pub fn outbound_to_wire(
             locks,
             transfers,
             onboards,
+            rotations,
         } => {
             let wire = proto::HyperWireMessage {
                 body: Some(proto::hyper_wire_message::Body::Block(
@@ -124,6 +126,7 @@ pub fn outbound_to_wire(
                         locks,
                         transfers,
                         onboards,
+                        rotations,
                     },
                 )),
             };
@@ -286,6 +289,7 @@ mod tests {
             locks: vec![],
             transfers: vec![],
             onboards: vec![],
+            rotations: vec![],
         };
         let (topic, wire) = outbound_to_wire(outbound).unwrap();
         assert_eq!(topic, TOPIC_HYPER_BLOCKS);

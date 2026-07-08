@@ -156,6 +156,7 @@ mod tests {
                 locks: vec![],
                 transfers: vec![],
                 onboards: vec![],
+                rotations: vec![],
             })
             .await
             .unwrap();

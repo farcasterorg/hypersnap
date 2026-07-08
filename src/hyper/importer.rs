@@ -122,6 +122,7 @@ pub fn import_hyper_block_chain_aware(
     locks_in_block: &[proto::HyperLockEvent],
     transfers_in_block: &[proto::HyperTransferTx],
     onboards_in_block: &[proto::HyperNativeOnboardBody],
+    rotations_in_block: &[proto::HyperCustodyRotationBody],
     chain: &mut ChainTracker,
 ) -> Result<(), ImportError> {
     // 0. Pre-import: chain continuity check (parent_hash + height).
@@ -136,6 +137,7 @@ pub fn import_hyper_block_chain_aware(
         locks_in_block,
         transfers_in_block,
         onboards_in_block,
+        rotations_in_block,
     )?;
 
     // 6. Advance the chain tracker.
@@ -154,6 +156,7 @@ pub fn import_hyper_block_with_index(
     locks_in_block: &[proto::HyperLockEvent],
     transfers_in_block: &[proto::HyperTransferTx],
     onboards_in_block: &[proto::HyperNativeOnboardBody],
+    rotations_in_block: &[proto::HyperCustodyRotationBody],
     chain: &mut ChainTracker,
     index: &HyperBlockIndex,
 ) -> Result<(), ImportError> {
@@ -165,6 +168,7 @@ pub fn import_hyper_block_with_index(
         locks_in_block,
         transfers_in_block,
         onboards_in_block,
+        rotations_in_block,
         chain,
     )?;
     index.record(block)?;
@@ -175,6 +179,7 @@ pub fn import_hyper_block_with_index(
         locks_in_block.to_vec(),
         transfers_in_block.to_vec(),
         onboards_in_block.to_vec(),
+        rotations_in_block.to_vec(),
     )?;
     Ok(())
 }
@@ -196,6 +201,7 @@ pub fn import_hyper_block_with_scoring(
     locks_in_block: &[proto::HyperLockEvent],
     transfers_in_block: &[proto::HyperTransferTx],
     onboards_in_block: &[proto::HyperNativeOnboardBody],
+    rotations_in_block: &[proto::HyperCustodyRotationBody],
     score_tracker: &ValidatorScoreTracker,
     active_validator_keys_by_index: &[Vec<u8>],
     proposer_index: u64,
@@ -208,6 +214,7 @@ pub fn import_hyper_block_with_scoring(
         locks_in_block,
         transfers_in_block,
         onboards_in_block,
+        rotations_in_block,
     )?;
 
     // After successful import, credit proposer + signers.
@@ -252,6 +259,7 @@ pub fn import_hyper_block(
     locks_in_block: &[proto::HyperLockEvent],
     transfers_in_block: &[proto::HyperTransferTx],
     onboards_in_block: &[proto::HyperNativeOnboardBody],
+    rotations_in_block: &[proto::HyperCustodyRotationBody],
 ) -> Result<(), ImportError> {
     let payload = block
         .envelope
@@ -287,10 +295,14 @@ pub fn import_hyper_block(
     // transfers, matching the producer's `produce_envelope` order) so every
     // node assigns the identical custody→FID bindings; the resulting identity
     // state is folded into the verkle root and covered by the root check below.
-    let mut messages: Vec<PendingMessage> =
-        Vec::with_capacity(onboards_in_block.len() + transfers_in_block.len());
+    let mut messages: Vec<PendingMessage> = Vec::with_capacity(
+        onboards_in_block.len() + rotations_in_block.len() + transfers_in_block.len(),
+    );
     for onboard in onboards_in_block {
         messages.push(PendingMessage::Onboard(onboard.clone()));
+    }
+    for rotation in rotations_in_block {
+        messages.push(PendingMessage::Rotation(rotation.clone()));
     }
     for tx in transfers_in_block {
         messages.push(PendingMessage::Transfer(tx.clone()));
@@ -335,6 +347,9 @@ pub fn import_hyper_block(
     }
     for onboard in onboards_in_block {
         mempool.forget_onboard(&onboard.custody_address);
+    }
+    for rotation in rotations_in_block {
+        mempool.forget_rotation(rotation.fid);
     }
 
     Ok(())

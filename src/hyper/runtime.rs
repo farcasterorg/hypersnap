@@ -390,7 +390,7 @@ impl HyperRuntime {
         let mut tree = VerkleTree::new(config.srs);
         if let Some((tip_height, _)) = block_index.latest_height_and_hash().ok().flatten() {
             for h in 0..=tip_height {
-                if let Ok((locks, transfers, onboards)) = block_index.get_messages(h) {
+                if let Ok((locks, transfers, onboards, rotations)) = block_index.get_messages(h) {
                     // F035 fix: the transparent-lock path is gated off
                     // in `import_hyper_block`, so any stored block from
                     // a previous build version may still carry locks.
@@ -405,9 +405,13 @@ impl HyperRuntime {
                     }
                     // ONBD-1: replay onboardings first (matching import order)
                     // so the in-root identity state is reconstructed identically.
-                    let mut messages = Vec::with_capacity(onboards.len() + transfers.len());
+                    let mut messages =
+                        Vec::with_capacity(onboards.len() + rotations.len() + transfers.len());
                     for o in onboards {
                         messages.push(crate::hyper::builder::PendingMessage::Onboard(o));
+                    }
+                    for r in rotations {
+                        messages.push(crate::hyper::builder::PendingMessage::Rotation(r));
                     }
                     for t in transfers {
                         messages.push(crate::hyper::builder::PendingMessage::Transfer(t));
@@ -4106,13 +4110,35 @@ impl HyperRuntime {
             return Ok(());
         }
         // FIP §4.3 custody rotation for hyper-native FIDs.
+        // ONBD-9: validate (structure + signature) + enqueue; the tree mutation
+        // (revoke old custody, bind new, bump nonce) is applied deterministically
+        // on-root at import, NOT here at gossip-ingestion time.
         if let Some(proto::hyper_message::Body::NativeCustodyRotation(ref body)) = msg.body {
-            crate::hyper::native_onboard::apply_custody_rotation(
-                &self.db,
+            let (current, new) = crate::hyper::native_onboard::validate_custody_rotation(
                 body,
                 self.protocol_chain_id,
             )
             .map_err(|e| RoutingError::NativeCustodyRotation(e.to_string()))?;
+            // Optimistic state checks against the current tree for early
+            // rejection; the authoritative checks are the in-tree apply at import.
+            if crate::hyper::builder::read_onboard_custody_fid(&self.tree, &current)
+                != Some(body.fid)
+            {
+                return Err(RoutingError::NativeCustodyRotation(format!(
+                    "current custody 0x{} does not hold fid {}",
+                    hex::encode(current),
+                    body.fid
+                )));
+            }
+            if crate::hyper::builder::read_onboard_custody_fid(&self.tree, &new).is_some() {
+                return Err(RoutingError::NativeCustodyRotation(format!(
+                    "new custody 0x{} already holds a hyper-native FID",
+                    hex::encode(new)
+                )));
+            }
+            self.mempool
+                .submit_rotation(body.clone())
+                .map_err(|e| RoutingError::NativeCustodyRotation(e.to_string()))?;
             return Ok(());
         }
         // FIP §6.2 Phase 2: sponsor locks atoms to back a future
@@ -4232,6 +4258,7 @@ impl HyperRuntime {
         Vec<proto::HyperLockEvent>,
         Vec<proto::HyperTransferTx>,
         Vec<proto::HyperNativeOnboardBody>,
+        Vec<proto::HyperCustodyRotationBody>,
     ) {
         self.mempool.drain()
     }
@@ -4822,10 +4849,25 @@ impl HyperRuntime {
         locks_in_block: &[crate::proto::HyperLockEvent],
         transfers_in_block: &[crate::proto::HyperTransferTx],
         onboards_in_block: &[crate::proto::HyperNativeOnboardBody],
+        rotations_in_block: &[crate::proto::HyperCustodyRotationBody],
     ) -> Result<[u8; 32], crate::hyper::importer::ImportError> {
         let dkls_addr = self
             .dkls_group_address_for_epoch(block.signature.epoch)
             .ok_or(crate::hyper::importer::ImportError::SignatureVerificationFailed)?;
+
+        // ONBD-9: re-validate every rotation's structure + signature before
+        // applying (malicious-proposer defense). State-dependent checks (current
+        // holds FID / new unbound / nonce) run deterministically in-tree at
+        // apply, as a no-op if stale.
+        for (i, body) in rotations_in_block.iter().enumerate() {
+            crate::hyper::native_onboard::validate_custody_rotation(body, self.protocol_chain_id)
+                .map_err(|e| {
+                crate::hyper::importer::ImportError::OnboardValidation(format!(
+                    "rotation[{}]: {}",
+                    i, e
+                ))
+            })?;
+        }
 
         // ONBD-1: re-validate every onboarding in the block before applying,
         // defending against a malicious proposer who included one off-mempool.
@@ -4913,6 +4955,7 @@ impl HyperRuntime {
             locks_in_block,
             transfers_in_block,
             onboards_in_block,
+            rotations_in_block,
             &mut self.chain,
             &self.block_index,
         )?;
@@ -4932,6 +4975,22 @@ impl HyperRuntime {
             .map_err(|e| {
                 crate::hyper::importer::ImportError::OnboardValidation(format!(
                     "mirror sync: {}",
+                    e
+                ))
+            })?;
+        }
+        // ONBD-9/10: sync the mirror to REFLECT rotations from the tree
+        // (tombstone → delete), so a later replayed onboard for a revoked
+        // custody cannot resurrect its binding.
+        if !rotations_in_block.is_empty() {
+            crate::hyper::native_onboard::sync_rotation_mirror_from_tree(
+                &self.db,
+                &self.tree,
+                rotations_in_block,
+            )
+            .map_err(|e| {
+                crate::hyper::importer::ImportError::OnboardValidation(format!(
+                    "rotation mirror sync: {}",
                     e
                 ))
             })?;
@@ -5007,6 +5066,7 @@ impl HyperRuntime {
             Vec<crate::proto::HyperLockEvent>,
             Vec<crate::proto::HyperTransferTx>,
             Vec<crate::proto::HyperNativeOnboardBody>,
+            Vec<crate::proto::HyperCustodyRotationBody>,
         ),
         crate::hyper::builder::BuilderError,
     > {
@@ -5033,6 +5093,7 @@ impl HyperRuntime {
             Vec<crate::proto::HyperLockEvent>,
             Vec<crate::proto::HyperTransferTx>,
             Vec<crate::proto::HyperNativeOnboardBody>,
+            Vec<crate::proto::HyperCustodyRotationBody>,
         ),
         crate::hyper::builder::BuilderError,
     > {
@@ -5075,15 +5136,37 @@ impl HyperRuntime {
             Vec<crate::proto::HyperLockEvent>,
             Vec<crate::proto::HyperTransferTx>,
             Vec<crate::proto::HyperNativeOnboardBody>,
+            Vec<crate::proto::HyperCustodyRotationBody>,
         ),
         crate::hyper::builder::BuilderError,
     > {
-        let (locks, transfers, onboards) = self.mempool.drain();
-        let mut messages = Vec::with_capacity(onboards.len() + locks.len() + transfers.len());
-        // ONBD-1: onboardings first, matching the import-side apply order so
-        // producer and importer derive the identical verkle root.
+        let (locks, transfers, onboards, rotations) = self.mempool.drain();
+        // ONBD-12: re-validate onboards at produce time against the current tip
+        // and DROP any that no longer validate (e.g. anchor aged past the
+        // window). Otherwise an aged onboard would be folded + signed into a
+        // block that every importer (including this producer's self-import)
+        // deterministically rejects with `AnchorTooOld`, and — since it was
+        // already drained out of the mempool here — it is simply discarded
+        // rather than re-poisoning the next block. Import still re-validates.
+        let onboards: Vec<crate::proto::HyperNativeOnboardBody> = {
+            let anchor = HyperRuntimeAnchor::new(self);
+            let chain_id = self.protocol_chain_id;
+            onboards
+                .into_iter()
+                .filter(|b| {
+                    crate::hyper::native_onboard::validate_onboarding(b, &anchor, chain_id).is_ok()
+                })
+                .collect()
+        };
+        let mut messages =
+            Vec::with_capacity(onboards.len() + rotations.len() + locks.len() + transfers.len());
+        // ONBD-1/9: onboardings then rotations first, matching the import-side
+        // apply order so producer and importer derive the identical verkle root.
         for o in &onboards {
             messages.push(crate::hyper::builder::PendingMessage::Onboard(o.clone()));
+        }
+        for r in &rotations {
+            messages.push(crate::hyper::builder::PendingMessage::Rotation(r.clone()));
         }
         for l in &locks {
             messages.push(crate::hyper::builder::PendingMessage::Lock(l.clone()));
@@ -5091,7 +5174,18 @@ impl HyperRuntime {
         for t in &transfers {
             messages.push(crate::hyper::builder::PendingMessage::Transfer(t.clone()));
         }
-        let envelope = crate::hyper::builder::HyperBlockBuilder::new(&mut self.tree)
+        // ONBD-11: build the candidate block against a SCRATCH CLONE of the
+        // tree, never `self.tree` directly. Production is speculative — the
+        // block may never finalize (DKLS stall + proposer reassignment). The
+        // authoritative tree is only mutated at `import_block` (including the
+        // producer's self-import of its own finalized block). Mutating
+        // `self.tree` here would strand a FID assignment + permanent `ever`
+        // marker + global-sequence bump for a block that never commits,
+        // permanently diverging this node's root (self-halt). Transfers were
+        // self-healing (content-addressed) but onboards are history-derived, so
+        // this scratch tree is required for correctness, not just tidiness.
+        let mut scratch_tree = self.tree.clone();
+        let envelope = crate::hyper::builder::HyperBlockBuilder::new(&mut scratch_tree)
             .build_envelope_with_full_anchor(
                 &messages,
                 canonical_block_id,
@@ -5115,7 +5209,7 @@ impl HyperRuntime {
                 );
             }
         }
-        Ok((envelope, locks, transfers, onboards))
+        Ok((envelope, locks, transfers, onboards, rotations))
     }
 
     /// F018 fix: drop DKLS23 share material for every epoch strictly
@@ -5267,10 +5361,11 @@ impl HyperRuntime {
             Vec<crate::proto::HyperLockEvent>,
             Vec<crate::proto::HyperTransferTx>,
             Vec<crate::proto::HyperNativeOnboardBody>,
+            Vec<crate::proto::HyperCustodyRotationBody>,
         ),
         RuntimeProduceError,
     > {
-        let (envelope, locks, transfers, onboards) = self
+        let (envelope, locks, transfers, onboards, rotations) = self
             .produce_envelope_with_full_anchor(
                 canonical_block_id,
                 parent_hash,
@@ -5307,7 +5402,7 @@ impl HyperRuntime {
                 // an ECDSA-shaped block ignores these.
             },
         };
-        Ok((block, locks, transfers, onboards))
+        Ok((block, locks, transfers, onboards, rotations))
     }
 
     /// Attach a finalized DKLS23 threshold ECDSA signature to a
@@ -5346,10 +5441,11 @@ impl HyperRuntime {
             Vec<crate::proto::HyperLockEvent>,
             Vec<crate::proto::HyperTransferTx>,
             Vec<crate::proto::HyperNativeOnboardBody>,
+            Vec<crate::proto::HyperCustodyRotationBody>,
         ),
         RuntimeProduceError,
     > {
-        let (mut block, locks, transfers, onboards) = self.produce_unsigned_block_dkls(
+        let (mut block, locks, transfers, onboards, rotations) = self.produce_unsigned_block_dkls(
             canonical_block_id,
             parent_hash,
             extra_rules_version,
@@ -5386,7 +5482,7 @@ impl HyperRuntime {
         let signature = hypersnap_crypto::dkls_sign::run_local_dkls_sign(&share.party, digest)
             .map_err(RuntimeProduceError::DklsSign)?;
         Self::attach_dkls_signature(&mut block, &committee, &signature);
-        Ok((block, locks, transfers, onboards))
+        Ok((block, locks, transfers, onboards, rotations))
     }
 }
 
@@ -5564,10 +5660,10 @@ mod tests {
             let mut rt = HyperRuntime::new(cfg);
             rt.install_local_dkls_share(0, 1, dkg.parties[0].clone(), dkg.group_address);
 
-            let (block0, _, _, _) = rt
+            let (block0, _, _, _, _) = rt
                 .produce_signed_block_dkls_local(0, vec![], 0, 0, vec![], 0)
                 .unwrap();
-            rt.import_block(&block0, &[], &[], &[]).unwrap()
+            rt.import_block(&block0, &[], &[], &[], &[]).unwrap()
         };
 
         // Phase 2: simulated restart — fresh runtime over same DB.
@@ -5593,7 +5689,7 @@ mod tests {
         assert_eq!(rt.last_block_hash(), Some(block0_hash));
         rt.install_local_dkls_share(0, 1, dkg.parties[0].clone(), dkg.group_address);
 
-        let (block1, _, _, _) = rt
+        let (block1, _, _, _, _) = rt
             .produce_signed_block_dkls_local(1, block0_hash.to_vec(), 0, 0, vec![], 0)
             .unwrap();
 
@@ -5622,8 +5718,8 @@ mod tests {
 
         let stored_block0 = rt.get_block_by_height(0).unwrap().unwrap();
         let block0 = decode_proto_block(stored_block0).unwrap();
-        peer.import_block(&block0, &[], &[], &[]).unwrap();
-        peer.import_block(&block1, &[], &[], &[])
+        peer.import_block(&block0, &[], &[], &[], &[]).unwrap();
+        peer.import_block(&block1, &[], &[], &[], &[])
             .expect("block 1 should import cleanly across restart");
     }
 
@@ -5874,7 +5970,7 @@ mod tests {
         // `submit_message_accepts_properly_authenticated_transfer`).
         let (mut rt, _dir) = make_runtime();
         assert_eq!(rt.pending_count(), 0);
-        let (locks, transfers, _onboards) = rt.drain_pending();
+        let (locks, transfers, _onboards, _rotations) = rt.drain_pending();
         assert_eq!(locks.len(), 0);
         assert_eq!(transfers.len(), 0);
         assert_eq!(rt.pending_count(), 0);
@@ -5987,7 +6083,7 @@ mod tests {
             hypersnap_crypto::dkls_threshold::run_honest_dkg(1, 1, [0xaa; 32]).expect("1-of-1 DKG");
         rt.install_local_dkls_share(0, 1, dkg.parties[0].clone(), dkg.group_address);
 
-        let (block, _locks, _transfers, _) = rt
+        let (block, _locks, _transfers, _, _) = rt
             .produce_signed_block_dkls_local(1, vec![0u8; 32], 0, 0, vec![], 0)
             .expect("produce + sign");
 
@@ -6043,7 +6139,7 @@ mod tests {
         let current = rt.epoch_resolver.current_epoch();
         rt.install_local_dkls_share(current, 1, dkg.parties[0].clone(), dkg.group_address);
 
-        let (block, _locks, _transfers, _) = rt
+        let (block, _locks, _transfers, _, _) = rt
             .produce_unsigned_block_dkls(7, vec![0u8; 32], 0, 0, vec![], 0)
             .expect("produce unsigned");
         assert!(block.signature.ecdsa_signature.is_empty());
@@ -6191,7 +6287,7 @@ mod tests {
     #[test]
     fn produce_envelope_with_no_pending_messages() {
         let (mut rt, _dir) = make_runtime();
-        let (env, locks, transfers, _) = rt.produce_envelope(1, vec![], 0).unwrap();
+        let (env, locks, transfers, _, _) = rt.produce_envelope(1, vec![], 0).unwrap();
         assert_eq!(env.metadata.canonical_block_id, 1);
         assert_eq!(env.metadata.retained_message_count, 0);
         assert_eq!(env.metadata.hyper_state_root.len(), 48);
@@ -6206,7 +6302,7 @@ mod tests {
         // envelope (no messages, no panics, retained count = 0).
         let (mut rt, _dir) = make_runtime();
         assert_eq!(rt.pending_count(), 0);
-        let (env, locks, transfers, _) = rt.produce_envelope(5, vec![0u8; 32], 0).unwrap();
+        let (env, locks, transfers, _, _) = rt.produce_envelope(5, vec![0u8; 32], 0).unwrap();
         assert_eq!(env.metadata.retained_message_count, 0);
         assert!(locks.is_empty());
         assert!(transfers.is_empty());
@@ -6223,8 +6319,8 @@ mod tests {
         // confidential path. For now we assert the trivial
         // determinism: two consecutive empty envelopes match.
         let (mut rt, _dir) = make_runtime();
-        let (env_a, _, _, _) = rt.produce_envelope(0, vec![], 0).unwrap();
-        let (env_b, _, _, _) = rt.produce_envelope(1, vec![0u8; 32], 0).unwrap();
+        let (env_a, _, _, _, _) = rt.produce_envelope(0, vec![], 0).unwrap();
+        let (env_b, _, _, _, _) = rt.produce_envelope(1, vec![0u8; 32], 0).unwrap();
         // Different parent_hash → different envelope hashes, but
         // the underlying state root must be the same (no state
         // mutated between calls).

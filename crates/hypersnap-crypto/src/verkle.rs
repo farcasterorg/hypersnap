@@ -91,6 +91,10 @@ impl VerkleNode {
     }
 }
 
+// Clone is used by the hyperblock producer to build a candidate block against
+// a scratch copy of the committed tree without mutating it speculatively
+// (ONBD-11). `srs` is Arc-shared, so a clone only deep-copies the node trie.
+#[derive(Clone)]
 pub struct VerkleTree {
     root: VerkleNode,
     srs: Arc<KzgSrs>,

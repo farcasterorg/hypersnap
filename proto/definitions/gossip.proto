@@ -54,6 +54,9 @@ message HyperWireBlock {
   // ordered list so every node derives the identical custody→FID binding; the
   // resulting onboarding state is folded into the verkle `hyper_state_root`.
   repeated HyperNativeOnboardBody onboards = 4;
+  // ONBD-9: custody rotations in this block, block-canonical order, applied to
+  // the verkle root so rotation identity is consensus-covered (not off-root).
+  repeated HyperCustodyRotationBody rotations = 5;
 }
 
 message HyperWireDkg {

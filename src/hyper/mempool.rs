@@ -29,6 +29,8 @@ pub enum MempoolError {
     DuplicateNullifier,
     #[error("duplicate onboarding (custody already pending)")]
     DuplicateOnboard,
+    #[error("duplicate rotation (fid already pending)")]
+    DuplicateRotation,
 }
 
 /// Sortable identifier so the mempool can deduplicate and order messages.
@@ -52,6 +54,9 @@ pub struct HyperMempool {
     /// order. FIDs are NOT assigned here — assignment happens at `import_block`
     /// in block-canonical order so every node derives the same custody→FID map.
     onboards: BTreeMap<Vec<u8>, proto::HyperNativeOnboardBody>,
+    /// ONBD-9: pending custody rotations, keyed by FID (one pending rotation per
+    /// FID, nonce-gated) for deterministic ordering. Applied on-root at import.
+    rotations: BTreeMap<u64, proto::HyperCustodyRotationBody>,
     /// All nullifiers across pending transfers — used to reject overlapping
     /// double-spend attempts within a single mempool view.
     pending_nullifiers: BTreeSet<Vec<u8>>,
@@ -66,6 +71,7 @@ enum MempoolKey {
     Lock(Vec<u8>),
     Transfer(Vec<u8>),
     Onboard(Vec<u8>),
+    Rotation(u64),
 }
 
 impl Default for HyperMempool {
@@ -84,6 +90,7 @@ impl HyperMempool {
             locks: BTreeMap::new(),
             transfers: BTreeMap::new(),
             onboards: BTreeMap::new(),
+            rotations: BTreeMap::new(),
             pending_nullifiers: BTreeSet::new(),
             insertion_order: std::collections::VecDeque::new(),
             capacity,
@@ -106,8 +113,12 @@ impl HyperMempool {
         self.onboards.len()
     }
 
+    pub fn rotation_count(&self) -> usize {
+        self.rotations.len()
+    }
+
     pub fn total_count(&self) -> usize {
-        self.locks.len() + self.transfers.len() + self.onboards.len()
+        self.locks.len() + self.transfers.len() + self.onboards.len() + self.rotations.len()
     }
 
     /// Evict the oldest entry if at capacity. Called before each insertion.
@@ -126,6 +137,9 @@ impl HyperMempool {
                 }
                 Some(MempoolKey::Onboard(custody)) => {
                     self.onboards.remove(&custody);
+                }
+                Some(MempoolKey::Rotation(fid)) => {
+                    self.rotations.remove(&fid);
                 }
                 None => break,
             }
@@ -214,6 +228,37 @@ impl HyperMempool {
         self.onboards.values()
     }
 
+    /// Admit a custody rotation. Structural + signature validation is done by
+    /// the caller; deduped by FID (one pending rotation per FID). The tree
+    /// mutation happens at import.
+    pub fn submit_rotation(
+        &mut self,
+        body: proto::HyperCustodyRotationBody,
+    ) -> Result<(), MempoolError> {
+        if self.rotations.contains_key(&body.fid) {
+            return Err(MempoolError::DuplicateRotation);
+        }
+        self.evict_if_full();
+        self.insertion_order
+            .push_back(MempoolKey::Rotation(body.fid));
+        self.rotations.insert(body.fid, body);
+        Ok(())
+    }
+
+    pub fn rotations(&self) -> impl Iterator<Item = &proto::HyperCustodyRotationBody> {
+        self.rotations.values()
+    }
+
+    pub fn forget_rotation(&mut self, fid: u64) -> bool {
+        if self.rotations.remove(&fid).is_some() {
+            self.insertion_order
+                .retain(|k| !matches!(k, MempoolKey::Rotation(f) if *f == fid));
+            true
+        } else {
+            false
+        }
+    }
+
     /// Drop a specific onboarding by custody (e.g. it landed in a peer's block
     /// we've now imported).
     pub fn forget_onboard(&mut self, custody: &[u8]) -> bool {
@@ -238,13 +283,15 @@ impl HyperMempool {
         Vec<proto::HyperLockEvent>,
         Vec<proto::HyperTransferTx>,
         Vec<proto::HyperNativeOnboardBody>,
+        Vec<proto::HyperCustodyRotationBody>,
     ) {
         let locks: Vec<_> = std::mem::take(&mut self.locks).into_values().collect();
         let transfers: Vec<_> = std::mem::take(&mut self.transfers).into_values().collect();
         let onboards: Vec<_> = std::mem::take(&mut self.onboards).into_values().collect();
+        let rotations: Vec<_> = std::mem::take(&mut self.rotations).into_values().collect();
         self.pending_nullifiers.clear();
         self.insertion_order.clear();
-        (locks, transfers, onboards)
+        (locks, transfers, onboards, rotations)
     }
 
     /// Drop a specific lock if it's no longer needed (e.g. it was included
@@ -388,10 +435,11 @@ mod tests {
         mp.submit_lock(sample_lock(2)).unwrap();
         mp.submit_transfer(sample_transfer(3)).unwrap();
 
-        let (locks, transfers, onboards) = mp.drain();
+        let (locks, transfers, onboards, rotations) = mp.drain();
         assert_eq!(locks.len(), 2);
         assert_eq!(transfers.len(), 1);
         assert_eq!(onboards.len(), 0);
+        assert_eq!(rotations.len(), 0);
         assert_eq!(mp.total_count(), 0);
     }
 
