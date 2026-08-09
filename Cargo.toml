@@ -30,10 +30,12 @@ path = "src/main.rs"
 
 [features]
 default = []
-# Replaces `EPOCH_LENGTH` (432,000 blocks) with 1,440 blocks (~6 minutes at
-# 250ms block time). Used by `scripts/run_epoch_transition_testnet.sh` to
-# exercise the single→multi validator DKG rotation flow in single-digit
-# minutes. Never enable in a release build.
+# Testnet-only build knob. (1) Replaces `EPOCH_LENGTH` (432,000 blocks) with
+# 1,440 blocks (~6 minutes at 250ms block time) so the single→multi validator
+# DKG rotation flow runs in single-digit minutes. (2) Lowers the onboarding POW
+# floor `MIN_DIFFICULTY_BITS` (30→12) so the harness can solve honest onboards
+# in milliseconds while still exercising the below-floor rejection path. Used
+# by `scripts/run_epoch_transition_testnet.sh`. Never enable in a release build.
 short-epochs = []
 
 [dependencies]

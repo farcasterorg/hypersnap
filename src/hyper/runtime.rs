@@ -4250,6 +4250,40 @@ impl HyperRuntime {
         self.block_index.get_by_hash(hash)
     }
 
+    /// The block's stored side-channel (locks, transfers, onboards, rotations)
+    /// keyed by height. Follower catch-up serves these alongside the block so
+    /// the requester re-imports it verbatim; empty vecs if the height has no
+    /// recorded side-channel.
+    pub fn get_block_messages(
+        &self,
+        height: u64,
+    ) -> Result<
+        (
+            Vec<proto::HyperLockEvent>,
+            Vec<proto::HyperTransferTx>,
+            Vec<proto::HyperNativeOnboardBody>,
+            Vec<proto::HyperCustodyRotationBody>,
+        ),
+        crate::hyper::block_index::IndexError,
+    > {
+        self.block_index.get_messages(height)
+    }
+
+    /// ONBD-1: the hyper-native FID currently bound to `custody` (20 bytes), or
+    /// `None` if unbound / rotated away. Reads the RocksDB mirror, which the
+    /// import path keeps in sync with the in-root verkle binding.
+    pub fn custody_fid(
+        &self,
+        custody: &[u8],
+    ) -> Result<Option<u64>, crate::hyper::native_onboard::OnboardError> {
+        if custody.len() != 20 {
+            return Ok(None);
+        }
+        let mut c = [0u8; 20];
+        c.copy_from_slice(custody);
+        crate::hyper::native_onboard::lookup_custody_fid(&self.db, &c)
+    }
+
     /// Drain pending messages and produce them as a `(locks, transfers)` pair
     /// for the proposer to assemble into a block.
     pub fn drain_pending(
@@ -5721,6 +5755,95 @@ mod tests {
         peer.import_block(&block0, &[], &[], &[], &[]).unwrap();
         peer.import_block(&block1, &[], &[], &[], &[])
             .expect("block 1 should import cleanly across restart");
+    }
+
+    // Reproduces the testnet follower-stall: a block carrying a native
+    // onboarding, produced by one node, must import on a *different* node
+    // (the follower path, applying onboards from the wire) with a matching
+    // verkle root. The producer self-imports its own block fine; the bug is
+    // whether a peer that only IMPORTS the block computes the same root.
+    #[test]
+    fn onboarding_block_imports_on_a_follower_node() {
+        use alloy_signer_local::PrivateKeySigner;
+        let mut rng = rand::rngs::OsRng;
+        let srs = Arc::new(KzgSrs::random_unsafe(
+            &mut rng,
+            hypersnap_crypto::kzg_lagrange::VERKLE_DOMAIN,
+        ));
+        let dkg = hypersnap_crypto::dkls_threshold::run_honest_dkg(1, 1, [0xcd; 32]).unwrap();
+
+        let mk_cfg = || {
+            let dir = TempDir::new().unwrap();
+            let db = RocksDB::new(dir.path().to_str().unwrap());
+            db.open().unwrap();
+            let cfg = HyperRuntimeConfig {
+                db: Arc::new(db),
+                srs: srs.clone(),
+                mempool_capacity: 100,
+                score_weights: ScoreWeights::default(),
+                bootstrap_validators: vec![],
+                max_reward_per_epoch: None,
+                max_reward_per_epoch_per_market: std::collections::HashMap::new(),
+                cutover_snapchain_block: 0,
+                min_validator_trust_score: 0.0,
+                protocol_chain_id: crate::hyper::DEFAULT_PROTOCOL_CHAIN_ID,
+                scoring_params: proof_of_quality::ScoringParams::default(),
+                seed_max_fid: 50_000,
+                retro_vesting_on_protocol_epochs: RETRO_VESTING_ON_PROTOCOL_EPOCHS_DEFAULT,
+                local_transport_secret_bytes: [0u8; 32],
+            };
+            (cfg, dir)
+        };
+
+        // Producer: block 0 (empty), then block 1 carrying an onboard.
+        let (cfg, _d1) = mk_cfg();
+        let mut rt = HyperRuntime::new(cfg);
+        rt.install_local_dkls_share(0, 1, dkg.parties[0].clone(), dkg.group_address);
+        let (block0, _, _, _, _) = rt
+            .produce_signed_block_dkls_local(0, vec![], 0, 0, vec![], 0)
+            .unwrap();
+        let block0_hash = rt.import_block(&block0, &[], &[], &[], &[]).unwrap();
+
+        // Onboard anchored at hyper block 0.
+        let anchor_hash = crate::hyper::chain::hyper_block_hash(&block0);
+        let signer = PrivateKeySigner::random();
+        let onboard_msg = crate::hyper::native_onboard::build_signed_onboard_message(
+            &signer,
+            0,
+            anchor_hash,
+            crate::hyper::DEFAULT_PROTOCOL_CHAIN_ID,
+            crate::hyper::native_onboard::OnboardGateSpec::Pow {
+                difficulty_bits: crate::hyper::native_onboard::MIN_DIFFICULTY_BITS,
+            },
+        );
+        rt.submit_message(onboard_msg)
+            .expect("onboard admitted to mempool");
+
+        let (block1, locks1, transfers1, onboards1, rotations1) = rt
+            .produce_signed_block_dkls_local(1, block0_hash.to_vec(), 0, 0, vec![], 0)
+            .unwrap();
+        assert_eq!(onboards1.len(), 1, "block 1 must carry the onboard");
+        // Producer self-import (this works on the testnet — sanity check).
+        rt.import_block(&block1, &locks1, &transfers1, &onboards1, &rotations1)
+            .expect("producer self-import of its own onboarding block");
+
+        // Follower: a *different* runtime that only imports. This is the path
+        // that stalls on the live testnet.
+        let (cfg_peer, _d2) = mk_cfg();
+        let mut peer = HyperRuntime::new(cfg_peer);
+        peer.install_dkls_group_address(0, dkg.group_address);
+        peer.import_block(&block0, &[], &[], &[], &[]).unwrap();
+        peer.import_block(&block1, &locks1, &transfers1, &onboards1, &rotations1)
+            .expect("FOLLOWER import of onboarding block (reproduces the testnet stall)");
+
+        // Both nodes must agree on the custody→FID binding.
+        let custody = signer.address().into_array().to_vec();
+        assert_eq!(
+            rt.custody_fid(&custody).unwrap(),
+            peer.custody_fid(&custody).unwrap(),
+            "producer and follower must agree on custody→FID"
+        );
+        assert!(rt.custody_fid(&custody).unwrap().is_some());
     }
 
     fn decode_proto_block(p: proto::HyperBlock) -> Option<crate::hyper::HyperBlock> {

@@ -38,7 +38,23 @@ pub async fn run_outbound_pump<F>(
             | HyperActorOutbound::BroadcastDkls { .. }
             | HyperActorOutbound::BroadcastDklsSign { .. }
             | HyperActorOutbound::BroadcastMessage(_)
+            | HyperActorOutbound::RequestBlocks { .. }
             | HyperActorOutbound::EvidenceConfirmed(_) => {
+                // Publisher-side trace: confirms a catch-up request actually
+                // reached the gossip layer (vs. being dropped between actor and
+                // pump). Paired with the peer-side "hyper serve: received
+                // catch-up request" log, this isolates where a request is lost.
+                if let HyperActorOutbound::RequestBlocks {
+                    start_height,
+                    end_height,
+                } = &item
+                {
+                    tracing::info!(
+                        start = *start_height,
+                        end = *end_height,
+                        "hyper pump: publishing catch-up request to gossip"
+                    );
+                }
                 if let Some((topic, wire)) = outbound_to_wire(item) {
                     if let Err(e) = gossip_tx
                         .send(GossipEvent::BroadcastHyperWire(topic, wire))

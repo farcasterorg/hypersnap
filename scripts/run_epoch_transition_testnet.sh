@@ -532,6 +532,243 @@ else
 fi
 
 # ──────────────────────────────────────────────────────────────────────
+# 4d3. Native-onboarding + custody-rotation misbehavior battery.
+#
+#      This exercises the FIP-hyper-native-onboarding attack surface end to
+#      end against the live 3-node cluster, validating the PR34 remediation
+#      (ONBD-1..12) under real consensus rather than in unit tests:
+#
+#        ONBD-1  cross-node convergence — onboards submitted to DIFFERENT
+#                nodes in different arrival orders must yield the SAME
+#                custody→FID binding on every node (identity is folded into
+#                the consensus verkle root; a divergence would fork or halt).
+#        ONBD-5  a below-floor POW onboard is rejected.
+#        ONBD-6  a stake-gated onboard is rejected (Phase-2 gate off in prod
+#                — the testnet build keeps the gate off too).
+#        ONBD-10 rotate a custody away, then REPLAY its onboard: the revoked
+#                custody must stay unbound (no mirror resurrection), and a
+#                re-rotation attempt from the revoked key must be a no-op.
+#
+#      Signal: the custody→FID binding read from GET /hyper/v1/custody/<addr>
+#      on each node. HTTP submit returns 202 before validation, so — as with
+#      the validator battery [4c] — we assert on committed STATE, never the
+#      wallet exit code. The testnet build uses MIN_DIFFICULTY_BITS=12
+#      (short-epochs), so honest POW solves are instant.
+# ──────────────────────────────────────────────────────────────────────
+echo "[4d3] Native-onboarding + custody-rotation misbehavior battery..."
+
+# Fetch a fresh onboarding anchor (a recent hyper block height + its canonical
+# hash) from node 1. Every node agrees on this block, so an onboard anchored
+# here validates on all three.
+ANCHOR_JSON=$(curl -sf "${HEAD_URL_1}/hyper/v1/head" 2>/dev/null || echo "{}")
+ANCHOR_HEIGHT=$(echo "$ANCHOR_JSON" | python3 -c "import json,sys;print(json.load(sys.stdin).get('height') or 0)" 2>/dev/null || echo 0)
+ANCHOR_HASH=$(echo "$ANCHOR_JSON" | python3 -c "import json,sys;print((json.load(sys.stdin).get('hash') or '').lstrip('0x'))" 2>/dev/null || echo "")
+echo "    Onboarding anchor: height=$ANCHOR_HEIGHT hash=0x${ANCHOR_HASH:0:16}…"
+
+ONBD_FAIL=0
+if [ "$ANCHOR_HEIGHT" -le 0 ] || [ -z "$ANCHOR_HASH" ]; then
+  echo "    WARN: no hyper head yet — skipping onboarding battery (need ≥1 hyperblock)."
+else
+  mkdir -p nodes/onboard
+
+  # cfid <url> <custody_hex> → prints the bound FID, 'null' (unbound), or 'err'
+  # (query failed). Empty custody is treated as 'err' so a missed capture can't
+  # masquerade as a value.
+  cfid() {
+    [ -z "$2" ] && { echo "err"; return; }
+    curl -sf "$1/hyper/v1/custody/$2" 2>/dev/null \
+      | python3 -c "import json,sys; v=json.load(sys.stdin).get('fid'); print(v if v is not None else 'null')" 2>/dev/null \
+      || echo "err"
+  }
+
+  # onboard <url> <keyfile> [extra wallet args...] → prints the custody addr
+  # (0x-prefix stripped) the wallet derived + submitted. Retries up to 3× on a
+  # transient wallet/submit failure; surfaces the wallet error on give-up.
+  onboard() {
+    local url="$1" kf="$2"; shift 2
+    local attempt addr
+    for attempt in 1 2 3; do
+      ./target/release/hypersnap_wallet --node-url "$url" native-onboard \
+        --custody-key-file "$kf" \
+        --anchor-height "$ANCHOR_HEIGHT" --anchor-hash-hex "$ANCHOR_HASH" \
+        "$@" > /tmp/onbd-out 2>&1 || true
+      addr=$(python3 -c "
+import json
+c = (json.load(open('/tmp/onbd-out')).get('custody') or '')
+print(c[2:] if c.startswith('0x') else c)
+" 2>/dev/null || echo "")
+      if [ -n "$addr" ]; then echo "$addr"; return; fi
+      sleep 3
+    done
+    echo "      [onboard] wallet did not return a custody after 3 tries:" >&2
+    sed 's/^/        /' /tmp/onbd-out >&2 | head -4
+    echo ""
+  }
+
+  # poll_fid <url> <custody> <timeout_s> → poll cfid until it resolves to a
+  # numeric FID (return it) or the timeout elapses (return the last value).
+  poll_fid() {
+    local url="$1" custody="$2" timeout="$3" waited=0 v
+    while [ "$waited" -lt "$timeout" ]; do
+      v=$(cfid "$url" "$custody")
+      if [ "$v" != "err" ] && [ "$v" != "null" ]; then echo "$v"; return; fi
+      sleep 3; waited=$((waited + 3))
+    done
+    echo "$v"
+  }
+
+  new_key() { dd if=/dev/urandom of="$1" bs=32 count=1 status=none; }
+  # A random 20-byte custody ADDRESS (for rotation targets we never sign from).
+  rand_addr() { head -c20 /dev/urandom | xxd -p | tr -d '\n'; }
+
+  # ── ONBD-1: cross-node convergence ──────────────────────────────────
+  echo "    [ONBD-1] onboarding custody A via node1 and custody B via node2 (distinct nodes)..."
+  new_key nodes/onboard/a.key
+  new_key nodes/onboard/b.key
+  A_ADDR=$(onboard "$HEAD_URL_1" nodes/onboard/a.key)
+  B_ADDR=$(onboard "$HEAD_URL_2" nodes/onboard/b.key)
+  echo "      custody A=0x${A_ADDR:0:16}… (via node1), B=0x${B_ADDR:0:16}… (via node2)"
+  if [ -z "$A_ADDR" ] || [ -z "$B_ADDR" ]; then
+    echo "      ✗ ONBD-1: onboard submission failed to return a custody (harness/wallet issue, not consensus)."
+    ONBD_FAIL=1
+  fi
+  # Poll node1 (the proposer) until BOTH onboards are included, then poll the
+  # followers to converge — robust to block-inclusion + gossip-propagation lag
+  # instead of a fixed sleep.
+  A1=$(poll_fid "$HEAD_URL_1" "$A_ADDR" 60); B1=$(poll_fid "$HEAD_URL_1" "$B_ADDR" 60)
+  A2=$(poll_fid "$HEAD_URL_2" "$A_ADDR" 40); A3=$(poll_fid "$HEAD_URL_3" "$A_ADDR" 40)
+  B2=$(poll_fid "$HEAD_URL_2" "$B_ADDR" 40); B3=$(poll_fid "$HEAD_URL_3" "$B_ADDR" 40)
+  echo "      custody A → node1=$A1 node2=$A2 node3=$A3"
+  echo "      custody B → node1=$B1 node2=$B2 node3=$B3"
+  if [ "$A1" = "null" ] || [ "$A1" = "err" ] || [ "$A1" != "$A2" ] || [ "$A2" != "$A3" ] \
+     || [ "$B1" = "null" ] || [ "$B1" = "err" ] || [ "$B1" != "$B2" ] || [ "$B2" != "$B3" ]; then
+    echo "      ✗ ONBD-1: nodes DISAGREE on a custody→FID binding (or an onboard didn't land)."
+    echo "        This is the exact per-node identity fork ONBD-1 was filed against."
+    ONBD_FAIL=1
+  elif [ "$A1" = "$B1" ]; then
+    echo "      ✗ ONBD-1: custody A and B were assigned the SAME FID ($A1) — collision."
+    ONBD_FAIL=1
+  else
+    # Both must be hyper-native FIDs (>= 2^63 = 9223372036854775808).
+    if [ "$A1" -lt 9223372036854775808 ] 2>/dev/null || [ "$B1" -lt 9223372036854775808 ] 2>/dev/null; then
+      echo "      ✗ ONBD-1: an assigned FID is below HYPER_FID_BASE (2^63) — FID-space violation."
+      ONBD_FAIL=1
+    else
+      echo "      ✓ ONBD-1: all 3 nodes agree (A→$A1, B→$B1), distinct, both ≥ 2^63."
+    fi
+  fi
+
+  # ── ONBD-5: below-floor POW rejected ────────────────────────────────
+  echo "    [ONBD-5] onboarding with difficulty 8 (< floor 12) — must be rejected..."
+  new_key nodes/onboard/weak.key
+  WEAK_ADDR=$(onboard "$HEAD_URL_1" nodes/onboard/weak.key --difficulty-bits 8)
+  sleep 8
+  WEAK_FID=$(cfid "$HEAD_URL_1" "$WEAK_ADDR")
+  if [ -z "$WEAK_ADDR" ]; then
+    echo "      ✗ ONBD-5: onboard submission failed (harness/wallet issue, not consensus)."
+    ONBD_FAIL=1
+  elif [ "$WEAK_FID" = "null" ]; then
+    echo "      ✓ ONBD-5: below-floor POW onboard rejected (custody unbound)."
+  else
+    echo "      ✗ ONBD-5: below-floor POW onboard was ADMITTED (fid=$WEAK_FID) — floor not enforced."
+    ONBD_FAIL=1
+  fi
+
+  # ── ONBD-6: stake gate rejected (Phase 2 disabled) ──────────────────
+  echo "    [ONBD-6] stake-gated onboard — must be rejected (StakeGateNotYetEnabled)..."
+  new_key nodes/onboard/stake.key
+  STAKE_ADDR=$(onboard "$HEAD_URL_1" nodes/onboard/stake.key \
+    --stake-lock-id-hex "$(head -c32 /dev/urandom | xxd -p | tr -d '\n')" \
+    --stake-amount 1000000000 --stake-duration 1000)
+  sleep 8
+  STAKE_FID=$(cfid "$HEAD_URL_1" "$STAKE_ADDR")
+  if [ -z "$STAKE_ADDR" ]; then
+    echo "      ✗ ONBD-6: onboard submission failed (harness/wallet issue, not consensus)."
+    ONBD_FAIL=1
+  elif [ "$STAKE_FID" = "null" ]; then
+    echo "      ✓ ONBD-6: stake-gated onboard rejected (custody unbound)."
+  else
+    echo "      ✗ ONBD-6: stake-gated onboard ADMITTED (fid=$STAKE_FID) — Phase-2 gate is live."
+    ONBD_FAIL=1
+  fi
+
+  # ── ONBD-10: rotate-away then replay must not resurrect the binding ──
+  echo "    [ONBD-10] onboard C1, rotate C1→C2, replay C1 onboard, re-rotate from C1..."
+  new_key nodes/onboard/c1.key
+  C1_ADDR=$(onboard "$HEAD_URL_1" nodes/onboard/c1.key)
+  C1_FID=$(poll_fid "$HEAD_URL_1" "$C1_ADDR" 60)
+  echo "      C1=0x${C1_ADDR:0:16}… onboarded → fid=$C1_FID"
+  if [ -z "$C1_ADDR" ] || [ "$C1_FID" = "null" ] || [ "$C1_FID" = "err" ]; then
+    echo "      ✗ ONBD-10 setup: C1 onboard didn't land; cannot run revocation test."
+    ONBD_FAIL=1
+  else
+    C2_ADDR=$(rand_addr)
+    echo "      rotating C1 → C2=0x${C2_ADDR:0:16}… (nonce 1)..."
+    ./target/release/hypersnap_wallet --node-url "$HEAD_URL_1" custody-rotate \
+      --custody-key-file nodes/onboard/c1.key --fid "$C1_FID" \
+      --new-custody-hex "$C2_ADDR" --nonce 1 > /tmp/rot-out 2>&1 || true
+    # Poll until the rotation lands (C2 picks up the FID), then read C1.
+    C2_AFTER_ROT=$(poll_fid "$HEAD_URL_1" "$C2_ADDR" 60)
+    C1_AFTER_ROT=$(cfid "$HEAD_URL_1" "$C1_ADDR")
+    echo "      post-rotation: C1→$C1_AFTER_ROT  C2→$C2_AFTER_ROT"
+    if [ "$C1_AFTER_ROT" != "null" ] || [ "$C2_AFTER_ROT" != "$C1_FID" ]; then
+      echo "      ✗ ONBD-9/rotation: rotation did not move the binding on-root as expected."
+      ONBD_FAIL=1
+    else
+      # Replay C1's byte-fresh onboard (new anchor, re-solved POW). The `ever`
+      # marker makes it a no-op; the tombstone-aware mirror must NOT resurrect.
+      echo "      replaying C1's onboard (must NOT resurrect the revoked binding)..."
+      onboard "$HEAD_URL_1" nodes/onboard/c1.key > /dev/null
+      sleep 8
+      C1_AFTER_REPLAY=$(cfid "$HEAD_URL_1" "$C1_ADDR")
+      # Attempt a re-rotation FROM the revoked C1 (nonce 2) — must be a no-op.
+      C3_ADDR=$(rand_addr)
+      ./target/release/hypersnap_wallet --node-url "$HEAD_URL_1" custody-rotate \
+        --custody-key-file nodes/onboard/c1.key --fid "$C1_FID" \
+        --new-custody-hex "$C3_ADDR" --nonce 2 > /dev/null 2>&1 || true
+      sleep 6
+      C3_AFTER=$(cfid "$HEAD_URL_1" "$C3_ADDR")
+      C2_FINAL=$(cfid "$HEAD_URL_1" "$C2_ADDR")
+      echo "      post-replay: C1→$C1_AFTER_REPLAY  C3(re-rotate target)→$C3_AFTER  C2→$C2_FINAL"
+      if [ "$C1_AFTER_REPLAY" != "null" ]; then
+        echo "      ✗ ONBD-10: onboard replay RESURRECTED the revoked custody C1 (→$C1_AFTER_REPLAY)."
+        ONBD_FAIL=1
+      elif [ "$C3_AFTER" != "null" ]; then
+        echo "      ✗ ONBD-10: a re-rotation from the REVOKED C1 succeeded (C3→$C3_AFTER)."
+        ONBD_FAIL=1
+      elif [ "$C2_FINAL" != "$C1_FID" ]; then
+        echo "      ✗ ONBD-10: C2 lost the FID (→$C2_FINAL); rotation state corrupted."
+        ONBD_FAIL=1
+      else
+        echo "      ✓ ONBD-10: C1 stayed revoked through replay + re-rotate; C2 holds fid=$C1_FID."
+      fi
+    fi
+  fi
+
+  # Onboarding must not have halted or forked hyper consensus: all nodes'
+  # hyper_state_root at their common height should still agree (identity is
+  # in-root). We snapshot each node's head root; a mismatch at equal height
+  # signals a divergence the ONBD-1 fold was meant to make impossible.
+  echo "    [ONBD-1 root] comparing hyper_state_root across nodes at common height..."
+  ROOTS=$(for url in "$HEAD_URL_1" "$HEAD_URL_2" "$HEAD_URL_3"; do
+    curl -sf "${url}/hyper/v1/head" 2>/dev/null | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+print(f\"h={d.get('height') or 0} root={d.get('hyper_state_root','')[:16]}\")
+" 2>/dev/null || echo "h=0 root=?"
+  done)
+  echo "$ROOTS" | sed 's/^/      /'
+
+  if [ "$ONBD_FAIL" -ne 0 ]; then
+    echo "    ERROR: native-onboarding/rotation misbehavior battery FAILED — see above."
+    echo "    The PR34 onboarding remediation (ONBD-1..12) is not holding on the live cluster."
+    $COMPOSE -f docker-compose.hyper.yml logs --tail=60 node1
+    exit 1
+  fi
+  echo "    ✓ native-onboarding + rotation battery passed (ONBD-1/5/6/10 held on the live cluster)."
+fi
+
+# ──────────────────────────────────────────────────────────────────────
 # 4e. Snapchain-side liveness check. Hyper rides on top of snapchain
 #     consensus; the two are SEPARATE BFT instances and snapchain has
 #     its own validator set (every node in this testnet is a snapchain
@@ -582,8 +819,9 @@ echo "$SNAPCHAIN_BEFORE" | sed 's/^/      /'
 #     epoch wait. Node 2 must rejoin gossip, catch up on missed
 #     hyper/snapchain blocks, and re-participate in the upcoming DKG
 #     ceremony so it ends up in the epoch-2 active set just like a
-#     never-restarted peer. The [5] poll and [6] convergence
-#     assertion both observe whether the restart was non-fatal.
+#     never-restarted peer. Step [4f2] explicitly asserts node2's
+#     hyper head catches up to the live tip (the follower catch-up/sync
+#     path); [5] poll and [6] convergence observe the rest.
 # ──────────────────────────────────────────────────────────────────────
 echo "[4f] Restart-safety: bouncing hyper-node2..."
 PRE_HEIGHT=$(curl -sf "${HEAD_URL_2}/hyper/v1/head" 2>/dev/null | python3 -c "
@@ -608,6 +846,100 @@ until curl -sf "http://127.0.0.1:3484/v1/info" > /dev/null 2>&1; do
   fi
 done
 echo "    node2 healthy again after ${waited}s"
+
+# ──────────────────────────────────────────────────────────────────────
+# 4f2. Hyper-head catch-up assertion (the follower catch-up/sync path).
+#      During node2's outage, node1 keeps producing hyperblocks that
+#      node2 misses. On reboot node2 replays its stored blocks and
+#      resumes at its old head — behind the live tip by the whole
+#      outage window. Live gossip only carries NEW blocks (tip+), which
+#      DON'T chain onto node2's stale head: chain.rs rejects them with
+#      ParentHashMismatch. Without the catch-up path node2's hyper head
+#      would freeze at its restart height forever while node1 races
+#      ahead. With it, node2 detects the gap, requests the missing run
+#      from peers, imports it in order, and converges on the tip.
+#
+#      We assert exactly that: node2's head must (a) advance beyond
+#      where it resumed AND (b) close to within LAG_TOLERANCE of node1's
+#      still-moving tip. A frozen head (the pre-sync bug) makes the gap
+#      grow without bound → this check times out and fails loudly.
+# ──────────────────────────────────────────────────────────────────────
+hyper_head_height() {
+  curl -sf "$1/hyper/v1/head" 2>/dev/null | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    print(d.get('height') or 0)
+except Exception:
+    print(0)
+" 2>/dev/null || echo 0
+}
+
+echo "[4f2] Verifying node2 hyper-head catch-up via the sync path (sustained)..."
+CATCHUP_TIMEOUT=120
+LAG_TOLERANCE=15
+# node1's tip must advance by at least this much AFTER node2's initial
+# convergence, and node2 must still be within LAG_TOLERANCE at that point.
+# This is the crux: a single-instant "head==tip" sample gives a FALSE GREEN
+# when node2 catches up once and then re-diverges (imports stop, head freezes
+# while the tip races away). Requiring node2 to keep pace with a MOVING tip is
+# what actually proves the ongoing sync/import path works.
+PROGRESS_MARGIN=30
+
+# Phase 1: initial convergence — node2 advances past its restart head and gets
+# within LAG_TOLERANCE of the tip.
+waited=0
+CONV_TIP=0
+while [ $waited -lt $CATCHUP_TIMEOUT ]; do
+  H1=$(hyper_head_height "$HEAD_URL_1")
+  H2=$(hyper_head_height "$HEAD_URL_2")
+  if [ "$H2" -gt "$PRE_HEIGHT" ] && [ $((H1 - H2)) -le $LAG_TOLERANCE ]; then
+    CONV_TIP=$H1
+    echo "    · initial convergence: node2=$H2, node1 tip=$H1 (lag=$((H1 - H2)) ≤ $LAG_TOLERANCE, resumed at $PRE_HEIGHT)"
+    break
+  fi
+  sleep 3
+  waited=$((waited + 3))
+  echo "    [t+${waited}s] node2=$H2, node1 tip=$H1 (need head>$PRE_HEIGHT and lag≤$LAG_TOLERANCE)..."
+done
+if [ "$CONV_TIP" -eq 0 ]; then
+  H1=$(hyper_head_height "$HEAD_URL_1")
+  H2=$(hyper_head_height "$HEAD_URL_2")
+  echo "    ✗ node2 never reached initial convergence after ${CATCHUP_TIMEOUT}s: head=$H2, node1 tip=$H1, resumed at $PRE_HEIGHT"
+  echo "    --- node2 tail ---"
+  $COMPOSE -f docker-compose.hyper.yml logs --tail=120 node2
+  exit 1
+fi
+
+# Phase 2: sustained — the tip must move on by >= PROGRESS_MARGIN and node2
+# must STILL be within LAG_TOLERANCE (i.e., it kept importing, didn't freeze).
+TARGET_TIP=$((CONV_TIP + PROGRESS_MARGIN))
+waited=0
+SUSTAINED=0
+while [ $waited -lt $CATCHUP_TIMEOUT ]; do
+  H1=$(hyper_head_height "$HEAD_URL_1")
+  H2=$(hyper_head_height "$HEAD_URL_2")
+  if [ "$H1" -ge "$TARGET_TIP" ]; then
+    if [ $((H1 - H2)) -le $LAG_TOLERANCE ] && [ "$H2" -gt "$CONV_TIP" ]; then
+      echo "    ✓ sustained catch-up: node1 tip advanced $CONV_TIP→$H1, node2 kept pace at $H2 (lag=$((H1 - H2)) ≤ $LAG_TOLERANCE) — sync path converged and STAYED converged"
+      SUSTAINED=1
+    else
+      echo "    ✗ node2 STALLED after initial catch-up: node1 tip=$H1 but node2 frozen at $H2 (lag=$((H1 - H2)) > $LAG_TOLERANCE)"
+      echo "      Restarted-follower re-divergence: it caught up once, then stopped importing."
+      echo "      A single-sample check would have (wrongly) passed here — the ongoing"
+      echo "      request/serve path is not delivering blocks to the restarted follower."
+      echo "    --- node2 tail (catch-up requests) ---"
+      $COMPOSE -f docker-compose.hyper.yml logs --tail=60 node2 2>&1 | grep -iE "catch-up|serve" | tail -20
+    fi
+    break
+  fi
+  sleep 3
+  waited=$((waited + 3))
+  echo "    [t+${waited}s] waiting for tip to reach $TARGET_TIP (node1=$H1, node2=$H2)..."
+done
+if [ "$SUSTAINED" -ne 1 ]; then
+  exit 1
+fi
 
 # ──────────────────────────────────────────────────────────────────────
 # 5. Poll for epoch >= 2. Registrations submitted in [4b] have
@@ -980,8 +1312,11 @@ echo "  SINGLE → MULTI VALIDATOR EPOCH HANDOVER VERIFIED"
 echo "============================================================"
 echo "  Genesis active set:       1 hyper signer (node 1, 1-of-1 share)"
 echo "  Live-registered:          $((NUM_NODES - 1)) hyper validator(s) via wallet during epoch 0"
-echo "  Misbehaving submissions:  4 attacks attempted in [4c]; survival of the"
-echo "                            active-set count below confirms rejections held"
+echo "  Misbehaving submissions:  4 validator attacks in [4c] (rejections confirmed"
+echo "                            via active-set count) + native-onboarding/rotation"
+echo "                            battery in [4d3] (ONBD-1 cross-node convergence,"
+echo "                            ONBD-5 weak-POW, ONBD-6 stake-gate, ONBD-10"
+echo "                            rotate-replay revocation — all held)"
 echo "  Hyper user-msg inclusion: $ADMITTED transfer(s) submitted, delta on fid=2 = $ACTUAL_DELTA atoms"
 echo "  Snapchain user-msg incl.: $CAST_COUNT cast(s) committed for fid=1"
 echo "  Epoch-1 hyper active set: $ACTIVE_COUNT signers (BFT threshold from active-set size)"

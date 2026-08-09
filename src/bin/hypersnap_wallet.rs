@@ -190,6 +190,67 @@ enum Command {
         #[arg(long, default_value = "devnet")]
         network: String,
     },
+    /// Build + submit a signed hyper-native onboarding message. Solves the
+    /// hashcash POW at `--difficulty-bits` and EIP-712-signs with the raw
+    /// 32-byte secp256k1 custody key. `--anchor-height`/`--anchor-hash-hex`
+    /// must reference a recent hyper block (read from `GET /hyper/v1/head`).
+    /// Pass `--difficulty-bits` below the node's floor to exercise the
+    /// rejection path, or `--stake-lock-id-hex` for the (Phase-2, rejected)
+    /// stake gate.
+    NativeOnboard {
+        #[arg(long)]
+        custody_key_file: std::path::PathBuf,
+        #[arg(long)]
+        anchor_height: u64,
+        #[arg(long)]
+        anchor_hash_hex: String,
+        #[arg(long, default_value = "12")]
+        difficulty_bits: u32,
+        /// Stake-gate variant (Phase 2). When set, builds a StakeProof gate
+        /// instead of POW — expected to be rejected in production builds.
+        #[arg(long)]
+        stake_lock_id_hex: Option<String>,
+        #[arg(long, default_value = "0")]
+        stake_amount: u64,
+        #[arg(long, default_value = "0")]
+        stake_duration: u64,
+    },
+    /// Build + submit a signed hyper-native custody rotation, EIP-712-signed
+    /// by the CURRENT custody key (`--custody-key-file`).
+    CustodyRotate {
+        #[arg(long)]
+        custody_key_file: std::path::PathBuf,
+        #[arg(long)]
+        fid: u64,
+        /// New custody address (20-byte hex).
+        #[arg(long)]
+        new_custody_hex: String,
+        #[arg(long)]
+        nonce: u64,
+    },
+}
+
+fn load_custody_signer(
+    path: &std::path::Path,
+) -> Result<alloy_signer_local::PrivateKeySigner, Box<dyn std::error::Error>> {
+    let bytes = std::fs::read(path)?;
+    if bytes.len() != 32 {
+        return Err(format!(
+            "custody key file must contain exactly 32 raw bytes (got {})",
+            bytes.len()
+        )
+        .into());
+    }
+    Ok(alloy_signer_local::PrivateKeySigner::from_slice(&bytes)?)
+}
+
+fn parse_hex_array<const N: usize>(
+    s: &str,
+    what: &str,
+) -> Result<[u8; N], Box<dyn std::error::Error>> {
+    let v = hex::decode(s.trim_start_matches("0x"))?;
+    v.try_into()
+        .map_err(|_| format!("{} must be {} bytes", what, N).into())
 }
 
 fn load_signer(cli: &Cli) -> Result<ed25519_dalek::SigningKey, Box<dyn std::error::Error>> {
@@ -551,6 +612,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "text": text,
                 "hash_hex": format!("0x{}", hex::encode(&msg.hash)),
                 "timestamp": ts,
+            }));
+        }
+        Command::NativeOnboard {
+            ref custody_key_file,
+            anchor_height,
+            ref anchor_hash_hex,
+            difficulty_bits,
+            ref stake_lock_id_hex,
+            stake_amount,
+            stake_duration,
+        } => {
+            let custody_signer = load_custody_signer(custody_key_file)?;
+            let custody_addr: [u8; 20] = custody_signer.address().into();
+            let anchor_hash: [u8; 32] = parse_hex_array(anchor_hash_hex, "anchor hash")?;
+            let gate = if let Some(id_hex) = stake_lock_id_hex {
+                let stake_lock_id: [u8; 32] = parse_hex_array(id_hex, "stake_lock_id")?;
+                hypersnap::hyper::native_onboard::OnboardGateSpec::Stake {
+                    stake_lock_id,
+                    amount_atoms: stake_amount,
+                    lock_duration_blocks: stake_duration,
+                }
+            } else {
+                hypersnap::hyper::native_onboard::OnboardGateSpec::Pow { difficulty_bits }
+            };
+            let msg = hypersnap::hyper::native_onboard::build_signed_onboard_message(
+                &custody_signer,
+                anchor_height,
+                anchor_hash,
+                cli.chain_id,
+                gate,
+            );
+            client.submit(&msg).await?;
+            output(&serde_json::json!({
+                "submitted": true,
+                "type": "native_onboard",
+                "custody": format!("0x{}", hex::encode(custody_addr)),
+                "gate": if stake_lock_id_hex.is_some() { "stake" } else { "pow" },
+                "difficulty_bits": difficulty_bits,
+            }));
+        }
+        Command::CustodyRotate {
+            ref custody_key_file,
+            fid,
+            ref new_custody_hex,
+            nonce,
+        } => {
+            let current_signer = load_custody_signer(custody_key_file)?;
+            let current_addr: [u8; 20] = current_signer.address().into();
+            let new_custody: [u8; 20] = parse_hex_array(new_custody_hex, "new_custody")?;
+            let msg = hypersnap::hyper::native_onboard::build_signed_rotation_message(
+                &current_signer,
+                fid,
+                new_custody,
+                nonce,
+                cli.chain_id,
+            );
+            client.submit(&msg).await?;
+            output(&serde_json::json!({
+                "submitted": true,
+                "type": "custody_rotate",
+                "fid": fid,
+                "current_custody": format!("0x{}", hex::encode(current_addr)),
+                "new_custody": format!("0x{}", hex::encode(new_custody)),
+                "nonce": nonce,
             }));
         }
     }

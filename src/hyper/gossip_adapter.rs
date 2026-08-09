@@ -102,6 +102,12 @@ pub fn wire_to_event_with_source(
             let block_b = decode_hyper_block(block_b_proto)?;
             Ok(HyperActorEvent::InboundEvidence { block_a, block_b })
         }
+        proto::hyper_wire_message::Body::BlockRequest(r) => {
+            Ok(HyperActorEvent::InboundBlockRequest {
+                start_height: r.start_height,
+                end_height: r.end_height,
+            })
+        }
     }
 }
 
@@ -170,6 +176,23 @@ pub fn outbound_to_wire(
                 )),
             };
             Some((TOPIC_HYPER_EVIDENCE, wire))
+        }
+        HyperActorOutbound::RequestBlocks {
+            start_height,
+            end_height,
+        } => {
+            // Rides the blocks topic so any holder — every full node subscribes
+            // to it — can serve. The `BlockRequest` variant distinguishes it
+            // from broadcast blocks; `wire_to_event` routes it to the server.
+            let wire = proto::HyperWireMessage {
+                body: Some(proto::hyper_wire_message::Body::BlockRequest(
+                    proto::HyperWireBlockRequest {
+                        start_height,
+                        end_height,
+                    },
+                )),
+            };
+            Some((TOPIC_HYPER_BLOCKS, wire))
         }
         HyperActorOutbound::DkgFinalized { .. } => None,
         HyperActorOutbound::DklsSignFinalized { .. } => None,
@@ -278,6 +301,81 @@ mod tests {
                 );
             }
             other => panic!("expected InboundMessage, got {:?}", other),
+        }
+    }
+
+    // A block carrying onboards + rotations must preserve them through a FULL
+    // prost encode→decode round-trip (what actually happens over gossip). The
+    // testnet follower stall was a block reaching a peer without its onboards
+    // → StateRootMismatch; this pins the wire half of that path.
+    #[test]
+    fn block_onboards_rotations_survive_prost_round_trip() {
+        let onboard = proto::HyperNativeOnboardBody {
+            custody_address: vec![0xaa; 20],
+            custody_signature: vec![0xbb; 65],
+            anchor_block_height: 5,
+            anchor_block_hash: vec![0xcc; 32],
+            gate_proof: Some(proto::hyper_native_onboard_body::GateProof::Pow(
+                proto::PowSolution {
+                    nonce: vec![1, 2, 3, 4, 5, 6, 7, 8],
+                    difficulty_bits: 12,
+                },
+            )),
+        };
+        let rotation = proto::HyperCustodyRotationBody {
+            fid: 9223372036854775808,
+            current_custody: vec![0x11; 20],
+            new_custody: vec![0x22; 20],
+            nonce: 1,
+            current_custody_signature: vec![0x33; 65],
+        };
+        let outbound = HyperActorOutbound::BroadcastBlock {
+            block: sample_block(),
+            locks: vec![],
+            transfers: vec![],
+            onboards: vec![onboard.clone()],
+            rotations: vec![rotation.clone()],
+        };
+        let (_topic, wire) = outbound_to_wire(outbound).unwrap();
+        // Serialize + deserialize exactly as the libp2p transport does.
+        let bytes = wire.encode_to_vec();
+        let decoded_wire = proto::HyperWireMessage::decode(bytes.as_slice()).unwrap();
+        match wire_to_event(decoded_wire).unwrap() {
+            HyperActorEvent::InboundBlock {
+                onboards,
+                rotations,
+                ..
+            } => {
+                assert_eq!(onboards.len(), 1, "onboard dropped in wire round-trip");
+                assert_eq!(onboards[0], onboard);
+                assert_eq!(rotations.len(), 1, "rotation dropped in wire round-trip");
+                assert_eq!(rotations[0], rotation);
+            }
+            other => panic!("expected InboundBlock, got {:?}", other),
+        }
+    }
+
+    // Follower catch-up: a block request must survive the full prost
+    // round-trip and route to the server on the blocks topic.
+    #[test]
+    fn block_request_round_trip_through_wire() {
+        let outbound = HyperActorOutbound::RequestBlocks {
+            start_height: 31,
+            end_height: 158,
+        };
+        let (topic, wire) = outbound_to_wire(outbound).unwrap();
+        assert_eq!(topic, TOPIC_HYPER_BLOCKS);
+        let bytes = wire.encode_to_vec();
+        let decoded_wire = proto::HyperWireMessage::decode(bytes.as_slice()).unwrap();
+        match wire_to_event(decoded_wire).unwrap() {
+            HyperActorEvent::InboundBlockRequest {
+                start_height,
+                end_height,
+            } => {
+                assert_eq!(start_height, 31);
+                assert_eq!(end_height, 158);
+            }
+            other => panic!("expected InboundBlockRequest, got {:?}", other),
         }
     }
 

@@ -121,6 +121,7 @@ impl HyperHttpHandler {
             (&Method::GET, ["validator", vk, "score", epoch]) => self.score(vk, epoch).await,
             (&Method::GET, ["validator", vk, "events"]) => self.validator_events(vk).await,
             (&Method::GET, ["rewards", fid]) => self.reward_balance(fid).await,
+            (&Method::GET, ["custody", custody_hex]) => self.custody_fid(custody_hex).await,
             (&Method::GET, ["nonce", fid]) => self.token_nonce(fid).await,
             (&Method::GET, ["lock", fid, lock_id_hex]) => {
                 self.token_lock_state(fid, lock_id_hex).await
@@ -559,6 +560,28 @@ impl HyperHttpHandler {
         Ok(json_response(
             StatusCode::OK,
             &RewardBalanceResponse { fid, balance },
+        ))
+    }
+
+    async fn custody_fid(
+        &self,
+        custody_hex: &str,
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, HandlerError> {
+        let custody = hex::decode(custody_hex.trim_start_matches("0x")).map_err(|_| {
+            HandlerError::BadRequest(format!("invalid custody hex: {}", custody_hex))
+        })?;
+        let fid = self
+            .client
+            .custody_fid(custody.clone())
+            .await
+            .map_err(client_err)?
+            .map_err(HandlerError::Internal)?;
+        Ok(json_response(
+            StatusCode::OK,
+            &CustodyFidResponse {
+                custody: format!("0x{}", hex::encode(&custody)),
+                fid,
+            },
         ))
     }
 
@@ -1377,6 +1400,12 @@ struct ScoreWeightsResponse {
 struct RewardBalanceResponse {
     fid: u64,
     balance: u64,
+}
+
+#[derive(Serialize)]
+struct CustodyFidResponse {
+    custody: String,
+    fid: Option<u64>,
 }
 
 #[derive(Serialize)]

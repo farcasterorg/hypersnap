@@ -61,6 +61,17 @@ pub struct HyperRuntimeFileConfig {
     /// commitment.
     #[serde(default)]
     pub allow_random_kzg_srs: bool,
+    /// Devnet/testnet only. When `allow_random_kzg_srs = true` AND this is set
+    /// to a 32-byte hex seed, the random SRS is sampled from a *deterministic*
+    /// ChaCha20 stream seeded by this value instead of OS entropy. This lets a
+    /// multi-node local testnet SHARE one trusted setup (every node with the
+    /// same seed derives the identical SRS), which is mandatory — verkle
+    /// commitments are SRS-dependent, so mismatched SRSs fork the chain the
+    /// instant any verkle-tree content (onboarding, confidential transfer,
+    /// lock) appears. Production must use a real `kzg_setup_path` ceremony
+    /// file and leave this unset.
+    #[serde(default)]
+    pub kzg_random_seed: Option<String>,
     /// SRS max degree when loading from a ceremony file. Defaults to the
     /// verkle domain size (256).
     #[serde(default = "default_srs_max_degree")]
@@ -324,6 +335,8 @@ pub enum ConfigError {
          devnets only, explicitly set allow_random_kzg_srs = true."
     )]
     MissingKzgSetup,
+    #[error("kzg_random_seed must be a 32-byte hex string")]
+    BadKzgRandomSeed,
     #[error(
         "kzg_setup_path is set but kzg_basis is missing. The canonical \
          EIP-4844 ceremony file is Lagrange-basis; this runtime's KZG \
@@ -498,11 +511,34 @@ impl HyperRuntimeFileConfig {
                 if !self.allow_random_kzg_srs {
                     return Err(ConfigError::MissingKzgSetup);
                 }
-                let mut rng = rand::rngs::OsRng;
-                Ok(Arc::new(KzgSrs::random_unsafe(
-                    &mut rng,
-                    self.srs_max_degree,
-                )))
+                // Devnet/testnet: if a shared seed is configured, derive the
+                // SRS deterministically so every node in the mesh gets the
+                // SAME trusted setup (see `kzg_random_seed`). Otherwise fall
+                // back to OS entropy (single-node dev use only).
+                match &self.kzg_random_seed {
+                    Some(seed_hex) => {
+                        use rand::SeedableRng;
+                        let bytes = hex::decode(seed_hex.trim_start_matches("0x"))
+                            .map_err(|_| ConfigError::BadKzgRandomSeed)?;
+                        if bytes.len() != 32 {
+                            return Err(ConfigError::BadKzgRandomSeed);
+                        }
+                        let mut seed = [0u8; 32];
+                        seed.copy_from_slice(&bytes);
+                        let mut rng = rand_chacha::ChaCha20Rng::from_seed(seed);
+                        Ok(Arc::new(KzgSrs::random_unsafe(
+                            &mut rng,
+                            self.srs_max_degree,
+                        )))
+                    }
+                    None => {
+                        let mut rng = rand::rngs::OsRng;
+                        Ok(Arc::new(KzgSrs::random_unsafe(
+                            &mut rng,
+                            self.srs_max_degree,
+                        )))
+                    }
+                }
             }
         }
     }
@@ -792,6 +828,7 @@ bootstrap_validators = [
             // explicitly. Production deployments must set
             // `kzg_setup_path` to a real ceremony file.
             allow_random_kzg_srs: true,
+            kzg_random_seed: None,
             srs_max_degree: 256,
             genesis_path,
             recovery_watcher: RecoveryWatcherFileConfig::default(),

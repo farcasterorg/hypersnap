@@ -293,6 +293,12 @@ pub struct SnapchainGossip {
     direct_peers: HashSet<PeerId>,
     local_topics: Vec<gossipsub::IdentTopic>,
     boot_resub_done: Arc<std::sync::atomic::AtomicBool>,
+    /// Debounce timestamp for validator-triggered subscription re-announcement.
+    /// When a known validator (re)connects we re-broadcast our topic
+    /// subscriptions so its gossipsub mesh can re-form (see the reconnect fix in
+    /// `on ConnectionEstablished`); this bounds it to one cycle per
+    /// [`VALIDATOR_RESUB_COOLDOWN`] window across connection flaps.
+    last_validator_resub_at: Option<tokio::time::Instant>,
     last_force_bounce_at: HashMap<PeerId, tokio::time::Instant>,
     peer_connected_at: HashMap<PeerId, tokio::time::Instant>,
     direct_peer_force_bounce_count: Arc<std::sync::atomic::AtomicU64>,
@@ -321,6 +327,12 @@ pub struct SnapchainGossip {
     /// **Fail-closed:** an empty set answers no one.
     validator_peers: HashSet<PeerId>,
 }
+
+/// Minimum spacing between validator-triggered subscription re-announcements.
+/// A restarting validator can produce several `ConnectionEstablished` events in
+/// quick succession (QUIC re-dials, lingering old connections); this collapses
+/// them into a single mesh-recovery cycle so we don't thrash every peer's mesh.
+const VALIDATOR_RESUB_COOLDOWN: Duration = Duration::from_secs(15);
 
 impl SnapchainGossip {
     pub(crate) fn encode_hyper_envelope(&self, envelope: HyperEnvelope) -> Option<Vec<u8>> {
@@ -552,6 +564,7 @@ impl SnapchainGossip {
             direct_peers,
             local_topics,
             boot_resub_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_validator_resub_at: None,
             last_force_bounce_at: HashMap::new(),
             peer_connected_at: HashMap::new(),
             direct_peer_force_bounce_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -579,6 +592,12 @@ impl SnapchainGossip {
             let topic = gossipsub::IdentTopic::new(*t);
             if let Err(e) = self.swarm.behaviour_mut().gossipsub.subscribe(&topic) {
                 warn!("Failed to subscribe to hyper topic {}: {:?}", t, e);
+            }
+            // Track hyper topics in `local_topics` so the mesh-recovery
+            // re-announcement on validator reconnect covers them too — otherwise
+            // a restarted validator's hyper block/message mesh never re-forms.
+            if !self.local_topics.iter().any(|lt| lt.hash() == topic.hash()) {
+                self.local_topics.push(topic);
             }
         }
     }
@@ -830,6 +849,40 @@ impl SnapchainGossip {
                                         let _ = self.swarm.behaviour_mut().gossipsub.subscribe(topic);
                                     }
                                     self.statsd_client.count("gossip.boot_resub_fired", 1, vec![]);
+                                }
+                            }
+
+                            // Mesh recovery on validator (re)connection — the fix for the
+                            // restarted-validator gossip stall. libp2p gossipsub only sends
+                            // its subscriptions on a peer's FIRST connection
+                            // (`other_established == 0`, behaviour.rs:2969). When a validator
+                            // RESTARTS, peers often still hold its stale connection, so the
+                            // restarted node's new connection is NOT the first — peers skip
+                            // sending their subscriptions to it. It therefore never learns
+                            // which topics they're subscribed to, never GRAFTs them into its
+                            // OUTBOUND mesh, and every message it publishes (consensus votes,
+                            // hyper catch-up requests) reaches no one — while inbound still
+                            // works (its own fresh boot re-announced its subs). We break the
+                            // asymmetry by re-announcing OUR subscriptions (cycle unsub/sub,
+                            // the only way to force a fresh SUBSCRIBE — plain subscribe is a
+                            // no-op when already subscribed) whenever a known validator
+                            // connects, so the reconnecting peer relearns our topics and its
+                            // mesh re-forms in both directions. Debounced so a burst of
+                            // reconnect events collapses to one cycle. Keyed on the validator
+                            // set, NOT direct/explicit peers.
+                            if self.validator_peers.contains(&peer_id) {
+                                let now = tokio::time::Instant::now();
+                                let due = self
+                                    .last_validator_resub_at
+                                    .map_or(true, |t| now.duration_since(t) >= VALIDATOR_RESUB_COOLDOWN);
+                                if due {
+                                    self.last_validator_resub_at = Some(now);
+                                    info!(peer = %peer_id, "Validator (re)connected — re-announcing subscriptions for mesh recovery");
+                                    for topic in &self.local_topics {
+                                        let _ = self.swarm.behaviour_mut().gossipsub.unsubscribe(topic);
+                                        let _ = self.swarm.behaviour_mut().gossipsub.subscribe(topic);
+                                    }
+                                    self.statsd_client.count("gossip.validator_resub_fired", 1, vec![]);
                                 }
                             }
 

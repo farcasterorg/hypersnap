@@ -42,7 +42,17 @@ message HyperWireMessage {
     // Slashing evidence for TOPIC_HYPER_EVIDENCE: two distinct blocks
     // signed under the same epoch's threshold key at the same height.
     HyperWireEvidence evidence = 4;
+    // Follower catch-up: a request for the hyper blocks in [start,end] (served
+    // on TOPIC_HYPER_BLOCKS). A node with a gap between its head and the
+    // real-time broadcast tip publishes this; peers holding those blocks
+    // re-broadcast the full HyperWireBlock (with side-channel) for each height.
+    HyperWireBlockRequest block_request = 5;
   }
+}
+
+message HyperWireBlockRequest {
+  uint64 start_height = 1;
+  uint64 end_height = 2;
 }
 
 message HyperWireBlock {

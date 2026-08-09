@@ -71,10 +71,13 @@ pub const STAKE_GATE_ENABLED: bool = true;
 /// permitted but grants nothing.
 ///
 /// Tests solve real POW at this floor, so under `cfg(test)` it drops to a
-/// trivially-solvable value — the production consensus floor is 30.
-#[cfg(not(test))]
+/// trivially-solvable value. The `short-epochs` testnet build likewise lowers
+/// it so the testnet harness (`run_epoch_transition_testnet.sh`) can solve
+/// honest onboards in milliseconds while still exercising the below-floor
+/// rejection path. The production consensus floor is 30.
+#[cfg(all(not(test), not(feature = "short-epochs")))]
 pub const MIN_DIFFICULTY_BITS: u32 = 30;
-#[cfg(test)]
+#[cfg(any(test, feature = "short-epochs"))]
 pub const MIN_DIFFICULTY_BITS: u32 = 12;
 
 /// Minimum stake amount accepted by an onboarding StakeProof. Smaller
@@ -876,6 +879,129 @@ pub fn sync_rotation_mirror_from_tree(
     db.commit(batch)
         .map_err(|e| OnboardError::Storage(e.to_string()))?;
     Ok(())
+}
+
+// ===========================================================================
+// Client-side message builders (wallet / testnet harness). These construct a
+// fully-signed HyperMessage off-node; they are not part of consensus. Kept
+// here so they can reuse the private POW / EIP-712 helpers above.
+// ===========================================================================
+
+/// Gate for a client-built onboarding message.
+pub enum OnboardGateSpec {
+    /// Hashcash POW at the given difficulty. Pass a value below the active
+    /// `MIN_DIFFICULTY_BITS` to exercise the below-floor rejection path (ONBD-5).
+    Pow { difficulty_bits: u32 },
+    /// Phase-2 stake gate — rejected in production builds (ONBD-6).
+    Stake {
+        stake_lock_id: [u8; 32],
+        amount_atoms: u64,
+        lock_duration_blocks: u64,
+    },
+}
+
+/// Build a fully-signed `NativeOnboard` `HyperMessage`. For the POW gate this
+/// solves the hashcash puzzle at `difficulty_bits`, then EIP-712-signs the
+/// typed payload with the custody secp256k1 key.
+pub fn build_signed_onboard_message(
+    custody_signer: &alloy_signer_local::PrivateKeySigner,
+    anchor_block_height: u64,
+    anchor_block_hash: [u8; 32],
+    chain_id: u64,
+    gate: OnboardGateSpec,
+) -> proto::HyperMessage {
+    use alloy_signer::SignerSync;
+    let custody: [u8; 20] = custody_signer.address().into();
+    let (gate_commitment, gate_proof) = match gate {
+        OnboardGateSpec::Pow { difficulty_bits } => {
+            let mut n: u64 = 0;
+            let nonce = loop {
+                let nb = n.to_be_bytes().to_vec();
+                if pow_target_met(
+                    &pow_hash(&custody, &anchor_block_hash, &nb),
+                    difficulty_bits,
+                ) {
+                    break nb;
+                }
+                n = n.wrapping_add(1);
+            };
+            (
+                pow_gate_commitment(&nonce, difficulty_bits),
+                proto::hyper_native_onboard_body::GateProof::Pow(proto::PowSolution {
+                    nonce,
+                    difficulty_bits,
+                }),
+            )
+        }
+        OnboardGateSpec::Stake {
+            stake_lock_id,
+            amount_atoms,
+            lock_duration_blocks,
+        } => (
+            stake_gate_commitment(&stake_lock_id, amount_atoms, lock_duration_blocks),
+            proto::hyper_native_onboard_body::GateProof::Stake(proto::StakeProof {
+                stake_lock_id: stake_lock_id.to_vec(),
+                amount_atoms,
+                lock_duration_blocks,
+            }),
+        ),
+    };
+    let typed = build_typed_data(
+        chain_id,
+        &custody,
+        anchor_block_height,
+        &anchor_block_hash,
+        &gate_commitment,
+    );
+    let prehash = eip712_prehash(typed).expect("eip712 prehash is infallible for valid inputs");
+    let sig = custody_signer
+        .sign_hash_sync(&alloy_primitives::B256::from(prehash))
+        .expect("PrivateKeySigner sign cannot fail");
+    let body = proto::HyperNativeOnboardBody {
+        custody_address: custody.to_vec(),
+        custody_signature: sig.as_bytes().to_vec(),
+        anchor_block_height,
+        anchor_block_hash: anchor_block_hash.to_vec(),
+        gate_proof: Some(gate_proof),
+    };
+    proto::HyperMessage {
+        message_type: proto::HyperMessageType::NativeOnboard as i32,
+        body: Some(proto::hyper_message::Body::NativeOnboard(body)),
+    }
+}
+
+/// Build a fully-signed `NativeCustodyRotation` `HyperMessage`, EIP-712-signed
+/// by the current custody key.
+pub fn build_signed_rotation_message(
+    current_signer: &alloy_signer_local::PrivateKeySigner,
+    fid: u64,
+    new_custody: [u8; 20],
+    nonce: u64,
+    chain_id: u64,
+) -> proto::HyperMessage {
+    use alloy_signer::SignerSync;
+    let current: [u8; 20] = current_signer.address().into();
+    let typed = rotation_typed_data(chain_id, fid, &current, &new_custody, nonce);
+    let typed_data: TypedData =
+        serde_json::from_value(typed).expect("rotation typed data construction");
+    let prehash: [u8; 32] = typed_data
+        .eip712_signing_hash()
+        .expect("rotation prehash")
+        .into();
+    let sig = current_signer
+        .sign_hash_sync(&alloy_primitives::B256::from(prehash))
+        .expect("PrivateKeySigner sign cannot fail");
+    let body = proto::HyperCustodyRotationBody {
+        fid,
+        current_custody: current.to_vec(),
+        new_custody: new_custody.to_vec(),
+        nonce,
+        current_custody_signature: sig.as_bytes().to_vec(),
+    };
+    proto::HyperMessage {
+        message_type: proto::HyperMessageType::NativeCustodyRotation as i32,
+        body: Some(proto::hyper_message::Body::NativeCustodyRotation(body)),
+    }
 }
 
 // ===========================================================================

@@ -495,6 +495,18 @@ fid = {fid}
         // Main TOML's `[hyper]` is the gate `main.rs` checks before it
         // even builds the hyper actor — without `runtime_config_path`
         // it skips the whole pipeline and `/hyper/v1/*` 404s.
+        // Shared KZG SRS seed: every node derives the SAME random trusted
+        // setup from this one seed (via `kzg_random_seed`). Without this, each
+        // node samples its own SRS from OS entropy and their verkle
+        // commitments diverge — the chain forks the instant any verkle-tree
+        // content (onboarding / confidential transfer / lock) is produced.
+        let kzg_seed_hex = {
+            use rand::RngCore;
+            let mut b = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut b);
+            hex::encode(b)
+        };
+
         for i in 1..=num_nodes {
             // Operator identity (signing key + fid + validator pubkey) is the
             // gate `main.rs` checks before spawning the block-production
@@ -516,6 +528,7 @@ operator_validator_pubkey_hex = "0x{operator_pubkey_hex}"
                 format!(
                     r#"enabled = true
 allow_random_kzg_srs = true
+kzg_random_seed = "{kzg_seed_hex}"
 genesis_path = "nodes/genesis.toml"
 local_dkls_share_path = "nodes/{i}/epoch0.share"
 local_dkls_share_party_index = {party_index}
@@ -531,6 +544,7 @@ transport_secret_path = "nodes/{i}/transport.key"
                 format!(
                     r#"enabled = true
 allow_random_kzg_srs = true
+kzg_random_seed = "{kzg_seed_hex}"
 genesis_path = "nodes/genesis.toml"
 retro_vesting_on_protocol_epochs = 1
 auto_generate_transport_secret = true

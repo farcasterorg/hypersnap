@@ -50,6 +50,10 @@ pub enum HyperActorEvent {
         onboards: Vec<proto::HyperNativeOnboardBody>,
         rotations: Vec<proto::HyperCustodyRotationBody>,
     },
+    /// Follower catch-up: a peer is missing hyper blocks in `[start, end]` and
+    /// is requesting them. We serve any we hold from the block index by
+    /// re-broadcasting the full `HyperWireBlock` for each height.
+    InboundBlockRequest { start_height: u64, end_height: u64 },
     /// Tick from the block-production scheduler — propose a block at this
     /// height with the given `parent_hash`. The actor signs and emits the
     /// resulting block on the outbound channel.
@@ -304,6 +308,13 @@ pub enum HyperActorQuery {
         fid: u64,
         reply: oneshot::Sender<Result<u64, String>>,
     },
+    /// ONBD-1: the hyper-native FID currently bound to a custody address
+    /// (20 bytes), or `None` if that custody has not onboarded / was rotated
+    /// away. Lets the testnet harness assert cross-node identity convergence.
+    CustodyFid {
+        custody: Vec<u8>,
+        reply: oneshot::Sender<Result<Option<u64>, String>>,
+    },
     /// Per-FID transparent-transfer nonce (FIP §13.1). Zero for FIDs
     /// that have never transacted.
     TokenNonce {
@@ -506,6 +517,10 @@ impl std::fmt::Debug for HyperActorQuery {
             Self::RewardBalance { fid, .. } => {
                 f.debug_struct("RewardBalance").field("fid", fid).finish()
             }
+            Self::CustodyFid { custody, .. } => f
+                .debug_struct("CustodyFid")
+                .field("custody", &hex::encode(custody))
+                .finish(),
             Self::TokenNonce { fid, .. } => f.debug_struct("TokenNonce").field("fid", fid).finish(),
             Self::TokenLockState { fid, lock_id, .. } => f
                 .debug_struct("TokenLockState")
@@ -567,6 +582,14 @@ impl std::fmt::Debug for HyperActorEvent {
             Self::InboundBlock { block, .. } => f
                 .debug_struct("InboundBlock")
                 .field("height", &block.envelope.metadata.canonical_block_id)
+                .finish(),
+            Self::InboundBlockRequest {
+                start_height,
+                end_height,
+            } => f
+                .debug_struct("InboundBlockRequest")
+                .field("start_height", start_height)
+                .field("end_height", end_height)
                 .finish(),
             Self::ProduceBlockDkls {
                 height,
@@ -635,6 +658,9 @@ pub enum HyperActorOutbound {
         onboards: Vec<proto::HyperNativeOnboardBody>,
         rotations: Vec<proto::HyperCustodyRotationBody>,
     },
+    /// Follower catch-up: ask peers for the hyper blocks in `[start, end]`.
+    /// Gossiped on `TOPIC_HYPER_BLOCKS`; holders re-broadcast the blocks.
+    RequestBlocks { start_height: u64, end_height: u64 },
     /// A locally-originated hyper message (lock/transfer/validator
     /// event/reward issuance) that should be gossiped on
     /// `TOPIC_HYPER_MESSAGES`. Emitted after a successful
@@ -938,6 +964,14 @@ impl HyperActorClient {
             .await
     }
 
+    pub async fn custody_fid(
+        &self,
+        custody: Vec<u8>,
+    ) -> Result<Result<Option<u64>, String>, HyperActorClientError> {
+        self.ask(move |reply| HyperActorQuery::CustodyFid { custody, reply })
+            .await
+    }
+
     pub async fn token_nonce(
         &self,
         fid: u64,
@@ -1118,6 +1152,18 @@ pub struct HyperActor {
     /// unboundedly under gossip-replay or attacker spam.
     submission_status: std::collections::HashMap<[u8; 32], SubmissionVerdict>,
     submission_status_order: std::collections::VecDeque<[u8; 32]>,
+    /// Follower catch-up buffer. Inbound blocks that arrive *ahead* of our
+    /// head (height > head+1) are parked here keyed by height instead of being
+    /// rejected outright — `chain.rs` enforces strict parent continuity, so an
+    /// out-of-order block would otherwise be dropped forever. On each in-order
+    /// import we drain the contiguous run starting at the new head+1. Bounded
+    /// by `PENDING_HYPER_BLOCKS_CAP` (lowest-height eviction) so a peer flooding
+    /// far-future heights cannot grow it without bound.
+    pending_hyper_blocks: std::collections::BTreeMap<u64, BufferedInboundBlock>,
+    /// Height of the last catch-up range we requested, to avoid re-emitting an
+    /// identical `RequestBlocks` on every buffered arrival while a sync is
+    /// already in flight. Reset once we catch up past it.
+    last_requested_sync_end: Option<u64>,
 }
 
 /// Bound for `HyperActor::submission_status` — enough to retain
@@ -1185,6 +1231,32 @@ struct PendingDklsBlock {
     committee: Vec<u8>,
 }
 
+/// A fully-decoded inbound block parked in the follower catch-up buffer
+/// (`pending_hyper_blocks`) because it arrived ahead of our head. Carries the
+/// same side-channel `import_block` needs so a later in-order drain re-imports
+/// it verbatim.
+struct BufferedInboundBlock {
+    block: HyperBlock,
+    locks: Vec<proto::HyperLockEvent>,
+    transfers: Vec<proto::HyperTransferTx>,
+    onboards: Vec<proto::HyperNativeOnboardBody>,
+    rotations: Vec<proto::HyperCustodyRotationBody>,
+}
+
+/// Ceiling on the follower catch-up buffer. A block at height `h` is ~a few KB
+/// with its side-channel; 512 entries bounds the buffer at a few MB while
+/// covering any realistic gossip reordering or the tail of a sync batch. When
+/// full, the lowest-height entry is evicted (it will be re-served by a later
+/// `RequestBlocks` if still needed).
+const PENDING_HYPER_BLOCKS_CAP: usize = 512;
+
+/// Maximum number of heights served per `InboundBlockRequest`, and the widest
+/// range a follower asks for in one `RequestBlocks`. Caps both the work a
+/// single request can force a server to do and the re-broadcast burst it
+/// produces; a follower with a larger gap catches up over several batches as
+/// each import advances its head.
+const MAX_SYNC_BATCH: u64 = 128;
+
 /// A scoring-driver output message awaiting its DKLS23 threshold
 /// signature. Either an unsigned reward issuance, an unsigned
 /// trust snapshot, or an unsigned lock-merkle-root update. Looked
@@ -1249,6 +1321,8 @@ impl HyperActor {
             pending_dkls_inbound: std::collections::BTreeMap::new(),
             active_dkls_sign: None,
             pending_dkls_blocks: std::collections::BTreeMap::new(),
+            pending_hyper_blocks: std::collections::BTreeMap::new(),
+            last_requested_sync_end: None,
             pending_dkls_messages: std::collections::BTreeMap::new(),
             pending_sign_queue: std::collections::VecDeque::new(),
             inbound: in_rx,
@@ -1288,6 +1362,8 @@ impl HyperActor {
             pending_dkls_inbound: std::collections::BTreeMap::new(),
             active_dkls_sign: None,
             pending_dkls_blocks: std::collections::BTreeMap::new(),
+            pending_hyper_blocks: std::collections::BTreeMap::new(),
+            last_requested_sync_end: None,
             pending_dkls_messages: std::collections::BTreeMap::new(),
             pending_sign_queue: std::collections::VecDeque::new(),
             inbound: in_rx,
@@ -1394,16 +1470,41 @@ impl HyperActor {
                 onboards,
                 rotations,
             } => {
-                let anchor_block = block.envelope.metadata.snapchain_anchor_block;
-                let anchor_ts = block.envelope.metadata.snapchain_anchor_timestamp;
-                self.runtime
-                    .import_block(&block, &locks, &transfers, &onboards, &rotations)?;
-                self.metric_count("hyper.blocks.imported", 1);
-                self.maybe_trigger_scoring(anchor_block, anchor_ts).await;
-                // Sign the seed before producing responses so the
-                // batch picks up the new seed in the same block.
-                self.maybe_sign_da_epoch_seed(anchor_block).await;
-                self.maybe_trigger_da_responses(anchor_block).await;
+                let height = block.envelope.metadata.canonical_block_id;
+                let next = self.next_expected_hyper_height();
+                if height < next {
+                    // Height we already hold (or older) — a duplicate/stale
+                    // re-broadcast. Sync responses ride the same blocks topic,
+                    // so honest replays are expected; drop silently.
+                    self.metric_count("hyper.blocks.sync_stale", 1);
+                    return Ok(());
+                }
+                if height > next {
+                    // Gap: `chain.rs` would reject this block for parent
+                    // discontinuity and it would be lost. Park it and ask peers
+                    // for the missing run [next, height-1] so we can catch up.
+                    self.buffer_inbound_block(BufferedInboundBlock {
+                        block,
+                        locks,
+                        transfers,
+                        onboards,
+                        rotations,
+                    });
+                    self.request_missing_blocks(next, height - 1).await;
+                    return Ok(());
+                }
+                // In order (height == next): import, then drain any contiguous
+                // buffered run that this import unblocks.
+                self.import_inbound_block(&block, &locks, &transfers, &onboards, &rotations)
+                    .await?;
+                self.drain_pending_hyper_blocks().await?;
+                Ok(())
+            }
+            HyperActorEvent::InboundBlockRequest {
+                start_height,
+                end_height,
+            } => {
+                self.serve_block_request(start_height, end_height).await;
                 Ok(())
             }
             HyperActorEvent::ProduceBlockDkls {
@@ -1962,6 +2063,13 @@ impl HyperActor {
                     .map_err(|e| e.to_string());
                 let _ = reply.send(r);
             }
+            HyperActorQuery::CustodyFid { custody, reply } => {
+                let r = self
+                    .runtime
+                    .custody_fid(&custody)
+                    .map_err(|e| e.to_string());
+                let _ = reply.send(r);
+            }
             HyperActorQuery::TokenNonce { fid, reply } => {
                 let r = self
                     .runtime
@@ -2427,6 +2535,210 @@ impl HyperActor {
             .send(HyperActorOutbound::BroadcastMessage(msg))
             .await;
         Ok(())
+    }
+
+    // ---- Follower catch-up / sync ---------------------------------------
+    //
+    // Hyper blocks reach followers only via real-time gossip, and `chain.rs`
+    // enforces strict parent continuity: a block whose parent isn't our head
+    // is rejected outright, with no buffering. A node that restarts behind, or
+    // misses a broadcast, would therefore stall forever — every future block
+    // chains off a head it never reached. These helpers close that gap: park
+    // ahead-of-head blocks, pull the missing run from peers, and drain them in
+    // order once the chain is contiguous again.
+
+    /// The next hyper height we can import in order — one past our head, or 0
+    /// if we hold no blocks yet (genesis).
+    fn next_expected_hyper_height(&self) -> u64 {
+        self.runtime.last_block_height().map(|h| h + 1).unwrap_or(0)
+    }
+
+    /// Import one in-order block and fire the post-import triggers (scoring,
+    /// DA seed/response). Shared by the direct InboundBlock path and the
+    /// catch-up drain so both behave identically.
+    async fn import_inbound_block(
+        &mut self,
+        block: &HyperBlock,
+        locks: &[proto::HyperLockEvent],
+        transfers: &[proto::HyperTransferTx],
+        onboards: &[proto::HyperNativeOnboardBody],
+        rotations: &[proto::HyperCustodyRotationBody],
+    ) -> Result<(), HyperActorError> {
+        let anchor_block = block.envelope.metadata.snapchain_anchor_block;
+        let anchor_ts = block.envelope.metadata.snapchain_anchor_timestamp;
+        self.runtime
+            .import_block(block, locks, transfers, onboards, rotations)?;
+        self.metric_count("hyper.blocks.imported", 1);
+        self.maybe_trigger_scoring(anchor_block, anchor_ts).await;
+        // Sign the seed before producing responses so the batch picks up the
+        // new seed in the same block.
+        self.maybe_sign_da_epoch_seed(anchor_block).await;
+        self.maybe_trigger_da_responses(anchor_block).await;
+        Ok(())
+    }
+
+    /// Park an ahead-of-head block in the catch-up buffer, keyed by height.
+    /// Duplicate heights keep the first copy. Enforces `PENDING_HYPER_BLOCKS_CAP`
+    /// by evicting the lowest-height entry when full — a peer streaming
+    /// far-future heights cannot grow the buffer without bound, and an evicted
+    /// height is simply re-served by a later `RequestBlocks` if still needed.
+    fn buffer_inbound_block(&mut self, buffered: BufferedInboundBlock) {
+        let height = buffered.block.envelope.metadata.canonical_block_id;
+        if self.pending_hyper_blocks.contains_key(&height) {
+            return;
+        }
+        while self.pending_hyper_blocks.len() >= PENDING_HYPER_BLOCKS_CAP {
+            // BTreeMap: first key is the lowest height.
+            let lowest = match self.pending_hyper_blocks.keys().next().copied() {
+                Some(k) => k,
+                None => break,
+            };
+            // Never evict the block we're about to insert if it's the lowest —
+            // that would make forward progress impossible.
+            if lowest >= height {
+                break;
+            }
+            self.pending_hyper_blocks.remove(&lowest);
+            self.metric_count("hyper.blocks.sync_buffer_evicted", 1);
+        }
+        self.pending_hyper_blocks.insert(height, buffered);
+        self.metric_count("hyper.blocks.sync_buffered", 1);
+    }
+
+    /// Ask peers for the hyper blocks in `[start, end]`. The range is clamped
+    /// to `MAX_SYNC_BATCH` heights; a wider gap is filled over successive
+    /// batches as each drained import advances our head and re-triggers this.
+    /// De-duplicated against the last range requested so a burst of buffered
+    /// arrivals doesn't emit a storm of identical requests.
+    async fn request_missing_blocks(&mut self, start: u64, end: u64) {
+        if end < start {
+            return;
+        }
+        let clamped_end = end.min(start + MAX_SYNC_BATCH - 1);
+        // Skip if we already have an outstanding request covering this start.
+        if self.last_requested_sync_end == Some(clamped_end) {
+            return;
+        }
+        self.last_requested_sync_end = Some(clamped_end);
+        self.metric_count("hyper.blocks.sync_requested", 1);
+        tracing::info!(
+            start,
+            end = clamped_end,
+            "hyper follower requesting catch-up blocks"
+        );
+        let _ = self
+            .outbound
+            .send(HyperActorOutbound::RequestBlocks {
+                start_height: start,
+                end_height: clamped_end,
+            })
+            .await;
+    }
+
+    /// After an in-order import, drain the contiguous run of buffered blocks
+    /// that now chains onto our head. Stops at the first missing height. If a
+    /// buffered block fails to import (e.g. corrupt/forged), it is dropped and
+    /// the drain stops there so we don't skip past a real gap. When a gap
+    /// remains after draining, re-issue a catch-up request for it.
+    async fn drain_pending_hyper_blocks(&mut self) -> Result<(), HyperActorError> {
+        loop {
+            let next = self.next_expected_hyper_height();
+            let buffered = match self.pending_hyper_blocks.remove(&next) {
+                Some(b) => b,
+                None => break,
+            };
+            let BufferedInboundBlock {
+                block,
+                locks,
+                transfers,
+                onboards,
+                rotations,
+            } = buffered;
+            if let Err(e) = self
+                .import_inbound_block(&block, &locks, &transfers, &onboards, &rotations)
+                .await
+            {
+                tracing::warn!(height = next, error = %e, "buffered catch-up block failed to import; dropping");
+                self.metric_count("hyper.blocks.sync_drain_failed", 1);
+                break;
+            }
+        }
+        // Caught up to the buffer, or hit a hole. If blocks still sit ahead,
+        // pull the run between our head and the lowest buffered height.
+        let head_next = self.next_expected_hyper_height();
+        if let Some(&lowest_ahead) = self.pending_hyper_blocks.keys().next() {
+            if lowest_ahead > head_next {
+                self.request_missing_blocks(head_next, lowest_ahead - 1)
+                    .await;
+            }
+        } else {
+            // Fully drained — clear the in-flight marker so the next genuine
+            // gap issues a fresh request.
+            self.last_requested_sync_end = None;
+        }
+        Ok(())
+    }
+
+    /// Serve a peer's catch-up request: for each height in `[start, end]`
+    /// (clamped to `MAX_SYNC_BATCH`) that we hold, re-broadcast the full
+    /// `HyperWireBlock` — block plus the locks/transfers/onboards/rotations
+    /// side-channel — so the requester can re-import it and advance its head.
+    /// Heights we don't have are skipped silently.
+    async fn serve_block_request(&mut self, start: u64, end: u64) {
+        if end < start {
+            return;
+        }
+        let clamped_end = end.min(start + MAX_SYNC_BATCH - 1);
+        // Entry trace: fires on EVERY received request, even if we serve zero
+        // blocks. Distinguishes "request never arrived" (no line) from "arrived
+        // but had nothing to serve" (served=0) when diagnosing sync stalls.
+        tracing::info!(
+            start,
+            end = clamped_end,
+            "hyper serve: received catch-up request"
+        );
+        let mut served = 0u64;
+        for height in start..=clamped_end {
+            let proto_block = match self.runtime.get_block_by_height(height) {
+                Ok(Some(b)) => b,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(height, error = %e, "sync serve: block lookup failed");
+                    continue;
+                }
+            };
+            let (locks, transfers, onboards, rotations) = match self
+                .runtime
+                .get_block_messages(height)
+            {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!(height, error = %e, "sync serve: side-channel lookup failed");
+                    continue;
+                }
+            };
+            let block = HyperBlock::from(proto_block);
+            let _ = self
+                .outbound
+                .send(HyperActorOutbound::BroadcastBlock {
+                    block,
+                    locks,
+                    transfers,
+                    onboards,
+                    rotations,
+                })
+                .await;
+            served += 1;
+        }
+        if served > 0 {
+            self.metric_count("hyper.blocks.sync_served", served as i64);
+            tracing::info!(
+                start,
+                end = clamped_end,
+                served,
+                "served hyper catch-up blocks"
+            );
+        }
     }
 
     async fn maybe_trigger_scoring(&mut self, anchor_block: u64, anchor_timestamp: u64) {
@@ -3862,6 +4174,218 @@ mod tests {
         );
     }
 
+    /// Build a bare `HyperActor` around `runtime` for white-box dispatch
+    /// tests, returning the actor plus the receiver end of its outbound
+    /// channel. The inbound channel is unused — tests call `dispatch`
+    /// directly and drain outbounds with `drain_outbounds`.
+    fn build_sync_test_actor(
+        runtime: HyperRuntime,
+    ) -> (HyperActor, mpsc::Receiver<HyperActorOutbound>) {
+        let (_in_tx, in_rx) = mpsc::channel(8);
+        let (out_tx, out_rx) = mpsc::channel(1024);
+        let actor = HyperActor {
+            runtime,
+            active_dkls: None,
+            pending_dkls_inbound: std::collections::BTreeMap::new(),
+            active_dkls_sign: None,
+            pending_dkls_blocks: std::collections::BTreeMap::new(),
+            pending_hyper_blocks: std::collections::BTreeMap::new(),
+            last_requested_sync_end: None,
+            pending_dkls_messages: std::collections::BTreeMap::new(),
+            pending_sign_queue: std::collections::VecDeque::new(),
+            inbound: in_rx,
+            outbound: out_tx,
+            statsd: None,
+            da_response_producer: None,
+            last_da_responded_epoch: None,
+            last_da_seed_signed_for_epoch: None,
+            recent_evidence: std::collections::VecDeque::with_capacity(RECENT_EVIDENCE_CAP),
+            submission_status: std::collections::HashMap::with_capacity(SUBMISSION_STATUS_CAP),
+            submission_status_order: std::collections::VecDeque::with_capacity(
+                SUBMISSION_STATUS_CAP,
+            ),
+        };
+        (actor, out_rx)
+    }
+
+    fn drain_outbounds(rx: &mut mpsc::Receiver<HyperActorOutbound>) -> Vec<HyperActorOutbound> {
+        let mut out = Vec::new();
+        while let Ok(o) = rx.try_recv() {
+            out.push(o);
+        }
+        out
+    }
+
+    fn inbound_block_event(
+        block: &HyperBlock,
+        locks: &[proto::HyperLockEvent],
+        transfers: &[proto::HyperTransferTx],
+        onboards: &[proto::HyperNativeOnboardBody],
+        rotations: &[proto::HyperCustodyRotationBody],
+    ) -> HyperActorEvent {
+        HyperActorEvent::InboundBlock {
+            block: block.clone(),
+            locks: locks.to_vec(),
+            transfers: transfers.to_vec(),
+            onboards: onboards.to_vec(),
+            rotations: rotations.to_vec(),
+        }
+    }
+
+    /// End-to-end follower catch-up: a node that holds only genesis, then sees
+    /// the chain tip arrive ahead of its head, must (a) NOT import the gap
+    /// block, (b) buffer it and request the missing run, (c) have that request
+    /// served from a peer's block index, and (d) drain to the tip in order and
+    /// converge on the identical head hash. Exercises the whole sync path
+    /// added for the restarted-follower `ParentHashMismatch` stall.
+    #[tokio::test]
+    async fn follower_with_gap_requests_serves_and_converges_to_tip() {
+        let mut rng = OsRng;
+        let srs = Arc::new(KzgSrs::random_unsafe(&mut rng, VERKLE_DOMAIN));
+        let dkg =
+            hypersnap_crypto::dkls_threshold::run_honest_dkg(1, 1, [0xf7; 32]).expect("1-of-1 dkg");
+
+        // ---- Producer: build + self-import a 5-block chain (heights 0..=4). ----
+        let (mut producer, _pd) = make_runtime_with_srs(srs.clone());
+        producer.install_local_dkls_share(0, 1, dkg.parties[0].clone(), dkg.group_address);
+        let mut chain: Vec<(
+            HyperBlock,
+            Vec<proto::HyperLockEvent>,
+            Vec<proto::HyperTransferTx>,
+            Vec<proto::HyperNativeOnboardBody>,
+            Vec<proto::HyperCustodyRotationBody>,
+        )> = Vec::new();
+        let mut parent: Vec<u8> = vec![];
+        for h in 0..5u64 {
+            let (block, locks, transfers, onboards, rotations) = producer
+                .produce_signed_block_dkls_local(h, parent.clone(), 0, 0, vec![], 0)
+                .expect("produce signed block");
+            let hash = producer
+                .import_block(&block, &locks, &transfers, &onboards, &rotations)
+                .expect("producer self-import");
+            parent = hash.to_vec();
+            chain.push((block, locks, transfers, onboards, rotations));
+        }
+        let tip_hash = producer.last_block_hash().expect("producer has a tip");
+
+        // Wrap the producer in an actor so it can serve catch-up requests
+        // from its block index.
+        let (mut server, mut server_out) = build_sync_test_actor(producer);
+
+        // ---- Follower: shared SRS, group address only (imports, never signs). ----
+        let (mut follower_rt, _fd) = make_runtime_with_srs(srs.clone());
+        follower_rt.install_dkls_group_address(0, dkg.group_address);
+        let (mut follower, mut follower_out) = build_sync_test_actor(follower_rt);
+
+        // Follower imports genesis in order.
+        let (b0, l0, t0, o0, r0) = &chain[0];
+        follower
+            .dispatch(inbound_block_event(b0, l0, t0, o0, r0))
+            .await
+            .expect("genesis imports");
+        assert_eq!(follower.runtime.last_block_height(), Some(0));
+        let _ = drain_outbounds(&mut follower_out);
+
+        // The chain tip (height 4) arrives with a 3-block gap. It must NOT
+        // import (chain continuity would reject it); instead it's buffered and
+        // a catch-up request for [1, 3] is emitted.
+        let (b4, l4, t4, o4, r4) = &chain[4];
+        follower
+            .dispatch(inbound_block_event(b4, l4, t4, o4, r4))
+            .await
+            .expect("gap block dispatch is ok (buffered)");
+        assert_eq!(
+            follower.runtime.last_block_height(),
+            Some(0),
+            "ahead-of-head block must not advance the chain"
+        );
+        assert!(
+            follower.pending_hyper_blocks.contains_key(&4),
+            "tip must be parked in the catch-up buffer"
+        );
+        let req = drain_outbounds(&mut follower_out)
+            .into_iter()
+            .find_map(|o| match o {
+                HyperActorOutbound::RequestBlocks {
+                    start_height,
+                    end_height,
+                } => Some((start_height, end_height)),
+                _ => None,
+            });
+        assert_eq!(
+            req,
+            Some((1, 3)),
+            "follower must request exactly the missing run [1,3]"
+        );
+
+        // Serve the request from the peer's block index.
+        server
+            .dispatch(HyperActorEvent::InboundBlockRequest {
+                start_height: 1,
+                end_height: 3,
+            })
+            .await
+            .expect("serve request");
+        let served: Vec<HyperActorEvent> = drain_outbounds(&mut server_out)
+            .into_iter()
+            .filter_map(|o| match o {
+                HyperActorOutbound::BroadcastBlock {
+                    block,
+                    locks,
+                    transfers,
+                    onboards,
+                    rotations,
+                } => Some(HyperActorEvent::InboundBlock {
+                    block,
+                    locks,
+                    transfers,
+                    onboards,
+                    rotations,
+                }),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(served.len(), 3, "server re-broadcasts heights 1,2,3");
+        // Ascending, contiguous 1..=3.
+        let heights: Vec<u64> = served
+            .iter()
+            .map(|e| match e {
+                HyperActorEvent::InboundBlock { block, .. } => {
+                    block.envelope.metadata.canonical_block_id
+                }
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(heights, vec![1, 2, 3]);
+
+        // Deliver the served blocks to the follower. Importing height 3 must
+        // drain the buffered tip (4) and converge.
+        for ev in served {
+            follower
+                .dispatch(ev)
+                .await
+                .expect("follower imports served block");
+        }
+        assert_eq!(
+            follower.runtime.last_block_height(),
+            Some(4),
+            "follower converges to the chain tip via catch-up"
+        );
+        assert!(
+            follower.pending_hyper_blocks.is_empty(),
+            "catch-up buffer fully drained"
+        );
+        assert_eq!(
+            follower.runtime.last_block_hash(),
+            Some(tip_hash),
+            "follower head hash matches the producer tip"
+        );
+        assert_eq!(
+            follower.last_requested_sync_end, None,
+            "in-flight sync marker cleared after full convergence"
+        );
+    }
+
     #[tokio::test]
     async fn evaluate_epoch_dkls_emits_signed_issuances_and_snapshot() {
         // Single-validator devnet: install 1-of-1 DKLS share for
@@ -5072,6 +5596,8 @@ mod tests {
             pending_dkls_inbound: std::collections::BTreeMap::new(),
             active_dkls_sign: None,
             pending_dkls_blocks: std::collections::BTreeMap::new(),
+            pending_hyper_blocks: std::collections::BTreeMap::new(),
+            last_requested_sync_end: None,
             pending_dkls_messages: std::collections::BTreeMap::new(),
             pending_sign_queue: std::collections::VecDeque::new(),
             inbound: in_rx,
@@ -5169,6 +5695,8 @@ mod tests {
             pending_dkls_inbound: std::collections::BTreeMap::new(),
             active_dkls_sign: None,
             pending_dkls_blocks: std::collections::BTreeMap::new(),
+            pending_hyper_blocks: std::collections::BTreeMap::new(),
+            last_requested_sync_end: None,
             pending_dkls_messages: std::collections::BTreeMap::new(),
             pending_sign_queue: std::collections::VecDeque::new(),
             inbound: in_rx,
@@ -5298,6 +5826,8 @@ mod tests {
             pending_dkls_inbound: std::collections::BTreeMap::new(),
             active_dkls_sign: None,
             pending_dkls_blocks: std::collections::BTreeMap::new(),
+            pending_hyper_blocks: std::collections::BTreeMap::new(),
+            last_requested_sync_end: None,
             pending_dkls_messages: std::collections::BTreeMap::new(),
             pending_sign_queue: std::collections::VecDeque::new(),
             inbound: in_rx,
@@ -5406,6 +5936,8 @@ mod tests {
             pending_dkls_inbound: std::collections::BTreeMap::new(),
             active_dkls_sign: None,
             pending_dkls_blocks: std::collections::BTreeMap::new(),
+            pending_hyper_blocks: std::collections::BTreeMap::new(),
+            last_requested_sync_end: None,
             pending_dkls_messages: std::collections::BTreeMap::new(),
             pending_sign_queue: std::collections::VecDeque::new(),
             inbound: in_rx,
@@ -5501,6 +6033,8 @@ mod tests {
             pending_dkls_inbound: std::collections::BTreeMap::new(),
             active_dkls_sign: None,
             pending_dkls_blocks: std::collections::BTreeMap::new(),
+            pending_hyper_blocks: std::collections::BTreeMap::new(),
+            last_requested_sync_end: None,
             pending_dkls_messages: std::collections::BTreeMap::new(),
             pending_sign_queue: std::collections::VecDeque::new(),
             inbound: in_rx,
