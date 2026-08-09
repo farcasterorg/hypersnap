@@ -6,7 +6,7 @@
 //! verified `(fid, op)` tuple or an error.
 
 use alloy_dyn_abi::TypedData;
-use alloy_primitives::{keccak256, Address, PrimitiveSignature, B256};
+use alloy_primitives::{keccak256, Address, Signature, B256};
 use async_trait::async_trait;
 use moka::sync::Cache;
 use serde_json::json;
@@ -147,8 +147,7 @@ impl WebhookAuthVerifier {
         // 5. Recover signer.
         let parity_byte = headers.signature[64];
         let parity = parity_byte != 0x1b && parity_byte != 0x00;
-        let signature =
-            PrimitiveSignature::from_bytes_and_parity(&headers.signature[0..64], parity);
+        let signature = Signature::from_bytes_and_parity(&headers.signature[0..64], parity);
         let recovered = signature
             .recover_address_from_prehash(&signing_hash)
             .map_err(|_| AuthError::BadSignature)?;

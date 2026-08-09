@@ -15,7 +15,7 @@ services:
       - "-c"
       - |
         #!/bin/bash
-        cat > config.toml <<EOF
+        cat > config.toml <<'EOF'
 
         rpc_address="0.0.0.0:3383"
         http_address="0.0.0.0:3381"
@@ -64,6 +64,12 @@ services:
         EOF
         exec $0 $@ # Now run the original command
     command: [ "./hypersnap", "--config-path", "config.toml" ]
+    depends_on:
+      # Ensures statsd is registered with the DNS resolver before the node
+      # resolves its metrics address. service_started is enough: the name is
+      # published at container start, not at healthcheck pass.
+      statsd:
+        condition: service_started
     ports:
       - "3381:3381/tcp"
       - "3382:3382/udp"

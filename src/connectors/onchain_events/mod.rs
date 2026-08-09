@@ -3,13 +3,12 @@ use crate::proto::TierPurchaseBody;
 use crate::storage::store::node_local_state;
 use alloy_primitives::U256;
 use alloy_primitives::{address, ruint::FromUintError, Address, FixedBytes};
-use alloy_provider::{Provider, ProviderBuilder, RootProvider};
+use alloy_provider::{Provider, RootProvider};
 use alloy_rpc_types::{Filter, Log};
 use alloy_sol_types::{sol, SolEvent, SolType};
-use alloy_transport_http::{Client, Http};
 use async_trait::async_trait;
-use foundry_common::ens::EnsResolver::EnsResolverInstance;
-use foundry_common::ens::{namehash, EnsError, EnsRegistry};
+use ens::EnsResolver::EnsResolverInstance;
+use ens::{namehash, EnsError, EnsRegistry};
 use futures_util::stream::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -35,6 +34,8 @@ use crate::{
     storage::store::node_local_state::LocalStateStore,
     utils::statsd_wrapper::StatsdClientWrapper,
 };
+
+pub(crate) mod ens;
 
 sol!(
     #[allow(missing_docs)]
@@ -175,7 +176,7 @@ pub fn get_request_fid_from_signer_event(signer_event_body: &SignerEventBody) ->
         return None;
     }
 
-    match SignedKeyRequestMetadata::abi_decode(&signer_event_body.metadata, true) {
+    match SignedKeyRequestMetadata::abi_decode(&signer_event_body.metadata) {
         Ok(decoded) => {
             // Convert U256 to u64, returning None if it doesn't fit
             decoded.requestFid.try_into().ok()
@@ -271,7 +272,7 @@ impl ChainClients {
 }
 
 pub struct RealL1Client {
-    provider: RootProvider<Http<Client>>,
+    provider: RootProvider,
     ens_resolver_address: Option<Address>,
 }
 
@@ -284,7 +285,7 @@ impl RealL1Client {
             return Err(SubscribeError::EmptyRpcUrl);
         }
         let url = rpc_url.parse()?;
-        let provider = ProviderBuilder::new().on_http(url);
+        let provider = RootProvider::new_http(url);
         Ok(RealL1Client {
             provider,
             ens_resolver_address,
@@ -295,7 +296,8 @@ impl RealL1Client {
 #[async_trait]
 impl ChainAPI for RealL1Client {
     async fn resolve_ens_name(&self, name: String) -> Result<Address, EnsError> {
-        // Copied from foundry_common::ens so we can support both ETH and Base mainnet
+        // Adapted from the ens module (originally foundry_common::ens) so we can support
+        // both ETH and Base mainnet
         let node = namehash(name.as_str());
         let ens_resolver_address = self.ens_resolver_address.ok_or(EnsError::ResolverNotFound(
             "no resolver address configured for chain".to_string(),
@@ -305,8 +307,7 @@ impl ChainAPI for RealL1Client {
             .resolver(node)
             .call()
             .await
-            .map_err(EnsError::Resolver)?
-            ._0;
+            .map_err(EnsError::Resolver)?;
         if address == Address::ZERO {
             return Err(EnsError::ResolverNotFound(name.to_string()));
         }
@@ -318,8 +319,7 @@ impl ChainAPI for RealL1Client {
             .map_err(EnsError::Resolve)
             .inspect_err(|e| {
                 warn!("Failed to resolve ens name {name}: {}", e);
-            })?
-            ._0;
+            })?;
         Ok(addr)
     }
 
@@ -343,7 +343,7 @@ impl ChainAPI for RealL1Client {
 
         let result = self
             .provider
-            .call(&tx)
+            .call(tx)
             .await
             .map_err(|e| format!("eth_call failed: {}", e))?;
 
@@ -459,7 +459,7 @@ impl Contract {
 }
 
 pub struct Subscriber {
-    provider: RootProvider<Http<Client>>,
+    provider: RootProvider,
     mempool_tx: mpsc::Sender<MempoolRequest>,
     start_block_number: Option<u64>,
     stop_block_number: Option<u64>,
@@ -484,7 +484,7 @@ impl Subscriber {
             return Err(SubscribeError::EmptyRpcUrl);
         }
         let url = config.rpc_url.parse()?;
-        let provider = ProviderBuilder::new().on_http(url);
+        let provider = RootProvider::new_http(url);
         Ok(Subscriber {
             local_state_store,
             provider,
@@ -676,11 +676,7 @@ impl Subscriber {
     async fn get_block_timestamp(&self, block_hash: FixedBytes<32>) -> Result<u64, SubscribeError> {
         let mut retry_count = 0;
         loop {
-            match self
-                .provider
-                .get_block_by_hash(block_hash, alloy_rpc_types::BlockTransactionsKind::Hashes)
-                .await
-            {
+            match self.provider.get_block_by_hash(block_hash).await {
                 Ok(Some(block)) => {
                     return Ok(block.header.timestamp);
                 }
@@ -1076,10 +1072,7 @@ impl Subscriber {
         loop {
             match self
                 .provider
-                .get_block_by_number(
-                    alloy_rpc_types::BlockNumberOrTag::Latest,
-                    alloy_rpc_types::BlockTransactionsKind::Hashes,
-                )
+                .get_block_by_number(alloy_rpc_types::BlockNumberOrTag::Latest)
                 .await
             {
                 Ok(block) => {

@@ -43,11 +43,13 @@ jobs:
           ref: ${{ env.MALACHITE_GIT_REF }}
           path: ./malachite
 
-      - name: Install Rust 1.89.0
+      # Must stay >= 1.94.1 (alloy 2.x MSRV) and in step with rust-toolchain.toml
+      # and the Dockerfile builder image.
+      - name: Install Rust 1.95.0
         uses: actions-rs/toolchain@v1
         with:
-          toolchain: 1.89.0
-          profile: default 
+          toolchain: 1.95.0
+          profile: default
           override: true
 
       - uses: actions/checkout@v4

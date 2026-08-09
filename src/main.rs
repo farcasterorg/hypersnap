@@ -514,11 +514,51 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )),
     }?;
 
-    let host = (statsd_host, statsd_port);
-    let socket = net::UdpSocket::bind("0.0.0.0:0").unwrap();
-    let sink = cadence::UdpMetricSink::from(host, socket)?;
-    let statsd_client =
-        cadence::StatsdClient::builder(app_config.statsd.prefix.as_str(), sink).build();
+    // Resolving the statsd host can fail transiently at boot, e.g. when the metrics
+    // container hasn't registered with the DNS resolver yet. Retry for a bounded
+    // window, then carry on without metrics: a metrics sink must never keep the node
+    // from starting.
+    const STATSD_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+    const STATSD_RESOLVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+    let deadline = tokio::time::Instant::now() + STATSD_RESOLVE_TIMEOUT;
+    let mut statsd_sink = None;
+    loop {
+        let socket = net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        match cadence::UdpMetricSink::from((statsd_host.as_str(), statsd_port), socket) {
+            Ok(sink) => {
+                statsd_sink = Some(sink);
+                break;
+            }
+            Err(e) if tokio::time::Instant::now() < deadline => {
+                warn!(
+                    addr = app_config.statsd.addr,
+                    error = e.to_string(),
+                    "Failed to resolve statsd address, retrying"
+                );
+                tokio::time::sleep(STATSD_RESOLVE_INTERVAL).await;
+            }
+            Err(e) => {
+                error!(
+                    addr = app_config.statsd.addr,
+                    error = e.to_string(),
+                    "Failed to resolve statsd address, continuing without metrics"
+                );
+                break;
+            }
+        }
+    }
+
+    let statsd_client = match statsd_sink {
+        Some(sink) => {
+            cadence::StatsdClient::builder(app_config.statsd.prefix.as_str(), sink).build()
+        }
+        None => cadence::StatsdClient::builder(
+            app_config.statsd.prefix.as_str(),
+            cadence::NopMetricSink,
+        )
+        .build(),
+    };
     let statsd_client = StatsdClientWrapper::new(statsd_client, app_config.statsd.use_tags);
 
     // We only use snapshots if the db directory doesn't exist or is empty.
@@ -1040,6 +1080,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     event_rx: senders.events_tx.subscribe(),
                     validator_sets: app_config.consensus.to_stored_validator_sets(0), // We care about the validator sets for shard 0 blocks only
                     config: app_config.block_receiver.clone(),
+                    statsd: statsd_client.clone(),
                 };
                 tokio::spawn(async move { block_receiver.run().await });
             }
