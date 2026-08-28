@@ -1987,7 +1987,8 @@ impl ApiHttpHandler {
         });
 
         if let Some(msg) = hub.get_cast_by_hash(&hash, fid_hint).await {
-            let cast = self.message_to_cast(&msg).await;
+            let mut cast = self.message_to_cast(&msg).await;
+            self.attach_cast_metrics(&mut cast, &msg.hash);
             return Ok(Self::json_response(StatusCode::OK, &CastResponse { cast }));
         }
 
@@ -2019,7 +2020,9 @@ impl ApiHttpHandler {
                     .as_ref()
                     .and_then(|idx| idx.get_fid_by_hash(&hash));
                 if let Some(msg) = hub.get_cast_by_hash(&hash, fid_hint).await {
-                    casts.push(self.message_to_cast(&msg).await);
+                    let mut cast = self.message_to_cast(&msg).await;
+                    self.attach_cast_metrics(&mut cast, &msg.hash);
+                    casts.push(cast);
                 }
             }
         }
@@ -2028,6 +2031,29 @@ impl ApiHttpHandler {
             StatusCode::OK,
             &BulkCastsResponse { casts },
         ))
+    }
+
+    /// Attach aggregate engagement data maintained by the metrics indexer.
+    ///
+    /// `message_to_cast` only converts the cast message itself, so endpoints
+    /// that return casts directly must explicitly hydrate these derived fields.
+    fn attach_cast_metrics(&self, cast: &mut Cast, hash: &[u8]) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        let Ok(metrics) = metrics.get_cast_metrics(cast.author.fid, hash) else {
+            return;
+        };
+
+        cast.reactions = CastReactions {
+            likes_count: metrics.likes,
+            recasts_count: metrics.recasts,
+            likes: Vec::new(),
+            recasts: Vec::new(),
+        };
+        cast.replies = CastReplies {
+            count: metrics.replies,
+        };
     }
 
     /// Handle GET /v2/farcaster/user/bulk-by-address?addresses=0x...,0x...
@@ -4709,6 +4735,87 @@ mod tests {
         ) -> Result<(Vec<u64>, Option<Vec<u8>>), String> {
             Ok((vec![], None))
         }
+    }
+
+    #[tokio::test]
+    async fn test_cast_lookup_includes_indexed_reaction_counts() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(crate::storage::db::RocksDB::new(
+            temp_dir.path().to_str().unwrap(),
+        ));
+        db.open().unwrap();
+
+        let metrics = Arc::new(MetricsIndexer::new(
+            crate::api::config::MetricsConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            db,
+        ));
+
+        let cast_fid = 15_211;
+        let cast_hash = hex::decode("ed45e6ef3fd1dec7c86b9bd8a9b837faffe628c7").unwrap();
+        let cast = crate::proto::Message {
+            data: Some(crate::proto::MessageData {
+                fid: cast_fid,
+                r#type: crate::proto::MessageType::CastAdd as i32,
+                body: Some(crate::proto::message_data::Body::CastAddBody(
+                    crate::proto::CastAddBody {
+                        text: "cast with likes".into(),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            }),
+            hash: cast_hash.clone(),
+            ..Default::default()
+        };
+
+        let reactions = [230_238, 230_239].map(|reactor_fid| crate::proto::Message {
+            data: Some(crate::proto::MessageData {
+                fid: reactor_fid,
+                r#type: crate::proto::MessageType::ReactionAdd as i32,
+                body: Some(crate::proto::message_data::Body::ReactionBody(
+                    crate::proto::ReactionBody {
+                        r#type: crate::proto::ReactionType::Like as i32,
+                        target: Some(crate::proto::reaction_body::Target::TargetCastId(
+                            crate::proto::CastId {
+                                fid: cast_fid,
+                                hash: cast_hash.clone(),
+                            },
+                        )),
+                    },
+                )),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        metrics
+            .process_batch(&[crate::api::events::IndexEvent::messages(
+                reactions.to_vec(),
+                1,
+                1,
+            )])
+            .await
+            .unwrap();
+
+        let handler = ApiHttpHandler::new(None, None, Some(metrics), None, None, None);
+        handler.set_hub_query(Arc::new(MockHubQuery {
+            notifications: vec![],
+            cast_lookup: Some(cast),
+        }));
+
+        let response = handler
+            .handle_cast_lookup(&hex::encode(cast_hash), "hash", None)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["cast"]["reactions"]["likes_count"], 2);
+        assert_eq!(json["cast"]["reactions"]["recasts_count"], 0);
+        assert_eq!(json["cast"]["reactions"]["likes"], serde_json::json!([]));
     }
 
     #[tokio::test]
