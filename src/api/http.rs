@@ -2045,15 +2045,9 @@ impl ApiHttpHandler {
             return;
         };
 
-        cast.reactions = CastReactions {
-            likes_count: metrics.likes,
-            recasts_count: metrics.recasts,
-            likes: Vec::new(),
-            recasts: Vec::new(),
-        };
-        cast.replies = CastReplies {
-            count: metrics.replies,
-        };
+        cast.reactions.likes_count = metrics.likes;
+        cast.reactions.recasts_count = metrics.recasts;
+        cast.replies.count = metrics.replies;
     }
 
     /// Handle GET /v2/farcaster/user/bulk-by-address?addresses=0x...,0x...
