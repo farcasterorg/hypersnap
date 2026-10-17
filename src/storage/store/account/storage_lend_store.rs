@@ -1,4 +1,4 @@
-use crate::hyper::StateContext;
+use crate::storage::store::state_context::StateContext;
 use tracing::warn;
 
 use super::{
@@ -56,7 +56,7 @@ impl StoreDef for StorageLendStoreDef {
             return false;
         }
         let data = message.data.as_ref().unwrap();
-        message.signature_scheme == SignatureScheme::Ed25519 as i32
+        SignatureScheme::is_message_scheme(message.signature_scheme)
             && data.r#type == MessageType::LendStorage as i32
             && data.body.is_some()
     }

@@ -5,13 +5,15 @@ members = [
     "crates/hypersnap-wallet",
     "crates/proof-of-quality",
     "crates/hypersnap-bridge-ceremony",
-    # Vendored from sibling repos. Keeping them in-tree so a fresh
-    # clone of `hypersnap` builds without external monorepo paths.
-    # To update: re-rsync from the upstream sources, exclude target/
-    # and Cargo.lock.
-    "crates/dkls23",
-    "crates/ed448-bulletproofs",
+    "crates/hypersnap-falcon",
+    "crates/hypersnap-ktrie",
+    "crates/hypersnap-messages",
+    # LWE-FSA, for the standalone `research/cert-stark` study only.
+    "crates/hypersnap-lattice",
+    "crates/hypersnap-relay",
 ]
+# The vendored rocksdb wrapper is a patched dependency, not a member.
+exclude = ["crates/rust-rocksdb"]
 resolver = "2"
 
 [package]
@@ -30,19 +32,14 @@ path = "src/main.rs"
 
 [features]
 default = []
-# Testnet-only build knob. (1) Replaces `EPOCH_LENGTH` (432,000 blocks) with
-# 1,440 blocks (~6 minutes at 250ms block time) so the single→multi validator
-# DKG rotation flow runs in single-digit minutes. (2) Lowers the onboarding POW
-# floor `MIN_DIFFICULTY_BITS` (30→12) so the harness can solve honest onboards
-# in milliseconds while still exercising the below-floor rejection path. Used
-# by `scripts/run_epoch_transition_testnet.sh`. Never enable in a release build.
-short-epochs = []
 
 [dependencies]
 hypersnap-proto = { path = "proto" }
 hypersnap-crypto = { path = "crates/hypersnap-crypto" }
-hypersnap-wallet = { path = "crates/hypersnap-wallet" }
 proof-of-quality = { path = "crates/proof-of-quality" }
+hypersnap-falcon = { path = "crates/hypersnap-falcon" }
+hypersnap-messages = { path = "crates/hypersnap-messages" }
+hypersnap-ktrie = { path = "crates/hypersnap-ktrie" }
 bincode = "1.3"
 tokio = { version = "1.40.0", features = ["full"] }
 tokio-stream = "0.1"
@@ -142,6 +139,8 @@ twox-hash = "1.6"
 
 
 [dev-dependencies]
+# The shard-0 engine tests run the wallet builders (src/chain/shard0/wallet_test.rs).
+hypersnap-wallet = { path = "crates/hypersnap-wallet" }
 serial_test = "3.1.1"
 tracing-test = { version = "0.2.5", features = ["no-env-filter"] }
 insta = { version = "1.40", features = ["json"] }
@@ -155,3 +154,9 @@ tower = { version = "0.5", default-features = false }
 
 [package.metadata.precommit]
 fmt = "cargo fmt --check --quiet"
+
+# FIP §17.7 boundary checkpoints need `TransactionDB::create_checkpoint`,
+# which the upstream wrapper does not expose. The Rust wrapper is vendored at
+# the same revision with that one addition; librocksdb-sys is unchanged.
+[patch."https://github.com/rust-rocksdb/rust-rocksdb.git"]
+rocksdb = { path = "crates/rust-rocksdb" }

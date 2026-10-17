@@ -407,6 +407,8 @@ pub struct ReadNodeMempool {
     gossip_tx: mpsc::Sender<GossipEvent<SnapchainValidatorContext>>,
     statsd_client: StatsdClientWrapper,
     network: FarcasterNetwork,
+    /// After the pivot: the Hypersnap routing of on-chain events (FIP §17.6).
+    hypersnap: bool,
 }
 
 impl ReadNodeMempool {
@@ -428,6 +430,7 @@ impl ReadNodeMempool {
             gossip_tx,
             statsd_client,
             network,
+            hypersnap: false,
         }
     }
 
@@ -528,6 +531,16 @@ impl ReadNodeMempool {
                 // TODO(aditi): Remove this codepath after migrating onchain events to shard 0
                 vec![0]
             }
+            // FIP §17.6: after the pivot, IdRegistry and KeyRegistry events go
+            // to shard 0 (shards 1 and 2 get them from its outbox). Hypersnap
+            // does not take StorageRegistry or TierRegistry events.
+            MempoolMessage::OnchainEvent(event) if self.hypersnap => match event.r#type() {
+                OnChainEventType::EventTypeStorageRent
+                | OnChainEventType::EventTypeTierPurchase => {
+                    vec![]
+                }
+                _ => vec![0],
+            },
             MempoolMessage::OnchainEvent(_) => {
                 // Onchain events need to get to shard 0 so that we can support other messages (lend storage) in shard 0.
                 vec![0, fid_shard]
@@ -639,9 +652,55 @@ pub struct Mempool {
     key_add_rate_limits: KeyAddRateLimits,
     live_at_rate_limits: LiveAtRateLimits,
     live_at_messages_by_fid: HashMap<(u32, u64), MempoolKey>,
+    /// After the pivot: native FIDs and Hypersnap types are normal messages
+    /// (FIP §14.1; Hyper-Native Onboarding §9 no longer applies).
+    hypersnap: bool,
+    /// Hypersnap: the shard-0 parameters for the FID-0 prechecks, and the
+    /// pending message of each dedupe key (`chain::shard0::precheck`).
+    shard0_params: Option<crate::chain::shard0::Shard0Params>,
+    fid0_keys: HashMap<Vec<u8>, MempoolKey>,
 }
 
 impl Mempool {
+    /// Run with the Hypersnap rules (after the pivot).
+    pub fn set_hypersnap(&mut self, shard0_params: crate::chain::shard0::Shard0Params) {
+        self.hypersnap = true;
+        self.read_node_mempool.hypersnap = true;
+        self.shard0_params = Some(shard0_params);
+    }
+
+    /// Hypersnap: an FID-0 message for shard 0 carries a valid
+    /// authorization, and no other pending message has its dedupe key (the
+    /// escrow and nonce, or the onboarding custody address).
+    fn check_fid0(&mut self, shard: u32, message: &MempoolMessage) -> Result<(), HubError> {
+        let (Some(params), MempoolMessage::UserMessage(user_msg)) = (&self.shard0_params, message)
+        else {
+            return Ok(());
+        };
+        if shard != 0 {
+            return Ok(());
+        }
+        let now = FarcasterTime::current().to_u64();
+        let key = match crate::chain::shard0::precheck::fid0_dedupe_key(user_msg, params, now) {
+            Ok(Some(key)) => key,
+            Ok(None) => return Ok(()),
+            Err(e) => return Err(HubError::validation_failure(&e.to_string())),
+        };
+        if let Some(pending) = self.fid0_keys.get(&key) {
+            if self
+                .messages
+                .get(&0)
+                .is_some_and(|messages| messages.contains_key(pending))
+            {
+                return Err(HubError::duplicate(
+                    "a message for this escrow nonce or custody address is pending",
+                ));
+            }
+        }
+        self.fid0_keys.insert(key, message.mempool_key());
+        Ok(())
+    }
+
     pub fn new(
         config: Config,
         network: FarcasterNetwork,
@@ -677,6 +736,9 @@ impl Mempool {
                 num_shards,
             ),
             live_at_messages_by_fid: HashMap::new(),
+            hypersnap: false,
+            shard0_params: None,
+            fid0_keys: HashMap::new(),
             config,
             read_node_mempool: ReadNodeMempool::new(
                 mempool_rx,
@@ -783,7 +845,7 @@ impl Mempool {
         // can't pollute snapchain block proposals with messages
         // snapchain-only peers cannot interpret.
         if let MempoolMessage::UserMessage(user_msg) = message {
-            if crate::hyper::is_hyper_fid(user_msg.fid()) {
+            if !self.hypersnap && crate::chain::is_hyper_fid(user_msg.fid()) {
                 return Err(HubError::validation_failure(
                     "hyper-native FID (fid >= 2^63) message arrived on snapchain mempool — must use hyper gossip topic",
                 ));
@@ -819,6 +881,9 @@ impl Mempool {
 
         if self.message_already_exists(shard, message) {
             return Err(HubError::duplicate("message has already been merged"));
+        }
+        if at_admission {
+            self.check_fid0(shard, message)?;
         }
         // Rate-limit checks are token-consuming. Run only at admission; re-running
         // at pull time would double-charge the 1/min KEY_ADD quota.

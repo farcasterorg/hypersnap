@@ -22,11 +22,6 @@ address = "/ip4/0.0.0.0/udp/3382/quic-v1"
 shard_ids = [1, 2]
 num_shards = 2
 
-[hyper]
-enabled = true
-# retention_soft_cap = 500000  # Optional: alert on disk growth
-# metrics_interval = "60s"
-
 [api]
 enabled = true
 

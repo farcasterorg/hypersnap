@@ -1,7 +1,6 @@
 #[cfg(test)]
 mod tests {
     use super::super::super::test_helper::{default_merge_ctx, FID_FOR_TEST};
-    use crate::hyper::StateContext;
     use crate::proto::cast_add_body::Parent;
     use crate::proto::reaction_body::Target;
     use crate::proto::{self as message, hub_event, CastType, HubEvent, HubEventType};
@@ -9,6 +8,7 @@ mod tests {
     use crate::storage::store::account::{
         CastStore, CastStoreDef, HubEventStorageExt, Store, StoreEventHandler, StoreOptions,
     };
+    use crate::storage::store::state_context::StateContext;
     use crate::utils::factory::{messages_factory, time};
     use std::sync::Arc;
     use tempfile::TempDir;

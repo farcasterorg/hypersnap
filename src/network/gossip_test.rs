@@ -1,5 +1,4 @@
 use crate::consensus::consensus::SystemMessage;
-use crate::hyper::{HyperBlockMetadata, HyperEnvelope, CAPABILITY_HYPER};
 use crate::mempool::mempool::{MempoolRequest, MempoolSource};
 use crate::network::gossip::{Config, GossipEvent, SnapchainGossip};
 use crate::proto::{self, FarcasterNetwork, Message, MessageData};
@@ -164,6 +163,53 @@ async fn test_gossip_communication() {
     // Wait for message to be received with timeout. Node 1 is not connected directly to node 3 via bootstrap, but autodiscovery should cause it to find node 3.
     let receive_counts = wait_for_message(&mut system_rx3, cast_add).await;
     assert_eq!(receive_counts, 1);
+}
+
+/// A Hypersnap node (namespaced topics and gossipsub protocol) and a snapchain
+/// node do not share messages, even when connected (FIP §4.7).
+#[tokio::test]
+#[serial]
+async fn test_hypersnap_namespace_is_isolated() {
+    let base = BASE_PORT_FOR_TEST + 40;
+    let addr = |i: u32| format!("/ip4/{HOST_FOR_TEST}/udp/{}/quic-v1", base + i);
+    let ns = Config::hypersnap_namespace(FarcasterNetwork::Devnet);
+    let configs = [
+        Config::new(addr(0), format!("{},{}", addr(1), addr(2))).with_namespace(ns.clone()),
+        Config::new(addr(1), addr(0)).with_namespace(ns.clone()),
+        Config::new(addr(2), addr(0)),
+    ];
+    let mut receivers = Vec::new();
+    let mut senders = Vec::new();
+    for config in &configs {
+        let (system_tx, system_rx) = mpsc::channel::<SystemMessage>(100);
+        let mut gossip = SnapchainGossip::create(
+            Keypair::generate(),
+            config,
+            Some(system_tx),
+            false,
+            FarcasterNetwork::Devnet,
+            statsd_client(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        senders.push(gossip.tx.clone());
+        receivers.push(system_rx);
+        tokio::spawn(async move { gossip.start().await });
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let cast = messages_factory::casts::create_cast_add(123, "namespaced", None, None);
+    senders[0]
+        .send(GossipEvent::BroadcastMempoolMessage(
+            MempoolMessage::UserMessage(cast.clone()),
+        ))
+        .await
+        .unwrap();
+    let mut snapchain_rx = receivers.pop().unwrap();
+    let mut hypersnap_rx = receivers.pop().unwrap();
+    assert_eq!(wait_for_message(&mut hypersnap_rx, cast.clone()).await, 1);
+    assert_eq!(wait_for_message(&mut snapchain_rx, cast).await, 0);
 }
 
 /// The mesh-diagnostics responder serves only validator peers: a request from a
@@ -596,114 +642,4 @@ async fn test_bootstrap_peer_reconnection() {
 
     let receive_counts = wait_for_message(&mut system_rx2, cast_add).await;
     assert_eq!(receive_counts, 1);
-}
-
-fn test_hyper_envelope() -> HyperEnvelope {
-    HyperEnvelope {
-        metadata: HyperBlockMetadata {
-            canonical_block_id: 42,
-            parent_hash: vec![1, 2, 3],
-            hyper_state_root: vec![4, 5, 6],
-            extra_rules_version: 1,
-            retained_message_count: 10,
-            missed_proposals: vec![],
-            snapchain_anchor_block: 0,
-            snapchain_anchor_hash: vec![],
-            snapchain_range_start_block: 0,
-            snapchain_range_root: vec![],
-            snapchain_anchor_timestamp: 0,
-        },
-        payload: vec![7, 8, 9],
-    }
-}
-
-#[tokio::test]
-async fn test_hyper_envelope_dropped_without_capability() {
-    let keypair = Keypair::generate();
-    let addr = format!(
-        "/ip4/{HOST_FOR_TEST}/udp/{}/quic-v1",
-        BASE_PORT_FOR_TEST + 20
-    );
-    let config = Config::new(addr.clone(), addr);
-    let (system_tx, _) = mpsc::channel::<SystemMessage>(10);
-    let gossip = SnapchainGossip::create(
-        keypair,
-        &config,
-        Some(system_tx),
-        false,
-        FarcasterNetwork::Devnet,
-        statsd_client(),
-        Vec::new(),
-    )
-    .await
-    .unwrap();
-
-    assert!(gossip
-        .encode_hyper_envelope(test_hyper_envelope().into())
-        .is_none());
-}
-
-#[tokio::test]
-async fn test_hyper_envelope_encoded_with_capability() {
-    let keypair = Keypair::generate();
-    let addr = format!(
-        "/ip4/{HOST_FOR_TEST}/udp/{}/quic-v1",
-        BASE_PORT_FOR_TEST + 30
-    );
-    let config = Config::new(addr.clone(), addr);
-    let (system_tx, _) = mpsc::channel::<SystemMessage>(10);
-    let gossip = SnapchainGossip::create(
-        keypair,
-        &config,
-        Some(system_tx),
-        false,
-        FarcasterNetwork::Devnet,
-        statsd_client(),
-        vec![CAPABILITY_HYPER.to_string()],
-    )
-    .await
-    .unwrap();
-
-    let encoded = gossip
-        .encode_hyper_envelope(test_hyper_envelope().into())
-        .expect("should encode");
-    let decoded = proto::GossipMessage::decode(encoded.as_slice()).unwrap();
-    assert!(matches!(
-        decoded.gossip_message,
-        Some(proto::gossip_message::GossipMessage::HyperEnvelope(_))
-    ));
-}
-
-#[tokio::test]
-async fn test_hyper_envelope_messages_are_ignored_on_receive() {
-    let keypair = Keypair::generate();
-    let addr = format!(
-        "/ip4/{HOST_FOR_TEST}/udp/{}/quic-v1",
-        BASE_PORT_FOR_TEST + 40
-    );
-    let config = Config::new(addr.clone(), addr);
-    let (system_tx, _) = mpsc::channel::<SystemMessage>(10);
-    let mut gossip = SnapchainGossip::create(
-        keypair,
-        &config,
-        Some(system_tx),
-        true,
-        FarcasterNetwork::Devnet,
-        statsd_client(),
-        vec![CAPABILITY_HYPER.to_string()],
-    )
-    .await
-    .unwrap();
-
-    let proto_envelope: proto::HyperEnvelope = test_hyper_envelope().into();
-    let bytes = proto::GossipMessage {
-        gossip_message: Some(proto::gossip_message::GossipMessage::HyperEnvelope(
-            proto_envelope,
-        )),
-    }
-    .encode_to_vec();
-
-    assert!(gossip
-        .map_gossip_bytes_to_system_message(PeerId::random(), bytes, None)
-        .is_none());
 }

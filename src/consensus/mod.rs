@@ -1,5 +1,6 @@
 pub mod consensus;
 pub mod malachite;
+pub mod pivot_guard;
 pub mod proposer;
 pub mod read_validator;
 pub mod validator;

@@ -1,32 +1,43 @@
-//! In-protocol Proof of Quality scoring (FIP-proof-of-work-tokenization §C-2,
-//! §10.5). Ports the offline `retro_rewards_finalize` formula to a
-//! deterministic per-validator computation that runs at every epoch
-//! boundary. The output — `(rewards, trust_map)` — is canonically encoded,
-//! threshold-signed by the active set, and broadcast as a
-//! `HyperRewardIssuance` (per work market) plus a trust snapshot.
+//! In-protocol Proof of Quality scoring (FIP-proof-of-work-tokenization
+//! §5–§8, §12). Computes, once per epoch and under consensus, the trust
+//! scores, the eligibility flags and the rewards of the three work
+//! markets. Every validator computes the same result and prevotes only
+//! for a `ScoringResult` that is identical to its own (§8.5).
 //!
 //! ## Determinism
 //!
-//! Every validator must produce identical output. To make that achievable
-//! against a Rust standard library where `HashMap` iteration order is
-//! randomized:
-//! - All maps that get iterated are `BTreeMap`. Sort order is on the key
-//!   (FID for FID-keyed maps, validator key for validator-keyed maps).
-//! - All FID lists are sorted ascending before processing.
-//! - All floating-point reductions go through deterministic order
-//!   (BTreeMap iteration). f64 sums are not associative; locking the
-//!   summation order is the difference between agreement and divergence.
+//! Every validator must produce bit-identical output on every platform
+//! (x86_64 Linux, aarch64 Linux, aarch64 macOS):
+//! - **No floating point.** All consensus arithmetic is integer fixed
+//!   point per FIP §8.5 (see [`fixed`]). `clippy::float_arithmetic` and
+//!   `clippy::disallowed_types` (`f32`/`f64`, configured in the crate's
+//!   `clippy.toml`) are denied crate-wide; only the test-only modules
+//!   (the f64 reference implementation and the test diagnostics) opt
+//!   out.
+//! - All maps that get iterated are `BTreeMap`/`BTreeSet`, so every
+//!   reduction runs in ascending FID order (§8.5 "Order").
+//!
+//! ## Fixed-point representation
+//!
+//! | Quantity | Representation |
+//! |---|---|
+//! | trust | `trust_fp: u32 = floor(trust · 10^6)` (0–1 000 000), used by every formula and stored/transported as `u32`; the fee formula alone uses the 0–10 000 view `trust_fp / 100` |
+//! | age factor, credibility, entropies, shares, ratios, stake factor, vouch boost | `u64`, 6-decimal fixed point (`floor(x · 10^6)`) |
+//! | growth score, composite, app work | `u128`, 6-decimal fixed point |
+//! | raw EigenTrust mass | `u128`, `EIGENTRUST_SCALE = 10^30` |
+//! | DA score | 6-decimal fixed point; `score_int = da_score_fp · 10^6` (= `floor(da_score · 10^12)`) |
+//! | rewards, stakes, fees | integer token base units (micro-units, §12) |
 //!
 //! ## Inputs
 //!
-//! Read via the [`SnapchainStateReader`] trait. Production wires this to
-//! snapchain's stores (`OnchainEventStore`, `LinkStore`, `ReactionStore`,
-//! `CastStore`); tests use [`InMemoryReader`].
+//! Read via the [`SnapchainStateReader`] trait. Production wires this
+//! to the node's stores; tests use [`InMemoryReader`].
 //!
 //! ## Outputs
 //!
 //! - One [`MarketReward`] per work market, listing `(fid, amount)`.
-//! - A trust map: `BTreeMap<u64, f64>` of fid → trust_score.
+//! - A trust map: `BTreeMap<u64, u32>` of fid → `trust_fp`.
+//! - The per-FID eligibility flags ([`Eligibility`], bit-packed F0–F6).
 //!
 //! ## Quick start
 //!
@@ -57,8 +68,12 @@
 //! let out = evaluate_epoch(&r, /*epoch=*/ 1, now, &seeds, &params).unwrap();
 //! assert_eq!(out.epoch, 1);
 //! assert_eq!(out.markets.len(), 3);
-//! // The threshold-signed output is what every validator agrees on.
+//! // Trust is 6-decimal fixed point: floor(trust · 10^6).
+//! assert_eq!(out.trust_snapshot[&1], 1_000_000);
 //! ```
+
+#![deny(clippy::float_arithmetic)]
+#![deny(clippy::disallowed_types)]
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -67,16 +82,81 @@ pub mod app_pow;
 pub mod da_pow;
 pub mod eligibility;
 pub mod fees;
+pub mod fixed;
 pub mod metrics;
 pub mod reader;
 pub mod scoring;
 pub mod uniqueness;
 
+#[cfg(test)]
+mod equivalence_test;
+#[cfg(test)]
+mod golden_test;
+#[cfg(test)]
+mod reference_f64;
+#[cfg(test)]
+mod v6_reproduction_test;
+
+pub use fixed::Exponent;
 pub use reader::{InMemoryReader, SnapchainStateReader};
 
-/// Three work markets per FIP-proof-of-work-tokenization §C-2. Mirrors
-/// `proto::WorkMarket` so the in-protocol output can be serialized into
-/// `HyperRewardIssuance` proto.
+/// FIP §8.2.1 `SEED_MAX_FID`: the EigenTrust seed cohort is every
+/// registered FID `≤ SEED_MAX_FID`. A fixed protocol constant. The
+/// crate takes the seed set as an input; callers build it with this
+/// constant.
+pub const SEED_MAX_FID: u64 = 50_000;
+
+/// FIP §8.2.2 `EIGENTRUST_ITERATIONS`: exactly this many iterations,
+/// no convergence test.
+pub const EIGENTRUST_ITERATIONS: u32 = 30;
+
+/// FIP §8.2.2 `EIGENTRUST_DAMPING = 0.85`, applied as
+/// `d · x = floor(x · 85 / 100)` (§8.5).
+pub const EIGENTRUST_DAMPING_NUM: u128 = 85;
+/// Denominator of [`EIGENTRUST_DAMPING_NUM`].
+pub const EIGENTRUST_DAMPING_DEN: u128 = 100;
+
+/// FIP §8.2.3 `EIGENTRUST_NORM_TOP_N`.
+pub const EIGENTRUST_NORM_TOP_N: usize = 100;
+
+/// FIP §6.1 / §15 `CREDITER_TRUST_FLOOR`: a crediter contributes only
+/// if `trust_fp ≥ 100` (trust ≥ 0.0001). The same floor gates the F5
+/// new-user count (engagers with `trust_fp < 100`) and the F5 trust
+/// escape (`trust_fp(f) ≥ 100`) of §8.3.
+pub const CREDITER_TRUST_FLOOR_FP: u32 = 100;
+
+/// FIP §6.2 / §15 `REAL_NEW_USER_WINDOW`: 30 days of new-user events, then
+/// `VOUCH_GRACE_EPOCHS` (12) epochs of 5 days to reach the crediter floor.
+pub const REAL_NEW_USER_WINDOW_SECS: u64 = 90 * 24 * 3600;
+
+/// FIP §8.4 / §15 `STAKE_MATURITY_AMOUNT` in micro-units (7.405867
+/// tokens): credibility stake + vouch stake received at or above this
+/// amount saturates `stake_factor` at 1.0.
+pub const STAKE_MATURITY_AMOUNT: u64 = 7_405_867;
+
+/// FIP §6.7 / §15 `VOUCH_MATURITY_AMOUNT` in micro-units (250 tokens):
+/// a vouch stake at or above this amount gives the full vouch boost.
+pub const VOUCH_MATURITY_AMOUNT: u64 = 250_000_000;
+
+/// FIP §6.7 / §15 `MAX_VOUCH_STAKE`. Enforced by the token runtime on
+/// `TOKEN_STAKE`, not by the scoring crate (the boost saturates at
+/// [`VOUCH_MATURITY_AMOUNT`] anyway). Exported for the glue.
+pub const MAX_VOUCH_STAKE: u64 = VOUCH_MATURITY_AMOUNT;
+
+/// FIP §6.7 / §15 `VOUCH_BOOST_MAX = 1`, in 6-decimal fixed point.
+pub const VOUCH_BOOST_MAX_FP: u64 = 1_000_000;
+
+/// FIP §2 / §15 `AGE_MATURITY_SECONDS` (180 days).
+pub const AGE_MATURITY_SECONDS: u64 = 15_552_000;
+
+/// FIP §4.3 / §15 `EPOCH_LENGTH` in shard-0 blocks.
+pub const EPOCH_LENGTH: u64 = 36_000;
+
+/// FIP §8.3 / §15 `NEW_USER_SHARE_ABSOLUTE_FLOOR = 0.10` (6-dp).
+pub const NEW_USER_SHARE_ABSOLUTE_FLOOR_FP: u64 = 100_000;
+
+/// Three work markets per FIP §5–§7. Mirrors `proto::WorkMarket` so the
+/// in-protocol output can be serialized into the reward issuance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum WorkMarket {
     DataAvailability = 1,
@@ -96,151 +176,103 @@ impl WorkMarket {
     }
 }
 
-/// Composite formula tunables (the same `k`, `j`, `p`, `q`, `g` from
-/// `retro_rewards_finalize`). Defaults match the calibrated values that
-/// produced the v6 retro distribution: `k=4, j=0.5, p=3, q=0.5, g=0.5,
-/// epsilon=0.001`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Scoring tunables. Defaults are the FIP §15 values. Every validator
+/// must run with identical values. All real-valued fields are 6-decimal
+/// fixed point (`_fp` suffix: `1.0 = 1_000_000`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScoringParams {
-    pub credibility_exponent: f64,     // k
-    pub trust_exponent: f64,           // j
-    pub ring_symmetry_exponent: f64,   // p
-    pub new_user_share_exponent: f64,  // q
-    pub new_user_share_smoothing: f64, // ε
-    pub growth_exponent: f64,          // g
+    /// §6.2 `CREDIBILITY_EXPONENT` (default `Int(4)`).
+    pub credibility_exponent: Exponent,
+    /// §6.2 `TRUST_EXPONENT` (default `Half`).
+    pub trust_exponent: Exponent,
+    /// §6.2 `RING_SYMMETRY_EXPONENT` (default `Int(3)`).
+    pub ring_symmetry_exponent: Exponent,
+    /// §6.2 `NEW_USER_SHARE_EXPONENT` (default `Half`).
+    pub new_user_share_exponent: Exponent,
+    /// §6.2 `NEW_USER_SHARE_EPSILON` (default 0.001 = `1_000`).
+    pub new_user_share_epsilon_fp: u64,
+    /// §6.2 `GROWTH_EXPONENT` (default `Half`).
+    pub growth_exponent: Exponent,
+    /// §6.2 `REAL_NEW_USER_WINDOW` in seconds: the composite's new-user
+    /// share counts the new-user events of engagers at or above the
+    /// crediter floor whose `effective_ts` is at most this long before
+    /// `now`. `None` is the v6 rule of the retro (§10): the composite uses
+    /// the F5 share, from engagers below the floor.
+    pub real_new_user_window_secs: Option<u64>,
 
-    /// Crediter-side trust gate for growth contributions. Crediters
-    /// whose trust is below this floor contribute zero to anyone's
-    /// growth (sybil rings land here).
-    pub crediter_trust_threshold: f64,
-
-    /// Per-market budget for one epoch's emission, denominated in the
-    /// canonical 18-decimal protocol-token unit. Each market is split
-    /// across eligible FIDs in proportion to their composite scores.
+    /// Per-market budget for one epoch's emission, in token base units
+    /// (micro-units, §12). Each market is split per its own reward
+    /// function (§5.4, §6.2, §7.4). If a market's total weight
+    /// (Σ composite, Σ score_int, Σ app_work) is 0, its budget for the
+    /// epoch is not minted and does not roll over.
     pub market_budgets: BTreeMap<WorkMarket, u128>,
 
     /// FIP §8.3 eligibility filter parameters.
     pub eligibility: EligibilityParams,
 
-    /// FIP §7 App-PoW signed-receipt action weight. Per spec the
-    /// receipt action weight is `0.5` — each receipt contributes
-    /// `receipt_weight × credibility(user)` to `app_work`.
-    pub app_pow_receipt_weight: f64,
+    /// §7.2 `APP_RECEIPT_WEIGHT` (default 0.5 = `500_000`).
+    pub app_pow_receipt_weight_fp: u64,
 
-    /// FIP §7c App-PoW miniapp-add action weight. Per spec the
-    /// MiniappAdd action weight is `5.0` (10× receipt weight) — a
-    /// user adding the miniapp to their personal collection is a
-    /// stronger engagement signal than a single interaction
-    /// receipt.
-    pub app_pow_add_weight: f64,
+    /// §7.2 `APP_ADD_WEIGHT` (default 5.0 = `5_000_000`).
+    pub app_pow_add_weight_fp: u64,
 
-    /// FIP §7 App-PoW per-app per-epoch maximum atoms. `0` means
-    /// "no cap" (a single app could in principle take the entire
-    /// AppUsage budget if it has all the work). When non-zero,
-    /// `min(raw_share, app_pow_max_per_epoch_atoms)` clips per
-    /// app; excess atoms remain unminted (matches the FIP §7.4
-    /// `min(...)` semantics — excess does NOT redistribute).
+    /// §7.4 `MAX_APP_REWARD_PER_EPOCH` in token base units. `0` means
+    /// "no cap". When non-zero, `min(raw, cap)` per app; the excess is
+    /// not minted and does NOT redistribute.
     pub app_pow_max_per_epoch_atoms: u128,
 
-    /// FIP §5 DA-PoW number of challenges issued to each
-    /// validator per epoch. Score numerator is the validator's
-    /// answered count; denominator is this constant. All
-    /// validators MUST agree on this number for the in-protocol
-    /// reward output to be byte-identical.
+    /// §5.1 / §15 `DA_CHALLENGES_PER_EPOCH`. Denominator of the
+    /// answered ratio.
     pub da_pow_challenges_per_epoch: u32,
 
-    /// FIP §12 vouch-boost trust gate: the §5d vouch multiplier
-    /// (`1 + stake_factor`) is only applied when the vouchee's
-    /// own `trust_score` reaches this floor. Below the floor the
-    /// boost stays at `1.0` regardless of staked atoms. Closes
-    /// the puppet-sybil pump where a high-trust voucher amplifies
-    /// their own engagement with a low-trust sybil. `0.0`
-    /// disables the gate (any vouch boosts unconditionally).
-    pub vouch_boost_min_vouchee_trust: f64,
-
-    /// F009: per-crediter contribution cap (DEPRECATED — inert for
-    /// dense rings; superseded by `min_distinct_crediters` + sqrt
-    /// damping). Retained for config compat; no longer evaluated.
-    pub max_growth_fraction_per_crediter: f64,
-
-    /// F009: minimum number of distinct reciprocating crediters
-    /// required for any growth contribution. Below this count,
-    /// growth is zero — a 2-person sybil pair gets nothing.
-    /// Default 3.
+    /// §6.1 `MIN_DISTINCT_CREDITERS` (F009 layer 1): growth is zero
+    /// below this crediter count. Default 3.
     pub min_distinct_crediters: usize,
 
-    /// F009 L2 (distribution-aware): exponent for the
-    /// distribution-skew damping over per-crediter contributions.
-    /// The retro reward algorithm uses Shannon entropy raised to
-    /// `ring_symmetry_exponent` on `engager_entropy *
-    /// interaction_entropy` (see `compute_composite`). The
-    /// symmetric construction here computes the normalized entropy
-    /// of the per-crediter growth contributions and damps the
-    /// growth sum by `(1 - H_norm)^growth_distribution_skew_exponent`:
-    /// a real user's contributions are skewed (one heavy crediter
-    /// dominates → low entropy → low penalty) while a sybil ring's
-    /// contributions are uniform (high entropy → heavy penalty,
-    /// approaching zero growth as the distribution becomes
-    /// perfectly flat).
-    ///
-    /// Default 2.0: tightens the prior count-only `sqrt(n)/n`
-    /// damping with distribution-awareness while leaving small,
-    /// naturally-uniform legitimate clusters (≤ `min_distinct_crediters`
-    /// reciprocating friends) gated by L1 rather than L2. Set to 0
-    /// to recover the count-only behavior.
-    pub growth_distribution_skew_exponent: f64,
+    /// §6.1 `GROWTH_SKEW_EXPONENT` (F009 layer 2): integer exponent of
+    /// `(1 − H)` in the skew damping. Default 2. `0` disables the skew
+    /// damping (factor 1.0).
+    pub growth_distribution_skew_exponent: u32,
 
-    /// F009 L2 fairness floor (R6 audit caveat): minimum value the
-    /// distribution-damping factor is clamped to before composing
-    /// with `sqrt(n)/n`. Without a floor, perfectly uniform
-    /// per-crediter contributions (entropy = 1.0) drive the
-    /// `(1 - H_norm)^exp` factor to exactly 0 — which correctly
-    /// zeroes a sybil ring but ALSO zeroes a legitimate popular
-    /// account whose many real fans engage at similar magnitudes
-    /// (creator with equal-weight engaged community). The audit
-    /// flagged this as a fairness/false-positive concern, not a
-    /// security hole (L0 — the `crediter_trust_threshold` — is the
-    /// real sybil gate; sybil rings are killed there). Clamping to
-    /// a small floor preserves a fraction of growth for the
-    /// uniform-legit case while keeping L2 effective as a backstop
-    /// for rings that somehow corrupt the trust graph past L0.
-    ///
-    /// Default 0.05 (5%): a uniform-distribution legit user with N
-    /// crediters keeps `raw_sum × sqrt(N)/N × 0.05` of their growth
-    /// (≈0.7% of raw for N=50, ≈0.5% for N=100) — small but
-    /// non-zero. Set to 0.0 to reproduce the strict R6 behavior
-    /// (uniform → 0).
-    pub growth_distribution_min_damping: f64,
+    /// §6.1 `GROWTH_MIN_DAMPING` (F009 layer 2 floor): the skew damping
+    /// is `max((1 − H)^exp, floor)`. Default 0.05 = `50_000`.
+    pub growth_distribution_min_damping_fp: u64,
+
+    /// §17.2 `PIVOT_HEIGHT_0`: height of the shard-0 pivot block (the
+    /// boundary block of epoch 1). Fixed in the release; the default 0
+    /// is a placeholder for tests and devnets.
+    pub pivot_height_0: u64,
+
+    /// §4.3 `EPOCH_LENGTH` in shard-0 blocks. Used for the epoch
+    /// boundary height and as the DA uptime denominator. Default
+    /// 36 000. `0` disables the DA uptime factor (tests only).
+    pub epoch_length_blocks: u64,
 }
 
-/// FIP §8.3 calibration + threshold knobs. Defaults match the
-/// values in the FIP spec.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// FIP §8.3 calibration + threshold knobs. Defaults match §15.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EligibilityParams {
-    /// F0: app detection. An FID is treated as an app (and
-    /// excluded from Growth) when at least `app_threshold` other
-    /// FIDs name it as their `requestFid` in signer metadata.
+    /// F0: an FID with `max(signer_authorizations, clustered,
+    /// miniapp_author_count) ≥ app_threshold` is an app.
     pub app_threshold: u32,
 
-    /// F2: minimum distinct other-FIDs whose reaction/reply
-    /// engagement reaches this FID.
+    /// F2: minimum distinct other-FIDs whose engagement reaches this FID.
     pub min_engagers: u32,
 
-    /// Calibration cohort: minimum post-transfer cast count for
-    /// inclusion in the percentile-threshold computation for
-    /// F3/F5/F6.
+    /// Calibration cohort: minimum post-transfer cast count.
     pub calibration_min_casts: u32,
 
     /// Calibration cohort: minimum distinct active days.
     pub calibration_min_active_days: u32,
 
-    /// Lower-tail percentile used to calibrate F3/F4/F6 thresholds.
-    /// FIDs at or above the percentile pass. F5 uses
-    /// `1.0 - threshold_percentile` (the upper tail).
-    pub threshold_percentile: f64,
+    /// `THRESHOLD_PERCENTILE` (6-dp, default 0.10 = `100_000`) for
+    /// F3/F4/F6. F5 uses the upper tail `1 − THRESHOLD_PERCENTILE`.
+    pub threshold_percentile_fp: u64,
 
-    /// F4 is optional per FIP §8.3 — off by default. Enable to
-    /// require engagement-per-cast above the calibration percentile.
+    /// F5 `NEW_USER_SHARE_ABSOLUTE_FLOOR` (6-dp, default 0.10).
+    pub new_user_share_absolute_floor_fp: u64,
+
+    /// F4 is optional per FIP §8.3 — off by default.
     pub enable_f4: bool,
 }
 
@@ -251,17 +283,17 @@ impl Default for EligibilityParams {
             min_engagers: 3,
             calibration_min_casts: 10,
             calibration_min_active_days: 5,
-            threshold_percentile: 0.10,
+            threshold_percentile_fp: 100_000,
+            new_user_share_absolute_floor_fp: NEW_USER_SHARE_ABSOLUTE_FLOOR_FP,
             enable_f4: false,
         }
     }
 }
 
-/// FIP §8.3 bit-packed eligibility flags, one bit per filter.
-/// Bit 0 = F0, bit 1 = F1, …, bit 6 = F6. `passes_all()` returns
-/// true iff every *enabled* filter bit is set. F4 is always
-/// considered "enabled" in the mask; when disabled the runner
-/// auto-passes the bit so the equality check still holds.
+/// FIP §8.3 / §8.5 bit-packed eligibility flags, one bit per filter.
+/// Bit 0 = F0, bit 1 = F1, …, bit 6 = F6. This is the `u8` stored under
+/// `RootPrefix::HyperEligibility`. `passes_all()` is true iff every bit
+/// is set; a disabled F4 auto-passes its bit.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Eligibility(pub u8);
 
@@ -305,73 +337,29 @@ impl Default for ScoringParams {
         budgets.insert(WorkMarket::Growth, 0);
         budgets.insert(WorkMarket::AppUsage, 0);
         Self {
-            credibility_exponent: 4.0,
-            trust_exponent: 0.5,
-            ring_symmetry_exponent: 3.0,
-            new_user_share_exponent: 0.5,
-            new_user_share_smoothing: 0.001,
-            growth_exponent: 0.5,
-            // F009 fix: ship a non-zero floor so noise-floor accounts
-            // (typical sybil-ring members, whose EigenTrust mass is
-            // ~10^-3 against the top-N anchor) don't contribute to
-            // anyone else's Growth credit. The threshold is well
-            // below the typical real-user score (>0.1 after age-
-            // adjustment), so legitimate engagement is unaffected.
-            crediter_trust_threshold: 0.05,
+            credibility_exponent: Exponent::Int(4),
+            trust_exponent: Exponent::Half,
+            ring_symmetry_exponent: Exponent::Int(3),
+            new_user_share_exponent: Exponent::Half,
+            new_user_share_epsilon_fp: 1_000,
+            growth_exponent: Exponent::Half,
+            real_new_user_window_secs: Some(REAL_NEW_USER_WINDOW_SECS),
             market_budgets: budgets,
             eligibility: EligibilityParams::default(),
-            app_pow_receipt_weight: 0.5,
-            app_pow_add_weight: 5.0,
+            app_pow_receipt_weight_fp: 500_000,
+            app_pow_add_weight_fp: 5_000_000,
             app_pow_max_per_epoch_atoms: 0,
             da_pow_challenges_per_epoch: 100,
-            // F013 fix: ship with a meaningful floor instead of 0.0.
-            // Below this trust score the vouch-stake multiplier
-            // (1 + stake_factor) stays at 1.0 regardless of staked
-            // atoms, so a high-trust voucher cannot amplify a fresh
-            // sybil's growth share. 0.3 is below the typical
-            // mid-tier user's trust score but well above the noise
-            // floor where new accounts land.
-            vouch_boost_min_vouchee_trust: 0.3,
-            // F009 fix: cap any single crediter's contribution to a
-            // recipient's growth at 5% of the total. A 100-member
-            // sybil ring where every node reciprocates every other
-            // node gives each member (N-1) crediters. Without the
-            // cap each crediter contributes ~1/(N-1) ≈ 1% and the
-            // ring saturates budget. With the cap at 0.05, each
-            // crediter contributes at most 5%, so legitimate users
-            // with diverse engagement outcompete a homogeneous ring.
-            max_growth_fraction_per_crediter: 0.05,
             min_distinct_crediters: 3,
-            // F009 L2: distribution-aware sybil-ring damping.
-            // Mirrors `ring_symmetry_exponent = 3.0` (used on
-            // `engager_entropy * interaction_entropy` in
-            // `compute_composite`); the growth-side construction
-            // applies an analogous `(1 - normalized_entropy)^k`
-            // factor over the per-crediter contributions, so a
-            // ring's uniformly-distributed contributions damp
-            // toward zero while a real user's skewed distribution
-            // keeps most of the growth sum. 2.0 is the default
-            // because the growth damping composes multiplicatively
-            // with the count-based sqrt-damping; a lower exponent
-            // there gives the same effective tightness as the
-            // composite's 3.0 acting alone.
-            growth_distribution_skew_exponent: 2.0,
-            // F009 L2 fairness floor (R6 audit caveat): without this,
-            // perfectly uniform contributions zero out — penalizing
-            // a legit creator with equal-weight engaged fans
-            // identically to a sybil ring. Clamping to 5% keeps L2
-            // effective as backstop (sybils get
-            // `0.05 × sqrt(N)/N ≈ 0.5%` of raw_sum at N=100, on top
-            // of being killed by L0) while preserving a small slice
-            // of growth for uniform-engagement legitimate users.
-            growth_distribution_min_damping: 0.05,
+            growth_distribution_skew_exponent: 2,
+            growth_distribution_min_damping_fp: 50_000,
+            pivot_height_0: 0,
+            epoch_length_blocks: EPOCH_LENGTH,
         }
     }
 }
 
-/// Per-FID reward in a single market. Rewards are integer amounts; the
-/// scoring path handles the float→int conversion at the renormalization
-/// step with deterministic rounding.
+/// Per-FID reward in a single market, in token base units.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RewardEntry {
     pub fid: u64,
@@ -387,14 +375,20 @@ pub struct MarketReward {
     pub entries: Vec<RewardEntry>,
 }
 
-/// Output of [`scoring::evaluate_epoch`]: per-market rewards and a fresh
-/// trust snapshot. Both sides are part of what the active set
-/// threshold-signs.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// Output of [`scoring::evaluate_epoch`]: per-market rewards, the trust
+/// encodings and the eligibility flags. All of it is part of the
+/// `ScoringResult` that validators agree on (§8.5).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EpochScoringOutput {
     pub epoch: u64,
     pub markets: Vec<MarketReward>,
-    pub trust_snapshot: BTreeMap<u64, f64>,
+    /// fid → `trust_fp = floor(trust · 10^6)` (0–1 000 000), the `u32`
+    /// value stored under `RootPrefix::HyperTrustScore`.
+    pub trust_snapshot: BTreeMap<u64, u32>,
+    /// fid → bit-packed F0–F6 flags, the value stored under
+    /// `RootPrefix::HyperEligibility`. Also the input of the §6.7 vouch
+    /// evaluation.
+    pub eligibility: BTreeMap<u64, Eligibility>,
     /// `filter_pass_counts[i]` = FIDs setting bit `i` in their
     /// eligibility flags. Operator-side gauge.
     pub filter_pass_counts: [u64; 7],
@@ -404,6 +398,14 @@ pub struct EpochScoringOutput {
 pub enum ScoringError {
     #[error("snapchain reader: {0}")]
     Reader(String),
+}
+
+/// FIP §4.3 / §5.1 `boundary_height` of epoch `e ≥ 1`: the height of
+/// the first shard-0 block of the epoch,
+/// `PIVOT_HEIGHT_0 + (e − 1) · EPOCH_LENGTH`. Epoch 0 (pre-network, no
+/// Hypersnap blocks) maps to `PIVOT_HEIGHT_0`. Saturating.
+pub fn epoch_boundary_height(pivot_height_0: u64, epoch: u64, epoch_length: u64) -> u64 {
+    pivot_height_0.saturating_add(epoch.saturating_sub(1).saturating_mul(epoch_length))
 }
 
 /// Convenience: deterministically iterate FIDs in ascending order from a

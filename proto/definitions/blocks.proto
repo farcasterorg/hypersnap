@@ -3,7 +3,6 @@ syntax = "proto3";
 import "message.proto";
 import "username_proof.proto";
 import "onchain_event.proto";
-import "hyper.proto";
 
 // Common types
 
@@ -77,14 +76,18 @@ message FullProposal {
   oneof proposed_value {
     Block block = 4;
     ShardChunk shard = 5;
+    // From the epoch-1 pivot: an encoded `HypersnapBlock` (hypersnap.proto).
+    // Bytes, because hypersnap.proto imports this file.
+    bytes hypersnap_block = 6;
   }
 }
 
 message DecidedValue {
+  reserved 4;
   oneof value {
     Block block = 2;
     ShardChunk shard = 3;
-    HyperBlock hyper_block = 4;
+    bytes hypersnap_block = 5;  // From the epoch-1 pivot: an encoded `HypersnapBlock`
   }
 }
 

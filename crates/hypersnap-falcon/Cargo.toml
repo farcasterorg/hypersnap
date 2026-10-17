@@ -1,0 +1,24 @@
+[package]
+name = "hypersnap-falcon"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+description = "Falcon-512 (FN-DSA-512) user keys and the domain-separator registry for Hypersnap"
+
+[dependencies]
+# fn-dsa is pre-1.0. Its README says that releases before 1.0 can change the
+# key and signature encodings without backward compatibility. The encodings are
+# consensus data, so the version is pinned exactly. A change of this pin is a
+# hard fork (see README.md).
+fn-dsa = "=0.4.0"
+# For `codec::comp_decode`: strict signature decoding without a public key.
+# Must stay on the same version as fn-dsa.
+fn-dsa-comm = "=0.4.0"
+# Keccak-256 (Ethereum Keccak, not SHA3-256) for key IDs.
+sha3 = "0.10"
+zeroize = "1.8"
+
+[dev-dependencies]
+# rand_chacha 0.3 implements the rand_core 0.6 traits that fn-dsa 0.4 uses.
+rand_chacha = "0.3"
+hex = "0.4"

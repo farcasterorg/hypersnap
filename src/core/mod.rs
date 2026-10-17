@@ -1,3 +1,4 @@
+pub mod consensus_keys;
 pub mod error;
 pub mod message;
 pub mod types;

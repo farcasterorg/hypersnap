@@ -40,12 +40,6 @@ pub enum SystemMessage {
 pub struct ValidatorSetConfig {
     pub effective_at: u64,
     pub validator_public_keys: Vec<String>,
-    /// Optional parallel array of BLS12-381 G1 public keys (hex-encoded, 48
-    /// bytes each). If non-empty, length must match `validator_public_keys`;
-    /// index `i` is validator `i`'s BLS key. Empty during the rollout phase
-    /// before BLS keys are registered.
-    #[serde(default)]
-    pub validator_bls_public_keys: Vec<String>,
     pub shard_ids: Vec<u32>,
 }
 
@@ -75,6 +69,20 @@ pub struct Config {
     pub sync_request_timeout: Duration,
     pub sync_status_update_interval: Duration,
     pub reconcile_heartbeat_event: u64,
+    /// Keep a shadow Keccak state trie per shard (plan R0, FIP §17.5). The
+    /// first start with this on runs a backfill in the background.
+    #[serde(default)]
+    pub shadow_trie: bool,
+    /// Run the content replay of each shard in the background (FIP §17.4):
+    /// the chunk history with no pruning, for the genesis state. It needs
+    /// the chunks from the first one. Without it, the node runs the replay
+    /// when it builds the genesis state.
+    #[serde(default)]
+    pub content_replay: bool,
+    /// Stop at this `PIVOT_HEIGHT` instead of the release value (FIP §17.2).
+    /// For pivot rehearsals and devnets; 0 = the release value.
+    #[serde(default)]
+    pub pivot_height_override: u64,
 }
 
 impl Config {
@@ -101,6 +109,9 @@ impl Config {
             sync_request_timeout: self.sync_request_timeout,
             sync_status_update_interval: self.sync_status_update_interval,
             reconcile_heartbeat_event: self.reconcile_heartbeat_event,
+            shadow_trie: self.shadow_trie,
+            content_replay: self.content_replay,
+            pivot_height_override: self.pivot_height_override,
         }
     }
 
@@ -115,7 +126,6 @@ impl Config {
             return vec![ValidatorSetConfig {
                 effective_at: 0,
                 validator_public_keys: addresses.clone(),
-                validator_bls_public_keys: vec![],
                 shard_ids: vec![shard_id],
             }];
         }
@@ -178,6 +188,9 @@ impl Default for Config {
             sync_request_timeout: Duration::from_secs(2),
             sync_status_update_interval: Duration::from_secs(10),
             reconcile_heartbeat_event: 0,
+            shadow_trie: false,
+            content_replay: false,
+            pivot_height_override: 0,
         }
     }
 }
@@ -191,7 +204,6 @@ mod tests {
         ValidatorSetConfig {
             effective_at,
             validator_public_keys: keys.iter().map(|k| k.to_string()).collect(),
-            validator_bls_public_keys: vec![],
             shard_ids,
         }
     }

@@ -9,49 +9,47 @@
 //! are anchored to "typical active users" rather than the noise
 //! floor or the seed cohort.
 //!
+//! All metrics and thresholds are 6-decimal fixed point (§8.5), so the
+//! comparisons are exact integer comparisons.
+//!
 //! Determinism: every reduction walks a `BTreeMap` in ascending FID
-//! order; the cohort vector is sorted before percentile lookup;
-//! ties are resolved by the deterministic vector index after sort.
+//! order; the cohort vector is sorted before percentile lookup.
 
+use crate::fixed::{FP_ONE, FP_SCALE};
 use crate::metrics::FidMetrics;
-use crate::{Eligibility, EligibilityParams};
+use crate::{Eligibility, EligibilityParams, CREDITER_TRUST_FLOOR_FP};
 use std::collections::BTreeMap;
 
-/// Calibrated thresholds for the data-derived filters. Computed
-/// once per epoch by [`compute_thresholds`] over the calibration
-/// cohort. Exposed publicly so callers (canonical encoders,
-/// debugging surfaces) can record them alongside the
-/// per-FID flags.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+/// Calibrated thresholds for the data-derived filters (6-decimal fixed
+/// point). Computed once per epoch by [`compute_thresholds`] over the
+/// calibration cohort.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EligibilityThresholds {
-    /// Lower-tail threshold for F3 (engager entropy). Pass if
-    /// `engager_entropy ≥ engager_entropy`.
-    pub engager_entropy: f64,
-    /// Lower-tail threshold for F4 (engagement per cast). Only
-    /// consulted when `EligibilityParams::enable_f4`.
-    pub engagement_per_cast: f64,
-    /// Upper-tail threshold for F5 (new-user engagement share).
-    /// Pass if `new_user_engagement_share < new_user_share`.
-    pub new_user_share: f64,
-    /// Lower-tail threshold for F6 (replies per cast). Pass if
-    /// `replies_per_cast ≥ replies_per_cast`.
-    pub replies_per_cast: f64,
-    /// Size of the cohort used to derive the above thresholds.
-    /// Reported for diagnostics; an empty cohort means thresholds
-    /// fall to 0 and the corresponding filters effectively pass
-    /// everyone (handled by the percentile function below).
+    /// F3 lower-tail threshold: pass if `engager_entropy ≥` this.
+    pub engager_entropy_fp: u64,
+    /// F4 lower-tail threshold (only when `enable_f4`).
+    pub engagement_per_cast_fp: u64,
+    /// F5 upper-tail threshold `T5`: one of the F5 pass conditions is
+    /// `new_user_share < T5`.
+    pub new_user_share_fp: u64,
+    /// F6 lower-tail threshold: pass if `replies_per_cast ≥` this.
+    pub replies_per_cast_fp: u64,
+    /// Size of the calibration cohort. An empty cohort gives all-zero
+    /// thresholds.
     pub cohort_size: usize,
 }
 
-/// Sort `values` ascending and return the value at fractional
-/// `percentile` ∈ [0, 1]. Mirrors `cohort_percentile_threshold` in
-/// the retro tool; deterministic for equal inputs.
-fn percentile_value(mut values: Vec<f64>, percentile: f64) -> f64 {
+/// §8.3: sort the `N` values ascending; the percentile `P` is the value
+/// at index `floor(N · P)` (the last value if past the end; 0 for an
+/// empty cohort). `percentile_fp` is 6-decimal fixed point.
+pub fn percentile_value(mut values: Vec<u64>, percentile_fp: u64) -> u64 {
     if values.is_empty() {
-        return 0.0;
+        return 0;
     }
-    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let idx = (values.len() as f64 * percentile) as usize;
+    values.sort_unstable();
+    let p = u128::from(percentile_fp.min(FP_ONE));
+    let idx = (values.len() as u128).saturating_mul(p) / FP_SCALE;
+    let idx = usize::try_from(idx).unwrap_or(usize::MAX);
     values[idx.min(values.len() - 1)]
 }
 
@@ -61,9 +59,9 @@ fn in_calibration_cohort(m: &FidMetrics, p: &EligibilityParams) -> bool {
 }
 
 /// Compute the data-derived thresholds for F3/F4/F5/F6 from the
-/// calibration cohort. F5 uses the upper-tail
-/// `1.0 - threshold_percentile`. Returns zeros for an empty
-/// cohort.
+/// calibration cohort. F5 uses the upper tail `1 − THRESHOLD_PERCENTILE`.
+/// Requires the trust-gated new-user share
+/// ([`crate::metrics::apply_new_user_share`]).
 pub fn compute_thresholds(
     metrics: &BTreeMap<u64, FidMetrics>,
     p: &EligibilityParams,
@@ -72,43 +70,53 @@ pub fn compute_thresholds(
         .values()
         .filter(|m| in_calibration_cohort(m, p))
         .collect();
-    let cohort_size = cohort.len();
-    let pct = p.threshold_percentile.clamp(0.0, 1.0);
-    let upper = (1.0 - pct).clamp(0.0, 1.0);
+    let pct = p.threshold_percentile_fp.min(FP_ONE);
+    let upper = FP_ONE - pct;
     EligibilityThresholds {
-        engager_entropy: percentile_value(cohort.iter().map(|m| m.engager_entropy).collect(), pct),
-        engagement_per_cast: percentile_value(
-            cohort.iter().map(|m| m.engagement_per_cast).collect(),
+        engager_entropy_fp: percentile_value(
+            cohort.iter().map(|m| m.engager_entropy_fp).collect(),
             pct,
         ),
-        new_user_share: percentile_value(
-            cohort.iter().map(|m| m.new_user_engagement_share).collect(),
+        engagement_per_cast_fp: percentile_value(
+            cohort.iter().map(|m| m.engagement_per_cast_fp).collect(),
+            pct,
+        ),
+        new_user_share_fp: percentile_value(
+            cohort
+                .iter()
+                .map(|m| m.new_user_engagement_share_fp)
+                .collect(),
             upper,
         ),
-        replies_per_cast: percentile_value(
-            cohort.iter().map(|m| m.replies_per_cast).collect(),
+        replies_per_cast_fp: percentile_value(
+            cohort.iter().map(|m| m.replies_per_cast_fp).collect(),
             pct,
         ),
-        cohort_size,
+        cohort_size: cohort.len(),
     }
 }
 
+/// §8.3 F5: passes if one or more of
+/// - `new_user_share < T5`,
+/// - `new_user_share < NEW_USER_SHARE_ABSOLUTE_FLOOR`,
+/// - `trust_fp ≥ CREDITER_TRUST_FLOOR_FP` (trust ≥ 0.0001).
+pub fn f5_passes(m: &FidMetrics, p: &EligibilityParams, t: &EligibilityThresholds) -> bool {
+    m.new_user_engagement_share_fp < t.new_user_share_fp
+        || m.new_user_engagement_share_fp < p.new_user_share_absolute_floor_fp
+        || m.trust_fp >= CREDITER_TRUST_FLOOR_FP
+}
+
 /// Apply the seven filters to a single FID. F4 auto-passes when
-/// `enable_f4` is false so the all-bits-set mask still holds for
-/// the disabled-F4 default.
+/// `enable_f4` is false so the all-bits-set mask still holds.
 pub fn classify_one(
     m: &FidMetrics,
     p: &EligibilityParams,
     t: &EligibilityThresholds,
 ) -> Eligibility {
     let mut flags = Eligibility::default();
-    // F0 (app detection): trips if ANY of the available signals
-    // is at-or-above the threshold. Three signals composed:
-    //   - signer_authorizations: managed-signer flow (gasless + on-chain)
-    //   - signer_authorizations_clustered: aggregated over shared-custody
-    //     FIDs (threat-model #295 anti-fragmentation)
-    //   - miniapp_author_count: self-declared via MiniappRegister
-    //     (threat-model #296 — direct-sign-app catcher)
+    // F0 (app detection): trips if ANY of the app signals reaches the
+    // threshold (signer authorizations, clustered over shared custody
+    // — #295 — and authored miniapps — #296).
     let max_app_signal = m
         .signer_authorizations
         .max(m.signer_authorizations_clustered)
@@ -116,29 +124,23 @@ pub fn classify_one(
     flags.set(0, max_app_signal < p.app_threshold);
     flags.set(1, m.total_casts > 0);
     flags.set(2, m.unique_engagers >= p.min_engagers);
-    flags.set(3, m.engager_entropy >= t.engager_entropy);
+    flags.set(3, m.engager_entropy_fp >= t.engager_entropy_fp);
     flags.set(
         4,
         if p.enable_f4 {
-            m.engagement_per_cast >= t.engagement_per_cast
+            m.engagement_per_cast_fp >= t.engagement_per_cast_fp
         } else {
             true
         },
     );
-    // Use `<=` not `<` so FIDs with zero new-user engagement still
-    // pass when the calibration cohort yields a zero threshold
-    // (e.g. tiny universes where everyone is older than the
-    // new-user window). Spam farms with high new_user_share are
-    // still filtered because their share strictly exceeds any
-    // non-zero threshold.
-    flags.set(5, m.new_user_engagement_share <= t.new_user_share);
-    flags.set(6, m.replies_per_cast >= t.replies_per_cast);
+    flags.set(5, f5_passes(m, p, t));
+    flags.set(6, m.replies_per_cast_fp >= t.replies_per_cast_fp);
     flags
 }
 
-/// Compute eligibility for every FID in `metrics`. Returns the
-/// per-FID bit-packed flags alongside the thresholds used (caller
-/// may want both for canonical encoding).
+/// Compute eligibility for every FID in `metrics`. Requires `trust_fp`
+/// and the trust-gated new-user share. Returns the per-FID flags and
+/// the thresholds used.
 pub fn compute_eligibility(
     metrics: &BTreeMap<u64, FidMetrics>,
     p: &EligibilityParams,
@@ -163,11 +165,11 @@ mod tests {
         m.total_casts = 50;
         m.active_days = 10;
         m.unique_engagers = 5;
-        m.engager_entropy = 0.5;
-        m.new_user_engagement_share = 0.05;
+        m.engager_entropy_fp = 500_000;
+        m.new_user_engagement_share_fp = 50_000;
         m.replies_received = 25;
-        m.replies_per_cast = 0.5;
-        m.engagement_per_cast = 1.2;
+        m.replies_per_cast_fp = 500_000;
+        m.engagement_per_cast_fp = 1_200_000;
         m
     }
 
@@ -176,24 +178,31 @@ mod tests {
         let metrics: BTreeMap<u64, FidMetrics> = BTreeMap::new();
         let p = EligibilityParams::default();
         let t = compute_thresholds(&metrics, &p);
-        assert_eq!(t.cohort_size, 0);
-        assert_eq!(t.engager_entropy, 0.0);
-        assert_eq!(t.engagement_per_cast, 0.0);
-        assert_eq!(t.new_user_share, 0.0);
-        assert_eq!(t.replies_per_cast, 0.0);
+        assert_eq!(t, EligibilityThresholds::default());
+    }
+
+    #[test]
+    fn percentile_index_is_floor_n_p() {
+        let v: Vec<u64> = (1..=9).collect();
+        assert_eq!(percentile_value(v.clone(), 100_000), 1); // floor(0.9) = 0
+        assert_eq!(percentile_value(v.clone(), 900_000), 9); // floor(8.1) = 8
+        assert_eq!(percentile_value(v.clone(), FP_ONE), 9); // past the end
+        let v: Vec<u64> = (1..=10).collect();
+        assert_eq!(percentile_value(v.clone(), 100_000), 2); // floor(1.0) = 1
+        assert_eq!(percentile_value(v, 900_000), 10); // floor(9.0) = 9
+        assert_eq!(percentile_value(Vec::new(), 500_000), 0);
     }
 
     #[test]
     fn all_pass_yields_passes_all() {
-        // A FID alone in the cohort can never pass F5 (`<` against
-        // its own value). Build a 6-element cohort with diverse
-        // shares so the upper-tail threshold sits strictly above
-        // the target's share.
         let mut metrics = BTreeMap::new();
         metrics.insert(7, base_metrics(7));
-        for (i, share) in [0.10f64, 0.20, 0.30, 0.40, 0.50].iter().enumerate() {
+        for (i, share) in [100_000u64, 200_000, 300_000, 400_000, 500_000]
+            .iter()
+            .enumerate()
+        {
             let mut m = base_metrics(100 + i as u64);
-            m.new_user_engagement_share = *share;
+            m.new_user_engagement_share_fp = *share;
             metrics.insert(100 + i as u64, m);
         }
         let p = EligibilityParams::default();
@@ -216,37 +225,29 @@ mod tests {
         assert!(!elig.passes_all());
     }
 
-    /// Threat-model #295: F0 trips on the CLUSTERED signer-auth
-    /// count even when the individual count is below threshold —
-    /// fragmenting an app across many sub-FIDs doesn't help.
+    /// Threat-model #295: F0 trips on the CLUSTERED signer-auth count.
     #[test]
     fn f0_fails_when_clustered_signer_auths_at_threshold() {
         let mut metrics = BTreeMap::new();
         let mut m = base_metrics(7);
-        m.signer_authorizations = 30; // below threshold individually
-        m.signer_authorizations_clustered = 100; // cluster sums to threshold
+        m.signer_authorizations = 30;
+        m.signer_authorizations_clustered = 100;
         metrics.insert(7, m);
         let p = EligibilityParams::default();
         let (e, _) = compute_eligibility(&metrics, &p);
-        let elig = e.get(&7).copied().unwrap();
-        assert!(!elig.get(0), "F0 must fail on clustered signal");
+        assert!(!e[&7].get(0), "F0 must fail on clustered signal");
     }
 
-    /// Threat-model #296: F0 trips when the FID has registered
-    /// miniapps (direct-sign app catcher), even with zero signer
-    /// authorizations of either flavor.
+    /// Threat-model #296: F0 trips when the FID has registered miniapps.
     #[test]
     fn f0_fails_when_fid_authored_miniapps_at_threshold() {
         let mut metrics = BTreeMap::new();
         let mut m = base_metrics(7);
-        m.signer_authorizations = 0;
-        m.signer_authorizations_clustered = 0;
-        m.miniapp_author_count = 100; // self-declared as app
+        m.miniapp_author_count = 100;
         metrics.insert(7, m);
         let p = EligibilityParams::default();
         let (e, _) = compute_eligibility(&metrics, &p);
-        let elig = e.get(&7).copied().unwrap();
-        assert!(!elig.get(0), "F0 must fail on miniapp-author signal");
+        assert!(!e[&7].get(0), "F0 must fail on miniapp-author signal");
     }
 
     #[test]
@@ -254,16 +255,14 @@ mod tests {
         let mut metrics = BTreeMap::new();
         let mut m = base_metrics(7);
         m.total_casts = 0;
-        m.unique_engagers = 5;
         m.replies_received = 0;
-        m.replies_per_cast = 0.0;
-        m.engagement_per_cast = 0.0;
+        m.replies_per_cast_fp = 0;
+        m.engagement_per_cast_fp = 0;
         metrics.insert(7, m);
         let p = EligibilityParams::default();
         let (e, _) = compute_eligibility(&metrics, &p);
-        let elig = e.get(&7).copied().unwrap();
-        assert!(!elig.get(1));
-        assert!(!elig.passes_all());
+        assert!(!e[&7].get(1));
+        assert!(!e[&7].passes_all());
     }
 
     #[test]
@@ -274,147 +273,129 @@ mod tests {
         metrics.insert(7, m);
         let p = EligibilityParams::default();
         let (e, _) = compute_eligibility(&metrics, &p);
-        let elig = e.get(&7).copied().unwrap();
-        assert!(!elig.get(2));
-        assert!(!elig.passes_all());
+        assert!(!e[&7].get(2));
+        assert!(!e[&7].passes_all());
     }
 
     #[test]
     fn f3_uses_calibration_percentile() {
-        // Build a cohort with engager entropy values 0.1..0.9 in
-        // steps of 0.1. With THRESHOLD_PERCENTILE = 0.10, the 10th
-        // percentile (idx = 0.9 → 0) is 0.1. A target FID with
-        // engager_entropy = 0.05 fails F3.
+        // Cohort engager entropy 0.1..0.9; P10 index floor(0.9) = 0 →
+        // threshold 0.1. A target outside the cohort with 0.05 fails.
         let mut metrics = BTreeMap::new();
-        for (i, ent) in [0.1f64, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
-            .iter()
-            .enumerate()
-        {
-            let mut m = base_metrics(100 + i as u64);
-            m.engager_entropy = *ent;
-            // Ensure they're all in the cohort.
-            m.total_casts = 50;
-            m.active_days = 10;
-            metrics.insert(100 + i as u64, m);
+        for i in 0..9u64 {
+            let mut m = base_metrics(100 + i);
+            m.engager_entropy_fp = (i + 1) * 100_000;
+            metrics.insert(100 + i, m);
         }
-        // Target FID with very low entropy, OUTSIDE the
-        // calibration cohort so its own value doesn't influence
-        // the percentile.
         let mut target = base_metrics(7);
-        target.engager_entropy = 0.05;
+        target.engager_entropy_fp = 50_000;
         target.total_casts = 1;
         target.active_days = 1;
         metrics.insert(7, target);
 
         let p = EligibilityParams::default();
         let (e, t) = compute_eligibility(&metrics, &p);
-        // Calibration threshold ≈ 0.1 (the 10th percentile of the
-        // cohort, idx 0 after sort).
-        assert!(
-            (t.engager_entropy - 0.1).abs() < 1e-9,
-            "got {}",
-            t.engager_entropy
-        );
-        let target_e = e.get(&7).copied().unwrap();
-        assert!(!target_e.get(3), "low-entropy FID must fail F3");
-        // High-entropy cohort members all pass F3.
-        let high_e = e.get(&108).copied().unwrap();
-        assert!(high_e.get(3));
+        assert_eq!(t.engager_entropy_fp, 100_000);
+        assert!(!e[&7].get(3), "low-entropy FID must fail F3");
+        assert!(e[&108].get(3));
     }
 
     #[test]
     fn f5_uses_upper_tail_threshold() {
-        // Cohort of new_user_engagement_share values 0.01..0.09.
-        // Upper-tail threshold (90th percentile) ≈ 0.09. A target
-        // FID with share = 0.5 must fail F5; cohort members with
-        // 0.01 must pass.
+        // Cohort shares 0.01..0.09; P90 index floor(8.1) = 8 → 0.09.
         let mut metrics = BTreeMap::new();
-        for (i, share) in [0.01f64, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09]
-            .iter()
-            .enumerate()
-        {
-            let mut m = base_metrics(100 + i as u64);
-            m.new_user_engagement_share = *share;
-            metrics.insert(100 + i as u64, m);
+        for i in 0..9u64 {
+            let mut m = base_metrics(100 + i);
+            m.new_user_engagement_share_fp = (i + 1) * 10_000;
+            metrics.insert(100 + i, m);
         }
         let mut target = base_metrics(7);
-        target.new_user_engagement_share = 0.5;
+        target.new_user_engagement_share_fp = 500_000;
         target.total_casts = 1;
         target.active_days = 1;
         metrics.insert(7, target);
 
         let p = EligibilityParams::default();
         let (e, t) = compute_eligibility(&metrics, &p);
-        // Upper-tail percentile at 0.90 maps to idx=8 → value 0.09.
-        assert!(
-            (t.new_user_share - 0.09).abs() < 1e-9,
-            "got {}",
-            t.new_user_share
-        );
-        let target_e = e.get(&7).copied().unwrap();
-        assert!(!target_e.get(5));
-        let low = e.get(&100).copied().unwrap();
-        assert!(low.get(5));
+        assert_eq!(t.new_user_share_fp, 90_000);
+        assert!(!e[&7].get(5), "untrusted high-share FID fails F5");
+        assert!(e[&100].get(5));
+    }
+
+    /// N4: F5 has three pass conditions; `share < T5` is strict.
+    #[test]
+    fn f5_three_conditions() {
+        let p = EligibilityParams::default();
+        let t = EligibilityThresholds {
+            new_user_share_fp: 300_000,
+            ..Default::default()
+        };
+        let mut m = base_metrics(7);
+        m.trust_fp = CREDITER_TRUST_FLOOR_FP - 1;
+        // share < T5 → pass.
+        m.new_user_engagement_share_fp = 299_999;
+        assert!(f5_passes(&m, &p, &t));
+        // share == T5, above the absolute floor, untrusted → fail
+        // (strict `<`).
+        m.new_user_engagement_share_fp = 300_000;
+        assert!(!f5_passes(&m, &p, &t));
+        // Trust escape: trust_fp ≥ 100 passes regardless of share.
+        m.trust_fp = CREDITER_TRUST_FLOOR_FP;
+        m.new_user_engagement_share_fp = FP_ONE;
+        assert!(f5_passes(&m, &p, &t));
+        // Absolute floor: share < 0.10 passes even when T5 is lower.
+        m.trust_fp = 0;
+        let t_low = EligibilityThresholds {
+            new_user_share_fp: 10_000,
+            ..Default::default()
+        };
+        m.new_user_engagement_share_fp = 99_999;
+        assert!(f5_passes(&m, &p, &t_low));
+        m.new_user_engagement_share_fp = 100_000;
+        assert!(!f5_passes(&m, &p, &t_low));
     }
 
     #[test]
     fn f4_optional_bit_auto_passes_when_disabled() {
-        // engagement_per_cast = 0.0, cohort threshold > 0, but F4
-        // is disabled → bit auto-passes.
         let mut metrics = BTreeMap::new();
         let mut m = base_metrics(7);
-        m.engagement_per_cast = 0.0;
-        // Exclude target from calibration cohort so its own value
-        // doesn't anchor the threshold to 0.0.
+        m.engagement_per_cast_fp = 0;
         m.total_casts = 1;
         m.active_days = 1;
         metrics.insert(7, m);
-        // Add cohort with high engagement_per_cast so threshold > 0.
-        for i in 0..5 {
+        for i in 0..5u64 {
             let mut c = base_metrics(100 + i);
-            c.engagement_per_cast = 2.0 + i as f64;
+            c.engagement_per_cast_fp = 2_000_000 + i * FP_ONE;
             metrics.insert(100 + i, c);
         }
         let mut p = EligibilityParams::default();
         assert!(!p.enable_f4);
         let (e, _) = compute_eligibility(&metrics, &p);
-        let elig = e.get(&7).copied().unwrap();
-        assert!(elig.get(4), "F4 must auto-pass when disabled");
+        assert!(e[&7].get(4), "F4 must auto-pass when disabled");
 
-        // Enable F4 → target fails.
         p.enable_f4 = true;
         let (e2, _) = compute_eligibility(&metrics, &p);
-        let elig2 = e2.get(&7).copied().unwrap();
-        assert!(!elig2.get(4));
+        assert!(!e2[&7].get(4));
     }
 
     #[test]
     fn calibration_cohort_filters_by_activity_floors() {
-        // Two cohorts: one passes calibration criteria (high
-        // total_casts + active_days), one doesn't (low). The
-        // low-activity FIDs MUST be excluded from threshold
-        // computation.
         let mut metrics = BTreeMap::new();
-        // Active cohort with engager_entropy clustered at 0.5.
-        for i in 0..5 {
+        for i in 0..5u64 {
             let mut m = base_metrics(100 + i);
-            m.engager_entropy = 0.5;
+            m.engager_entropy_fp = 500_000;
             metrics.insert(100 + i, m);
         }
-        // Inactive accounts with very high entropy (1.0) — must
-        // NOT influence the threshold.
-        for i in 0..5 {
+        for i in 0..5u64 {
             let mut m = base_metrics(200 + i);
             m.total_casts = 1; // < CALIBRATION_MIN_CASTS = 10
             m.active_days = 1; // < CALIBRATION_MIN_ACTIVE_DAYS = 5
-            m.engager_entropy = 1.0;
+            m.engager_entropy_fp = FP_ONE;
             metrics.insert(200 + i, m);
         }
         let p = EligibilityParams::default();
         let t = compute_thresholds(&metrics, &p);
         assert_eq!(t.cohort_size, 5, "only the 5 active FIDs are in-cohort");
-        // Threshold is the 10th percentile of the active cohort
-        // (all 0.5) → 0.5, NOT influenced by the 1.0 inactives.
-        assert!((t.engager_entropy - 0.5).abs() < 1e-9);
+        assert_eq!(t.engager_entropy_fp, 500_000);
     }
 }

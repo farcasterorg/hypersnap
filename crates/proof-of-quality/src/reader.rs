@@ -1,21 +1,35 @@
-//! Deterministic read-only view over the snapchain state needed by the
-//! scoring pipeline.
+//! Deterministic read-only view over the state needed by the scoring
+//! pipeline.
 //!
-//! Production wires this to snapchain's stores (`OnchainEventStore`,
-//! `LinkStore`, `ReactionStore`, `CastStore`) at the snapchain anchor
-//! block. Tests use [`InMemoryReader`].
+//! Production wires this to the node's stores at the epoch boundary
+//! (FIP §17.7: the boundary state fixes the inputs). Tests use
+//! [`InMemoryReader`].
 //!
 //! The trait is intentionally narrow: every read needed by the scoring
 //! pipeline is enumerated here, so production wiring can be reviewed for
 //! "every validator returns the same thing for the same inputs."
+//!
+//! ## Post-transfer filter (FIP §8.1)
+//!
+//! Every engagement / follow input is post-transfer: an event with
+//! timestamp `ts` between FIDs `(a, b)` counts only if
+//! `ts > max(a.effective_ts, b.effective_ts)`. One-sided metrics (cast
+//! count, active days) use only the FID's own `effective_ts`. The
+//! implementation applies the filter; the crate trusts it.
+//!
+//! ## Amounts
+//!
+//! All stake amounts are integer token base units (micro-units, §12).
+//! The crate computes every derived factor (stake factor, vouch boost)
+//! itself in fixed point; readers never return reals.
 
 use crate::ScoringError;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Per-FID engagement counts toward another FID, partitioned into
-/// "first-30-days from the source's `effective_ts`" and "all other".
-/// Together they sum to the total directed engagement count from
-/// `source` → `target` post-transfer.
+/// new-user events (FIP §8.1: timestamp `≤ source.effective_ts + 30
+/// days`) and all other events. Together they sum to the total directed
+/// post-transfer engagement count from `source` → `target`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EngagementCount {
     pub first_30d: u32,
@@ -31,53 +45,61 @@ impl EngagementCount {
 /// Required reads. Implementations must be deterministic: identical input
 /// state must yield identical output across any number of calls.
 pub trait SnapchainStateReader {
-    /// Universe of FIDs that have any post-transfer activity within the
-    /// scoring window (the snapchain anchor block range). Returned as a
-    /// `BTreeSet` so the caller can iterate in canonical order.
+    /// The scoring universe. FIP §8.2.1: every registered FID
+    /// (Optimism-registered and hyper-native). Returned as a `BTreeSet`
+    /// so the caller can iterate in canonical order.
+    ///
+    /// The universe must contain every FID that holds a vouch stake:
+    /// the crate derives each FID's `vouch_stake_received` (§8.4
+    /// `stake_factor`, option (b) of §6.7) by summing
+    /// [`vouches_from`](Self::vouches_from) over the universe.
     fn all_active_fids(&self) -> Result<BTreeSet<u64>, ScoringError>;
 
-    /// FID's `effective_ts` — the later of (registration timestamp,
-    /// most-recent custody-transfer timestamp). Used to gate engagement
-    /// counts to "post-transfer" only and to determine whether an
-    /// engagement source counts as a "new user" (within 30 days of their
-    /// own effective_ts).
+    /// FID's `effective_ts` (FIP §2): the latest non-exempt custody
+    /// change, or the registration timestamp if there is none. `None`
+    /// if no registration is known (age 0). Used for the age factor;
+    /// the post-transfer filter and the new-user partition are applied
+    /// by the reader itself.
     fn effective_ts(&self, fid: u64) -> Result<Option<u64>, ScoringError>;
 
-    /// The follow graph: for each FID, the FIDs they follow. Edges are
-    /// post-transfer only. Used to seed EigenTrust.
+    /// The follow graph: for each FID, the FIDs they follow. A follow
+    /// edge `j → i` is included only if its `followed_at` is
+    /// post-transfer for `j` and for `i` (FIP §8.2.2). Used for
+    /// EigenTrust.
     fn followees(&self, fid: u64) -> Result<Vec<u64>, ScoringError>;
 
-    /// Engagement counts directed `from → to` (likes + recasts + replies),
-    /// post-transfer, partitioned into "first 30 days from `from`'s
-    /// `effective_ts`" and the remainder. Sparse — implementations may
-    /// return only entries with non-zero `total()`.
+    /// Engagement counts directed `from → to` (likes + recasts +
+    /// replies to casts of `to`), post-transfer for both FIDs,
+    /// partitioned into new-user events (`ts ≤ from.effective_ts + 30
+    /// days`) and the remainder. Sparse — implementations may return
+    /// only entries with non-zero `total()`.
     fn engagement_from(&self, from: u64) -> Result<BTreeMap<u64, EngagementCount>, ScoringError>;
 
-    /// Total post-transfer cast count for `fid`.
+    /// Total post-transfer cast count for `fid` (one-sided filter).
     fn total_casts(&self, fid: u64) -> Result<u32, ScoringError>;
 
-    /// Distinct active days for `fid`. Used by some filter calibrations.
+    /// Distinct days with one or more post-transfer casts (one-sided
+    /// filter). Used by the calibration cohort.
     fn active_days(&self, fid: u64) -> Result<u32, ScoringError>;
 
-    /// Replies-received count: how many casts authored by `fid` got
-    /// at least one reply. Used as a quality signal in filter 6.
+    /// Replies-received (FIP §8.3 F6): the number of casts of `fid`
+    /// with one or more post-transfer replies — not the number of
+    /// replies.
     fn replies_received(&self, fid: u64) -> Result<u32, ScoringError>;
 
-    /// FIP §8.4 stake_factor component. Default implementation
-    /// returns `0.0` so test readers (`InMemoryReader`, retro
-    /// offline tools) don't have to opt in until they need to.
-    /// The production hyper-side reader overrides this to read
-    /// the FID's `STAKE_TYPE_CREDIBILITY` balance and saturate
-    /// against `STAKE_MATURITY_ATOMS`.
-    fn stake_factor_for_fid(&self, _fid: u64) -> Result<f64, ScoringError> {
-        Ok(0.0)
+    /// FIP §8.4 / §12 credibility stake (`STAKE_TYPE_CREDIBILITY`) of
+    /// `fid`, in micro-units. The crate adds the vouch stake the FID
+    /// receives and saturates against `STAKE_MATURITY_AMOUNT`. Default
+    /// 0 so test readers and retro tools don't have to opt in.
+    fn credibility_stake(&self, _fid: u64) -> Result<u64, ScoringError> {
+        Ok(0)
     }
 
-    /// FIP §12 vouch graph: ordered map `vouchee → atoms` of all
-    /// vouches `voucher` has staked. Used to boost the voucher's
-    /// growth-score contribution toward each vouchee in
-    /// `compute_growth_harmonic`. Default empty so test readers
-    /// and retro tools don't have to opt in.
+    /// FIP §6.7 vouch graph: ordered map `vouchee → amount` (micro-units)
+    /// of the `STAKE_TYPE_VOUCH` stakes that `voucher` holds. Used two
+    /// ways: (1) the vouch boost on `contribution(voucher, vouchee)`
+    /// and (2) summed over all vouchers into the vouchee's
+    /// `stake_factor`. Default empty.
     fn vouches_from(&self, _voucher: u64) -> Result<BTreeMap<u64, u64>, ScoringError> {
         Ok(BTreeMap::new())
     }
@@ -110,10 +132,10 @@ pub trait SnapchainStateReader {
     }
 
     /// FIP §7 App-PoW input: map `(app_owner_fid, user_fid)` →
-    /// count of receipts logged in `epoch`. Reads from
-    /// `HyperAppReceiptCount[epoch][*]` in production. Default
-    /// empty so non-prod readers (retro tools, narrow tests)
-    /// don't have to opt in.
+    /// count of valid `APP_USAGE_RECEIPT`s of `epoch` (already limited
+    /// to `MAX_RECEIPTS_PER_APP_PER_EPOCH` per user and app, §7.5). The
+    /// owner FID is resolved from the miniapp registry (§7.3). Default
+    /// empty so non-prod readers don't have to opt in.
     fn app_receipt_counts_for_epoch(
         &self,
         _epoch: u64,
@@ -134,9 +156,9 @@ pub trait SnapchainStateReader {
         Ok(BTreeMap::new())
     }
 
-    /// FIP §5 DA-PoW input: map `fid → answered_count` for
-    /// `epoch`. Reads from `HyperDaAnsweredCount[epoch][*]` in
-    /// production. Default empty.
+    /// FIP §5.4 DA-PoW input: map `validator fid → answered(v, e)`, the
+    /// number of valid responses to the challenges of `epoch`. Default
+    /// empty.
     fn da_answered_counts_for_epoch(
         &self,
         _epoch: u64,
@@ -144,26 +166,16 @@ pub trait SnapchainStateReader {
         Ok(BTreeMap::new())
     }
 
-    /// FIP §5b DA-PoW input: map `fid → sum_of_response_block_heights`
-    /// for `epoch`. Divided by `da_answered_counts_for_epoch[fid]`
-    /// at scoring time to derive the validator's average response
-    /// block, which feeds the latency factor. Default empty.
+    /// FIP §5.4 DA-PoW input: map `validator fid → Σ response_height`
+    /// over the answered challenges of `epoch`, where `response_height`
+    /// is the height of the shard-0 block that includes the response.
+    /// The crate derives `avg_offset = Σ / answered − boundary_height`
+    /// with `boundary_height = PIVOT_HEIGHT_0 + (epoch − 1) ·
+    /// EPOCH_LENGTH` (§4.3). Default empty.
     fn da_response_block_sum_for_epoch(
         &self,
         _epoch: u64,
     ) -> Result<BTreeMap<u64, u128>, ScoringError> {
-        Ok(BTreeMap::new())
-    }
-
-    /// FIP §5c DA-PoW input: map `fid → commit_signatures_in_epoch`,
-    /// reflecting validator block-participation. Feeds the uptime
-    /// factor `uptime = clamp(commit_signatures / EPOCH_LENGTH, 0, 1)`.
-    /// Production reads via the validator score tracker; default
-    /// empty so non-prod readers don't have to opt in.
-    fn validator_commit_signatures_for_epoch(
-        &self,
-        _epoch: u64,
-    ) -> Result<BTreeMap<u64, u64>, ScoringError> {
         Ok(BTreeMap::new())
     }
 }
@@ -179,8 +191,9 @@ pub struct InMemoryReader {
     pub total_casts: BTreeMap<u64, u32>,
     pub active_days: BTreeMap<u64, u32>,
     pub replies_received: BTreeMap<u64, u32>,
-    pub stake_atoms: BTreeMap<u64, u64>,
-    /// FIP §12 vouch graph: `voucher → (vouchee → atoms)`.
+    /// FIP §8.4 credibility stake per FID (micro-units).
+    pub credibility_stake: BTreeMap<u64, u64>,
+    /// FIP §6.7 vouch graph: `voucher → (vouchee → amount)`.
     pub vouches: BTreeMap<u64, BTreeMap<u64, u64>>,
     /// FIP §8.3 F0 input: per-FID count of signer authorizations
     /// pointing at this FID as `requestFid`.
@@ -197,12 +210,10 @@ pub struct InMemoryReader {
     pub app_receipts: BTreeMap<u64, BTreeMap<(u64, u64), u32>>,
     /// FIP §7c App-PoW: `epoch → ((app_fid, user_fid) → add events)`.
     pub miniapp_add_events: BTreeMap<u64, BTreeMap<(u64, u64), u32>>,
-    /// FIP §5 DA-PoW: `epoch → (fid → answered_count)`.
+    /// FIP §5.4 DA-PoW: `epoch → (fid → answered_count)`.
     pub da_answered: BTreeMap<u64, BTreeMap<u64, u32>>,
-    /// FIP §5b DA-PoW: `epoch → (fid → sum_of_response_block_heights)`.
+    /// FIP §5.4 DA-PoW: `epoch → (fid → Σ response_height)`.
     pub da_response_block_sum: BTreeMap<u64, BTreeMap<u64, u128>>,
-    /// FIP §5c DA-PoW: `epoch → (fid → commit_signatures)`.
-    pub validator_commit_signatures: BTreeMap<u64, BTreeMap<u64, u64>>,
 }
 
 impl InMemoryReader {
@@ -254,17 +265,18 @@ impl InMemoryReader {
         self.replies_received.insert(fid, n);
     }
 
-    pub fn set_stake_atoms(&mut self, fid: u64, atoms: u64) {
-        self.stake_atoms.insert(fid, atoms);
+    /// Set the credibility stake (micro-units) of `fid`.
+    pub fn set_credibility_stake(&mut self, fid: u64, amount: u64) {
+        self.credibility_stake.insert(fid, amount);
     }
 
-    /// Add a vouch stake of `atoms` from `voucher → vouchee`. Overwrites
-    /// any prior amount for that pair.
-    pub fn add_vouch(&mut self, voucher: u64, vouchee: u64, atoms: u64) {
+    /// Add a vouch stake of `amount` (micro-units) from `voucher →
+    /// vouchee`. Overwrites any prior amount for that pair.
+    pub fn add_vouch(&mut self, voucher: u64, vouchee: u64, amount: u64) {
         self.vouches
             .entry(voucher)
             .or_default()
-            .insert(vouchee, atoms);
+            .insert(vouchee, amount);
     }
 
     /// Set the FIP §8.3 F0 input: number of other FIDs whose
@@ -319,14 +331,6 @@ impl InMemoryReader {
             .or_default()
             .insert(fid, sum);
     }
-
-    /// Set the FIP §5c DA-PoW commit-signature count for `(epoch, fid)`.
-    pub fn set_validator_commit_signatures(&mut self, epoch: u64, fid: u64, sigs: u64) {
-        self.validator_commit_signatures
-            .entry(epoch)
-            .or_default()
-            .insert(fid, sigs);
-    }
 }
 
 impl SnapchainStateReader for InMemoryReader {
@@ -358,9 +362,8 @@ impl SnapchainStateReader for InMemoryReader {
         Ok(self.replies_received.get(&fid).copied().unwrap_or(0))
     }
 
-    fn stake_factor_for_fid(&self, fid: u64) -> Result<f64, ScoringError> {
-        let atoms = self.stake_atoms.get(&fid).copied().unwrap_or(0);
-        Ok(crate::metrics::stake_factor_from_atoms(atoms))
+    fn credibility_stake(&self, fid: u64) -> Result<u64, ScoringError> {
+        Ok(self.credibility_stake.get(&fid).copied().unwrap_or(0))
     }
 
     fn vouches_from(&self, voucher: u64) -> Result<BTreeMap<u64, u64>, ScoringError> {
@@ -412,17 +415,6 @@ impl SnapchainStateReader for InMemoryReader {
     ) -> Result<BTreeMap<u64, u128>, ScoringError> {
         Ok(self
             .da_response_block_sum
-            .get(&epoch)
-            .cloned()
-            .unwrap_or_default())
-    }
-
-    fn validator_commit_signatures_for_epoch(
-        &self,
-        epoch: u64,
-    ) -> Result<BTreeMap<u64, u64>, ScoringError> {
-        Ok(self
-            .validator_commit_signatures
             .get(&epoch)
             .cloned()
             .unwrap_or_default())

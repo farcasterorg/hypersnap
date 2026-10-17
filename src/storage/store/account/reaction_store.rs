@@ -4,7 +4,7 @@ use super::{
     store::{Store, StoreDef},
     MessagesPage, StoreEventHandler, PAGE_SIZE_MAX, TS_HASH_LENGTH,
 };
-use crate::hyper::StateContext;
+use crate::storage::store::state_context::StateContext;
 use crate::{core::error::HubError, proto::SignatureScheme, storage::store::account::StoreOptions};
 use crate::{proto::message_data::Body, storage::db::PageOptions};
 use crate::{
@@ -48,7 +48,7 @@ impl StoreDef for ReactionStoreDef {
             return false;
         }
         let data = message.data.as_ref().unwrap();
-        message.signature_scheme == SignatureScheme::Ed25519 as i32
+        SignatureScheme::is_message_scheme(message.signature_scheme)
             && data.r#type == MessageType::ReactionAdd as i32
             && data.body.is_some()
     }
@@ -59,7 +59,7 @@ impl StoreDef for ReactionStoreDef {
             return false;
         }
         let data = message.data.as_ref().unwrap();
-        message.signature_scheme == SignatureScheme::Ed25519 as i32
+        SignatureScheme::is_message_scheme(message.signature_scheme)
             && data.r#type == MessageType::ReactionRemove as i32
             && data.body.is_some()
     }

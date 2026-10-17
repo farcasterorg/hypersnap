@@ -409,6 +409,70 @@ pub enum RootPrefix {
     /// FID locks atoms backing a future onboarding). Key:
     /// `[115][stake_lock_id 32B]`, value: encoded `OnboardingStakeLock`.
     HyperOnboardingStakeLock = 115,
+
+    // Shard-0 state after the pivot (FIP-proof-of-work-tokenization §14.6).
+    // Layouts are in `chain::shard0::keys`.
+    HyperFidCustody = 120,
+    HyperFalconSigner = 121,
+    HyperSignerPair = 122,
+    HyperPivotRecord = 123,
+    HyperCertificate = 124,
+    HyperShieldedSupply = 125,
+    HyperQctNullifier = 126,
+    HyperQctNoteTree = 127,
+    HyperEpochBoundaryRecord = 128,
+    HyperScoringResult = 129,
+    HyperBridgeLockTree = 130,
+    HyperEligibility = 131,
+    HyperSpendKey = 132,
+    HyperSpendKeyUsage = 133,
+    /// Shard-0 outbox to shards 1 and 2 (FIP §17.7). Key:
+    /// `[134][height BE u64][index BE u32]`, value: encoded `OutboxEntry`.
+    HyperOutbox = 134,
+    /// Shard-0 chain counters (supply, burns, cursors). Key: `[135][id u8]`.
+    HyperChainMeta = 135,
+    /// Exempt recovery set (FIP §2). Key: `[136][fid BE u64][tx_hash 32B][log_index BE u32]`,
+    /// value: empty.
+    HyperExemptRecovery = 136,
+    /// Custody-change clock of an FID (FIP §2). Key: `[137][fid BE u64]`,
+    /// value: encoded `chain::shard0::keys::FidClock`.
+    HyperFidClock = 137,
+    /// Shards 1 and 2: the fee charges of the shard's blocks that shard 0 has
+    /// not settled (FIP §12). Key: `[138][height BE u64][fid BE u64]`, value:
+    /// u64 BE.
+    HyperUnsettledCharge = 138,
+    /// On-chain events that shard 0 does not apply (for a migrated FID, FIP
+    /// §16.9), kept so that each event is applied or ignored once. Key:
+    /// `[139][tx_hash][log_index BE u32]`, value: encoded `OnChainEvent`.
+    HyperOnchainIgnored = 139,
+    /// Records of the per-shard Keccak state trie (FIP §16.13). Key:
+    /// `[140] || hypersnap_ktrie::NodeKey::encode()`. Derived from state; not
+    /// itself part of the trie. Before the pivot this is the shadow trie
+    /// (plan R0).
+    KeccakTrieNode = 140,
+    /// Status of the Keccak trie of the shard (building / live at a height).
+    /// Key: `[141][0]`, value: see `storage::trie::shadow_trie::ShadowStatus`.
+    KeccakTrieMeta = 141,
+    /// Decided Hypersnap blocks of the shard (after the pivot). Key:
+    /// `[142][height BE u64]`, value: encoded `HypersnapBlock` with its
+    /// certificate.
+    HypersnapBlock = 142,
+    /// Vouches by vouchee (FIP §6.7). Key: `[143][vouchee BE u64][voucher BE u64]`,
+    /// value: empty.
+    HyperVouchByVouchee = 143,
+    /// Native FID registry (Hyper-Native Onboarding FIP §3, PoW FIP §16.9).
+    /// Key: `[144][fid BE u64]`, value: 20-byte classical custody address.
+    /// Replicated to the FID's shard.
+    HyperNativeFid = 144,
+    /// Shards 1 and 2: the `KEY_REMOVE` messages that are leaves of the state
+    /// trie. No snapchain store keeps them; the content replay and the
+    /// Hypersnap blocks write them with each trie update. Key:
+    /// `[145][fid BE u64][hash]`, value: encoded `Message`.
+    HyperKeyRemoveMessage = 145,
+    /// Shards 1 and 2: the last use of a Falcon-512 signer of a migrated FID
+    /// (FIP §16.10). Key: `[146][fid BE u64][keccak256(falcon_key)]`, value:
+    /// Farcaster time, BE u64. In the state trie as the stored bytes.
+    HyperFalconSignerLastUse = 146,
 }
 
 /** Copied from the JS code */

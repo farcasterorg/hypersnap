@@ -50,7 +50,6 @@ mod tests {
         let validator_set_config = ValidatorSetConfig {
             effective_at: 0,
             validator_public_keys: vec![proposer_address.to_hex()],
-            validator_bls_public_keys: vec![],
             shard_ids: vec![read_node_engine.shard_id()],
         };
 
@@ -71,6 +70,7 @@ mod tests {
             shard_id,
             test_helper::statsd_client(),
             config,
+            None,
         )
         .await
         .unwrap();

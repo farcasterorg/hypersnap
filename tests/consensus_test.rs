@@ -568,7 +568,6 @@ impl TestNetwork {
         let validator_sets = vec![ValidatorSetConfig {
             effective_at: 0,
             validator_public_keys: validator_addresses,
-            validator_bls_public_keys: vec![],
             shard_ids: (1..=num_shards).collect(),
         }];
         Self {

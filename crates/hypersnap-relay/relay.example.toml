@@ -1,0 +1,79 @@
+# hypersnap-relay configuration (FIP-proof-of-work-tokenization Appendix A.8).
+# Every key can also be set with HYPERSNAP_RELAY_<KEY>; a double underscore
+# selects a nested key, e.g. HYPERSNAP_RELAY_START_HEIGHTS__SNAPCHAIN__SHARD_1.
+
+[relay]
+# Farcaster network of both sides: mainnet | testnet | devnet.
+network = "mainnet"
+
+# Snapchain nodes (gRPC), in failover order.
+snapchain_endpoints = ["https://snapchain-a.example:3383", "https://snapchain-b.example:3383"]
+
+# Hypersnap nodes (gRPC), in failover order.
+hypersnap_endpoints = ["https://hypersnap-a.example:3383"]
+
+# Optional "user:password" for nodes with RPC auth.
+# snapchain_auth = "relay:secret"
+# hypersnap_auth = "relay:secret"
+
+# Directions
+inbound_enabled = true
+outbound_enabled = true
+inbound_shards = [0, 1, 2]    # snapchain shard 0 carries KEY_ADD / KEY_REMOVE / LEND_STORAGE
+outbound_shards = [0, 1, 2]
+
+# "auto" reads GetInfo.version of the snapchain node; or pin e.g. "0.13.3".
+snapchain_version = "auto"
+# "certified" (the node's `GetCertifiedBlocks` stream) or
+# "shard_chunks" (interim, devnets only).
+hypersnap_block_source = "certified"
+
+# Cursor and seen-set storage
+state_dir = "/var/lib/hypersnap-relay"
+seen_set_capacity = 10_000_000   # per seen set; about 33-66 bytes of RAM per entry
+
+# Retry policy for transient errors and rate limits
+retry_initial_ms = 500
+retry_max_ms = 60_000
+max_message_attempts = 20
+
+# Polling and batching
+poll_interval_ms = 1_000
+fetch_page_size = 50
+submit_batch_size = 100
+request_timeout_ms = 15_000
+connect_timeout_ms = 5_000
+max_grpc_message_bytes = 67_108_864
+tip_interval_ms = 15_000
+metrics_log_interval_secs = 60
+
+# Fork points from the PivotRecord (FIP 17.2). Without this section, the
+# relay reads them from the Hypersnap node (GetPivotRecord) at start. They
+# give the first cursor of each shard when no cursor is persisted:
+#   snapchain shard 0 and Hypersnap shard 0 start at pivot_height,
+#   shard s starts at H_s + 1 on both networks.
+# [relay.pivot]
+# pivot_height = 12_345_678
+# fork_heights = { shard_1 = 9_876_543, shard_2 = 9_870_000 }
+
+# Explicit first heights; they win over [relay.pivot]. A persisted cursor wins
+# over both.
+# [relay.start_heights.snapchain]
+# shard_1 = 9_876_544
+# [relay.start_heights.hypersnap]
+# shard_0 = 12_345_678
+
+[relay.rate_limits]
+# 0 = no limit. A node limits each IP to 120 RPCs per minute unless it exempts
+# the relay; 100 keeps the relay under that limit.
+snapchain_rpcs_per_minute = 0
+hypersnap_rpcs_per_minute = 0
+snapchain_messages_per_second = 0
+hypersnap_messages_per_second = 0
+
+[relay.deferred]
+# Messages rejected for state the target does not have yet (FIP A.6).
+capacity = 1024
+max_attempts = 5
+retry_ms = 30_000
+error_patterns = ["unknown fid", "invalid signer", "fname is not registered for fid"]

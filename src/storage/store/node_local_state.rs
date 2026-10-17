@@ -42,6 +42,11 @@ pub enum DataType {
     BaseOnchainEvent = 3,
     OnchainEventsMigrationPageToken = 4,
     ShardHalt = 5,
+    /// The pivot marker (FIP §17.5 step 4): written when shard 0 has applied
+    /// the fork block and every shard is at its fork height.
+    PivotMarker = 6,
+    /// A Hypersnap validator's view of Optimism (`chain::watchers`).
+    HypersnapOnchainView = 7,
 }
 
 /// Why a shard stopped applying blocks.

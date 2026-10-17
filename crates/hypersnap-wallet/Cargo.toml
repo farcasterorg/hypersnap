@@ -2,26 +2,28 @@
 name = "hypersnap-wallet"
 version = "0.1.0"
 edition = "2021"
-description = "Hypersnap wallet SDK — transaction builders, stealth scanning, and node client"
+license = "GPL-3.0"
+description = "Hypersnap wallet: Falcon-512, Ed25519 and custody keys, signed message builders, and a node client"
+
+[[bin]]
+name = "hypersnap-wallet"
+path = "src/main.rs"
 
 [dependencies]
-hypersnap-crypto = { path = "../hypersnap-crypto" }
+hypersnap-messages = { path = "../hypersnap-messages" }
 hypersnap-proto = { path = "../../proto" }
-ed25519-dalek = { version = "2.1.1", features = ["batch"] }
-reqwest = { version = "0.12.9", features = ["json"] }
+hypersnap-falcon = { path = "../hypersnap-falcon" }
+ed25519-dalek = "2.1.1"
+alloy-signer-local = "2.0"
 prost = "0.13.3"
-serde = { version = "1.0", features = ["derive"] }
+reqwest = "0.12.9"
 serde_json = "1.0"
 hex = "0.4.3"
 thiserror = "1.0"
 tokio = { version = "1.40.0", features = ["rt", "macros"] }
 rand = "0.8.5"
-sha2 = "0.10"
-blake3 = "1.4"
-alloy-primitives = "1"
-alloy-dyn-abi = { version = "1", features = ["eip712"] }
-alloy-signer = "2.0"
-alloy-signer-local = "2.0"
+clap = { version = "4.3.0", features = ["derive"] }
 
 [dev-dependencies]
-x25519-dalek = { version = "2", features = ["static_secrets"] }
+# rand_chacha 0.3 implements the rand_core 0.6 traits that fn-dsa 0.4 uses.
+rand_chacha = "0.3"

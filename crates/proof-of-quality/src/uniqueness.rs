@@ -5,7 +5,7 @@
 //! Two casts whose Hamming distance is ≤ [`NEAR_DUP_HAMMING_THRESHOLD`]
 //! are considered near-duplicates. The live fee path uses the count of
 //! near-dup matches found in the rolling fingerprint store to drive the
-//! `uniqueness_score`.
+//! integer `uniqueness_enc` (FIP §12, §8.5).
 
 use std::hash::Hasher;
 use twox_hash::XxHash64;
@@ -66,19 +66,20 @@ pub fn fingerprint(text: &str) -> u128 {
     simhash_128(text, POQ_SIMHASH_NGRAM)
 }
 
-/// Saturating uniqueness score in `[0, 1]` given a count of near-duplicate
-/// neighbours found in the rolling fingerprint window.
-/// 0 neighbours → 1.0 (fully novel). At [`NEIGHBOR_SATURATION`] or more
-/// → 0.0 (treated as full-fee duplicate).
+/// Number of near-duplicates at which uniqueness reaches 0 (§12:
+/// `uniqueness = max(0, 1 − near_duplicates / 8)`).
 pub const NEIGHBOR_SATURATION: u32 = 8;
 
-pub fn uniqueness_score_from_neighbor_count(near_dup_count: u32) -> f64 {
-    if near_dup_count == 0 {
-        return 1.0;
-    }
-    let denom = NEIGHBOR_SATURATION as f64;
-    let raw = 1.0 - (near_dup_count as f64 / denom);
-    raw.clamp(0.0, 1.0)
+/// `10000 / NEIGHBOR_SATURATION`: uniqueness lost per near-duplicate,
+/// in the 0–10000 encoding.
+pub const UNIQUENESS_ENC_STEP: u32 = 1_250;
+
+/// §12 in fixed point: `uniqueness_enc = max(0, 10000 − 1250 ·
+/// near_duplicates)`. 0 neighbours → 10000 (fully novel); 8 or more →
+/// 0 (full-fee duplicate).
+pub fn uniqueness_enc_from_neighbor_count(near_dup_count: u32) -> u16 {
+    let lost = near_dup_count.saturating_mul(UNIQUENESS_ENC_STEP);
+    u16::try_from(10_000u32.saturating_sub(lost)).unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -119,15 +120,15 @@ mod tests {
 
     #[test]
     fn uniqueness_curve_endpoints() {
-        assert_eq!(uniqueness_score_from_neighbor_count(0), 1.0);
+        assert_eq!(uniqueness_enc_from_neighbor_count(0), 10_000);
+        assert_eq!(uniqueness_enc_from_neighbor_count(1), 8_750);
+        assert_eq!(uniqueness_enc_from_neighbor_count(7), 1_250);
+        assert_eq!(uniqueness_enc_from_neighbor_count(NEIGHBOR_SATURATION), 0);
         assert_eq!(
-            uniqueness_score_from_neighbor_count(NEIGHBOR_SATURATION),
-            0.0
+            uniqueness_enc_from_neighbor_count(NEIGHBOR_SATURATION * 2),
+            0
         );
-        assert_eq!(
-            uniqueness_score_from_neighbor_count(NEIGHBOR_SATURATION * 2),
-            0.0
-        );
+        assert_eq!(uniqueness_enc_from_neighbor_count(u32::MAX), 0);
     }
 
     #[test]

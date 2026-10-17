@@ -1,0 +1,19 @@
+[package]
+name = "quil-lattice-proof-sys"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Experimental native lattice proof backend; not enabled for production tokens"
+links = "quil_lattice_proof"
+
+[features]
+default = []
+native-backend = []
+
+[build-dependencies]
+cc = "1.2.67"
+
+# HYPERSNAP: standalone workspace root, so this vendored crate builds and
+# tests on its own while it is not a member of the Hypersnap workspace.
+# Remove it when the crate becomes a workspace member. See crates/VENDORED.md.
+[workspace]

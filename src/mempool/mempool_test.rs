@@ -1352,4 +1352,134 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         pull_message(&messages_request_tx, 1, None).await;
     }
+
+    /// Hypersnap: an FID-0 escrow claim needs a valid authorization when it
+    /// arrives, and one claim for each escrow and nonce can be pending.
+    #[tokio::test]
+    async fn test_hypersnap_fid0_messages_are_checked_and_deduplicated() {
+        use crate::chain::shard0::auth::test_keys::{
+            falcon, falcon_public, falcon_sign, unsigned_message,
+        };
+        use crate::proto::{message_data::Body, MessageData, MessageType, TokenEscrowClaimBody};
+        use prost::Message as _;
+
+        // The other channels stay open: the mempool stops on a closed one.
+        let (
+            _engines,
+            _block,
+            _gossip,
+            mut mempool,
+            mempool_tx,
+            _requests,
+            _chunks,
+            _blocks,
+            _system,
+        ) = setup(None, false, 2).await;
+        mempool.set_hypersnap(crate::chain::shard0::test_support::params());
+        tokio::spawn(async move { mempool.run().await });
+
+        let key = falcon(5);
+        let now = messages_factory::farcaster_time();
+        let claim = |nonce: u64, destination_fid: u64, broken: bool| {
+            let data = |body: TokenEscrowClaimBody| MessageData {
+                r#type: MessageType::TokenEscrowClaim as i32,
+                fid: 0,
+                timestamp: now,
+                network: FarcasterNetwork::Devnet as i32,
+                body: Some(Body::TokenEscrowClaimBody(body)),
+            };
+            let mut body = TokenEscrowClaimBody {
+                destination_fid,
+                nonce,
+                falcon_custody_key: falcon_public(&key),
+                ..Default::default()
+            };
+            body.falcon_signature = falcon_sign(
+                &key,
+                hypersnap_falcon::domains::TOKEN_ESCROW_CLAIM,
+                &data(body.clone()).encode_to_vec(),
+            );
+            if broken {
+                body.destination_fid += 1;
+            }
+            unsigned_message(data(body))
+        };
+        let add = |m: proto::Message| {
+            let tx = mempool_tx.clone();
+            async move {
+                let (reply, rx) = oneshot::channel();
+                tx.send(MempoolRequest::AddMessage(
+                    MempoolMessage::UserMessage(m),
+                    MempoolSource::Local,
+                    Some(reply),
+                ))
+                .await
+                .unwrap();
+                rx.await.unwrap()
+            }
+        };
+
+        assert!(add(claim(1, 2000, false)).await.is_ok());
+        let dup = add(claim(1, 3000, false)).await.unwrap_err();
+        assert_eq!(dup.code, "bad_request.duplicate", "{}", dup);
+        assert!(add(claim(2, 2000, false)).await.is_ok());
+        let bad = add(claim(3, 2000, true)).await.unwrap_err();
+        assert_eq!(bad.code, "bad_request.validation_failure", "{}", bad);
+    }
+
+    /// Hypersnap: IdRegistry events go to shard 0; StorageRegistry events
+    /// are not taken (FIP §17.6).
+    #[tokio::test]
+    async fn test_hypersnap_takes_no_storage_events() {
+        let (
+            _engines,
+            _block,
+            _gossip,
+            mut mempool,
+            mempool_tx,
+            messages_request_tx,
+            _chunks,
+            _blocks,
+            _system,
+        ) = setup(None, false, 2).await;
+        mempool.set_hypersnap(crate::chain::shard0::test_support::params());
+        tokio::spawn(async move { mempool.run().await });
+
+        let fid = 1234;
+        let rent = events_factory::create_rent_event(
+            fid,
+            10,
+            proto::StorageUnitType::UnitType2025,
+            false,
+            proto::FarcasterNetwork::Devnet,
+        );
+        let id = events_factory::create_id_register_event(
+            fid,
+            proto::IdRegisterEventType::Register,
+            vec![1; 20],
+            None,
+        );
+        for event in [&rent, &id] {
+            mempool_tx
+                .send(MempoolRequest::AddMessage(
+                    MempoolMessage::OnchainEvent(event.clone()),
+                    MempoolSource::Local,
+                    None,
+                ))
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        pull_message(
+            &messages_request_tx,
+            0,
+            Some(MempoolMessage::OnchainEvent(id.clone())),
+        )
+        .await;
+        pull_message(&messages_request_tx, 0, None).await;
+        for shard in [1, 2] {
+            pull_message(&messages_request_tx, shard, None).await;
+        }
+    }
 }

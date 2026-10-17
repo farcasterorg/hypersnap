@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use super::pivot_guard::PivotGuard;
 use super::validator::StoredValidatorSets;
 use crate::consensus::consensus::SystemMessage;
 use crate::core::types::{CommitsExt, SnapchainValidatorContext};
@@ -28,6 +29,9 @@ pub struct ReadValidator {
     pub statsd_client: StatsdClientWrapper,
     pub validator_sets: StoredValidatorSets,
     pub system_tx: mpsc::Sender<SystemMessage>,
+    /// Set when the release fixes `PIVOT_HEIGHT` for the network. Shard 1/2
+    /// chunks then wait for a shard-0 witness (see `pivot_guard`).
+    pub pivot_guard: Option<PivotGuard>,
 }
 
 impl ReadValidator {
@@ -37,6 +41,8 @@ impl ReadValidator {
             Engine::ShardEngine(engine) => engine.get_confirmed_height(),
         };
         self.last_height = height;
+        // A shard that is already at its fork height reports it at start.
+        self.after_commit(height);
     }
 
     pub fn get_min_height(&self) -> Height {
@@ -92,12 +98,48 @@ impl ReadValidator {
         };
     }
 
+    /// False if the pivot guard holds this value back for now.
+    fn pivot_guard_allows(&self, height: Height) -> bool {
+        match &self.pivot_guard {
+            Some(guard) => guard.allows(self.shard_id, height.block_number),
+            None => true,
+        }
+    }
+
+    /// After a commit (FIP §17.5 steps 1-4): when shard 0 has applied the
+    /// fork block and every shard is at its fork height, persist the marker
+    /// and stop the process. The next start is a Hypersnap node.
+    fn after_commit(&mut self, height: Height) {
+        let Some(guard) = &self.pivot_guard else {
+            return;
+        };
+        let Some(marker) = guard.record_height(self.shard_id, height.block_number) else {
+            return;
+        };
+        if let Err(e) = crate::consensus::pivot_guard::write_marker(guard.db(), &marker) {
+            error!("Cannot write the pivot marker: {}", e);
+            return;
+        }
+        info!(
+            fork_height = guard.fork_height(),
+            "Applied the fork block and the fork heights; restart as a Hypersnap node"
+        );
+        let _ = self.system_tx.try_send(SystemMessage::ExitWithError(
+            "pivot: the fork block is applied; restart as a Hypersnap node".to_string(),
+        ));
+    }
+
     async fn process_buffered_blocks(&mut self) -> u64 {
         let mut num_blocks_processed = 0;
         // This works only because [buffered_blocks] is ordered by height. It's important to maintain this property
         while let Some((height, value)) = self.buffered_blocks.pop_first() {
             if height == self.last_height.increment() {
+                if !self.pivot_guard_allows(height) {
+                    self.buffered_blocks.insert(height, value);
+                    break;
+                }
                 self.commit_decided_value(&value, height).await;
+                self.after_commit(height);
                 num_blocks_processed += 1;
             } else if height > self.last_height.increment() {
                 self.buffered_blocks.insert(height, value);
@@ -122,19 +164,11 @@ impl ReadValidator {
                 block.header.as_ref().and_then(|h| h.height)
             }
 
-            proto::decided_value::Value::HyperBlock(hb) => {
-                // Hyperblocks have their own consensus path. This helper is not
-                // meant to handle them, but we provide a best-effort height in
-                // case of accidental routing.
-                let canonical = hb
-                    .envelope
-                    .as_ref()
-                    .and_then(|e| e.metadata.as_ref())
-                    .map(|m| m.canonical_block_id)
-                    .unwrap_or(0);
-                Some(Height {
-                    shard_index: 0,
-                    block_number: canonical,
+            proto::decided_value::Value::HypersnapBlock(bytes) => {
+                let view = proto::HypersnapBlockView::decode(bytes.as_slice()).ok()?;
+                view.header.map(|h| Height {
+                    shard_index: h.shard_id,
+                    block_number: h.height,
                 })
             }
         }
@@ -158,13 +192,9 @@ impl ReadValidator {
                 None => return false,
             },
 
-            proto::decided_value::Value::HyperBlock(_) => {
-                // Hyperblocks carry threshold BLS signatures, not Ed25519
-                // commits. They are verified against the per-epoch group public
-                // key on a separate path; this Ed25519-quorum verifier is not
-                // applicable.
-                return false;
-            }
+            // Hypersnap blocks (after the pivot) are not part of the
+            // snapchain read path.
+            proto::decided_value::Value::HypersnapBlock(_) => return false,
         };
 
         verify_signatures(&commits, &self.validator_sets)
@@ -359,18 +389,38 @@ impl ReadValidator {
         let num_committed_values = if height > self.last_height.increment() {
             if (self.buffered_blocks.len() as u32) < self.max_num_buffered_blocks {
                 self.buffered_blocks.insert(height, value);
-                0
+                // The value at last_height + 1 may be one that the pivot
+                // guard held back; shard 0 may have witnessed it since.
+                if self.pivot_guard.is_some() {
+                    self.process_buffered_blocks().await
+                } else {
+                    0
+                }
             } else {
                 warn!(%height, last_height = %self.last_height, "Dropping decided block because buffered block space is full");
                 0
             }
         } else if height == self.last_height.increment() {
-            self.commit_decided_value(&value, height).await;
-            let num_buffered_blocks_processed = self.process_buffered_blocks().await;
-            num_buffered_blocks_processed + 1
+            if self.pivot_guard_allows(height) {
+                self.commit_decided_value(&value, height).await;
+                self.after_commit(height);
+                let num_buffered_blocks_processed = self.process_buffered_blocks().await;
+                num_buffered_blocks_processed + 1
+            } else {
+                // Not witnessed by shard 0 yet. Keep it; a later decided
+                // value retries the buffer.
+                self.buffered_blocks.insert(height, value);
+                0
+            }
         } else {
             debug!(%height, last_height = %self.last_height, "Dropping decided block because height is too low");
-            0
+            // Retry values that the pivot guard held back: shard 0 may have
+            // witnessed them since.
+            if self.pivot_guard.is_some() {
+                self.process_buffered_blocks().await
+            } else {
+                0
+            }
         };
         self.statsd_client.gauge_with_shard(
             self.shard_id,

@@ -361,6 +361,11 @@ pub struct MyHubService {
     // the background fname connector has polled the corresponding transfer. None
     // disables on-demand recovery (e.g. when fnames are configured off).
     fname_lookup: Option<Arc<dyn FnameTransferLookup>>,
+    /// Set on a Hypersnap node after the pivot: the certified-block calls and
+    /// the certified tips in `GetInfo` (FIP Appendix A).
+    hypersnap: Option<Arc<dyn crate::network::hypersnap_rpc::HypersnapRpc>>,
+    /// A read node with the content replay (FIP §17.4).
+    content_replay: Option<crate::node::content_replay::ReplayDbs>,
 }
 
 /// Opaque cursor for notifications pagination.
@@ -467,8 +472,25 @@ impl MyHubService {
             peer_id,
             id_registry_cache,
             fname_lookup,
+            hypersnap: None,
+            content_replay: None,
         };
         service
+    }
+
+    /// A Hypersnap node after the pivot.
+    pub fn with_hypersnap(
+        mut self,
+        rpc: Arc<dyn crate::network::hypersnap_rpc::HypersnapRpc>,
+    ) -> Self {
+        self.hypersnap = Some(rpc);
+        self
+    }
+
+    /// A read node with the content replay: its roots in `GetShadowRoots`.
+    pub fn with_content_replay(mut self, dbs: crate::node::content_replay::ReplayDbs) -> Self {
+        self.content_replay = Some(dbs);
+        self
     }
 
     async fn submit_message_internal(
@@ -476,11 +498,12 @@ impl MyHubService {
         message: proto::Message,
     ) -> Result<proto::Message, HubError> {
         let fid = message.fid();
-        if fid == 0 {
+        let dst_shard = routing::route_message(&self.message_router, &message, self.num_shards);
+        // On a Hypersnap node, shard 0 decides: escrow messages have FID 0
+        // (FIP §16.8).
+        if fid == 0 && !(self.hypersnap.is_some() && dst_shard == 0) {
             return Err(HubError::invalid_parameter("fid cannot be 0"));
         }
-
-        let dst_shard = routing::route_message(&self.message_router, &message, self.num_shards);
 
         match self
             .simulate_message_for_shard_typed(&message, dst_shard)
@@ -767,6 +790,13 @@ impl MyHubService {
         message: &proto::Message,
         shard_id: u32,
     ) -> Result<(), engine::MessageValidationError> {
+        if self.hypersnap.is_some() {
+            return self
+                .simulate_hypersnap(std::slice::from_ref(message), shard_id)
+                .await
+                .pop()
+                .unwrap_or(Ok(()));
+        }
         if shard_id == 0 {
             // Handle shard 0 (block engine) specially
             let mut block_engine = block_engine::BlockEngine::new(
@@ -824,6 +854,14 @@ impl MyHubService {
         messages: &[proto::Message],
         shard_id: u32,
     ) -> Vec<Result<(), HubError>> {
+        if self.hypersnap.is_some() {
+            return self
+                .simulate_hypersnap(messages, shard_id)
+                .await
+                .into_iter()
+                .map(|r| r.map_err(simulate_error_to_hub_error))
+                .collect();
+        }
         if shard_id == 0 {
             messages
                 .iter()
@@ -877,6 +915,60 @@ impl MyHubService {
                     })
                 })
                 .collect()
+        }
+    }
+
+    /// A Hypersnap node checks messages with its own rules: the shard-0
+    /// engine for shard 0, and a shard engine in Hypersnap mode (the replica
+    /// signers, the fee gate, native FIDs) for shards 1 and 2.
+    async fn simulate_hypersnap(
+        &self,
+        messages: &[proto::Message],
+        shard_id: u32,
+    ) -> Vec<Result<(), engine::MessageValidationError>> {
+        let all = |e: HubError| {
+            messages
+                .iter()
+                .map(|_| Err(engine::MessageValidationError::StoreError(e.clone())))
+                .collect()
+        };
+        let Some(hypersnap) = &self.hypersnap else {
+            return all(HubError::invalid_internal_state("not a Hypersnap node"));
+        };
+        if shard_id == 0 {
+            return hypersnap
+                .simulate_shard0(messages)
+                .into_iter()
+                .map(|r| r.map_err(engine::MessageValidationError::StoreError))
+                .collect();
+        }
+        let Some(stores) = self.shard_stores.get(&shard_id) else {
+            return all(HubError::invalid_parameter("shard not found for fid"));
+        };
+        let mut readonly_engine = match ShardEngine::new(
+            stores.db.clone(),
+            self.network,
+            stores.trie.clone(),
+            shard_id,
+            stores.store_limits.clone(),
+            self.statsd_client.clone(),
+            100,
+            None,
+            None,
+            None,
+        )
+        .await
+        {
+            Ok(engine) => engine,
+            Err(e) => return all(e),
+        };
+        if let Err(e) = readonly_engine.enter_hypersnap_mode(None) {
+            return all(e);
+        }
+        if messages.len() == 1 {
+            vec![readonly_engine.simulate_message(&messages[0])]
+        } else {
+            readonly_engine.simulate_bulk_messages(messages)
         }
     }
 
@@ -1388,6 +1480,38 @@ impl HubService for MyHubService {
     }
 
     type GetBlocksStream = ReceiverStream<Result<Block, Status>>;
+    type GetCertifiedBlocksStream = ReceiverStream<Result<proto::HypersnapBlock, Status>>;
+
+    async fn get_certified_blocks(
+        &self,
+        request: Request<proto::CertifiedBlocksRequest>,
+    ) -> Result<Response<Self::GetCertifiedBlocksStream>, Status> {
+        let rpc = self
+            .hypersnap
+            .clone()
+            .ok_or_else(|| Status::unimplemented("not a Hypersnap node"))?;
+        let r = request.into_inner();
+        let (tx, rx) = mpsc::channel(100);
+        tokio::spawn(crate::network::hypersnap_rpc::stream_certified_blocks(
+            rpc,
+            r.shard_id,
+            r.start_height,
+            r.stop_height,
+            tx,
+        ));
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    async fn get_pivot_record(
+        &self,
+        _request: Request<proto::GetPivotRecordRequest>,
+    ) -> Result<Response<proto::PivotRecord>, Status> {
+        self.hypersnap
+            .as_ref()
+            .and_then(|h| h.pivot_record())
+            .map(Response::new)
+            .ok_or_else(|| Status::unimplemented("not a Hypersnap node"))
+    }
 
     async fn get_blocks(
         &self,
@@ -1468,6 +1592,42 @@ impl HubService for MyHubService {
                 }
             }
         }
+    }
+
+    async fn get_shadow_roots(
+        &self,
+        request: Request<proto::GetShadowRootsRequest>,
+    ) -> Result<Response<proto::GetShadowRootsResponse>, Status> {
+        let height = request.into_inner().height;
+        let mut shard_ids: Vec<u32> = self.shard_stores.keys().copied().collect();
+        shard_ids.sort();
+        let mut roots = Vec::new();
+        for shard_id in shard_ids {
+            let stores = &self.shard_stores[&shard_id];
+            roots.push(shadow_root_entry(
+                &stores.db,
+                shard_id,
+                height,
+                &stores.shard_store,
+            )?);
+        }
+        let mut replay_roots = Vec::new();
+        if let Some(dbs) = &self.content_replay {
+            let dbs: Vec<_> = dbs
+                .read()
+                .unwrap()
+                .iter()
+                .map(|(s, db)| (*s, db.clone()))
+                .collect();
+            for (shard_id, db) in dbs {
+                let store = crate::storage::store::shard::ShardStore::new(db.clone(), shard_id);
+                replay_roots.push(shadow_root_entry(&db, shard_id, height, &store)?);
+            }
+        }
+        Ok(Response::new(proto::GetShadowRootsResponse {
+            roots,
+            replay_roots,
+        }))
     }
 
     async fn get_info(
@@ -1586,6 +1746,19 @@ impl HubService for MyHubService {
         let next_engine_version_timestamp =
             EngineVersion::next_version_timestamp_for(&current_farcaster_time, self.network)
                 .unwrap_or(0);
+
+        // A Hypersnap node reports the certified tip of each shard, and the
+        // delay from its timestamp.
+        if let Some(h) = &self.hypersnap {
+            for info in shard_infos.iter_mut() {
+                if let Some(tip) = h.tip(info.shard_id) {
+                    info.max_height = tip;
+                    if let Some(header) = h.block(info.shard_id, tip).and_then(|b| b.header) {
+                        info.block_delay = current_time.saturating_sub(header.timestamp);
+                    }
+                }
+            }
+        }
 
         Ok(Response::new(GetInfoResponse {
             db_stats: Some(DbStats {
@@ -3679,4 +3852,50 @@ impl crate::api::HubQueryHandler for MyHubService {
         all_fids.truncate(limit);
         Ok((all_fids, None))
     }
+}
+
+/// The Keccak root of one shard DB for `GetShadowRoots`: the current root
+/// (`height` 0) or a recorded one.
+fn shadow_root_entry(
+    db: &Arc<crate::storage::db::RocksDB>,
+    shard_id: u32,
+    height: u64,
+    shard_store: &crate::storage::store::shard::ShardStore,
+) -> Result<proto::ShadowRoot, Status> {
+    use crate::storage::trie::shadow_trie::{self, ShadowStatus};
+    let report =
+        shadow_trie::report_from_db(db.clone()).map_err(|e| Status::internal(e.to_string()))?;
+    let (status, live_height) = match report.status {
+        ShadowStatus::Absent => ("absent", 0),
+        ShadowStatus::Building { snapshot_height } => ("building", snapshot_height),
+        ShadowStatus::Built { height } => ("built", height),
+        ShadowStatus::Live { height } => ("live", height),
+    };
+    let snapchain_root = |chunk: Option<proto::ShardChunk>| {
+        chunk
+            .and_then(|c| c.header)
+            .map(|h| h.shard_root)
+            .unwrap_or_default()
+    };
+    if height == 0 {
+        return Ok(proto::ShadowRoot {
+            shard_id,
+            height: live_height,
+            keccak_root: report.root.to_vec(),
+            leaf_count: report.leaf_count,
+            snapchain_root: snapchain_root(shard_store.get_last_shard_chunk().ok().flatten()),
+            status: status.to_string(),
+        });
+    }
+    let (root, leaf_count) = shadow_trie::root_at(db, height).ok_or_else(|| {
+        Status::not_found(format!("no shadow root recorded at height {}", height))
+    })?;
+    Ok(proto::ShadowRoot {
+        shard_id,
+        height,
+        keccak_root: root.to_vec(),
+        leaf_count,
+        snapchain_root: snapchain_root(shard_store.get_chunk_by_height(height).ok().flatten()),
+        status: status.to_string(),
+    })
 }

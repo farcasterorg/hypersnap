@@ -8,7 +8,7 @@ use super::{
     MessagesPage, StoreEventHandler,
 };
 use crate::core::message::HubEventExt;
-use crate::hyper::StateContext;
+use crate::storage::store::state_context::StateContext;
 use crate::{
     core::error::HubError,
     proto::{
@@ -59,7 +59,7 @@ impl StoreDef for UserDataStoreDef {
             return false;
         }
         let data = message.data.as_ref().unwrap();
-        message.signature_scheme == SignatureScheme::Ed25519 as i32
+        SignatureScheme::is_message_scheme(message.signature_scheme)
             && data.r#type == MessageType::UserDataAdd as i32
             && data.body.is_some()
     }
@@ -100,7 +100,7 @@ impl StoreDef for UserDataStoreDef {
         // 2^63) have no canonical username system in Phase 1. Hard-
         // reject USERNAME UserData for them rather than silently
         // accepting an unverifiable value.
-        if crate::hyper::is_hyper_fid(fid)
+        if crate::chain::is_hyper_fid(fid)
             && user_data_body.r#type == proto::UserDataType::Username as i32
         {
             return Err(HubError {

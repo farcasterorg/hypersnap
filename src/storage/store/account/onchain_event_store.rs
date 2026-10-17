@@ -2,7 +2,6 @@ use super::{get_from_db_or_txn, make_fid_key, StoreEventHandler};
 use crate::core::error::HubError;
 use crate::core::message::HubEventExt;
 use crate::core::util::FarcasterTime;
-use crate::hyper::StateContext;
 use crate::proto::{
     self, on_chain_event, on_chain_event::Body, FarcasterNetwork, HubEvent, HubEventType,
     IdRegisterEventBody, IdRegisterEventType, MergeOnChainEventBody, OnChainEvent,
@@ -12,6 +11,7 @@ use crate::proto::{LendStorageBody, StorageUnitType};
 use crate::storage::constants::{OnChainEventPostfix, RootPrefix, PAGE_SIZE_MAX};
 use crate::storage::db::{PageOptions, RocksDB, RocksDbTransactionBatch, RocksdbError};
 use crate::storage::store::account::StoreOptions;
+use crate::storage::store::state_context::StateContext;
 use crate::storage::util::increment_vec_u8;
 use crate::version::version::{EngineVersion, ProtocolFeature};
 use prost::{DecodeError, Message};
@@ -76,7 +76,7 @@ fn make_onchain_event_type_prefix(onchain_event_type: OnChainEventType) -> Vec<u
     ]
 }
 
-fn make_onchain_event_primary_key(onchain_event: &OnChainEvent) -> Vec<u8> {
+pub fn make_onchain_event_primary_key(onchain_event: &OnChainEvent) -> Vec<u8> {
     let mut primary_key = make_onchain_event_type_prefix(onchain_event.r#type());
     primary_key.extend(make_fid_key(onchain_event.fid));
     primary_key.extend(make_block_number_key(onchain_event.block_number));

@@ -57,7 +57,13 @@ pub const MAX_GASLESS_KEYS_PER_FID: u32 = 1000;
 // `MessageType` discriminants, so by pigeonhole any list longer than the MessageType enum's
 // variant count is guaranteed to contain duplicates. Keep this in sync with the enum in
 // `proto/definitions/message.proto` — bumping a new MessageType adds one slot.
-pub const MAX_KEY_ADD_SCOPES: usize = MessageType::VARIANT_COUNT;
+pub const MAX_KEY_ADD_SCOPES: usize = MessageType::VARIANT_COUNT - HYPERSNAP_MESSAGE_TYPE_COUNT;
+
+/// Number of Hypersnap message types (values 100–999, FIP §14.2) in
+/// `MessageType`. They are not snapchain key scopes, so the KEY_ADD scope cap
+/// stays equal to snapchain's, which counts only Farcaster types. A test
+/// checks this count against the enum.
+pub const HYPERSNAP_MESSAGE_TYPE_COUNT: usize = 30;
 
 // EIP-712 domain shared by KEY_ADD and KEY_REMOVE custody signatures. The FIP specifies a single
 // domain "Farcaster KeyAdd" for both primary types; the primary type itself disambiguates.
@@ -349,7 +355,7 @@ pub fn verify_signed_key_request_metadata(
 /// `EmptyScopes` when the list is empty and `InvalidScope(raw)` for any bad value, including the
 /// custody-level operations (`KEY_ADD` / `KEY_REMOVE`) which a signer must never be able to
 /// authorize — allowing those would let a signer mint or revoke other signers.
-fn validate_key_add_scopes(scopes: &[i32]) -> Result<(), ValidationError> {
+pub fn validate_key_add_scopes(scopes: &[i32]) -> Result<(), ValidationError> {
     if scopes.is_empty() {
         return Err(ValidationError::EmptyScopes);
     }
@@ -931,6 +937,20 @@ mod tests {
             validate_key_remove_body(&body),
             Err(ValidationError::InvalidSignatureType)
         );
+    }
+
+    #[test]
+    fn scope_cap_counts_farcaster_types_only() {
+        // Values 1..=17 without the retired 9 and 10, plus NONE: what snapchain
+        // counts. Hypersnap types (100–999) must not change the cap.
+        let hypersnap = (100..1000)
+            .filter(|v| MessageType::try_from(*v).is_ok())
+            .count();
+        assert_eq!(hypersnap, HYPERSNAP_MESSAGE_TYPE_COUNT);
+        let farcaster = (0..100)
+            .filter(|v| MessageType::try_from(*v).is_ok())
+            .count();
+        assert_eq!(MAX_KEY_ADD_SCOPES, farcaster);
     }
 
     #[test]

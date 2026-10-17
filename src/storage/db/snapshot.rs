@@ -87,6 +87,21 @@ fn snapshot_directory(network: FarcasterNetwork, shard_id: u32) -> String {
     return format!("{}/{}", network.as_str_name(), shard_id);
 }
 
+/// The directory of the genesis state snapshot of `shard_id` (FIP §17.4):
+/// the content replay DB at the fork height of the pivot.
+pub fn genesis_snapshot_directory(
+    network: FarcasterNetwork,
+    pivot_height: u64,
+    shard_id: u32,
+) -> String {
+    format!(
+        "{}/genesis-{}/{}",
+        network.as_str_name(),
+        pivot_height,
+        shard_id
+    )
+}
+
 #[derive(Error, Debug)]
 pub enum SnapshotError {
     #[error(transparent)]
@@ -237,11 +252,11 @@ pub async fn clear_old_snapshots(
 }
 
 fn metadata_path(network: FarcasterNetwork, shard_id: u32) -> String {
-    format!(
-        "{}/{}",
-        snapshot_directory(network, shard_id),
-        "latest.json"
-    )
+    metadata_path_in(&snapshot_directory(network, shard_id))
+}
+
+fn metadata_path_in(directory: &str) -> String {
+    format!("{}/{}", directory, "latest.json")
 }
 
 async fn download_metadata(
@@ -249,10 +264,17 @@ async fn download_metadata(
     shard_id: u32,
     snapshot_config: &Config,
 ) -> Result<SnapshotMetadata, SnapshotError> {
+    download_metadata_in(&snapshot_directory(network, shard_id), snapshot_config).await
+}
+
+async fn download_metadata_in(
+    directory: &str,
+    snapshot_config: &Config,
+) -> Result<SnapshotMetadata, SnapshotError> {
     let metadata_url = format!(
         "{}/{}",
         snapshot_config.snapshot_download_url,
-        metadata_path(network, shard_id)
+        metadata_path_in(directory)
     );
     info!("Retrieving metadata from {}", metadata_url);
     let metadata = reqwest::get(metadata_url)
@@ -268,13 +290,27 @@ pub async fn download_snapshots(
     db_dir: String,
     shard_ids: Vec<u32>,
 ) -> Result<(), SnapshotError> {
+    let directories = shard_ids
+        .into_iter()
+        .map(|shard_id| (shard_id, snapshot_directory(network, shard_id)))
+        .collect();
+    download_snapshot_dirs(snapshot_config, db_dir, directories).await
+}
+
+/// Download and unpack the latest snapshot in each `(shard_id, directory)`.
+pub async fn download_snapshot_dirs(
+    snapshot_config: &Config,
+    db_dir: String,
+    directories: Vec<(u32, String)>,
+) -> Result<(), SnapshotError> {
     let snapshot_dir = snapshot_config.snapshot_download_dir.clone();
     std::fs::create_dir_all(snapshot_dir.clone())?;
+    let shard_ids: Vec<u32> = directories.iter().map(|(shard_id, _)| *shard_id).collect();
 
     // First, fetch metadata for all shards
     let mut all_metadata = HashMap::new();
-    for &shard_id in &shard_ids {
-        let metadata = download_metadata(network, shard_id, snapshot_config).await?;
+    for (shard_id, directory) in &directories {
+        let metadata = download_metadata_in(directory, snapshot_config).await?;
         all_metadata.insert(shard_id.to_string(), metadata);
     }
 
@@ -397,35 +433,47 @@ pub async fn download_snapshots(
         }
 
         let tar_filename = format!("{}/shard_{}_snapshot.tar", snapshot_dir, shard_id);
-        let mut tar_file = BufWriter::new(tokio::fs::File::create(tar_filename.clone()).await?);
-
-        for filename in local_chunks {
-            info!(
-                "Unzipping snapshot chunk {} for shard {}",
-                filename, shard_id
-            );
-            let file = std::fs::File::open(filename)?;
-            let reader = BufReader::new(file);
-            let mut gz_decoder = GzDecoder::new(reader);
-            let mut buffer = Vec::new();
-            // These files are small, 100MB max each
-            gz_decoder.read_to_end(&mut buffer)?;
-            tar_file.write_all(&buffer).await?;
-        }
-        tar_file.flush().await?;
-
-        let file = std::fs::File::open(tar_filename.clone())?;
-        info!(
-            "Unpacking snapshot file {} for shard {}",
-            tar_filename, shard_id
-        );
-        let mut archive = Archive::new(file);
-        std::fs::create_dir_all(&db_dir)?;
-        archive.unpack(&db_dir)?;
+        unpack_chunks(&local_chunks, &tar_filename, &db_dir, shard_id).await?;
     }
 
     main_pb.finish_with_message("All snapshots downloaded successfully!");
     std::fs::remove_dir_all(snapshot_dir)?;
+    Ok(())
+}
+
+/// Join the gzip chunks of a snapshot (`backup::backup_db`) into
+/// `tar_filename` and unpack it into `db_dir`.
+pub async fn unpack_chunks(
+    local_chunks: &[String],
+    tar_filename: &str,
+    db_dir: &str,
+    shard_id: u32,
+) -> Result<(), SnapshotError> {
+    let mut tar_file = BufWriter::new(tokio::fs::File::create(tar_filename).await?);
+
+    for filename in local_chunks {
+        info!(
+            "Unzipping snapshot chunk {} for shard {}",
+            filename, shard_id
+        );
+        let file = std::fs::File::open(filename)?;
+        let reader = BufReader::new(file);
+        let mut gz_decoder = GzDecoder::new(reader);
+        let mut buffer = Vec::new();
+        // These files are small, 100MB max each
+        gz_decoder.read_to_end(&mut buffer)?;
+        tar_file.write_all(&buffer).await?;
+    }
+    tar_file.flush().await?;
+
+    let file = std::fs::File::open(tar_filename)?;
+    info!(
+        "Unpacking snapshot file {} for shard {}",
+        tar_filename, shard_id
+    );
+    let mut archive = Archive::new(file);
+    std::fs::create_dir_all(db_dir)?;
+    archive.unpack(db_dir)?;
     Ok(())
 }
 
@@ -538,6 +586,25 @@ pub async fn upload_to_s3(
     shard_id: u32,
     statsd_client: &StatsdClientWrapper,
 ) -> Result<(), SnapshotError> {
+    upload_to_s3_in(
+        snapshot_directory(network, shard_id),
+        chunked_dir_path,
+        snapshot_config,
+        shard_id,
+        statsd_client,
+    )
+    .await
+}
+
+/// Upload the chunks of a snapshot to `directory`, and then its
+/// `latest.json`.
+pub async fn upload_to_s3_in(
+    directory: String,
+    chunked_dir_path: String,
+    snapshot_config: &Config,
+    shard_id: u32,
+    statsd_client: &StatsdClientWrapper,
+) -> Result<(), SnapshotError> {
     info!(shard_id, chunked_dir_path, "Starting upload to s3");
     let start_timetamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
     let start_date = chrono::DateTime::from_timestamp_millis(start_timetamp)
@@ -545,7 +612,7 @@ pub async fn upload_to_s3(
         .date_naive();
     let upload_dir = format!(
         "{}/snapshot-{}-{}.tar.gz",
-        snapshot_directory(network, shard_id),
+        directory,
         start_date,
         start_timetamp / 1000
     );
@@ -608,7 +675,7 @@ pub async fn upload_to_s3(
     };
 
     let metadata_json = serde_json::to_string(&metadata)?;
-    let metadata_key = metadata_path(network, shard_id);
+    let metadata_key = metadata_path_in(&directory);
     let retry_strategy = tokio_retry2::strategy::FixedInterval::from_millis(10_000).take(5);
     Retry::spawn(retry_strategy, || {
         let body = metadata_json.as_bytes().to_vec();

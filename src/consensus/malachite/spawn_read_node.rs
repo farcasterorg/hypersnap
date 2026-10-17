@@ -8,6 +8,7 @@ use crate::consensus::consensus::{Config, SystemMessage};
 use crate::consensus::malachite::network_connector::{
     MalachiteNetworkActorMsg, MalachiteNetworkEvent,
 };
+use crate::consensus::pivot_guard::PivotGuard;
 use crate::consensus::read_validator::{self, Engine};
 use crate::consensus::validator::{StoredValidatorSet, StoredValidatorSets};
 use crate::core::types::{ShardId, SnapchainValidatorContext};
@@ -28,6 +29,7 @@ pub async fn spawn_read_host(
     engine: Engine,
     system_tx: mpsc::Sender<SystemMessage>,
     config: Config,
+    pivot_guard: Option<PivotGuard>,
 ) -> Result<ReadHostRef, ractor::SpawnErr> {
     let validator_set_config = config.get_validator_set_config(shard_id);
     let validator_sets = validator_set_config
@@ -47,6 +49,7 @@ pub async fn spawn_read_host(
             validator_sets: StoredValidatorSets::new(shard_id, validator_sets),
             statsd_client,
             system_tx: system_tx.clone(),
+            pivot_guard,
         },
         system_tx,
     };
@@ -92,6 +95,7 @@ impl MalachiteReadNodeActors {
         shard_id: u32,
         statsd_client: StatsdClientWrapper,
         config: Config,
+        pivot_guard: Option<PivotGuard>,
     ) -> Result<Self, ractor::SpawnErr> {
         let name = if shard_id == 0 {
             format!("Block")
@@ -107,8 +111,15 @@ impl MalachiteReadNodeActors {
         };
         let network_actor =
             spawn_network_actor(gossip_tx.clone(), local_peer_id, statsd_client.clone()).await?;
-        let host_actor =
-            spawn_read_host(shard_id, statsd_client, engine, system_tx, config).await?;
+        let host_actor = spawn_read_host(
+            shard_id,
+            statsd_client,
+            engine,
+            system_tx,
+            config,
+            pivot_guard,
+        )
+        .await?;
         let sync_actor = spawn_read_sync_actor(
             ctx.clone(),
             network_actor.clone(),

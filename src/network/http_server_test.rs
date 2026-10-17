@@ -97,6 +97,32 @@ pub mod tests {
             Ok(Response::new(response))
         }
 
+        async fn get_shadow_roots(
+            &self,
+            _request: Request<crate::proto::GetShadowRootsRequest>,
+        ) -> Result<Response<crate::proto::GetShadowRootsResponse>, Status> {
+            Ok(Response::new(
+                crate::proto::GetShadowRootsResponse::default(),
+            ))
+        }
+
+        type GetCertifiedBlocksStream =
+            ReceiverStream<Result<crate::proto::HypersnapBlock, Status>>;
+
+        async fn get_certified_blocks(
+            &self,
+            _request: Request<crate::proto::CertifiedBlocksRequest>,
+        ) -> Result<Response<Self::GetCertifiedBlocksStream>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
+
+        async fn get_pivot_record(
+            &self,
+            _request: Request<crate::proto::GetPivotRecordRequest>,
+        ) -> Result<Response<crate::proto::PivotRecord>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
+
         async fn get_fids(
             &self,
             _request: Request<FidsRequest>,
@@ -460,6 +486,7 @@ pub mod tests {
                 snapchain_version: "0.2.1".to_string(),
                 timestamp: FARCASTER_EPOCH,
                 capabilities: vec![],
+                hypersnap: None,
             }],
             peers: vec![],
         });

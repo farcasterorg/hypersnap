@@ -4,7 +4,7 @@ use super::{
     store::{Store, StoreDef},
     MessagesPage, StoreEventHandler, TS_HASH_LENGTH,
 };
-use crate::hyper::StateContext;
+use crate::storage::store::state_context::StateContext;
 use crate::{
     core::error::HubError,
     proto::{Protocol, SignatureScheme, VerificationAddAddressBody, VerificationRemoveBody},
@@ -58,7 +58,7 @@ impl StoreDef for VerificationStoreDef {
             return false;
         }
         let data = message.data.as_ref().unwrap();
-        message.signature_scheme == SignatureScheme::Ed25519 as i32
+        SignatureScheme::is_message_scheme(message.signature_scheme)
             && data.r#type == MessageType::VerificationAddEthAddress as i32
             && data.body.is_some()
             && match data.body.as_ref().unwrap() {
@@ -76,7 +76,7 @@ impl StoreDef for VerificationStoreDef {
             return false;
         }
         let data = message.data.as_ref().unwrap();
-        message.signature_scheme == SignatureScheme::Ed25519 as i32
+        SignatureScheme::is_message_scheme(message.signature_scheme)
             && data.r#type == MessageType::VerificationRemove as i32
             && data.body.is_some()
             && match data.body.as_ref().unwrap() {

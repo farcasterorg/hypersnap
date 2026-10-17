@@ -1,7 +1,7 @@
 use crate::{
     api::{self},
     connectors::{self},
-    consensus, hyper,
+    consensus,
     mempool::{self, block_receiver},
     network::{self, http_server},
     proto::FarcasterNetwork,
@@ -104,7 +104,6 @@ pub struct Config {
     pub http_address: String,
     pub rocksdb_dir: String,
     pub clear_db: bool,
-    pub hyper: hyper::HyperConfig,
     pub statsd: StatsdConfig,
     pub l1_rpc_url: String,
     pub fc_network: FarcasterNetwork,
@@ -115,6 +114,9 @@ pub struct Config {
     pub block_receiver: block_receiver::Config,
     #[serde(default)]
     pub api: api::ApiConfig,
+    /// The Hypersnap validator after the pivot.
+    #[serde(default)]
+    pub hypersnap: crate::node::hypersnap_main::HypersnapConfig,
 }
 
 impl Default for Config {
@@ -138,7 +140,6 @@ impl Default for Config {
             http_address: format!("127.0.0.1:{}", DEFAULT_HTTP_PORT),
             rocksdb_dir: ".rocks".to_string(),
             clear_db: false,
-            hyper: hyper::HyperConfig::default(),
             statsd: StatsdConfig::default(),
             l1_rpc_url: "".to_string(),
             fc_network: FarcasterNetwork::Devnet,
@@ -149,6 +150,7 @@ impl Default for Config {
             replication: ReplicationConfig::default(),
             block_receiver: block_receiver::Config::default(),
             api: api::ApiConfig::default(),
+            hypersnap: crate::node::hypersnap_main::HypersnapConfig::default(),
         }
     }
 }

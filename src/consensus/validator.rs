@@ -52,31 +52,14 @@ pub struct StoredValidatorSet {
 
 impl StoredValidatorSet {
     pub fn new(shard_id: SnapchainShard, config: &ValidatorSetConfig) -> Self {
-        let bls_keys = &config.validator_bls_public_keys;
-        if !bls_keys.is_empty() && bls_keys.len() != config.validator_public_keys.len() {
-            panic!(
-                "validator_bls_public_keys length ({}) must match validator_public_keys length ({})",
-                bls_keys.len(),
-                config.validator_public_keys.len()
-            );
-        }
-
         let mut validators = SnapchainValidatorSet::new(vec![]);
-        for (i, address) in config.validator_public_keys.iter().enumerate() {
-            let mut validator = SnapchainValidator::new(
+        for address in &config.validator_public_keys {
+            validators.add(SnapchainValidator::new(
                 shard_id,
                 PublicKey::try_from_bytes(&hex::decode(address).unwrap()).unwrap(),
                 None,
                 config.effective_at,
-            );
-            if let Some(bls_hex) = bls_keys.get(i) {
-                let bls_bytes =
-                    hex::decode(bls_hex).expect("validator_bls_public_keys must be valid hex");
-                hypersnap_crypto::bls::BlsPublicKey::from_bytes(&bls_bytes)
-                    .expect("validator_bls_public_keys must decode as BLS12-381 G1 points");
-                validator = validator.with_bls_public_key(bls_bytes);
-            }
-            validators.add(validator);
+            ));
         }
 
         Self {
@@ -103,6 +86,9 @@ pub struct ShardValidator {
     // TODO: Fix once we remove the actor system
     block_proposer: Option<BlockProposer>,
     shard_proposer: Option<ShardProposer>,
+    /// After the pivot: Hypersnap blocks, with Falcon-512 epoch sets
+    /// (`chain::proposer`, `chain::shard0::proposer`).
+    hypersnap_proposer: Option<crate::chain::proposer::HypersnapProposer>,
     pub started: bool,
     local_state_store: LocalStateStore,
     pub statsd: StatsdClientWrapper,
@@ -136,13 +122,56 @@ impl ShardValidator {
             current_proposer: None,
             block_proposer,
             shard_proposer,
+            hypersnap_proposer: None,
             started: false,
             local_state_store,
             statsd,
         }
     }
 
+    /// A validator of a Hypersnap shard after the pivot. The epoch sets
+    /// replace the configured validator sets.
+    pub fn new_hypersnap(
+        address: Address,
+        shard: SnapchainShard,
+        proposer: impl Into<crate::chain::proposer::HypersnapProposer>,
+        local_state_store: LocalStateStore,
+        statsd: StatsdClientWrapper,
+    ) -> ShardValidator {
+        ShardValidator {
+            shard_id: shard.clone(),
+            address,
+            validator_sets: StoredValidatorSets::new(shard.shard_id(), vec![]),
+            current_height: None,
+            proposal_source: ProposalSource::Consensus,
+            current_round: Round::new(0),
+            height_started_at: None,
+            proposed_at: None,
+            current_proposer: None,
+            block_proposer: None,
+            shard_proposer: None,
+            hypersnap_proposer: Some(proposer.into()),
+            started: false,
+            local_state_store,
+            statsd,
+        }
+    }
+
+    /// True for a Hypersnap shard validator (after the pivot).
+    pub fn is_hypersnap(&self) -> bool {
+        self.hypersnap_proposer.is_some()
+    }
+
     pub fn get_validator_set(&self, height: u64) -> SnapchainValidatorSet {
+        if let Some(p) = &self.hypersnap_proposer {
+            // A height whose epoch is not known yet (more than one ahead)
+            // gets the set of the next height; consensus never asks for it
+            // before the parent is decided.
+            return p
+                .validator_set(height)
+                .or_else(|| p.validator_set(p.next_height()))
+                .expect("epoch set of the next height");
+        }
         self.validator_sets.get_validator_set(height)
     }
 
@@ -159,6 +188,8 @@ impl ShardValidator {
             return p.get_confirmed_height();
         } else if let Some(p) = &self.shard_proposer {
             return p.get_confirmed_height();
+        } else if let Some(p) = &self.hypersnap_proposer {
+            return p.get_confirmed_height();
         }
         panic!("No proposer set on validator");
     }
@@ -167,6 +198,8 @@ impl ShardValidator {
         if let Some(p) = &self.block_proposer {
             return p.get_min_height();
         } else if let Some(p) = &self.shard_proposer {
+            return p.get_min_height();
+        } else if let Some(p) = &self.hypersnap_proposer {
             return p.get_min_height();
         }
         panic!("No proposer set on validator");
@@ -234,6 +267,8 @@ impl ShardValidator {
             block_proposer.decide(commits.clone()).await;
         } else if let Some(shard_proposer) = &mut self.shard_proposer {
             shard_proposer.decide(commits.clone()).await;
+        } else if let Some(p) = &mut self.hypersnap_proposer {
+            p.decide(commits.clone()).await;
         } else {
             panic!("No proposer set");
         }
@@ -269,6 +304,8 @@ impl ShardValidator {
             return block_proposer.get_decided_value(height).await;
         } else if let Some(shard_proposer) = &self.shard_proposer {
             return shard_proposer.get_decided_value(height).await;
+        } else if let Some(p) = &self.hypersnap_proposer {
+            return p.get_decided_value(height).await;
         }
         panic!("No proposer set");
     }
@@ -317,6 +354,12 @@ impl ShardValidator {
             block_proposer.add_proposed_value(full_proposal)
         } else if let Some(shard_proposer) = &mut self.shard_proposer {
             shard_proposer.add_proposed_value(full_proposal)
+        } else if let Some(p) = &mut self.hypersnap_proposer {
+            if self.proposal_source == ProposalSource::Sync {
+                p.add_synced_value(full_proposal)
+            } else {
+                p.add_proposed_value(full_proposal)
+            }
         } else {
             panic!("No proposer set");
         };
@@ -352,6 +395,8 @@ impl ShardValidator {
             block_proposer.propose_value(height, round, timeout).await
         } else if let Some(shard_proposer) = &mut self.shard_proposer {
             shard_proposer.propose_value(height, round, timeout).await
+        } else if let Some(p) = &mut self.hypersnap_proposer {
+            p.propose_value(height, round, timeout).await
         } else {
             panic!("No proposer set");
         };
@@ -370,94 +415,10 @@ impl ShardValidator {
             block_proposer.get_proposed_value(shard_hash)
         } else if let Some(shard_proposer) = &mut self.shard_proposer {
             shard_proposer.get_proposed_value(shard_hash)
+        } else if let Some(p) = &mut self.hypersnap_proposer {
+            p.get_proposed_value(shard_hash)
         } else {
             panic!("No proposer set");
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use hypersnap_crypto::bls::BlsPrivateKey;
-    use libp2p::identity::ed25519::Keypair;
-    use rand::rngs::OsRng;
-
-    fn ed25519_hex() -> String {
-        hex::encode(Keypair::generate().public().to_bytes())
-    }
-
-    #[test]
-    fn validator_set_without_bls_keys_loads() {
-        let config = ValidatorSetConfig {
-            effective_at: 0,
-            validator_public_keys: vec![ed25519_hex(), ed25519_hex()],
-            validator_bls_public_keys: vec![],
-            shard_ids: vec![1],
-        };
-        let stored = StoredValidatorSet::new(SnapchainShard::new(1), &config);
-        assert_eq!(stored.validators.validators.len(), 2);
-        for v in &stored.validators.validators {
-            assert!(v.bls_public_key.is_none());
-        }
-    }
-
-    #[test]
-    fn validator_set_with_bls_keys_loads() {
-        let mut rng = OsRng;
-        let bls_pks: Vec<_> = (0..3)
-            .map(|_| BlsPrivateKey::generate(&mut rng).public_key())
-            .collect();
-
-        let config = ValidatorSetConfig {
-            effective_at: 0,
-            validator_public_keys: vec![ed25519_hex(), ed25519_hex(), ed25519_hex()],
-            validator_bls_public_keys: bls_pks
-                .iter()
-                .map(|pk| hex::encode(pk.to_bytes()))
-                .collect(),
-            shard_ids: vec![1],
-        };
-        let stored = StoredValidatorSet::new(SnapchainShard::new(1), &config);
-        assert_eq!(stored.validators.validators.len(), 3);
-        for (i, v) in stored.validators.validators.iter().enumerate() {
-            // The validator set sorts internally, so we look up by matching bytes.
-            let bls = v.bls_public_key.as_ref().expect("BLS pubkey should be set");
-            let expected_bytes = bls_pks
-                .iter()
-                .find(|pk| pk.to_bytes().to_vec() == *bls)
-                .map(|pk| pk.to_bytes().to_vec());
-            assert!(
-                expected_bytes.is_some(),
-                "validator {} has unexpected BLS key",
-                i
-            );
-        }
-    }
-
-    #[test]
-    #[should_panic(expected = "validator_bls_public_keys length")]
-    fn mismatched_lengths_panic() {
-        let mut rng = OsRng;
-        let bls_pk = BlsPrivateKey::generate(&mut rng).public_key();
-        let config = ValidatorSetConfig {
-            effective_at: 0,
-            validator_public_keys: vec![ed25519_hex(), ed25519_hex()],
-            validator_bls_public_keys: vec![hex::encode(bls_pk.to_bytes())],
-            shard_ids: vec![1],
-        };
-        let _ = StoredValidatorSet::new(SnapchainShard::new(1), &config);
-    }
-
-    #[test]
-    #[should_panic(expected = "BLS12-381 G1")]
-    fn invalid_bls_bytes_panic() {
-        let config = ValidatorSetConfig {
-            effective_at: 0,
-            validator_public_keys: vec![ed25519_hex()],
-            validator_bls_public_keys: vec![hex::encode([0xffu8; 48])],
-            shard_ids: vec![1],
-        };
-        let _ = StoredValidatorSet::new(SnapchainShard::new(1), &config);
     }
 }

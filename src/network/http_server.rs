@@ -372,6 +372,35 @@ pub struct IdRequest {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct InfoRequest {} // Doesn't take dbstats not sure if issue
 
+/// `GET /v1/shadowRoots[?height=N]` (plan R0, diagnostic).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ShadowRootsRequest {
+    #[serde(default)]
+    pub height: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ShadowRootJson {
+    #[serde(rename = "shardId")]
+    pub shard_id: u32,
+    pub height: u64,
+    #[serde(rename = "keccakRoot")]
+    pub keccak_root: String,
+    #[serde(rename = "leafCount")]
+    pub leaf_count: u64,
+    #[serde(rename = "snapchainRoot")]
+    pub snapchain_root: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ShadowRootsResponse {
+    pub roots: Vec<ShadowRootJson>,
+    /// The content replay of each shard (FIP §17.4), on a node that runs it.
+    #[serde(rename = "replayRoots", default, skip_serializing_if = "Vec::is_empty")]
+    pub replay_roots: Vec<ShadowRootJson>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct InfoResponse {
     #[serde(rename = "dbStats", skip_serializing_if = "Option::is_none")]
@@ -2505,6 +2534,11 @@ fn map_proto_message_data_to_json_message_data(
                 key_remove_body: Some(result),
             })
         }
+        // Hypersnap message types have no JSON form here yet (FIP §14).
+        Some(_) => Err(ErrorResponse {
+            error: "Unsupported message body".to_string(),
+            error_detail: Some("Hypersnap message types are served by the gRPC API".to_string()),
+        }),
         None => Err(ErrorResponse {
             error: "No message data".to_string(),
             error_detail: None,
@@ -2754,6 +2788,10 @@ pub fn map_proto_hub_event_to_json_hub_event(
 #[async_trait]
 pub trait HubHttpService {
     async fn get_info(&self, req: InfoRequest) -> Result<InfoResponse, ErrorResponse>;
+    async fn get_shadow_roots(
+        &self,
+        req: ShadowRootsRequest,
+    ) -> Result<ShadowRootsResponse, ErrorResponse>;
     async fn get_fids(&self, req: GetFidsRequest) -> Result<GetFidsResponse, ErrorResponse>;
     async fn get_cast_by_id(&self, req: IdRequest) -> Result<Message, ErrorResponse>;
     async fn get_casts_by_fid(
@@ -2862,6 +2900,35 @@ impl<T> HubHttpService for HubHttpServiceImpl<T>
 where
     T: HubService,
 {
+    async fn get_shadow_roots(
+        &self,
+        request: ShadowRootsRequest,
+    ) -> Result<ShadowRootsResponse, ErrorResponse> {
+        let response = self
+            .service
+            .get_shadow_roots(tonic::Request::new(proto::GetShadowRootsRequest {
+                height: request.height,
+            }))
+            .await
+            .map_err(|e| ErrorResponse {
+                error: "Failed to get shadow roots".to_string(),
+                error_detail: Some(e.to_string()),
+            })?;
+        let json = |r: proto::ShadowRoot| ShadowRootJson {
+            shard_id: r.shard_id,
+            height: r.height,
+            keccak_root: format!("0x{}", hex::encode(r.keccak_root)),
+            leaf_count: r.leaf_count,
+            snapchain_root: format!("0x{}", hex::encode(r.snapchain_root)),
+            status: r.status,
+        };
+        let response = response.into_inner();
+        Ok(ShadowRootsResponse {
+            roots: response.roots.into_iter().map(json).collect(),
+            replay_roots: response.replay_roots.into_iter().map(json).collect(),
+        })
+    }
+
     async fn get_info(&self, _request: InfoRequest) -> Result<InfoResponse, ErrorResponse> {
         let response = self
             .service
@@ -3730,7 +3797,7 @@ where
 pub struct Router<Service: HubService> {
     service: Arc<HubHttpServiceImpl<Service>>,
     api_handler: Option<ApiHttpHandler>,
-    hyper_handler: Option<crate::hyper::http_handler::HyperHttpHandler>,
+    hyper_handler: Option<crate::node::hyper_v1::HyperV1>,
     /// F031: per-request rate limiter. When set, every request
     /// (not just the initial TCP accept) is gated by the limiter
     /// before any work. Keeps keep-alive pipelining bounded.
@@ -3772,12 +3839,9 @@ where
         self
     }
 
-    /// Attach the hyper-protocol HTTP handler (`/hyper/v1/*`).
-    /// Operator constructs it from the spawned `HyperActor`'s handles.
-    pub fn with_hyper_handler(
-        mut self,
-        handler: crate::hyper::http_handler::HyperHttpHandler,
-    ) -> Self {
+    /// Attach the `/hyper/v1/*` reads of the shard-0 state (a Hypersnap
+    /// node).
+    pub fn with_hyper_handler(mut self, handler: crate::node::hyper_v1::HyperV1) -> Self {
         self.hyper_handler = Some(handler);
         self
     }
@@ -3880,6 +3944,13 @@ where
                 self.handle_request::<InfoRequest, InfoResponse, _>(req, |service, req| {
                     Box::pin(async move { service.get_info(req).await })
                 })
+                .await
+            }
+            (&Method::GET, "/v1/shadowRoots") => {
+                self.handle_request::<ShadowRootsRequest, ShadowRootsResponse, _>(
+                    req,
+                    |service, req| Box::pin(async move { service.get_shadow_roots(req).await }),
+                )
                 .await
             }
             (&Method::GET, "/v1/fids") => {

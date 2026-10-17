@@ -1,11 +1,9 @@
 use informalsystems_malachitebft_core_types::{NilOrVal, ThresholdParams};
-use libp2p::identity::ed25519::PublicKey;
 
 use crate::consensus::validator::StoredValidatorSets;
 use crate::core::error::HubError;
-use crate::core::types::{CommitsExt, Vote, FARCASTER_EPOCH};
+use crate::core::types::{Address, CommitsExt, Vote, FARCASTER_EPOCH};
 use crate::proto::{self};
-use itertools::Itertools;
 use tracing::error;
 
 #[derive(Clone, Debug, PartialEq, PartialOrd, Eq, Ord)]
@@ -124,25 +122,31 @@ pub fn verify_signatures(commits: &proto::Commits, validator_sets: &StoredValida
 
     let validator_set = validator_sets.get_validator_set(certificate.height.as_u64());
 
-    let mut expected_pubkeys = validator_set
+    let expected: std::collections::HashMap<
+        &Address,
+        &crate::core::consensus_keys::ConsensusPublicKey,
+    > = validator_set
         .validators
         .iter()
-        .map(|validator| validator.public_key.to_bytes());
+        .map(|validator| (&validator.address, &validator.public_key))
+        .collect();
 
     if !ThresholdParams::default().quorum.is_met(
         certificate.aggregated_signature.signatures.len() as u64,
-        expected_pubkeys.len() as u64,
+        expected.len() as u64,
     ) {
         error!(%certificate.height, "Block did not have quorum");
         return false;
     }
 
     for signature in certificate.aggregated_signature.signatures {
-        let address_bytes = &signature.address.0;
-        if !expected_pubkeys.contains(address_bytes) {
-            error!(%certificate.height, "Block contained signatures from unexpected signers");
-            return false;
-        }
+        let public_key = match expected.get(&signature.address) {
+            Some(pk) => *pk,
+            None => {
+                error!(%certificate.height, "Block contained signatures from unexpected signers");
+                return false;
+            }
+        };
 
         let vote = Vote::new_precommit(
             certificate.height,
@@ -151,8 +155,11 @@ pub fn verify_signatures(commits: &proto::Commits, validator_sets: &StoredValida
             signature.address.clone(),
         );
 
-        let public_key = PublicKey::try_from_bytes(address_bytes).unwrap();
-        if !public_key.verify(&vote.to_sign_bytes(), &signature.signature.0) {
+        if !public_key.verify(
+            crate::core::consensus_keys::ConsensusDomain::Vote,
+            &vote.to_sign_bytes(),
+            &signature.signature.0,
+        ) {
             error!(%certificate.height, "Block contained invalid signatures");
             return false;
         }
@@ -217,7 +224,6 @@ mod tests {
         let cfg = ValidatorSetConfig {
             effective_at: 0,
             validator_public_keys: vec![],
-            validator_bls_public_keys: vec![],
             shard_ids: vec![0],
         };
         let stored = StoredValidatorSet::new(SnapchainShard::new(0), &cfg);
@@ -252,7 +258,6 @@ mod tests {
         let cfg = ValidatorSetConfig {
             effective_at: 0,
             validator_public_keys: vec![],
-            validator_bls_public_keys: vec![],
             shard_ids: vec![0],
         };
         let stored = StoredValidatorSet::new(SnapchainShard::new(0), &cfg);
@@ -280,7 +285,6 @@ mod tests {
         let cfg = ValidatorSetConfig {
             effective_at: 0,
             validator_public_keys: vec![],
-            validator_bls_public_keys: vec![],
             shard_ids: vec![0],
         };
         let stored = StoredValidatorSet::new(SnapchainShard::new(0), &cfg);

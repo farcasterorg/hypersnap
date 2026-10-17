@@ -1,87 +1,54 @@
+//! A client of the submit endpoint of a Hypersnap node (`submit_address`).
+//!
+//! `POST /v1/submitMessage` takes a protobuf `Message`. The node checks it
+//! with the rules of the gRPC `SubmitMessage` (shard 0 simulates it in
+//! block order) and answers 200, or 400 with the reason.
+
 use crate::error::WalletError;
-use hypersnap_proto as proto;
-use prost::Message;
+use hypersnap_proto::Message;
+use prost::Message as _;
 
 pub struct HypersnapClient {
     base_url: String,
+    authorization: Option<String>,
     http: reqwest::Client,
+}
+
+/// The tip of shard 0 (`GET /v1/shard0/tip`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Shard0Tip {
+    pub height: u64,
+    pub hash: String,
+    pub epoch: u64,
 }
 
 impl HypersnapClient {
     pub fn new(node_url: &str) -> Self {
         Self {
             base_url: node_url.trim_end_matches('/').to_string(),
+            authorization: None,
             http: reqwest::Client::new(),
         }
     }
 
-    pub async fn balance(&self, fid: u64) -> Result<u64, WalletError> {
-        let url = format!("{}/hyper/v1/rewards/{}", self.base_url, fid);
-        let resp = self.http.get(&url).send().await?;
-        self.check_status(&resp).await?;
-        let body: serde_json::Value = resp.json().await?;
-        Ok(body["balance"].as_u64().unwrap_or(0))
+    /// The `authorization` header value for a node with `rpc_auth` (for
+    /// example `Basic <base64(user:password)>`).
+    pub fn with_authorization(mut self, value: impl Into<String>) -> Self {
+        self.authorization = Some(value.into());
+        self
     }
 
-    pub async fn fee_balance(&self, fid: u64) -> Result<u64, WalletError> {
-        let url = format!("{}/hyper/v1/rewards/{}", self.base_url, fid);
-        let resp = self.http.get(&url).send().await?;
-        self.check_status(&resp).await?;
-        let body: serde_json::Value = resp.json().await?;
-        Ok(body["fee_balance"].as_u64().unwrap_or(0))
-    }
-
-    pub async fn nonce(&self, fid: u64) -> Result<u64, WalletError> {
-        let url = format!("{}/hyper/v1/nonce/{}", self.base_url, fid);
-        let resp = self.http.get(&url).send().await?;
-        self.check_status(&resp).await?;
-        let body: serde_json::Value = resp.json().await?;
-        Ok(body["nonce"].as_u64().unwrap_or(0))
-    }
-
-    pub async fn staked_breakdown(&self, fid: u64) -> Result<serde_json::Value, WalletError> {
-        let url = format!("{}/hyper/v1/staked/{}", self.base_url, fid);
-        let resp = self.http.get(&url).send().await?;
-        self.check_status(&resp).await?;
-        Ok(resp.json().await?)
-    }
-
-    pub async fn nullifier_spent(&self, nullifier_hex: &str) -> Result<bool, WalletError> {
-        let url = format!("{}/hyper/v1/nullifier/{}", self.base_url, nullifier_hex);
-        let resp = self.http.get(&url).send().await?;
-        self.check_status(&resp).await?;
-        let body: serde_json::Value = resp.json().await?;
-        Ok(body["spent"].as_bool().unwrap_or(false))
-    }
-
-    pub async fn head(&self) -> Result<serde_json::Value, WalletError> {
-        let url = format!("{}/hyper/v1/head", self.base_url);
-        let resp = self.http.get(&url).send().await?;
-        self.check_status(&resp).await?;
-        Ok(resp.json().await?)
-    }
-
-    pub async fn epoch(&self) -> Result<u64, WalletError> {
-        let url = format!("{}/hyper/v1/epoch", self.base_url);
-        let resp = self.http.get(&url).send().await?;
-        self.check_status(&resp).await?;
-        let body: serde_json::Value = resp.json().await?;
-        Ok(body["epoch"].as_u64().unwrap_or(0))
-    }
-
-    /// Submit a snapchain user message (`CastAdd`, `LinkAdd`,
-    /// `ReactionAdd`, etc.) via `POST /v1/submitMessage`. Distinct
-    /// from `submit` which sends to the hyper endpoint.
-    pub async fn submit_snapchain_message(&self, msg: &proto::Message) -> Result<(), WalletError> {
-        use prost::Message as _;
-        let body = msg.encode_to_vec();
-        let resp = self
+    /// Submit a signed message.
+    pub async fn submit(&self, message: &Message) -> Result<(), WalletError> {
+        let mut request = self
             .http
             .post(format!("{}/v1/submitMessage", self.base_url))
             .header("content-type", "application/octet-stream")
-            .body(body)
-            .send()
-            .await?;
+            .body(message.encode_to_vec());
+        if let Some(auth) = &self.authorization {
+            request = request.header("authorization", auth);
+        }
+        let resp = request.send().await?;
         if resp.status().is_success() {
             Ok(())
         } else {
@@ -91,57 +58,26 @@ impl HypersnapClient {
         }
     }
 
-    pub async fn submit(&self, msg: &proto::HyperMessage) -> Result<(), WalletError> {
-        let body = msg.encode_to_vec();
+    pub async fn shard0_tip(&self) -> Result<Shard0Tip, WalletError> {
         let resp = self
             .http
-            .post(format!("{}/hyper/v1/messages", self.base_url))
-            .header("content-type", "application/octet-stream")
-            .body(body)
+            .get(format!("{}/v1/shard0/tip", self.base_url))
             .send()
             .await?;
-        if resp.status().is_success() {
-            Ok(())
-        } else {
-            let status = resp.status().as_u16();
-            let text = resp.text().await.unwrap_or_default();
-            Err(WalletError::NodeError { status, body: text })
+        let status = resp.status().as_u16();
+        let body = resp.text().await?;
+        if status != 200 {
+            return Err(WalletError::NodeError { status, body });
         }
-    }
-
-    /// Devnet-only: POST a prost-encoded `HyperWireEvidence` body to
-    /// `/hyper/v1/admin/inject_evidence`. The route returns 404 if
-    /// the receiving node was built without
-    /// `[hyper] devnet_admin_endpoints_enabled = true`.
-    pub async fn admin_inject_evidence(
-        &self,
-        wire: &proto::HyperWireEvidence,
-    ) -> Result<(), WalletError> {
-        let body = wire.encode_to_vec();
-        let resp = self
-            .http
-            .post(format!("{}/hyper/v1/admin/inject_evidence", self.base_url))
-            .header("content-type", "application/octet-stream")
-            .body(body)
-            .send()
-            .await?;
-        if resp.status().is_success() {
-            Ok(())
-        } else {
-            let status = resp.status().as_u16();
-            let text = resp.text().await.unwrap_or_default();
-            Err(WalletError::NodeError { status, body: text })
-        }
-    }
-
-    async fn check_status(&self, resp: &reqwest::Response) -> Result<(), WalletError> {
-        if resp.status().is_success() {
-            Ok(())
-        } else {
-            Err(WalletError::NodeError {
-                status: resp.status().as_u16(),
-                body: format!("GET {}", resp.url()),
-            })
-        }
+        let v: serde_json::Value =
+            serde_json::from_str(&body).map_err(|e| WalletError::NodeError {
+                status,
+                body: e.to_string(),
+            })?;
+        Ok(Shard0Tip {
+            height: v["height"].as_u64().unwrap_or(0),
+            hash: v["hash"].as_str().unwrap_or_default().to_string(),
+            epoch: v["epoch"].as_u64().unwrap_or(0),
+        })
     }
 }

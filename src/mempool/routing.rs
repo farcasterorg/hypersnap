@@ -46,6 +46,8 @@ pub fn route_message(
     // by FID hash.
     match message.msg_type() {
         MessageType::LendStorage | MessageType::KeyAdd | MessageType::KeyRemove => 0,
+        // All Hypersnap types are shard-0 state (FIP §14.2).
+        t if t.is_hypersnap() => 0,
         _ => router.route_fid(message.fid(), num_shards),
     }
 }
@@ -80,6 +82,18 @@ mod tests {
                 route_message(&router, &msg(MessageType::KeyRemove, fid), 2),
                 0
             );
+        }
+    }
+
+    #[test]
+    fn hypersnap_types_route_to_shard_zero() {
+        let router: Box<dyn MessageRouter> = Box::new(ShardRouter {});
+        for t in [
+            MessageType::TokenTransfer,
+            MessageType::CustodyMigration,
+            MessageType::NativeOnboard,
+        ] {
+            assert_eq!(route_message(&router, &msg(t, 12345), 2), 0);
         }
     }
 

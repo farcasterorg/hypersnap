@@ -1,0 +1,30 @@
+[package]
+name = "hypersnap-ktrie"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+description = "Keccak-256 sparse binary Merkle trie: the per-shard state commitment of Hypersnap (FIP §16.13)"
+
+
+[features]
+# Use the ARMv8 SHA-3 instructions / assembly Keccak-f backend where available.
+asm = ["sha3/asm"]
+
+[dependencies]
+sha3 = "0.10"
+# Randomly seeded fast hasher for the in-memory node maps (already in the
+# main workspace's dependency graph via hashbrown).
+foldhash = "0.2"
+
+[dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
+serde_json = "1"
+# Thread CPU time in the bench (already in the dependency graph via cpufeatures).
+libc = "0.2"
+
+[[bench]]
+name = "ktrie"
+harness = false
+
+[profile.bench]
+debug = false

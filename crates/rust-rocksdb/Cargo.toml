@@ -1,0 +1,50 @@
+[package]
+name = "rocksdb"
+description = "Rust wrapper for Facebook's RocksDB embeddable database"
+version = "0.24.0"
+edition = "2021"
+rust-version = "1.85.0"
+authors = [
+    "Tyler Neely <t@jujit.su>",
+    "David Greenberg <dsg123456789@gmail.com>",
+]
+repository = "https://github.com/rust-rocksdb/rust-rocksdb"
+license = "Apache-2.0"
+categories = ["database"]
+keywords = ["database", "embedded", "LSM-tree", "persistence"]
+homepage = "https://github.com/rust-rocksdb/rust-rocksdb"
+exclude = [".gitignore", ".travis.yml", "deploy.sh", "test/**/*"]
+
+[features]
+default = ["snappy", "lz4", "zstd", "zlib", "bzip2", "bindgen-runtime"]
+jemalloc = ["librocksdb-sys/jemalloc"]
+io-uring = ["librocksdb-sys/io-uring"]
+valgrind = []
+mt_static = ["librocksdb-sys/mt_static"]
+snappy = ["librocksdb-sys/snappy"]
+lz4 = ["librocksdb-sys/lz4"]
+zstd = ["librocksdb-sys/zstd"]
+zlib = ["librocksdb-sys/zlib"]
+bzip2 = ["librocksdb-sys/bzip2"]
+rtti = ["librocksdb-sys/rtti"]
+multi-threaded-cf = []
+serde1 = ["serde"]
+bindgen-runtime = ["librocksdb-sys/bindgen-runtime"]
+bindgen-static = ["librocksdb-sys/bindgen-static"]
+lto = ["librocksdb-sys/lto"]
+raw-ptr = []
+
+[dependencies]
+libc = "0.2"
+# The C++ library stays on the pinned upstream revision; only this Rust
+# wrapper is vendored (see VENDORED.md).
+librocksdb-sys = { git = "https://github.com/rust-rocksdb/rust-rocksdb.git", rev = "a4f178d0ca668c4b48d993ab8aef6f4004780f23", version = "0.18.0", default-features = false, features = [
+    "static",
+] }
+serde = { version = "1", features = ["derive"], optional = true }
+
+[dev-dependencies]
+bincode = "2"
+pretty_assertions = "1"
+tempfile = "3"
+trybuild = "1"

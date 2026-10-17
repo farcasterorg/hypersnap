@@ -6,12 +6,9 @@ use crate::{
         MessageType, OnChainEventType,
     },
     storage::{
-        db::{PageOptions, RocksDbTransactionBatch},
+        db::RocksDbTransactionBatch,
         store::{
-            account::{
-                LinkStore, StorageLendStore, UserDataStore, UsernameProofStore, VerificationStore,
-                FID_BYTES,
-            },
+            account::{UserDataStore, FID_BYTES},
             engine::PostCommitMessage,
             stores::Stores,
         },
@@ -349,115 +346,19 @@ impl Replicator {
             return Ok(cache.clone());
         }
 
-        let mut page_options = PageOptions::default();
-        // Get all messages in one go, no need for paging through an individual FIDs messages by message_type
-        page_options.page_size = Some(usize::MAX);
-
-        // No filter, we want all messages of fid + message_type
-        let filter = Option::<fn(&proto::Message) -> bool>::None;
-
-        // Handle each store type directly
-        let messages = match user_message_type {
-            proto::MessageType::FrameAction
-            | proto::MessageType::None
-            | proto::MessageType::KeyAdd
-            | proto::MessageType::KeyRemove => {
-                // KEY_ADD/KEY_REMOVE replication is wired up in a follow-up task once the
-                // gasless key store lands; until then they are not replicated here.
-                return Err(ReplicationError::InvalidMessage(format!(
-                    "Invalid message type for FID {}: {:?}",
-                    fid, user_message_type
-                )));
-            }
-            proto::MessageType::CastAdd => {
-                stores
-                    .cast_store
-                    .get_adds_by_fid(fid, &page_options, filter)?
-                    .messages
-            }
-            proto::MessageType::CastRemove => {
-                stores
-                    .cast_store
-                    .get_removes_by_fid(fid, &page_options, filter)?
-                    .messages
-            }
-            proto::MessageType::ReactionAdd => {
-                stores
-                    .reaction_store
-                    .get_adds_by_fid(fid, &page_options, filter)?
-                    .messages
-            }
-            proto::MessageType::ReactionRemove => {
-                stores
-                    .reaction_store
-                    .get_removes_by_fid(fid, &page_options, filter)?
-                    .messages
-            }
-            proto::MessageType::LinkAdd => {
-                stores
-                    .link_store
-                    .get_adds_by_fid(fid, &page_options, filter)?
-                    .messages
-            }
-            proto::MessageType::LinkRemove => {
-                stores
-                    .link_store
-                    .get_removes_by_fid(fid, &page_options, filter)?
-                    .messages
-            }
-            proto::MessageType::LinkCompactState => {
-                LinkStore::get_link_compact_state_message_by_fid(
-                    &stores.link_store,
-                    fid,
-                    &page_options,
-                )?
-                .messages
-            }
-            proto::MessageType::UserDataAdd => {
-                stores
-                    .user_data_store
-                    .get_adds_by_fid(fid, &page_options, filter)?
-                    .messages
-            }
-            proto::MessageType::VerificationAddEthAddress => {
-                VerificationStore::get_verification_adds_by_fid(
-                    &stores.verification_store,
-                    fid,
-                    &page_options,
-                )?
-                .messages
-            }
-            proto::MessageType::VerificationRemove => {
-                VerificationStore::get_verification_removes_by_fid(
-                    &stores.verification_store,
-                    fid,
-                    &page_options,
-                )?
-                .messages
-            }
-            proto::MessageType::UsernameProof => {
-                UsernameProofStore::get_username_proofs_by_fid(
-                    &stores.username_proof_store,
-                    fid,
-                    &page_options,
-                )?
-                .messages
-            }
-            proto::MessageType::LendStorage => {
-                let mut messages = stores
-                    .storage_lend_store
-                    .get_adds_by_fid(fid, &page_options, filter)?
-                    .messages;
-
-                let borrows = StorageLendStore::get_messages_by_borrower_fid(
-                    &stores.storage_lend_store,
-                    fid,
-                )?;
-
-                messages.extend(borrows);
-                messages
-            }
-        };
+        // KEY_ADD/KEY_REMOVE replication is wired up in a follow-up task once the
+        // gasless key store lands; until then they are not replicated here.
+        let messages = crate::storage::trie::key_resolver::messages_for_fid_and_type(
+            stores,
+            fid,
+            user_message_type,
+        )?
+        .ok_or_else(|| {
+            ReplicationError::InvalidMessage(format!(
+                "Invalid message type for FID {}: {:?}",
+                fid, user_message_type
+            ))
+        })?;
 
         // Build a hashmap of message_hash -> message and put it in the cache
         let message_hash_map = Arc::new(

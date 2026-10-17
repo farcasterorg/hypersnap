@@ -404,6 +404,21 @@ message ContactInfoBody {
   uint64 timestamp = 5;
   string announce_rpc_address = 6;
   repeated string capabilities = 7;
+  // A Hypersnap validator: its epoch registration (FIP §4.10).
+  HypersnapContact hypersnap = 8;
+}
+
+// The registration of a Hypersnap validator in its contact info (FIP §4.10):
+// the `ValidatorRecord` fields without the consensus key. A peer checks it
+// against the shard-0 state; `libp2p_peer_id` must be the peer of the contact.
+message HypersnapContact {
+  uint64 fid = 1;
+  bytes consensus_key_hash = 2;
+  bytes node_key_hash = 3;
+  bytes libp2p_peer_id = 4;
+  uint64 registration_epoch = 5;
+  uint64 join_epoch = 6;
+  uint64 leave_epoch = 7;
 }
 
 message GetConnectedPeersRequest {

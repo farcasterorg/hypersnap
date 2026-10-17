@@ -30,7 +30,7 @@
 //!     [--budget-app 3000000]
 
 use clap::Parser;
-use hypersnap::hyper::poq_reader::PoqReader;
+use hypersnap::chain::poq_reader::PoqReader;
 use hypersnap::storage::db::RocksDB;
 use proof_of_quality::reader::SnapchainStateReader;
 use proof_of_quality::scoring::evaluate_epoch;
@@ -81,10 +81,6 @@ struct Args {
     new_user_share_smoothing: Option<f64>,
     #[arg(long)]
     growth_exponent: Option<f64>,
-    #[arg(long)]
-    crediter_trust_threshold: Option<f64>,
-    #[arg(long)]
-    vouch_boost_min_vouchee_trust: Option<f64>,
 
     // --- App-PoW tunables ---
     #[arg(long)]
@@ -129,37 +125,50 @@ fn now_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// The consensus exponents are 0, 1/2 or a whole number (FIP §8.5).
+fn exponent(name: &str, v: f64) -> proof_of_quality::fixed::Exponent {
+    use proof_of_quality::fixed::Exponent;
+    if v == 0.0 {
+        Exponent::Zero
+    } else if v == 0.5 {
+        Exponent::Half
+    } else if v >= 1.0 && v.fract() == 0.0 {
+        Exponent::Int(v as u32)
+    } else {
+        panic!("--{}: {} is not 0, 0.5 or a whole number", name, v)
+    }
+}
+
+/// A fraction as 6-decimal fixed point.
+fn fp(v: f64) -> u64 {
+    (v.max(0.0) * 1_000_000.0).round() as u64
+}
+
 fn build_params(args: &Args) -> ScoringParams {
     let mut p = ScoringParams::default();
     if let Some(v) = args.credibility_exponent {
-        p.credibility_exponent = v;
+        p.credibility_exponent = exponent("credibility-exponent", v);
     }
     if let Some(v) = args.trust_exponent {
-        p.trust_exponent = v;
+        p.trust_exponent = exponent("trust-exponent", v);
     }
     if let Some(v) = args.ring_symmetry_exponent {
-        p.ring_symmetry_exponent = v;
+        p.ring_symmetry_exponent = exponent("ring-symmetry-exponent", v);
     }
     if let Some(v) = args.new_user_share_exponent {
-        p.new_user_share_exponent = v;
+        p.new_user_share_exponent = exponent("new-user-share-exponent", v);
     }
     if let Some(v) = args.new_user_share_smoothing {
-        p.new_user_share_smoothing = v;
+        p.new_user_share_epsilon_fp = fp(v);
     }
     if let Some(v) = args.growth_exponent {
-        p.growth_exponent = v;
-    }
-    if let Some(v) = args.crediter_trust_threshold {
-        p.crediter_trust_threshold = v;
-    }
-    if let Some(v) = args.vouch_boost_min_vouchee_trust {
-        p.vouch_boost_min_vouchee_trust = v;
+        p.growth_exponent = exponent("growth-exponent", v);
     }
     if let Some(v) = args.app_pow_receipt_weight {
-        p.app_pow_receipt_weight = v;
+        p.app_pow_receipt_weight_fp = fp(v);
     }
     if let Some(v) = args.app_pow_add_weight {
-        p.app_pow_add_weight = v;
+        p.app_pow_add_weight_fp = fp(v);
     }
     if let Some(v) = args.app_pow_max_per_epoch_atoms {
         p.app_pow_max_per_epoch_atoms = v;
@@ -177,7 +186,7 @@ fn build_params(args: &Args) -> ScoringParams {
         p.eligibility.calibration_min_active_days = v;
     }
     if let Some(v) = args.threshold_percentile {
-        p.eligibility.threshold_percentile = v;
+        p.eligibility.threshold_percentile_fp = fp(v);
     }
     if args.enable_f4 {
         p.eligibility.enable_f4 = true;

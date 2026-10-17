@@ -1,0 +1,14 @@
+# Output of: python3 coresvp.py   (pure-Python cross-check, NOT authoritative)
+
+== calibration: Dilithium round 3 (published: LWE 423/623, SIS 423/638) ==
+Dilithium2: LWE primal beta=424  SIS(weak) beta=423
+Dilithium3: LWE primal beta=624  SIS(weak) beta=638
+
+== LWE-FSA provisional v1 (id 1) ==
+q=4193633 (2^22.00) n=1280 m=1280 k=256 kappa=60 eta=1 gamma1=262144 gamma2=131051 B=262083
+LWE primal uSVP : beta=547 (samples used 1152)  classical 160.0  quantum 145.1
+LWE dual        : beta=545 (samples used 1193)  classical 159.4
+LWE dual        : beta=545 (samples used 1193)  quantum 144.6
+SIS weak unforgeability  : zeta=262103  beta=562  classical 164.4  quantum 149.1
+SIS strong unforgeability: zeta=524206  beta=501  classical 146.5  quantum 132.9
+

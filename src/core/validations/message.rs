@@ -101,6 +101,27 @@ pub fn validate_message(
     block_timestamp: &FarcasterTime,
     version: EngineVersion,
 ) -> Result<(), ValidationError> {
+    validate_message_with(
+        message,
+        current_network,
+        is_pro_user,
+        block_timestamp,
+        version,
+        true,
+    )
+}
+
+/// `validate_message` with the Ed25519 signature check optional: after the
+/// pivot, a message of a migrated FID has a Falcon-512 or dual signature,
+/// which the caller verified against the shard-0 records (FIP §16.8).
+pub fn validate_message_with(
+    message: &proto::Message,
+    current_network: proto::FarcasterNetwork,
+    is_pro_user: bool,
+    block_timestamp: &FarcasterTime,
+    version: EngineVersion,
+    check_ed25519_signature: bool,
+) -> Result<(), ValidationError> {
     let data_bytes;
     let message_data;
     if message.data_bytes.is_some() {
@@ -159,12 +180,14 @@ pub fn validate_message(
     }
 
     validate_message_hash(message.hash_scheme, &data_bytes, &message.hash)?;
-    validate_signature(
-        message.signature_scheme,
-        &message.hash,
-        &message.signature,
-        &message.signer,
-    )?;
+    if check_ed25519_signature {
+        validate_signature(
+            message.signature_scheme,
+            &message.hash,
+            &message.signature,
+            &message.signer,
+        )?;
+    }
     validate_timestamp(message_data.timestamp, block_timestamp, version)?;
 
     match &message_data.body {
@@ -236,6 +259,9 @@ pub fn validate_message(
         Some(proto::message_data::Body::KeyRemoveBody(key_remove_body)) => {
             key::validate_key_remove_body(&key_remove_body)?;
         }
+        // Hypersnap bodies are not snapchain messages. The shard-0 engine
+        // validates them after the pivot (FIP §14); here they are invalid.
+        Some(_) => return Err(ValidationError::InvalidMessageType),
         None => {}
     }
 

@@ -5,9 +5,11 @@ pub mod block;
 pub mod block_engine;
 pub mod engine;
 pub mod engine_metrics;
+pub mod hyper_backfill;
 pub mod mempool_poller;
 pub mod node_local_state;
 pub mod shard;
+pub mod state_context;
 pub mod stores;
 pub mod utils;
 

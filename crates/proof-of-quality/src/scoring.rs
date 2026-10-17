@@ -1,357 +1,442 @@
-//! Per-epoch scoring pipeline. Top-level entry: [`evaluate_epoch`].
+//! Per-epoch scoring pipeline in fixed point (FIP §5–§8.5). Top-level
+//! entry: [`evaluate_epoch`].
 //!
-//! Mirrors the Phase 3–6 pipeline of `retro_rewards_finalize.rs`, but
-//! deterministic (BTreeMap iteration everywhere) and scoped to the
-//! in-protocol composite formula with `harmonic` mutuality.
+//! Order of the pipeline ([`score_fids`]):
+//!
+//! 1. [`build_metrics`]: raw reader inputs, age factor, entropies,
+//!    ratios, stake factor (credibility stake + vouch stake received).
+//! 2. [`compute_eigentrust`] over the post-transfer follow graph
+//!    (`EIGENTRUST_SCALE = 10^30`, exactly 30 iterations).
+//! 3. [`apply_trust_and_credibility`]: `trust_fp` and credibility.
+//! 4. [`apply_new_user_share`]: the F5 new-user count from engagers
+//!    below the crediter floor (needs trust).
+//! 5. [`compute_eligibility`]: F0–F6 (needs the gated share and trust).
+//! 6. [`compute_growth_harmonic`]: §6.1 growth score (needs
+//!    eligibility for the §6.7 vouch boost).
+//! 7. [`compute_composite`]: §6.2 five-factor composite.
+//!
+//! [`evaluate_epoch`] then allocates the three market budgets.
 
+use crate::eligibility::{compute_eligibility, EligibilityThresholds};
+use crate::fixed::{
+    fp_div, fp_ln_ge_one, fp_mul, fp_pow, fp_ratio_capped, fp_sqrt, mul_div_floor, sat_u32,
+    EIGENTRUST_SCALE, FP_ONE, FP_SCALE,
+};
 use crate::metrics::{
-    build_metrics, compute_credibility_weight, stake_factor_from_atoms, FidMetrics, W_AGE,
-    W_DIVERSITY, W_ENTROPY, W_STAKE, W_TRUST,
+    apply_new_user_share, build_metrics, compute_credibility_weight_fp,
+    normalized_entropy_of_values, FidMetrics,
 };
 use crate::reader::SnapchainStateReader;
 use crate::{
-    EpochScoringOutput, MarketReward, RewardEntry, ScoringError, ScoringParams, WorkMarket,
+    epoch_boundary_height, Eligibility, EpochScoringOutput, MarketReward, RewardEntry,
+    ScoringError, ScoringParams, WorkMarket, CREDITER_TRUST_FLOOR_FP, EIGENTRUST_DAMPING_DEN,
+    EIGENTRUST_DAMPING_NUM, EIGENTRUST_ITERATIONS, EIGENTRUST_NORM_TOP_N, VOUCH_BOOST_MAX_FP,
+    VOUCH_MATURITY_AMOUNT,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-/// EigenTrust propagation: given a follow graph and a seed set, return
-/// per-FID raw trust scores. Iterative Markov-chain solver, bounded
-/// iteration count for determinism.
+/// §8.2.2 EigenTrust in fixed point (`EIGENTRUST_SCALE = 10^30`):
 ///
-/// Mirrors `compute_eigentrust` from the offline tool. Uses BTreeMap
-/// iteration order so the reduction is deterministic regardless of
-/// hash randomness.
+/// ```text
+/// seed(i)    = floor(10^30 / |S|)              if i ∈ S, else 0
+/// t_0(i)     = seed(i)
+/// t_{n+1}(i) = floor(Σ_j floor(t_n(j) / out_degree(j)) · 85 / 100)
+///            + floor(seed(i) · 15 / 100)
+/// ```
+///
+/// `j` runs over the followers of `i` in ascending FID order;
+/// `out_degree(j)` is the number of distinct FIDs that `j` follows.
+/// Exactly `iterations` rounds, no convergence test. Returns the raw
+/// mass of every FID of the universe (graph FIDs ∪ seeds); empty when
+/// the universe or the seed set is empty.
 pub fn compute_eigentrust(
     follow_graph: &BTreeMap<u64, Vec<u64>>,
     seed_set: &BTreeSet<u64>,
     iterations: u32,
-    alpha: f64,
-) -> BTreeMap<u64, f64> {
+) -> BTreeMap<u64, u128> {
     let mut universe: BTreeSet<u64> = BTreeSet::new();
     for (&j, followees) in follow_graph {
         universe.insert(j);
-        for &i in followees {
-            universe.insert(i);
-        }
+        universe.extend(followees.iter().copied());
     }
-    for &s in seed_set {
-        universe.insert(s);
-    }
+    universe.extend(seed_set.iter().copied());
     if universe.is_empty() || seed_set.is_empty() {
         return BTreeMap::new();
     }
-
-    let seed_weight = 1.0 / seed_set.len() as f64;
-    let mut t: BTreeMap<u64, f64> = BTreeMap::new();
-    for &fid in &universe {
-        if seed_set.contains(&fid) {
-            t.insert(fid, seed_weight);
-        } else {
-            t.insert(fid, 0.0);
+    // Dense indices in ascending FID order: index order == FID order,
+    // so every per-node reduction below runs in FID order.
+    let fids: Vec<u64> = universe.into_iter().collect();
+    let index_of = |f: u64| fids.binary_search(&f).unwrap_or(0);
+    let n = fids.len();
+    let mut out_degree: Vec<u128> = vec![0; n];
+    let mut followers: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (&j, followees) in follow_graph {
+        let mut fs = followees.clone();
+        fs.sort_unstable();
+        fs.dedup();
+        let jj = index_of(j);
+        out_degree[jj] = fs.len() as u128;
+        for i in fs {
+            // `follow_graph` iterates j ascending, so each follower list
+            // is built in ascending FID order.
+            followers[index_of(i)].push(jj);
         }
     }
 
-    // Pre-compute reverse follower edges: for each followee, who follows
-    // them. Used to push trust along incoming edges.
-    let mut reverse: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
-    for (&follower, followees) in follow_graph {
-        for &followee in followees {
-            reverse.entry(followee).or_default().push(follower);
-        }
-    }
-    // Sort followers for determinism (BTreeMap iteration is already
-    // ordered, but the inner Vec needs an explicit sort).
-    for v in reverse.values_mut() {
-        v.sort_unstable();
-        v.dedup();
-    }
-
-    // Each follower distributes their trust uniformly across their
-    // followees. Cache out-degrees for the propagation step.
-    let mut out_degree: BTreeMap<u64, usize> = BTreeMap::new();
-    for (&follower, followees) in follow_graph {
-        out_degree.insert(follower, followees.len());
-    }
-
+    let seed_mass = EIGENTRUST_SCALE / seed_set.len() as u128;
+    let seed_kick =
+        seed_mass * (EIGENTRUST_DAMPING_DEN - EIGENTRUST_DAMPING_NUM) / EIGENTRUST_DAMPING_DEN;
+    let is_seed: Vec<bool> = fids.iter().map(|f| seed_set.contains(f)).collect();
+    let mut t: Vec<u128> = is_seed
+        .iter()
+        .map(|&s| if s { seed_mass } else { 0 })
+        .collect();
+    let mut next: Vec<u128> = vec![0; n];
     for _ in 0..iterations {
-        let mut next: BTreeMap<u64, f64> = BTreeMap::new();
-        for &fid in &universe {
-            let mut acc = 0.0_f64;
-            if let Some(followers) = reverse.get(&fid) {
-                for &f in followers {
-                    let od = *out_degree.get(&f).unwrap_or(&0);
-                    if od == 0 {
-                        continue;
-                    }
-                    let cur = *t.get(&f).unwrap_or(&0.0);
-                    acc += cur / od as f64;
-                }
+        for i in 0..n {
+            let mut acc: u128 = 0;
+            for &j in &followers[i] {
+                // out_degree(j) ≥ 1: j follows i.
+                acc = acc.saturating_add(t[j] / out_degree[j]);
             }
-            // Random restart toward the seed set.
-            let seed_kick = if seed_set.contains(&fid) {
-                seed_weight
-            } else {
-                0.0
-            };
-            next.insert(fid, alpha * acc + (1.0 - alpha) * seed_kick);
+            let mut v = acc.saturating_mul(EIGENTRUST_DAMPING_NUM) / EIGENTRUST_DAMPING_DEN;
+            if is_seed[i] {
+                v = v.saturating_add(seed_kick);
+            }
+            next[i] = v;
         }
-        t = next;
+        std::mem::swap(&mut t, &mut next);
     }
-    t
+    fids.into_iter().zip(t).collect()
 }
 
-/// Normalize raw EigenTrust scores against the average of the top-N
-/// (gives the seeds trust ≈ 1.0 and tails trust ≈ 0). Mirrors the
-/// retro tool's `top_n_avg_norm`.
-fn top_n_avg(scores: &BTreeMap<u64, f64>, n: usize) -> f64 {
-    let mut vals: Vec<f64> = scores.values().copied().collect();
+/// §8.2.3 `trust_norm`: the average of the top `n` raw values (all
+/// values if fewer; `10^30` = 1.0 if the sum is 0), as a floor division.
+pub fn trust_normalizer(raw: &BTreeMap<u64, u128>, n: usize) -> u128 {
+    let mut vals: Vec<u128> = raw.values().copied().collect();
     if vals.is_empty() {
-        return 1.0;
+        return EIGENTRUST_SCALE;
     }
-    vals.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    vals.sort_unstable_by(|a, b| b.cmp(a));
     let take = vals.len().min(n.max(1));
-    let sum: f64 = vals[..take].iter().sum();
-    if sum == 0.0 {
-        1.0
+    let sum = vals[..take].iter().fold(0u128, |a, &v| a.saturating_add(v));
+    if sum == 0 {
+        EIGENTRUST_SCALE
     } else {
-        sum / take as f64
+        (sum / take as u128).max(1)
     }
 }
 
-/// Apply EigenTrust + age normalization + credibility blend in one
-/// sweep. After this call, `metrics[fid].trust_score` and
-/// `metrics[fid].credibility_weight` are populated.
+/// §8.2.3 trust score in 6-decimal fixed point:
+///
+/// ```text
+/// ratio    = min(1, floor(raw · 10^6 / trust_norm))
+/// trust_fp = floor(ratio · age_factor / 10^6)          (0..=1_000_000)
+/// ```
+pub fn trust_fp_from_raw(raw: u128, trust_norm: u128, age_factor_fp: u64) -> u32 {
+    if trust_norm == 0 {
+        return 0;
+    }
+    let ratio = mul_div_floor(raw, FP_SCALE, trust_norm).min(FP_SCALE);
+    sat_u32(fp_mul(ratio, u128::from(age_factor_fp)).min(FP_SCALE))
+}
+
+/// Apply the EigenTrust normalization + age adjustment (`trust_fp`)
+/// and the §8.4 credibility blend in one sweep.
 pub fn apply_trust_and_credibility(
     metrics: &mut BTreeMap<u64, FidMetrics>,
-    eigentrust_raw: &BTreeMap<u64, f64>,
+    eigentrust_raw: &BTreeMap<u64, u128>,
 ) {
-    let norm = top_n_avg(eigentrust_raw, 100);
+    let norm = trust_normalizer(eigentrust_raw, EIGENTRUST_NORM_TOP_N);
     for (fid, m) in metrics.iter_mut() {
-        let raw = eigentrust_raw.get(fid).copied().unwrap_or(0.0);
-        let normalized = (raw / norm).min(1.0);
-        m.trust_score = (normalized * m.age_factor).clamp(0.0, 1.0);
-        m.credibility_weight = compute_credibility_weight(
-            m.age_factor,
-            m.trust_score,
-            m.interaction_entropy,
-            m.stake_factor,
+        let raw = eigentrust_raw.get(fid).copied().unwrap_or(0);
+        m.trust_fp = trust_fp_from_raw(raw, norm, m.age_factor_fp);
+        m.credibility_weight_fp = compute_credibility_weight_fp(
+            m.age_factor_fp,
+            m.trust_fp,
+            m.interaction_entropy_fp,
+            m.stake_factor_fp,
         );
-        let _ = (W_AGE, W_TRUST, W_ENTROPY, W_STAKE, W_DIVERSITY); // doc cross-reference
     }
 }
 
-/// Per-mode growth scoring (harmonic-only in the in-protocol path).
-/// Mirrors `compute_growth_scores` from the offline tool. Each pair's
-/// contribution is `ln(1 + harmonic_mean(a, b)) · credibility(crediter)`,
-/// gated on the crediter's trust being above the floor.
+/// §6.1 `harmonic(a, b) = 2ab / (a + b)` as a 6-dp quotient; 0 if
+/// either side is 0.
+pub fn harmonic_fp(a: u32, b: u32) -> u128 {
+    if a == 0 || b == 0 {
+        return 0;
+    }
+    let (a, b) = (u128::from(a), u128::from(b));
+    fp_div(2 * a * b, a + b)
+}
+
+/// §6.7 `vouch_boost = 1 + VOUCH_BOOST_MAX · min(1, stake /
+/// VOUCH_MATURITY_AMOUNT)` for an eligible vouchee (6-dp). The caller
+/// applies the eligibility gate.
+pub fn vouch_boost_fp(vouch_stake: u64) -> u64 {
+    let ratio = fp_ratio_capped(u128::from(vouch_stake), u128::from(VOUCH_MATURITY_AMOUNT));
+    let extra = fp_mul(u128::from(VOUCH_BOOST_MAX_FP), ratio);
+    FP_ONE.saturating_add(u64::try_from(extra).unwrap_or(u64::MAX))
+}
+
+/// §6.1 one contribution, as products from left to right:
+/// `ln(1 + harmonic(a, b)) · credibility(u) · vouch_boost(f, u)`, with
+/// `ln(1 + h) = q32_to_fp(ln_q32(10^6 + h_fp, 10^6))`.
+pub fn contribution_fp(count_fu: u32, count_uf: u32, credibility_u_fp: u64, boost_fp: u64) -> u128 {
+    let h = harmonic_fp(count_fu, count_uf);
+    if h == 0 {
+        return 0;
+    }
+    let ln = fp_ln_ge_one(FP_SCALE + h);
+    let c = fp_mul(ln, u128::from(credibility_u_fp));
+    fp_mul(c, u128::from(boost_fp))
+}
+
+/// §6.1 `1 / √n` as 6-dp: `floor(10^6 · 10^6 / isqrt(n · 10^12))`.
+pub fn inv_sqrt_count_fp(n: usize) -> u128 {
+    let sqrt_n = fp_sqrt((n as u128).saturating_mul(FP_SCALE));
+    fp_div(FP_SCALE, sqrt_n)
+}
+
+/// §6.1 growth score in fixed point (harmonic mutuality):
 ///
-/// FIP §12 vouch boost: when crediter `u` has staked a vouch on
-/// vouchee `f` with `atoms` atoms, `u`'s contribution to `f`'s growth
-/// is multiplied by `1 + stake_factor_from_atoms(atoms)`. A
-/// fully-saturated vouch doubles the contribution; no vouch leaves it
-/// unchanged. Per-pair, so `u → f` and `u → g` are independent.
+/// ```text
+/// contribution(f, u) = ln(1 + harmonic(count(f→u), count(u→f)))
+///                    · credibility(u) · vouch_boost(f, u)
+/// growth(f)          = 0                                   if n(f) < MIN_DISTINCT_CREDITERS
+///                      Σ C(f) · (1/√n(f)) · skew_damping(f)  otherwise
+/// skew_damping(f)    = max((1 − H(C(f)))^GROWTH_SKEW_EXPONENT, GROWTH_MIN_DAMPING)
+/// ```
 ///
-/// The boost is additionally gated on the vouchee's own trust
-/// (`vouch_boost_min_vouchee_trust`): the multiplier only applies
-/// when `metrics[f].trust_score ≥ threshold`. Below the threshold
-/// the boost is forced to `1.0` regardless of atoms — this closes
-/// the puppet-sybil pump where a high-trust voucher amplifies their
-/// engagement with a low-trust sybil.
+/// `u` is a crediter of `f` iff `count(f→u) > 0`, `count(u→f) > 0`,
+/// `trust_fp(u) ≥ CREDITER_TRUST_FLOOR_FP` (trust ≥ 0.0001) and
+/// `credibility(u) > 0`.
+/// `vouch_boost(f, u)` uses the vouch stake of `f` for `u`
+/// (`metrics[f].vouches_from[u]`) and applies only if `u` passes all
+/// eligibility filters; otherwise it is 1.0. `C(f)` is in crediter-FID
+/// order. The three products are evaluated left to right.
+///
+/// `growth_distribution_skew_exponent = 0` disables the skew damping.
 pub fn compute_growth_harmonic(
     metrics: &BTreeMap<u64, FidMetrics>,
-    crediter_trust_threshold: f64,
-    vouch_boost_min_vouchee_trust: f64,
-    _max_growth_fraction_per_crediter: f64,
-    min_distinct_crediters: usize,
-    growth_distribution_skew_exponent: f64,
-    growth_distribution_min_damping: f64,
-) -> BTreeMap<u64, f64> {
-    let mut growth: BTreeMap<u64, f64> = BTreeMap::new();
+    eligibility: &BTreeMap<u64, Eligibility>,
+    params: &ScoringParams,
+) -> BTreeMap<u64, u128> {
+    let mut growth: BTreeMap<u64, u128> = BTreeMap::new();
     for (&f, m_f) in metrics.iter() {
-        if m_f.credibility_weight <= 0.0 {
+        if m_f.credibility_weight_fp == 0 {
             continue;
         }
-        // First pass: collect raw per-crediter contributions.
-        // `all_time_engagement` is a BTreeMap so iteration is in
-        // ascending crediter-FID order — deterministic across
-        // validators (required for the entropy reduction below).
-        let mut contributions: Vec<f64> = Vec::new();
+        // `all_time_engagement` is a BTreeMap → crediter-FID order.
+        let mut contributions: Vec<u128> = Vec::new();
         for (&u, &count_uf) in m_f.all_time_engagement.iter() {
-            let count_fu = metrics
-                .get(&u)
-                .and_then(|m_u| m_u.all_time_engagement.get(&f))
-                .copied()
-                .unwrap_or(0);
-            if count_fu == 0 {
+            if u == f || count_uf == 0 {
                 continue;
             }
             let m_u = match metrics.get(&u) {
                 Some(m) => m,
                 None => continue,
             };
-            if m_u.trust_score < crediter_trust_threshold {
+            let count_fu = m_u.all_time_engagement.get(&f).copied().unwrap_or(0);
+            if count_fu == 0 {
                 continue;
             }
-            let cred_u = m_u.credibility_weight;
-            if cred_u <= 0.0 {
+            if m_u.trust_fp < CREDITER_TRUST_FLOOR_FP || m_u.credibility_weight_fp == 0 {
                 continue;
             }
-            let a = count_fu as f64;
-            let b = count_uf as f64;
-            let harmonic = if a + b > 0.0 {
-                2.0 * a * b / (a + b)
-            } else {
-                0.0
+            let vouchee_eligible = eligibility.get(&u).map(|e| e.passes_all()).unwrap_or(false);
+            let boost = match m_f.vouches_from.get(&u) {
+                Some(&stake) if vouchee_eligible => vouch_boost_fp(stake),
+                _ => FP_ONE,
             };
-            if harmonic <= 0.0 {
-                continue;
-            }
-            let vouch_atoms = m_u.vouches_from.get(&f).copied().unwrap_or(0);
-            let vouch_boost = if m_f.trust_score >= vouch_boost_min_vouchee_trust {
-                1.0 + stake_factor_from_atoms(vouch_atoms)
-            } else {
-                1.0
-            };
-            contributions.push((1.0 + harmonic).ln() * cred_u * vouch_boost);
+            contributions.push(contribution_fp(
+                count_fu,
+                count_uf,
+                m_u.credibility_weight_fp,
+                boost,
+            ));
         }
-        if contributions.is_empty() {
+        let n = contributions.len();
+        if n == 0 || n < params.min_distinct_crediters {
             continue;
         }
-        // F009: three-layer sybil defense.
-        //
-        // Layer 0 — crediter trust floor (enforced above via
-        // `crediter_trust_threshold`): noise-floor accounts with
-        // trust < 0.05 don't contribute, so a same-trust-tier sybil
-        // ring contributes nothing here.
-        //
-        // Layer 1 — distinct-crediter count gate: growth is zero
-        // unless at least `min_distinct_crediters` (default 3)
-        // unique crediters reciprocate. A 2-person sybil pair gets
-        // nothing; a legitimate user with diverse engagement
-        // clears easily.
-        //
-        // Layer 2 — distribution-aware damping. Mirrors the retro
-        // reward algorithm's `(engager_entropy * interaction_entropy)
-        // ^ ring_symmetry_exponent` factor in `compute_composite`.
-        // The growth-side analogue computes the normalized Shannon
-        // entropy of the per-crediter contributions and damps the
-        // sum by `(1 - H_norm)^growth_distribution_skew_exponent`,
-        // composed multiplicatively with the count-based
-        // `sqrt(n)/n`. A 100-member sybil ring where every pair
-        // reciprocates with similar engagement has near-uniform
-        // contributions (`H_norm ≈ 1`) → damping toward zero. A
-        // real user with skewed engagement (`H_norm ≈ 0.4-0.6`)
-        // keeps most of the sum. Distribution-blind by the prior
-        // sqrt-only damping is closed (see audit F009 R5 caveat).
-        let n_crediters = contributions.len();
-        if n_crediters < min_distinct_crediters {
-            continue;
-        }
-        let count_damping = (n_crediters as f64).sqrt() / n_crediters as f64;
-        let entropy = crate::metrics::normalized_entropy_of_values(&contributions);
-        let skew = (1.0 - entropy).max(0.0);
-        let distribution_damping = if growth_distribution_skew_exponent > 0.0 {
-            // F009 L2 fairness floor (R6 audit caveat): clamp the
-            // distribution-damping factor so a perfectly uniform
-            // contribution distribution (H_norm = 1) doesn't zero
-            // out a legit popular user with equal-weight fans. L0
-            // (the trust floor) is the real sybil gate; this floor
-            // only matters when an attacker has already corrupted
-            // the trust graph past L0, in which case the residual
-            // damping (`min × sqrt(N)/N`) still penalizes large
-            // rings heavily.
-            skew.powf(growth_distribution_skew_exponent)
-                .max(growth_distribution_min_damping)
+        let sum = contributions
+            .iter()
+            .fold(0u128, |acc, &c| acc.saturating_add(c));
+        let damping = if params.growth_distribution_skew_exponent == 0 {
+            FP_SCALE
         } else {
-            1.0
+            let h = u128::from(normalized_entropy_of_values(&contributions));
+            let skew = FP_SCALE.saturating_sub(h);
+            fp_pow(skew, params.growth_distribution_skew_exponent)
+                .max(u128::from(params.growth_distribution_min_damping_fp))
         };
-        let raw_sum: f64 = contributions.iter().sum();
-        let acc = raw_sum * count_damping * distribution_damping;
-        if acc > 0.0 {
-            growth.insert(f, acc);
+        let g = fp_mul(fp_mul(sum, inv_sqrt_count_fp(n)), damping);
+        if g > 0 {
+            growth.insert(f, g);
         }
     }
     growth
 }
 
-/// `composite(f) = credibility^k · trust^j · (eg·int)^p · (share+ε)^q · growth^g`.
+/// The six inputs of the §6.2 composite, in fixed point.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CompositeInputs {
+    pub credibility_weight_fp: u64,
+    pub trust_fp: u32,
+    pub engager_entropy_fp: u64,
+    pub interaction_entropy_fp: u64,
+    pub new_user_share_fp: u64,
+    pub growth_fp: u128,
+}
+
+impl CompositeInputs {
+    /// The new-user share is `real_new_user_share_fp`, or the F5 share
+    /// under the v6 rule (`real_new_user_window_secs = None`).
+    pub fn from_metrics(m: &FidMetrics, growth_fp: u128, p: &ScoringParams) -> Self {
+        Self {
+            credibility_weight_fp: m.credibility_weight_fp,
+            trust_fp: m.trust_fp,
+            engager_entropy_fp: m.engager_entropy_fp,
+            interaction_entropy_fp: m.interaction_entropy_fp,
+            new_user_share_fp: match p.real_new_user_window_secs {
+                Some(_) => m.real_new_user_share_fp,
+                None => m.new_user_engagement_share_fp,
+            },
+            growth_fp,
+        }
+    }
+}
+
+/// §6.2 composite of one FID, 6-dp:
+///
+/// ```text
+/// credibility^k · trust^j · (engager_entropy · interaction_entropy)^p
+///     · (new_user_share + ε)^q · growth^g
+/// ```
+///
+/// with `trust = trust_fp / 10^6`. Each factor uses [`Exponent::apply`]
+/// (`x^4`, `x^3` as left-to-right products, `x^(1/2) = isqrt(x · 10^6)`).
+/// See [`composite_from_parts`] for the normative product order.
+///
+/// [`Exponent::apply`]: crate::fixed::Exponent::apply
+pub fn composite_score(inputs: &CompositeInputs, p: &ScoringParams) -> u128 {
+    composite_from_parts(
+        u128::from(inputs.credibility_weight_fp),
+        u128::from(inputs.trust_fp),
+        u128::from(inputs.engager_entropy_fp),
+        u128::from(inputs.interaction_entropy_fp),
+        u128::from(inputs.new_user_share_fp),
+        inputs.growth_fp,
+        p,
+    )
+}
+
+/// §6.2 composite from its six 6-dp inputs.
+///
+/// **Normative product order.** The five factors are multiplied as
+///
+/// ```text
+/// composite = ((((growth^g · credibility^k) · trust^j) · symmetry^p) · new_user^q)
+/// ```
+///
+/// each `·` being one fixed-point product `floor(a · b / 10^6)`: the
+/// growth factor first, then the other four in the order of the §6.2
+/// formula. `growth^g` is usually > 1 and the other factors are ≤ 1
+/// (`new_user^q ≤ √1.001`), so the partial products do not increase and
+/// each floor costs at most 1 ulp of a value ≥ the result. (Multiplying
+/// `growth^g` last amplifies the earlier floors by `growth^g`: 0.26% on
+/// a v6 composite of 0.031.) Every implementation must use this order.
+pub fn composite_from_parts(
+    credibility_fp: u128,
+    trust_fp: u128,
+    engager_entropy_fp: u128,
+    interaction_entropy_fp: u128,
+    new_user_share_fp: u128,
+    growth_fp: u128,
+    p: &ScoringParams,
+) -> u128 {
+    let cred = p.credibility_exponent.apply(credibility_fp);
+    let trust = p.trust_exponent.apply(trust_fp);
+    let symmetry = p
+        .ring_symmetry_exponent
+        .apply(fp_mul(engager_entropy_fp, interaction_entropy_fp));
+    let new_user = p
+        .new_user_share_exponent
+        .apply(new_user_share_fp.saturating_add(u128::from(p.new_user_share_epsilon_fp)));
+    let growth = p.growth_exponent.apply(growth_fp);
+    fp_mul(
+        fp_mul(fp_mul(fp_mul(growth, cred), trust), symmetry),
+        new_user,
+    )
+}
+
+/// §6.2 composite for every FID with positive growth.
 pub fn compute_composite(
     metrics: &BTreeMap<u64, FidMetrics>,
-    growth: &BTreeMap<u64, f64>,
+    growth: &BTreeMap<u64, u128>,
     p: &ScoringParams,
-) -> BTreeMap<u64, f64> {
+) -> BTreeMap<u64, u128> {
     let mut out = BTreeMap::new();
     for (fid, m) in metrics {
         let g = match growth.get(fid) {
-            Some(&v) if v > 0.0 => v,
+            Some(&v) if v > 0 => v,
             _ => continue,
         };
-        let cred = m.credibility_weight.max(0.0).powf(p.credibility_exponent);
-        let trust = if p.trust_exponent > 0.0 {
-            m.trust_score.max(0.0).powf(p.trust_exponent)
-        } else {
-            1.0
-        };
-        let entropy_prod = m.engager_entropy * m.interaction_entropy;
-        let symmetry = if p.ring_symmetry_exponent > 0.0 {
-            entropy_prod.max(0.0).powf(p.ring_symmetry_exponent)
-        } else {
-            1.0
-        };
-        let new_user_factor = if p.new_user_share_exponent > 0.0 {
-            (m.new_user_engagement_share.max(0.0) + p.new_user_share_smoothing)
-                .powf(p.new_user_share_exponent)
-        } else {
-            1.0
-        };
-        let compressed_growth = if p.growth_exponent != 1.0 && p.growth_exponent > 0.0 {
-            g.max(0.0).powf(p.growth_exponent)
-        } else {
-            g
-        };
-        let score = cred * trust * symmetry * new_user_factor * compressed_growth;
-        if score > 0.0 {
+        let score = composite_score(&CompositeInputs::from_metrics(m, g, p), p);
+        if score > 0 {
             out.insert(*fid, score);
         }
     }
     out
 }
 
-/// Allocate `budget` across FIDs in proportion to their composite
-/// scores. Deterministic rounding (truncation) leaves a small
-/// remainder; we hand it to the highest-composite FID so the totals
-/// always equal `budget` exactly.
-pub fn allocate_budget(composite: &BTreeMap<u64, f64>, budget: u128) -> Vec<RewardEntry> {
+/// §6.2 allocation: `emission(f) = floor(composite(f) · budget /
+/// Σ composite)` (one floor of the exact ratio, 256-bit intermediate).
+/// The rounding remainder goes to the highest composite (tie: smaller
+/// FID), so the total equals `budget` exactly.
+///
+/// If `Σ composite = 0` (no eligible FID has a composite ≥ 1 ulp), the
+/// result is empty: the market's budget for the epoch is **not minted**
+/// and does not roll over to a later epoch. The same rule applies to
+/// the DA (`Σ score_int = 0`) and App (`Σ app_work = 0`) markets.
+pub fn allocate_budget(composite: &BTreeMap<u64, u128>, budget: u128) -> Vec<RewardEntry> {
+    allocate_proportional(composite, budget)
+}
+
+/// Shared proportional allocator: `floor(w · budget / Σ w)` per key in
+/// FID order, remainder to the largest weight (tie: smaller FID).
+pub(crate) fn allocate_proportional(
+    weights: &BTreeMap<u64, u128>,
+    budget: u128,
+) -> Vec<RewardEntry> {
     if budget == 0 {
         return Vec::new();
     }
-    let total: f64 = composite.values().sum();
-    if !(total.is_finite()) || total <= 0.0 {
+    let total = weights.values().fold(0u128, |a, &w| a.saturating_add(w));
+    if total == 0 {
         return Vec::new();
     }
-    let budget_f = budget as f64;
-    let mut entries: Vec<RewardEntry> = Vec::with_capacity(composite.len());
+    let mut entries: Vec<RewardEntry> = Vec::with_capacity(weights.len());
     let mut allocated: u128 = 0;
-    for (&fid, &c) in composite {
-        let share = (c / total) * budget_f;
-        let amt = share.floor().max(0.0) as u128;
+    let mut top: Option<(u64, u128)> = None;
+    for (&fid, &w) in weights {
+        if w == 0 {
+            continue;
+        }
+        let amt = mul_div_floor(w, budget, total);
         if amt > 0 {
             entries.push(RewardEntry { fid, amount: amt });
             allocated = allocated.saturating_add(amt);
         }
+        // Ascending FID iteration + strict `>` keeps the smaller FID on ties.
+        if top.map(|(_, best)| w > best).unwrap_or(true) {
+            top = Some((fid, w));
+        }
     }
-    // Hand the rounding remainder to the highest-composite FID. Tie-break
-    // by smaller fid so the result is deterministic across validators.
     if allocated < budget {
         let remainder = budget - allocated;
-        if let Some((&top_fid, _)) =
-            composite
-                .iter()
-                .max_by(|(fa, ca), (fb, cb)| match ca.partial_cmp(cb) {
-                    Some(std::cmp::Ordering::Equal) | None => fb.cmp(fa),
-                    Some(o) => o,
-                })
-        {
+        if let Some((top_fid, _)) = top {
             if let Some(e) = entries.iter_mut().find(|e| e.fid == top_fid) {
                 e.amount = e.amount.saturating_add(remainder);
             } else {
@@ -366,22 +451,30 @@ pub fn allocate_budget(composite: &BTreeMap<u64, f64>, budget: u128) -> Vec<Rewa
     entries
 }
 
-/// Top-level pipeline: build metrics → eigentrust → growth → composite →
-/// per-market allocation. Returns a fully-formed [`EpochScoringOutput`]
-/// ready to be canonically encoded and threshold-signed.
-pub fn evaluate_epoch<R: SnapchainStateReader + ?Sized>(
-    reader: &R,
-    epoch: u64,
-    now_unix: u64,
-    seed_set: &BTreeSet<u64>,
-    params: &ScoringParams,
-) -> Result<EpochScoringOutput, ScoringError> {
-    let mut metrics = build_metrics(reader, now_unix)?;
+/// Intermediate results of [`score_fids`]. Exposed for diagnostics,
+/// golden tests and the vouch evaluation glue.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScoringState {
+    /// Per-FID metrics with trust, credibility and the gated F5 share.
+    pub metrics: BTreeMap<u64, FidMetrics>,
+    /// Raw EigenTrust mass at `EIGENTRUST_SCALE`.
+    pub eigentrust_raw: BTreeMap<u64, u128>,
+    pub eligibility: BTreeMap<u64, Eligibility>,
+    pub thresholds: EligibilityThresholds,
+    /// §6.1 growth score (6-dp), FIDs with positive growth only.
+    pub growth: BTreeMap<u64, u128>,
+    /// §6.2 composite (6-dp), FIDs with positive composite only, before
+    /// the eligibility gate.
+    pub composite: BTreeMap<u64, u128>,
+}
 
-    // Build the follow graph for EigenTrust (post-transfer follows).
-    let fids = reader.all_active_fids()?;
+/// Build the post-transfer follow graph for the FIDs of `metrics`.
+fn follow_graph<R: SnapchainStateReader + ?Sized>(
+    reader: &R,
+    fids: impl Iterator<Item = u64>,
+) -> Result<BTreeMap<u64, Vec<u64>>, ScoringError> {
     let mut graph: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
-    for &f in &fids {
+    for f in fids {
         let mut followees = reader.followees(f)?;
         followees.sort_unstable();
         followees.dedup();
@@ -389,44 +482,72 @@ pub fn evaluate_epoch<R: SnapchainStateReader + ?Sized>(
             graph.insert(f, followees);
         }
     }
+    Ok(graph)
+}
 
-    let eigentrust = compute_eigentrust(&graph, seed_set, 30, 0.85);
-    apply_trust_and_credibility(&mut metrics, &eigentrust);
-
-    let growth = compute_growth_harmonic(
-        &metrics,
-        params.crediter_trust_threshold,
-        params.vouch_boost_min_vouchee_trust,
-        params.max_growth_fraction_per_crediter,
-        params.min_distinct_crediters,
-        params.growth_distribution_skew_exponent,
-        params.growth_distribution_min_damping,
+/// Run the PoQ + Growth pipeline (steps 1–7 of the module docs).
+pub fn score_fids<R: SnapchainStateReader + ?Sized>(
+    reader: &R,
+    now_unix: u64,
+    seed_set: &BTreeSet<u64>,
+    params: &ScoringParams,
+) -> Result<ScoringState, ScoringError> {
+    let mut metrics = build_metrics(reader, now_unix)?;
+    let graph = follow_graph(reader, metrics.keys().copied())?;
+    let eigentrust_raw = compute_eigentrust(&graph, seed_set, EIGENTRUST_ITERATIONS);
+    apply_trust_and_credibility(&mut metrics, &eigentrust_raw);
+    apply_new_user_share(
+        &mut metrics,
+        now_unix,
+        params.real_new_user_window_secs.unwrap_or(0),
     );
+    let (eligibility, thresholds) = compute_eligibility(&metrics, &params.eligibility);
+    let growth = compute_growth_harmonic(&metrics, &eligibility, params);
     let composite = compute_composite(&metrics, &growth, params);
+    Ok(ScoringState {
+        metrics,
+        eigentrust_raw,
+        eligibility,
+        thresholds,
+        growth,
+        composite,
+    })
+}
 
-    // FIP §8.3 / §6.5: zero composite for FIDs failing eligibility
-    // filters BEFORE allocating budget. F0–F6 are pre-computed in
-    // one pass; the result is also exposed on `EpochScoringOutput`
-    // for surfacing to wallets and indexers.
-    let (eligibility, _thresholds) =
-        crate::eligibility::compute_eligibility(&metrics, &params.eligibility);
-    let gated: BTreeMap<u64, f64> = composite
+/// Top-level pipeline: [`score_fids`] → per-market allocation. Returns
+/// the [`EpochScoringOutput`] that goes into the `ScoringResult`.
+///
+/// - Growth: [`allocate_budget`] over the composites of eligible FIDs.
+/// - AppUsage: [`crate::app_pow::compute_app_pow_rewards`] (§7.4).
+/// - DataAvailability: [`crate::da_pow::compute_da_pow_rewards`] with
+///   `boundary_height = PIVOT_HEIGHT_0 + (epoch − 1) · EPOCH_LENGTH`
+///   from `params.pivot_height_0` / `params.epoch_length_blocks`.
+pub fn evaluate_epoch<R: SnapchainStateReader + ?Sized>(
+    reader: &R,
+    epoch: u64,
+    now_unix: u64,
+    seed_set: &BTreeSet<u64>,
+    params: &ScoringParams,
+) -> Result<EpochScoringOutput, ScoringError> {
+    let state = score_fids(reader, now_unix, seed_set, params)?;
+
+    // §6.5: only eligible FIDs share the Growth pool.
+    let gated: BTreeMap<u64, u128> = state
+        .composite
         .iter()
-        .filter_map(|(&fid, &c)| {
-            let pass = eligibility
-                .get(&fid)
-                .map(|e| e.passes_all())
-                .unwrap_or(false);
-            if pass && c > 0.0 {
-                Some((fid, c))
-            } else {
-                None
-            }
+        .filter(|(fid, &c)| {
+            c > 0
+                && state
+                    .eligibility
+                    .get(fid)
+                    .map(|e| e.passes_all())
+                    .unwrap_or(false)
         })
+        .map(|(&fid, &c)| (fid, c))
         .collect();
 
     let mut filter_pass_counts = [0u64; 7];
-    for flags in eligibility.values() {
+    for flags in state.eligibility.values() {
         for i in 0..7u8 {
             if flags.get(i) {
                 filter_pass_counts[i as usize] = filter_pass_counts[i as usize].saturating_add(1);
@@ -434,23 +555,12 @@ pub fn evaluate_epoch<R: SnapchainStateReader + ?Sized>(
         }
     }
 
-    // FIP §7 App-PoW: AppUsage is allocated per the §7.4 reward
-    // function (app_work-weighted, with optional per-app cap), NOT
-    // by the §6 composite.
-    // FIP §5 DA-PoW: DataAvailability is allocated proportional to
-    // per-validator answered counts, NOT by the §6 composite.
     let app_receipt_counts = reader.app_receipt_counts_for_epoch(epoch)?;
     let miniapp_add_events = reader.miniapp_add_events_for_epoch(epoch)?;
     let da_answered = reader.da_answered_counts_for_epoch(epoch)?;
     let da_block_sum = reader.da_response_block_sum_for_epoch(epoch)?;
-    let da_commit_sigs = reader.validator_commit_signatures_for_epoch(epoch)?;
-    // Epoch-start block height: needed to compute the per-validator
-    // average response-block height relative to the boundary for
-    // the §5.4 latency factor. EPOCH_LENGTH lives in the hypersnap
-    // crate; mirror its definition here to avoid a cross-crate
-    // dependency. (Validators MUST agree on this constant.)
-    const EPOCH_LENGTH_BLOCKS: u64 = 432_000;
-    let epoch_start_block = epoch.saturating_mul(EPOCH_LENGTH_BLOCKS);
+    let boundary_height =
+        epoch_boundary_height(params.pivot_height_0, epoch, params.epoch_length_blocks);
 
     let mut markets: Vec<MarketReward> = Vec::with_capacity(WorkMarket::ALL.len());
     for &market in WorkMarket::ALL.iter() {
@@ -459,20 +569,18 @@ pub fn evaluate_epoch<R: SnapchainStateReader + ?Sized>(
             WorkMarket::AppUsage => crate::app_pow::compute_app_pow_rewards(
                 &app_receipt_counts,
                 &miniapp_add_events,
-                &metrics,
+                &state.metrics,
                 params,
                 budget,
             ),
             WorkMarket::DataAvailability => crate::da_pow::compute_da_pow_rewards(
                 &da_answered,
                 &da_block_sum,
-                &da_commit_sigs,
-                epoch_start_block,
-                EPOCH_LENGTH_BLOCKS,
+                boundary_height,
                 params,
                 budget,
             ),
-            _ => allocate_budget(&gated, budget),
+            WorkMarket::Growth => allocate_budget(&gated, budget),
         };
         markets.push(MarketReward {
             market,
@@ -481,13 +589,17 @@ pub fn evaluate_epoch<R: SnapchainStateReader + ?Sized>(
         });
     }
 
-    let trust_snapshot: BTreeMap<u64, f64> =
-        metrics.iter().map(|(&f, m)| (f, m.trust_score)).collect();
+    let trust_snapshot: BTreeMap<u64, u32> = state
+        .metrics
+        .iter()
+        .map(|(&f, m)| (f, m.trust_fp))
+        .collect();
 
     Ok(EpochScoringOutput {
         epoch,
         markets,
         trust_snapshot,
+        eligibility: state.eligibility,
         filter_pass_counts,
     })
 }
@@ -495,144 +607,94 @@ pub fn evaluate_epoch<R: SnapchainStateReader + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reader::EngagementCount;
-    use crate::reader::InMemoryReader;
+    use crate::reader::{EngagementCount, InMemoryReader};
+    use crate::STAKE_MATURITY_AMOUNT;
+
+    fn ec(first_30d: u32, later: u32) -> EngagementCount {
+        EngagementCount { first_30d, later }
+    }
+
+    fn amount(out: &EpochScoringOutput, market: WorkMarket, fid: u64) -> u128 {
+        out.markets
+            .iter()
+            .find(|m| m.market == market)
+            .unwrap()
+            .entries
+            .iter()
+            .find(|e| e.fid == fid)
+            .map(|e| e.amount)
+            .unwrap_or(0)
+    }
 
     /// Tiny canonical scenario:
-    /// - FIDs 1, 2, 3 are seeds (low FIDs).
-    /// - FID 100 is a real account: follows + is followed by all seeds, has
+    /// - FIDs 1, 2, 3 are seeds.
+    /// - FID 100 is a real account: follows + is followed by all seeds,
     ///   reciprocal engagement with each seed.
-    /// - FID 999 is a sybil: follows seeds but isn't followed back, only
-    ///   engaged-with by other low-trust sybils (none in this scenario).
+    /// - FID 999 is a sybil: follows seeds but isn't followed back.
+    ///
     /// Expected: FID 100 gets a healthy reward, FID 999 gets 0.
     #[test]
     fn end_to_end_real_vs_sybil() {
         let mut r = InMemoryReader::new();
         let now = 1_700_000_000;
-        let old = now - 60 * 60 * 24 * 365; // 1 year old
-
+        let old = now - 60 * 60 * 24 * 365;
         for &fid in &[1u64, 2, 3, 100, 999] {
             r.add_fid(fid, old);
             r.set_total_casts(fid, 100);
             r.set_active_days(fid, 200);
-            // Seed enough replies-received that F6 has non-trivial
-            // data; uniform value means the percentile threshold is
-            // 10 and `replies_per_cast = 0.1` passes for all.
             r.set_replies_received(fid, 10);
         }
-        // Add a handful of pad FIDs with high new-user share so
-        // F5's upper-tail calibration produces a non-trivial
-        // threshold (otherwise everyone's `share = 0 < 0` fails).
         for pad in 800u64..810 {
             r.add_fid(pad, old);
             r.set_total_casts(pad, 100);
             r.set_active_days(pad, 200);
             r.set_replies_received(pad, 10);
-            // These pads receive high-new-user share so the cohort
-            // upper-tail rises above the test FIDs' zero shares.
-            r.add_engagement(
-                1,
-                pad,
-                EngagementCount {
-                    first_30d: 100,
-                    later: 0,
-                },
-            );
+            r.add_engagement(1, pad, ec(100, 0));
         }
-
-        // Follow graph: seeds follow each other + 100; 100 follows seeds.
-        // 999 follows seeds but no one follows 999.
         for &s in &[1u64, 2, 3] {
             r.add_follows(s, vec![1, 2, 3, 100].into_iter().filter(|&x| x != s));
         }
         r.add_follows(100, vec![1u64, 2, 3]);
         r.add_follows(999, vec![1u64, 2, 3]);
-
-        // Reciprocal engagement between 100 and each seed.
         for &s in &[1u64, 2, 3] {
-            r.add_engagement_pair(
-                100,
-                s,
-                EngagementCount {
-                    first_30d: 0,
-                    later: 30,
-                },
-                EngagementCount {
-                    first_30d: 0,
-                    later: 30,
-                },
-            );
+            r.add_engagement_pair(100, s, ec(0, 30), ec(0, 30));
         }
-        // Seeds engage with each other a bit so they get growth too.
         for &(a, b) in [(1u64, 2u64), (2, 3), (1, 3)].iter() {
-            r.add_engagement_pair(
-                a,
-                b,
-                EngagementCount {
-                    first_30d: 0,
-                    later: 5,
-                },
-                EngagementCount {
-                    first_30d: 0,
-                    later: 5,
-                },
-            );
+            r.add_engagement_pair(a, b, ec(0, 5), ec(0, 5));
         }
 
         let mut params = ScoringParams::default();
         params
             .market_budgets
             .insert(WorkMarket::Growth, 1_000_000_000);
-        let mut seeds = BTreeSet::new();
-        seeds.insert(1u64);
-        seeds.insert(2);
-        seeds.insert(3);
+        let seeds: BTreeSet<u64> = [1u64, 2, 3].into_iter().collect();
 
         let out = evaluate_epoch(&r, 1, now, &seeds, &params).unwrap();
         assert_eq!(out.epoch, 1);
         assert_eq!(out.markets.len(), 3);
 
-        // Trust snapshot: seeds and 100 all positive, 999 stays near zero.
-        let trust_100 = out.trust_snapshot.get(&100).copied().unwrap_or(0.0);
-        let trust_999 = out.trust_snapshot.get(&999).copied().unwrap_or(0.0);
+        let trust_100 = out.trust_snapshot[&100];
+        let trust_999 = out.trust_snapshot[&999];
+        assert!(trust_100 > trust_999, "{trust_100} vs {trust_999}");
+        assert_eq!(trust_999, 0);
+
         assert!(
-            trust_100 > trust_999,
-            "real account trust ({}) should exceed sybil ({})",
-            trust_100,
-            trust_999
+            amount(&out, WorkMarket::Growth, 100) > 0,
+            "real account got zero"
+        );
+        assert_eq!(
+            amount(&out, WorkMarket::Growth, 999),
+            0,
+            "sybil got non-zero"
         );
 
-        // Growth market: 100 gets a non-zero allocation, 999 doesn't.
-        let growth_market = out
-            .markets
-            .iter()
-            .find(|m| m.market == WorkMarket::Growth)
-            .unwrap();
-        let amount_100 = growth_market
-            .entries
-            .iter()
-            .find(|e| e.fid == 100)
-            .map(|e| e.amount)
-            .unwrap_or(0);
-        let amount_999 = growth_market
-            .entries
-            .iter()
-            .find(|e| e.fid == 999)
-            .map(|e| e.amount)
-            .unwrap_or(0);
-        assert!(amount_100 > 0, "real account got zero reward");
-        assert_eq!(amount_999, 0, "sybil got non-zero reward");
-
-        // Total allocated equals the budget exactly (rounding remainder
-        // handled).
-        let total: u128 = growth_market.entries.iter().map(|e| e.amount).sum();
+        let total: u128 = out.markets[1].entries.iter().map(|e| e.amount).sum();
         assert_eq!(total, 1_000_000_000);
+        assert!(out.eligibility[&100].passes_all());
     }
 
     #[test]
     fn deterministic_across_repeated_evaluations() {
-        // Same input twice → identical output (canonical iteration
-        // order is the property we're testing).
         let mut r = InMemoryReader::new();
         let now = 1_700_000_000;
         for &fid in &[1u64, 2, 3, 4, 5, 100] {
@@ -640,26 +702,11 @@ mod tests {
         }
         for &s in &[1u64, 2, 3, 4, 5] {
             r.add_follows(s, vec![100]);
-            r.add_engagement_pair(
-                s,
-                100,
-                EngagementCount {
-                    first_30d: 0,
-                    later: 10,
-                },
-                EngagementCount {
-                    first_30d: 0,
-                    later: 10,
-                },
-            );
+            r.add_engagement_pair(s, 100, ec(0, 10), ec(0, 10));
         }
         let mut params = ScoringParams::default();
         params.market_budgets.insert(WorkMarket::Growth, 1_000);
-        let mut seeds = BTreeSet::new();
-        for s in 1u64..=5 {
-            seeds.insert(s);
-        }
-
+        let seeds: BTreeSet<u64> = (1u64..=5).collect();
         let a = evaluate_epoch(&r, 0, now, &seeds, &params).unwrap();
         let b = evaluate_epoch(&r, 0, now, &seeds, &params).unwrap();
         assert_eq!(a, b);
@@ -678,264 +725,271 @@ mod tests {
         }
     }
 
-    /// FIP §12 Phase 5d-scoring: a fully-saturated vouch from u→f
-    /// doubles u's contribution to f's growth. Compare two
-    /// otherwise-identical universes: one with vouch, one without.
-    /// Build a minimal scenario so the ratio is clean.
     #[test]
-    fn vouch_doubles_voucher_contribution_at_saturation() {
-        use crate::metrics::STAKE_MATURITY_ATOMS;
-        use crate::reader::EngagementCount;
+    fn eigentrust_fixed_point_basics() {
+        // Two-node cycle: seed 1 ↔ 100. Mass is conserved up to floors.
+        let graph: BTreeMap<u64, Vec<u64>> =
+            [(1u64, vec![100]), (100u64, vec![1])].into_iter().collect();
+        let seeds: BTreeSet<u64> = [1u64].into_iter().collect();
+        let t = compute_eigentrust(&graph, &seeds, 30);
+        let total = t[&1] + t[&100];
+        assert!(total <= EIGENTRUST_SCALE && total > EIGENTRUST_SCALE - 1_000);
+        assert!(t[&1] > t[&100]);
+        // Empty seed set → empty output.
+        assert!(compute_eigentrust(&graph, &BTreeSet::new(), 30).is_empty());
+        // Duplicate followees count once in the out-degree.
+        let dup: BTreeMap<u64, Vec<u64>> = [(1u64, vec![100, 100]), (100u64, vec![1])]
+            .into_iter()
+            .collect();
+        assert_eq!(compute_eigentrust(&dup, &seeds, 30), t);
+    }
 
-        let build = |with_vouch: bool| {
-            let mut r = InMemoryReader::new();
-            let now = 1_700_000_000;
-            let old = now - 60 * 60 * 24 * 365;
-            for &fid in &[1u64, 2, 100] {
-                r.add_fid(fid, old);
+    #[test]
+    fn trust_fp_floors_and_caps() {
+        let s = EIGENTRUST_SCALE;
+        assert_eq!(trust_fp_from_raw(s, s, FP_ONE), 1_000_000);
+        assert_eq!(trust_fp_from_raw(2 * s, s, FP_ONE), 1_000_000);
+        assert_eq!(trust_fp_from_raw(s / 2, s, FP_ONE), 500_000);
+        assert_eq!(trust_fp_from_raw(s / 2, s, 500_000), 250_000);
+        // 0.0001 exactly → 100 (the crediter floor); just below → 99.
+        assert_eq!(trust_fp_from_raw(s / 10_000, s, FP_ONE), 100);
+        assert_eq!(trust_fp_from_raw(s / 10_000 - 1, s, FP_ONE), 99);
+        // Full 6-decimal resolution, no 4-decimal quantization.
+        assert_eq!(
+            trust_fp_from_raw(s / 1_000_000 * 123_457, s, FP_ONE),
+            123_457
+        );
+        assert_eq!(trust_fp_from_raw(0, s, FP_ONE), 0);
+    }
+
+    #[test]
+    fn harmonic_and_contribution_fixed_point() {
+        assert_eq!(harmonic_fp(0, 5), 0);
+        assert_eq!(harmonic_fp(10, 10), 10_000_000);
+        assert_eq!(harmonic_fp(1, 2), 1_333_333);
+        // ln(1 + 10) = 2.397895 → × cred 1.0 × boost 1.0.
+        assert_eq!(contribution_fp(10, 10, FP_ONE, FP_ONE), 2_397_895);
+        assert_eq!(contribution_fp(10, 10, FP_ONE, 2 * FP_ONE), 4_795_790);
+        assert_eq!(inv_sqrt_count_fp(1), 1_000_000);
+        assert_eq!(inv_sqrt_count_fp(4), 500_000);
+        assert_eq!(inv_sqrt_count_fp(2), 707_107);
+    }
+
+    #[test]
+    fn vouch_boost_curve() {
+        assert_eq!(vouch_boost_fp(0), FP_ONE);
+        assert_eq!(vouch_boost_fp(VOUCH_MATURITY_AMOUNT / 2), 1_500_000);
+        assert_eq!(vouch_boost_fp(VOUCH_MATURITY_AMOUNT), 2_000_000);
+        assert_eq!(vouch_boost_fp(VOUCH_MATURITY_AMOUNT * 10), 2_000_000);
+    }
+
+    /// Hand-built metrics: recipient `f` with crediters `(fid, count(f→u),
+    /// count(u→f))`. Every FID has trust 1.0 and credibility 1.0.
+    fn shape(f: u64, crediters: &[(u64, u32, u32)]) -> BTreeMap<u64, FidMetrics> {
+        let mut metrics: BTreeMap<u64, FidMetrics> = BTreeMap::new();
+        let mut m_f = FidMetrics::new(f);
+        m_f.trust_fp = 1_000_000;
+        m_f.credibility_weight_fp = FP_ONE;
+        for &(u, _f_to_u, u_to_f) in crediters {
+            m_f.all_time_engagement.insert(u, u_to_f);
+        }
+        metrics.insert(f, m_f);
+        for &(u, f_to_u, _u_to_f) in crediters {
+            let mut m_u = FidMetrics::new(u);
+            m_u.trust_fp = 1_000_000;
+            m_u.credibility_weight_fp = FP_ONE;
+            m_u.all_time_engagement.insert(f, f_to_u);
+            metrics.insert(u, m_u);
+        }
+        metrics
+    }
+
+    fn all_eligible(m: &BTreeMap<u64, FidMetrics>) -> BTreeMap<u64, Eligibility> {
+        m.keys()
+            .map(|&f| (f, Eligibility(Eligibility::ALL_PASS)))
+            .collect()
+    }
+
+    /// Params with the F009 count gate and skew damping off, so a
+    /// single-crediter growth equals the raw contribution.
+    fn plain_params() -> ScoringParams {
+        ScoringParams {
+            min_distinct_crediters: 0,
+            growth_distribution_skew_exponent: 0,
+            ..ScoringParams::default()
+        }
+    }
+
+    /// §6.7: a vouch of f for u boosts contribution(f, u) — the
+    /// voucher's own growth — by `1 + min(1, stake / 250 tokens)`.
+    #[test]
+    fn vouch_boosts_voucher_growth_from_eligible_vouchee() {
+        let base = shape(100, &[(1, 10, 10)]);
+        let elig = all_eligible(&base);
+        let p = plain_params();
+        let g = |stake: Option<u64>| {
+            let mut m = base.clone();
+            if let Some(s) = stake {
+                m.get_mut(&100).unwrap().vouches_from.insert(1, s);
             }
-            // Make 1 the seed, follow graph: 1↔100, 2 isolated.
-            r.add_follows(1, vec![100]);
-            r.add_follows(100, vec![1]);
-            // Reciprocal engagement 1 ↔ 100 only.
-            r.add_engagement_pair(
-                1,
-                100,
-                EngagementCount {
-                    first_30d: 0,
-                    later: 10,
-                },
-                EngagementCount {
-                    first_30d: 0,
-                    later: 10,
-                },
-            );
-            if with_vouch {
-                r.add_vouch(1, 100, STAKE_MATURITY_ATOMS);
-            }
-            (r, now)
+            compute_growth_harmonic(&m, &elig, &p)[&100]
         };
+        let g0 = g(None);
+        assert_eq!(g0, contribution_fp(10, 10, FP_ONE, FP_ONE));
+        assert_eq!(g(Some(0)), g0);
+        assert_eq!(g(Some(VOUCH_MATURITY_AMOUNT / 2)), g0 * 3 / 2);
+        assert_eq!(g(Some(VOUCH_MATURITY_AMOUNT)), g0 * 2);
+        assert_eq!(g(Some(VOUCH_MATURITY_AMOUNT * 10)), g0 * 2);
+    }
 
-        let (r_no, now) = build(false);
-        let (r_yes, _) = build(true);
+    /// §6.7: no boost if the vouchee is not eligible.
+    #[test]
+    fn vouch_boost_requires_eligible_vouchee() {
+        let mut m = shape(100, &[(1, 10, 10)]);
+        m.get_mut(&100)
+            .unwrap()
+            .vouches_from
+            .insert(1, VOUCH_MATURITY_AMOUNT);
+        let mut elig = all_eligible(&m);
+        let p = plain_params();
+        let boosted = compute_growth_harmonic(&m, &elig, &p)[&100];
+        elig.insert(1, Eligibility(Eligibility::ALL_PASS & !(1 << 5)));
+        let unboosted = compute_growth_harmonic(&m, &elig, &p)[&100];
+        assert_eq!(boosted, unboosted * 2);
+        elig.remove(&1);
+        assert_eq!(compute_growth_harmonic(&m, &elig, &p)[&100], unboosted);
+    }
 
-        let mut seeds = BTreeSet::new();
-        seeds.insert(1u64);
-
-        let metrics_no = {
-            let mut m = build_metrics(&r_no, now).unwrap();
-            // Apply the same eigentrust output to both runs.
-            let graph: BTreeMap<u64, Vec<u64>> =
-                [(1u64, vec![100]), (100u64, vec![1])].into_iter().collect();
-            let et = compute_eigentrust(&graph, &seeds, 30, 0.85);
-            apply_trust_and_credibility(&mut m, &et);
-            m
-        };
-        let metrics_yes = {
-            let mut m = build_metrics(&r_yes, now).unwrap();
-            let graph: BTreeMap<u64, Vec<u64>> =
-                [(1u64, vec![100]), (100u64, vec![1])].into_iter().collect();
-            let et = compute_eigentrust(&graph, &seeds, 30, 0.85);
-            apply_trust_and_credibility(&mut m, &et);
-            m
-        };
-
-        let growth_no = compute_growth_harmonic(&metrics_no, 0.0, 0.0, 0.0, 0, 0.0, 0.0);
-        let growth_yes = compute_growth_harmonic(&metrics_yes, 0.0, 0.0, 0.0, 0, 0.0, 0.0);
-
-        let g_no = growth_no.get(&100).copied().unwrap_or(0.0);
-        let g_yes = growth_yes.get(&100).copied().unwrap_or(0.0);
-        assert!(g_no > 0.0, "baseline growth must be positive");
-        // Saturated vouch from u=1 (the only crediter) doubles the
-        // single contribution → factor of 2.
-        let ratio = g_yes / g_no;
-        assert!(
-            (ratio - 2.0).abs() < 1e-9,
-            "expected 2x boost, got ratio={ratio} (no={g_no}, yes={g_yes})"
+    /// The boost follows the vouch direction: u's vouch for f does NOT
+    /// boost f's growth (that was the pre-FIP direction).
+    #[test]
+    fn vouchee_vouching_back_does_not_boost() {
+        let mut m = shape(100, &[(1, 10, 10)]);
+        m.get_mut(&1)
+            .unwrap()
+            .vouches_from
+            .insert(100, VOUCH_MATURITY_AMOUNT);
+        let elig = all_eligible(&m);
+        let p = plain_params();
+        let base = shape(100, &[(1, 10, 10)]);
+        assert_eq!(
+            compute_growth_harmonic(&m, &elig, &p)[&100],
+            compute_growth_harmonic(&base, &elig, &p)[&100]
+        );
+        // ...but it boosts FID 1's own growth from crediter 100.
+        assert_eq!(
+            compute_growth_harmonic(&m, &elig, &p)[&1],
+            compute_growth_harmonic(&base, &elig, &p)[&1] * 2
         );
     }
 
-    /// Half-saturation gives a 1.5x boost; no vouch is 1.0x.
+    /// Per-pair: f's vouch for u1 does not change the contribution of u2.
     #[test]
-    fn vouch_boost_scales_linearly_in_atoms() {
-        use crate::metrics::STAKE_MATURITY_ATOMS;
-        use crate::reader::EngagementCount;
-        let build = |atoms: u64| {
-            let mut r = InMemoryReader::new();
-            let now = 1_700_000_000;
-            let old = now - 60 * 60 * 24 * 365;
-            for &fid in &[1u64, 100] {
-                r.add_fid(fid, old);
-            }
-            r.add_follows(1, vec![100]);
-            r.add_follows(100, vec![1]);
-            r.add_engagement_pair(
-                1,
-                100,
-                EngagementCount {
-                    first_30d: 0,
-                    later: 10,
-                },
-                EngagementCount {
-                    first_30d: 0,
-                    later: 10,
-                },
-            );
-            if atoms > 0 {
-                r.add_vouch(1, 100, atoms);
-            }
-            (r, now)
-        };
-        let mut seeds = BTreeSet::new();
-        seeds.insert(1u64);
-        let graph: BTreeMap<u64, Vec<u64>> =
-            [(1u64, vec![100]), (100u64, vec![1])].into_iter().collect();
-
-        let g_for = |atoms: u64| -> f64 {
-            let (r, now) = build(atoms);
-            let mut m = build_metrics(&r, now).unwrap();
-            let et = compute_eigentrust(&graph, &seeds, 30, 0.85);
-            apply_trust_and_credibility(&mut m, &et);
-            let g = compute_growth_harmonic(&m, 0.0, 0.0, 0.0, 0, 0.0, 0.0);
-            g.get(&100).copied().unwrap_or(0.0)
-        };
-
-        let g0 = g_for(0);
-        let g_half = g_for(STAKE_MATURITY_ATOMS / 2);
-        let g_full = g_for(STAKE_MATURITY_ATOMS);
-        let g_over = g_for(STAKE_MATURITY_ATOMS * 10);
-        assert!((g_half / g0 - 1.5).abs() < 1e-9);
-        assert!((g_full / g0 - 2.0).abs() < 1e-9);
-        // Saturates at 2.0x.
-        assert!((g_over / g0 - 2.0).abs() < 1e-9);
+    fn vouch_boost_is_per_pair() {
+        let base = shape(100, &[(1, 10, 10), (2, 10, 10)]);
+        let elig = all_eligible(&base);
+        let p = plain_params();
+        let mut one = base.clone();
+        one.get_mut(&100)
+            .unwrap()
+            .vouches_from
+            .insert(1, VOUCH_MATURITY_AMOUNT);
+        let mut both = one.clone();
+        both.get_mut(&100)
+            .unwrap()
+            .vouches_from
+            .insert(2, VOUCH_MATURITY_AMOUNT);
+        let c = contribution_fp(10, 10, FP_ONE, FP_ONE);
+        let inv = inv_sqrt_count_fp(2);
+        let expect = |sum: u128| fp_mul(fp_mul(sum, inv), FP_SCALE);
+        assert_eq!(
+            compute_growth_harmonic(&base, &elig, &p)[&100],
+            expect(2 * c)
+        );
+        assert_eq!(
+            compute_growth_harmonic(&one, &elig, &p)[&100],
+            expect(3 * c)
+        );
+        assert_eq!(
+            compute_growth_harmonic(&both, &elig, &p)[&100],
+            expect(4 * c)
+        );
     }
 
-    /// Vouch is per-pair: u's vouch on f does NOT boost u's
-    /// contribution toward g (a different vouchee).
+    /// N3: a crediter with trust_fp 99 (trust 0.000099) contributes
+    /// nothing; trust_fp 100 (trust 0.0001) is enough.
     #[test]
-    fn vouch_boost_is_per_pair_not_per_voucher() {
-        use crate::metrics::STAKE_MATURITY_ATOMS;
-        use crate::reader::EngagementCount;
-        let build = |with_vouch_on_f: bool| {
-            let mut r = InMemoryReader::new();
-            let now = 1_700_000_000;
-            let old = now - 60 * 60 * 24 * 365;
-            for &fid in &[1u64, 100, 200] {
-                r.add_fid(fid, old);
-            }
-            r.add_follows(1, vec![100, 200]);
-            r.add_follows(100, vec![1]);
-            r.add_follows(200, vec![1]);
-            r.add_engagement_pair(
-                1,
-                100,
-                EngagementCount {
-                    first_30d: 0,
-                    later: 10,
-                },
-                EngagementCount {
-                    first_30d: 0,
-                    later: 10,
-                },
-            );
-            r.add_engagement_pair(
-                1,
-                200,
-                EngagementCount {
-                    first_30d: 0,
-                    later: 10,
-                },
-                EngagementCount {
-                    first_30d: 0,
-                    later: 10,
-                },
-            );
-            if with_vouch_on_f {
-                r.add_vouch(1, 100, STAKE_MATURITY_ATOMS);
-            }
-            (r, now)
-        };
-
-        let mut seeds = BTreeSet::new();
-        seeds.insert(1u64);
-        let graph: BTreeMap<u64, Vec<u64>> =
-            [(1u64, vec![100, 200]), (100u64, vec![1]), (200u64, vec![1])]
-                .into_iter()
-                .collect();
-
-        let g_for = |with: bool, fid: u64| -> f64 {
-            let (r, now) = build(with);
-            let mut m = build_metrics(&r, now).unwrap();
-            let et = compute_eigentrust(&graph, &seeds, 30, 0.85);
-            apply_trust_and_credibility(&mut m, &et);
-            let g = compute_growth_harmonic(&m, 0.0, 0.0, 0.0, 0, 0.0, 0.0);
-            g.get(&fid).copied().unwrap_or(0.0)
-        };
-
-        let g100_no = g_for(false, 100);
-        let g100_yes = g_for(true, 100);
-        let g200_no = g_for(false, 200);
-        let g200_yes = g_for(true, 200);
-
-        // f (100) gets the boost.
-        assert!((g100_yes / g100_no - 2.0).abs() < 1e-9);
-        // g (200) is unchanged — vouch on f doesn't leak into f' g's score.
-        assert!((g200_yes / g200_no - 1.0).abs() < 1e-12);
+    fn crediter_floor_is_trust_fp_100() {
+        let mut m = shape(100, &[(1, 10, 10)]);
+        let elig = all_eligible(&m);
+        let p = plain_params();
+        m.get_mut(&1).unwrap().trust_fp = CREDITER_TRUST_FLOOR_FP;
+        assert!(compute_growth_harmonic(&m, &elig, &p).contains_key(&100));
+        m.get_mut(&1).unwrap().trust_fp = CREDITER_TRUST_FLOOR_FP - 1;
+        assert!(!compute_growth_harmonic(&m, &elig, &p).contains_key(&100));
     }
 
-    /// FIP §5a end-to-end: DA-PoW answered counts surface
-    /// DataAvailability rewards proportional to validator answers.
+    /// F009 L1: fewer than `min_distinct_crediters` crediters → zero.
+    #[test]
+    fn min_distinct_crediters_gate() {
+        let m = shape(100, &[(1, 10, 10), (2, 10, 10)]);
+        let elig = all_eligible(&m);
+        let p = ScoringParams::default();
+        assert!(!compute_growth_harmonic(&m, &elig, &p).contains_key(&100));
+        let m3 = shape(100, &[(1, 10, 10), (2, 10, 10), (3, 10, 10)]);
+        assert!(compute_growth_harmonic(&m3, &all_eligible(&m3), &p).contains_key(&100));
+    }
+
+    /// FIP §5.4 end-to-end: DA answered counts → 80:20 split at full
+    /// uptime (commit signatures = EPOCH_LENGTH).
     #[test]
     fn da_pow_rewards_flow_through_evaluate_epoch() {
         let mut r = InMemoryReader::new();
-        let now = 1_700_000_000;
-        // Validators 42 and 99 answer 80 and 20 challenges
-        // respectively → 80:20 split of the DA budget.
         r.set_da_answered(1, 42, 80);
         r.set_da_answered(1, 99, 20);
-        // Both validators have full uptime (commit_signatures =
-        // EPOCH_LENGTH_BLOCKS) so the uptime_factor cancels out
-        // of the ratio.
-        r.set_validator_commit_signatures(1, 42, 432_000);
-        r.set_validator_commit_signatures(1, 99, 432_000);
-
         let mut params = ScoringParams::default();
         params
             .market_budgets
             .insert(WorkMarket::DataAvailability, 1_000_000);
-        let seeds = BTreeSet::new();
-
-        let out = evaluate_epoch(&r, 1, now, &seeds, &params).unwrap();
-        let da_market = out
-            .markets
-            .iter()
-            .find(|m| m.market == WorkMarket::DataAvailability)
-            .unwrap();
-        let amt_42 = da_market
-            .entries
-            .iter()
-            .find(|e| e.fid == 42)
-            .unwrap()
-            .amount;
-        let amt_99 = da_market
-            .entries
-            .iter()
-            .find(|e| e.fid == 99)
-            .unwrap()
-            .amount;
-        assert_eq!(amt_42, 800_000);
-        assert_eq!(amt_99, 200_000);
-        let total: u128 = da_market.entries.iter().map(|e| e.amount).sum();
-        assert_eq!(total, 1_000_000);
+        let out = evaluate_epoch(&r, 1, 1_700_000_000, &BTreeSet::new(), &params).unwrap();
+        assert_eq!(amount(&out, WorkMarket::DataAvailability, 42), 800_000);
+        assert_eq!(amount(&out, WorkMarket::DataAvailability, 99), 200_000);
     }
 
-    /// FIP §7c end-to-end: MiniappAdd events surface AppUsage
-    /// rewards weighted 10× a single receipt. Two apps: one earning
-    /// via 10 receipts, one earning via 1 add — should receive
-    /// equal payouts.
+    /// A6: the DA latency factor is measured from the §4.3 boundary
+    /// height `PIVOT_HEIGHT_0 + (e − 1) · EPOCH_LENGTH`.
+    #[test]
+    fn da_latency_uses_epoch_boundary_from_params() {
+        let mut params = ScoringParams {
+            pivot_height_0: 1_000_000,
+            ..ScoringParams::default()
+        };
+        params
+            .market_budgets
+            .insert(WorkMarket::DataAvailability, 1_000_000);
+        let epoch = 3u64;
+        let boundary = 1_000_000 + 2 * crate::EPOCH_LENGTH;
+        assert_eq!(
+            epoch_boundary_height(params.pivot_height_0, epoch, params.epoch_length_blocks),
+            boundary
+        );
+        let mut r = InMemoryReader::new();
+        for fid in [42u64, 99] {
+            r.set_da_answered(epoch, fid, 100);
+        }
+        // 42 answers at the boundary (offset 0); 99 at offset 20 →
+        // latency 1 − 20/25 = 0.2.
+        r.set_da_response_block_sum(epoch, 42, u128::from(boundary) * 100);
+        r.set_da_response_block_sum(epoch, 99, u128::from(boundary + 20) * 100);
+        let out = evaluate_epoch(&r, epoch, 0, &BTreeSet::new(), &params).unwrap();
+        // Scores 1.0 : 0.2 → 833_333 : 166_666 (+1 remainder to 42).
+        assert_eq!(amount(&out, WorkMarket::DataAvailability, 42), 833_334);
+        assert_eq!(amount(&out, WorkMarket::DataAvailability, 99), 166_666);
+    }
+
+    /// FIP §7.2: one miniapp add (5.0) = ten receipts (10 × 0.5).
     #[test]
     fn miniapp_adds_drive_app_pow_rewards() {
-        use crate::reader::EngagementCount;
         let mut r = InMemoryReader::new();
         let now = 1_700_000_000;
         let old = now - 60 * 60 * 24 * 365;
@@ -947,19 +1001,7 @@ mod tests {
         }
         r.add_follows(1, vec![7]);
         r.add_follows(7, vec![1]);
-        r.add_engagement_pair(
-            1,
-            7,
-            EngagementCount {
-                first_30d: 0,
-                later: 30,
-            },
-            EngagementCount {
-                first_30d: 0,
-                later: 30,
-            },
-        );
-        // App 42 via 10 receipts; app 99 via 1 add.
+        r.add_engagement_pair(1, 7, ec(0, 30), ec(0, 30));
         r.set_app_receipt_count(1, 42, 7, 10);
         r.set_miniapp_add_events(1, 99, 7, 1);
 
@@ -967,390 +1009,110 @@ mod tests {
         params
             .market_budgets
             .insert(WorkMarket::AppUsage, 2_000_000);
-        let mut seeds = BTreeSet::new();
-        seeds.insert(1u64);
-
+        let seeds: BTreeSet<u64> = [1u64].into_iter().collect();
         let out = evaluate_epoch(&r, 1, now, &seeds, &params).unwrap();
-        let app_market = out
-            .markets
-            .iter()
-            .find(|m| m.market == WorkMarket::AppUsage)
-            .unwrap();
-        let amt_42 = app_market
-            .entries
-            .iter()
-            .find(|e| e.fid == 42)
-            .map(|e| e.amount)
-            .unwrap_or(0);
-        let amt_99 = app_market
-            .entries
-            .iter()
-            .find(|e| e.fid == 99)
-            .map(|e| e.amount)
-            .unwrap_or(0);
-        assert!(amt_42 > 0 && amt_99 > 0);
-        // Equal work (10 × 0.5 vs 1 × 5.0) → equal payouts.
-        assert_eq!(amt_42, amt_99);
+        let (a42, a99) = (
+            amount(&out, WorkMarket::AppUsage, 42),
+            amount(&out, WorkMarket::AppUsage, 99),
+        );
+        assert!(a42 > 0 && a99 > 0);
+        assert_eq!(a42, a99);
     }
 
-    /// FIP §7 end-to-end: receipts logged in the epoch surface
-    /// AppUsage rewards proportional to user credibility, while
-    /// Growth allocation is untouched. App owners receive payouts
-    /// even if they would fail §8.3 (apps live in the §7 lane,
-    /// not §6).
+    /// FIP §7: apps earn AppUsage even when §8.3-ineligible.
     #[test]
     fn app_pow_rewards_flow_through_evaluate_epoch() {
-        use crate::reader::EngagementCount;
         let mut r = InMemoryReader::new();
         let now = 1_700_000_000;
         let old = now - 60 * 60 * 24 * 365;
-        // Two users with positive credibility, two apps. Both apps
-        // would otherwise fail F0 (signer_authorizations >= 100)
-        // — they should still earn AppUsage rewards.
         for &fid in &[1u64, 7, 8, 42, 99] {
             r.add_fid(fid, old);
             r.set_total_casts(fid, 100);
             r.set_active_days(fid, 200);
             r.set_replies_received(fid, 10);
         }
-        // Apps tagged as apps via signer_authorizations.
         r.set_signer_authorizations(42, 150);
         r.set_signer_authorizations(99, 150);
-        // Trust seed.
         r.add_follows(1, vec![7, 8]);
         r.add_follows(7, vec![1]);
         r.add_follows(8, vec![1]);
-        // Seed reciprocal engagement so users have credibility.
-        r.add_engagement_pair(
-            1,
-            7,
-            EngagementCount {
-                first_30d: 0,
-                later: 30,
-            },
-            EngagementCount {
-                first_30d: 0,
-                later: 30,
-            },
-        );
-        r.add_engagement_pair(
-            1,
-            8,
-            EngagementCount {
-                first_30d: 0,
-                later: 30,
-            },
-            EngagementCount {
-                first_30d: 0,
-                later: 30,
-            },
-        );
-
-        // App 42: 30 receipts from user 7. App 99: 10 receipts from user 8.
-        r.set_app_receipt_count(/*epoch=*/ 1, /*app=*/ 42, /*user=*/ 7, 30);
+        r.add_engagement_pair(1, 7, ec(0, 30), ec(0, 30));
+        r.add_engagement_pair(1, 8, ec(0, 30), ec(0, 30));
+        r.set_app_receipt_count(1, 42, 7, 30);
         r.set_app_receipt_count(1, 99, 8, 10);
 
         let mut params = ScoringParams::default();
         params
             .market_budgets
             .insert(WorkMarket::AppUsage, 1_000_000);
-        let mut seeds = BTreeSet::new();
-        seeds.insert(1u64);
-
+        let seeds: BTreeSet<u64> = [1u64].into_iter().collect();
         let out = evaluate_epoch(&r, 1, now, &seeds, &params).unwrap();
-        let app_market = out
-            .markets
-            .iter()
-            .find(|m| m.market == WorkMarket::AppUsage)
-            .unwrap();
-        // Both apps should receive non-zero payouts despite being
-        // §6-ineligible.
-        let amt_42 = app_market
-            .entries
-            .iter()
-            .find(|e| e.fid == 42)
-            .map(|e| e.amount)
-            .unwrap_or(0);
-        let amt_99 = app_market
-            .entries
-            .iter()
-            .find(|e| e.fid == 99)
-            .map(|e| e.amount)
-            .unwrap_or(0);
-        assert!(amt_42 > 0, "app 42 earned AppUsage despite F0 fail");
-        assert!(amt_99 > 0, "app 99 earned AppUsage despite F0 fail");
-        // App 42 has 3× the receipts, with equal-cred users, so
-        // it should receive ~3× the share.
-        let ratio = amt_42 as f64 / amt_99 as f64;
-        assert!(
-            (ratio - 3.0).abs() < 0.05,
-            "expected ~3× ratio, got {ratio} (42={amt_42}, 99={amt_99})"
-        );
-        // Sum equals budget (no cap → rounding remainder
-        // redistributes).
-        let total: u128 = app_market.entries.iter().map(|e| e.amount).sum();
-        assert_eq!(total, 1_000_000);
+        let a42 = amount(&out, WorkMarket::AppUsage, 42);
+        let a99 = amount(&out, WorkMarket::AppUsage, 99);
+        assert!(a42 > 0 && a99 > 0);
+        // Users 7 and 8 have the same credibility → exactly 3:1.
+        assert_eq!(a42, 750_000);
+        assert_eq!(a99, 250_000);
+        assert!(!out.eligibility[&42].get(0));
     }
 
-    /// FIP §8.3 Phase: an FID with positive growth/composite still
-    /// gets 0 reward when it fails an eligibility filter. We force
-    /// F0 to fail by setting `signer_authorizations >=
-    /// APP_THRESHOLD`; the rest of the metrics are healthy.
+    /// §8.3 gate: an FID with positive composite gets 0 when it fails a
+    /// filter (F0 here).
     #[test]
     fn ineligible_fid_gets_zero_reward_even_with_positive_growth() {
-        use crate::reader::EngagementCount;
         let mut r = InMemoryReader::new();
         let now = 1_700_000_000;
         let old = now - 60 * 60 * 24 * 365;
-        for &fid in &[1u64, 2, 100] {
+        for &fid in &[1u64, 2, 3, 100] {
             r.add_fid(fid, old);
             r.set_total_casts(fid, 100);
             r.set_active_days(fid, 200);
             r.set_replies_received(fid, 10);
         }
-        // FID 100 looks like an app (≥ APP_THRESHOLD signer auths).
         r.set_signer_authorizations(100, 100);
-        for &s in &[1u64, 2] {
+        for &s in &[1u64, 2, 3] {
             r.add_follows(s, vec![100]);
-            r.add_engagement_pair(
-                s,
-                100,
-                EngagementCount {
-                    first_30d: 0,
-                    later: 10,
-                },
-                EngagementCount {
-                    first_30d: 0,
-                    later: 10,
-                },
-            );
+            r.add_engagement_pair(s, 100, ec(0, 10), ec(0, 10));
         }
-        r.add_follows(100, vec![1, 2]);
-        // Pads for F5 variance.
-        for pad in 800u64..810 {
-            r.add_fid(pad, old);
-            r.set_total_casts(pad, 100);
-            r.set_active_days(pad, 200);
-            r.set_replies_received(pad, 10);
-            r.add_engagement(
-                1,
-                pad,
-                EngagementCount {
-                    first_30d: 100,
-                    later: 0,
-                },
-            );
-        }
-
+        r.add_follows(100, vec![1, 2, 3]);
         let mut params = ScoringParams::default();
         params
             .market_budgets
             .insert(WorkMarket::Growth, 1_000_000_000);
-        let mut seeds = BTreeSet::new();
-        seeds.insert(1u64);
-        seeds.insert(2);
-
+        let seeds: BTreeSet<u64> = [1u64, 2, 3].into_iter().collect();
+        let state = score_fids(&r, now, &seeds, &params).unwrap();
+        assert!(state.composite.get(&100).copied().unwrap_or(0) > 0);
         let out = evaluate_epoch(&r, 1, now, &seeds, &params).unwrap();
-        let growth_market = out
-            .markets
-            .iter()
-            .find(|m| m.market == WorkMarket::Growth)
-            .unwrap();
-        let amount_100 = growth_market
-            .entries
-            .iter()
-            .find(|e| e.fid == 100)
-            .map(|e| e.amount)
-            .unwrap_or(0);
-        assert_eq!(amount_100, 0, "app-flagged FID must get zero reward");
+        assert_eq!(amount(&out, WorkMarket::Growth, 100), 0);
     }
 
-    /// Two distinct vouchers each get their own per-pair boost;
-    /// boosts do not stack on each other (independent per
-    /// crediter).
+    /// Option (b) end-to-end: a vouch stake received raises the
+    /// vouchee's stake factor and hence its credibility.
     #[test]
-    fn distinct_vouchers_get_independent_boosts() {
-        use crate::metrics::STAKE_MATURITY_ATOMS;
-        use crate::reader::EngagementCount;
-        let build = |vouch_a: u64, vouch_b: u64| {
-            let mut r = InMemoryReader::new();
-            let now = 1_700_000_000;
-            let old = now - 60 * 60 * 24 * 365;
-            for &fid in &[1u64, 2, 100] {
-                r.add_fid(fid, old);
-            }
-            r.add_follows(1, vec![100]);
-            r.add_follows(2, vec![100]);
-            r.add_follows(100, vec![1, 2]);
-            r.add_engagement_pair(
-                1,
-                100,
-                EngagementCount {
-                    first_30d: 0,
-                    later: 10,
-                },
-                EngagementCount {
-                    first_30d: 0,
-                    later: 10,
-                },
-            );
-            r.add_engagement_pair(
-                2,
-                100,
-                EngagementCount {
-                    first_30d: 0,
-                    later: 10,
-                },
-                EngagementCount {
-                    first_30d: 0,
-                    later: 10,
-                },
-            );
-            if vouch_a > 0 {
-                r.add_vouch(1, 100, vouch_a);
-            }
-            if vouch_b > 0 {
-                r.add_vouch(2, 100, vouch_b);
-            }
-            (r, now)
-        };
-        let mut seeds = BTreeSet::new();
-        seeds.insert(1u64);
-        seeds.insert(2u64);
-        let graph: BTreeMap<u64, Vec<u64>> =
-            [(1u64, vec![100]), (2u64, vec![100]), (100u64, vec![1, 2])]
-                .into_iter()
-                .collect();
-        let g_for = |va: u64, vb: u64| -> f64 {
-            let (r, now) = build(va, vb);
-            let mut m = build_metrics(&r, now).unwrap();
-            let et = compute_eigentrust(&graph, &seeds, 30, 0.85);
-            apply_trust_and_credibility(&mut m, &et);
-            let g = compute_growth_harmonic(&m, 0.0, 0.0, 0.0, 0, 0.0, 0.0);
-            g.get(&100).copied().unwrap_or(0.0)
-        };
-
-        let base = g_for(0, 0);
-        let only_a = g_for(STAKE_MATURITY_ATOMS, 0);
-        let only_b = g_for(0, STAKE_MATURITY_ATOMS);
-        let both = g_for(STAKE_MATURITY_ATOMS, STAKE_MATURITY_ATOMS);
-
-        // The two crediters contribute equal credibility-weighted
-        // logs (mirror scenario), so each saturation contributes
-        // +50% of base. Both saturated → 2x.
-        assert!((only_a / base - 1.5).abs() < 1e-9, "{}", only_a / base);
-        assert!((only_b / base - 1.5).abs() < 1e-9);
-        assert!((both / base - 2.0).abs() < 1e-9);
-    }
-
-    /// Anti-puppet-sybil-pump: when the vouchee's own trust_score
-    /// is below `vouch_boost_min_vouchee_trust`, the boost
-    /// collapses to 1.0 regardless of how many atoms the voucher
-    /// has staked. Identical metrics, just toggling the threshold,
-    /// should give identical growth scores when the vouchee fails
-    /// the trust floor.
-    #[test]
-    fn vouch_boost_gated_by_vouchee_trust_floor() {
-        use crate::metrics::STAKE_MATURITY_ATOMS;
-        let mut metrics: BTreeMap<u64, FidMetrics> = BTreeMap::new();
-        // u = 1 (voucher, high trust + cred). f = 100 (vouchee, LOW trust).
-        let mut m_u = FidMetrics::new(1);
-        m_u.trust_score = 0.9;
-        m_u.credibility_weight = 0.9;
-        // Reciprocal engagement counts.
-        m_u.all_time_engagement.insert(100, 10);
-        m_u.vouches_from.insert(100, STAKE_MATURITY_ATOMS);
-        metrics.insert(1, m_u);
-
-        let mut m_f = FidMetrics::new(100);
-        m_f.trust_score = 0.10; // below the gate threshold
-        m_f.credibility_weight = 0.10;
-        m_f.all_time_engagement.insert(1, 10);
-        metrics.insert(100, m_f);
-
-        // Ungated: full 2× boost applies.
-        let g_open = compute_growth_harmonic(&metrics, 0.0, 0.0, 0.0, 0, 0.0, 0.0);
-        // Gated at 0.5: vouchee's 0.10 < 0.5 → boost suppressed.
-        let g_gated = compute_growth_harmonic(&metrics, 0.0, 0.5, 0.0, 0, 0.0, 0.0);
-
-        let v_open = g_open.get(&100).copied().unwrap_or(0.0);
-        let v_gated = g_gated.get(&100).copied().unwrap_or(0.0);
-        // Ungated growth has the 2× boost; gated growth is the
-        // half-magnitude baseline (no boost). Ratio ≈ 2.
-        assert!(
-            (v_open / v_gated - 2.0).abs() < 1e-9,
-            "expected 2× ratio: ungated={v_open}, gated={v_gated}"
-        );
-    }
-
-    /// Confirm the floor only blocks the boost when the vouchee
-    /// FAILS the threshold. A high-trust vouchee still gets the
-    /// boost even with the gate on.
-    #[test]
-    fn vouch_boost_applies_when_vouchee_passes_trust_floor() {
-        use crate::metrics::STAKE_MATURITY_ATOMS;
-        let mut metrics: BTreeMap<u64, FidMetrics> = BTreeMap::new();
-        let mut m_u = FidMetrics::new(1);
-        m_u.trust_score = 0.9;
-        m_u.credibility_weight = 0.9;
-        m_u.all_time_engagement.insert(100, 10);
-        m_u.vouches_from.insert(100, STAKE_MATURITY_ATOMS);
-        metrics.insert(1, m_u);
-
-        let mut m_f = FidMetrics::new(100);
-        m_f.trust_score = 0.6; // above the 0.5 gate
-        m_f.credibility_weight = 0.6;
-        m_f.all_time_engagement.insert(1, 10);
-        metrics.insert(100, m_f);
-
-        let g_open = compute_growth_harmonic(&metrics, 0.0, 0.0, 0.0, 0, 0.0, 0.0);
-        let g_gated = compute_growth_harmonic(&metrics, 0.0, 0.5, 0.0, 0, 0.0, 0.0);
-        // Identical (vouchee passes floor → boost identical).
-        let v_open = g_open.get(&100).copied().unwrap_or(0.0);
-        let v_gated = g_gated.get(&100).copied().unwrap_or(0.0);
-        assert!((v_open - v_gated).abs() < 1e-12);
-    }
-
-    /// Build a metrics map where FID `recipient` receives reciprocal
-    /// engagement from `crediters`, each with the specified
-    /// `(recipient_count, crediter_count)` shape — i.e. how many
-    /// engagements each side directed at the other. Used to set up
-    /// known-shape per-crediter contribution distributions for the
-    /// F009 L2 damping tests.
-    fn build_metrics_with_shape(
-        recipient: u64,
-        recipient_trust: f64,
-        crediters: &[(u64, u32, u32)], // (crediter_fid, recipient→crediter, crediter→recipient)
-    ) -> BTreeMap<u64, FidMetrics> {
-        let mut metrics: BTreeMap<u64, FidMetrics> = BTreeMap::new();
-        let mut m_r = FidMetrics::new(recipient);
-        m_r.trust_score = recipient_trust;
-        m_r.credibility_weight = recipient_trust;
-        for &(c_fid, r_to_c, _c_to_r) in crediters {
-            m_r.all_time_engagement.insert(c_fid, r_to_c);
+    fn vouch_stake_received_raises_vouchee_credibility() {
+        let mut r = InMemoryReader::new();
+        let now = 1_700_000_000;
+        for &fid in &[1u64, 2] {
+            r.add_fid(fid, now - 60 * 60 * 24 * 365);
         }
-        metrics.insert(recipient, m_r);
-        for &(c_fid, _r_to_c, c_to_r) in crediters {
-            let mut m_c = FidMetrics::new(c_fid);
-            m_c.trust_score = 1.0;
-            m_c.credibility_weight = 1.0;
-            m_c.all_time_engagement.insert(recipient, c_to_r);
-            metrics.insert(c_fid, m_c);
-        }
-        metrics
+        let before = score_fids(&r, now, &BTreeSet::new(), &ScoringParams::default())
+            .unwrap()
+            .metrics[&2]
+            .credibility_weight_fp;
+        r.add_vouch(1, 2, STAKE_MATURITY_AMOUNT);
+        let after = score_fids(&r, now, &BTreeSet::new(), &ScoringParams::default())
+            .unwrap()
+            .metrics[&2]
+            .credibility_weight_fp;
+        assert_eq!(after - before, crate::metrics::W_STAKE_FP);
     }
 
-    /// F009 L2: a recipient with skewed per-crediter contributions
-    /// (the real-user pattern — one or two heavy engagers among many
-    /// lighter ones) keeps most of its growth; a sybil ring with
-    /// uniform per-crediter contributions gets heavily damped.
+    /// F009 L2: skewed (real-user) contributions keep most growth; a
+    /// uniform ring is damped.
     #[test]
     fn distribution_aware_damping_penalizes_uniform_rings() {
-        // Real-user pattern: one heavy crediter dominates, several
-        // lighter ones tail off. Asymmetric harmonic means produce
-        // a skewed contribution distribution.
-        let real_crediters: Vec<(u64, u32, u32)> = vec![
-            (10, 100, 100), // heavy reciprocal
+        let real: Vec<(u64, u32, u32)> = vec![
+            (10, 100, 100),
             (11, 20, 20),
             (12, 10, 10),
             (13, 5, 5),
@@ -1361,122 +1123,113 @@ mod tests {
             (18, 2, 2),
             (19, 2, 2),
         ];
-        let m_real = build_metrics_with_shape(100, 1.0, &real_crediters);
-
-        // Sybil-ring pattern: 10 crediters with identical reciprocal
-        // engagement → perfectly uniform contributions.
-        let ring_crediters: Vec<(u64, u32, u32)> = (10u64..20).map(|c| (c, 5u32, 5u32)).collect();
-        let m_ring = build_metrics_with_shape(100, 1.0, &ring_crediters);
-
-        let skew_exp = 2.0;
-        // floor = 0.0 keeps the original (R6) discrimination — a
-        // perfectly uniform ring gets damped all the way to zero.
-        let g_real = compute_growth_harmonic(&m_real, 0.0, 0.0, 0.0, 3, skew_exp, 0.0);
-        let g_ring = compute_growth_harmonic(&m_ring, 0.0, 0.0, 0.0, 3, skew_exp, 0.0);
-
-        let v_real = g_real.get(&100).copied().unwrap_or(0.0);
-        let v_ring = g_ring.get(&100).copied().unwrap_or(0.0);
-        assert!(
-            v_real > 0.0,
-            "real-user growth must be positive; got {}",
-            v_real
-        );
-        // The ring's uniform distribution lands at H_norm ≈ 1, so
-        // (1 - H_norm)^2 ≈ 0 → ring growth should be at least an
-        // order of magnitude below the real user's (with floor=0).
-        assert!(
-            v_ring < v_real / 10.0,
-            "ring should be damped >10× below real user: real={}, ring={}",
-            v_real,
-            v_ring
-        );
-
-        // Sanity check: with the skew exponent off, the ring is NOT
-        // damped distribution-wise (the prior count-only behavior).
-        let g_real_no_l2 = compute_growth_harmonic(&m_real, 0.0, 0.0, 0.0, 3, 0.0, 0.0);
-        let g_ring_no_l2 = compute_growth_harmonic(&m_ring, 0.0, 0.0, 0.0, 3, 0.0, 0.0);
-        let v_ring_no_l2 = g_ring_no_l2.get(&100).copied().unwrap_or(0.0);
-        let v_real_no_l2 = g_real_no_l2.get(&100).copied().unwrap_or(0.0);
-        // Without L2, the ring is much closer to the real user (the
-        // count-only sqrt-damping is the same for both n=10).
-        assert!(
-            v_ring_no_l2 > v_real_no_l2 / 4.0,
-            "without L2 damping, ring should NOT be heavily penalized: real={}, ring={}",
-            v_real_no_l2,
-            v_ring_no_l2
-        );
+        let ring: Vec<(u64, u32, u32)> = (10u64..20).map(|c| (c, 5, 5)).collect();
+        let m_real = shape(100, &real);
+        let m_ring = shape(100, &ring);
+        let mut p = ScoringParams {
+            growth_distribution_min_damping_fp: 0,
+            ..ScoringParams::default()
+        };
+        let g = |m: &BTreeMap<u64, FidMetrics>, p: &ScoringParams| {
+            compute_growth_harmonic(m, &all_eligible(m), p)
+                .get(&100)
+                .copied()
+                .unwrap_or(0)
+        };
+        let v_real = g(&m_real, &p);
+        let v_ring = g(&m_ring, &p);
+        assert!(v_real > 0);
+        assert!(v_ring < v_real / 10, "real={v_real} ring={v_ring}");
+        p.growth_distribution_skew_exponent = 0;
+        let v_real_no_l2 = g(&m_real, &p);
+        let v_ring_no_l2 = g(&m_ring, &p);
+        assert!(v_ring_no_l2 > v_real_no_l2 / 4);
     }
 
-    /// F009 L2: setting `growth_distribution_skew_exponent = 0`
-    /// recovers the prior count-only sqrt-damping behavior.
-    #[test]
-    fn distribution_skew_exponent_zero_recovers_count_only() {
-        let ring_crediters: Vec<(u64, u32, u32)> = (10u64..15).map(|c| (c, 5u32, 5u32)).collect();
-        let metrics = build_metrics_with_shape(100, 1.0, &ring_crediters);
-
-        // With L2 disabled (exp = 0), distribution_damping = 1, so
-        // the result is `raw_sum * sqrt(n) / n` — the prior behavior.
-        let g = compute_growth_harmonic(&metrics, 0.0, 0.0, 0.0, 3, 0.0, 0.0);
-        assert!(g.get(&100).copied().unwrap_or(0.0) > 0.0);
-    }
-
-    /// F009 L2 fairness floor (R6 audit caveat): a uniform-engagement
-    /// LEGIT user (e.g. a creator with equal-weight engaged fans)
-    /// gets a non-zero growth contribution when the floor is set,
-    /// addressing the "uniform = sybil-shaped" false-positive the
-    /// auditor flagged. The floor preserves a small slice of growth
-    /// for uniform-distribution legit users while still heavily
-    /// damping them (L0 — the crediter trust floor — is the real
-    /// sybil gate; this is just defense-in-depth not falsely
-    /// zeroing legit accounts).
+    /// F009 L2 floor: a uniform legit user keeps ≈ 5% of the
+    /// count-damped sum.
     #[test]
     fn distribution_min_damping_preserves_uniform_legit_user() {
-        // 50 crediters, all with identical reciprocal engagement —
-        // the structurally-indistinguishable-from-ring case.
-        let crediters: Vec<(u64, u32, u32)> = (10u64..60).map(|c| (c, 5u32, 5u32)).collect();
-        let metrics = build_metrics_with_shape(100, 1.0, &crediters);
-        let skew_exp = 2.0;
+        let crediters: Vec<(u64, u32, u32)> = (10u64..60).map(|c| (c, 5, 5)).collect();
+        let m = shape(100, &crediters);
+        let elig = all_eligible(&m);
+        let g = |p: &ScoringParams| {
+            compute_growth_harmonic(&m, &elig, p)
+                .get(&100)
+                .copied()
+                .unwrap_or(0)
+        };
+        let no_floor = ScoringParams {
+            growth_distribution_min_damping_fp: 0,
+            ..ScoringParams::default()
+        };
+        assert_eq!(g(&no_floor), 0, "uniform → 0 without the floor");
+        let with_floor = ScoringParams::default();
+        let v_floor = g(&with_floor);
+        let no_l2 = ScoringParams {
+            growth_distribution_skew_exponent: 0,
+            ..ScoringParams::default()
+        };
+        let v_no_l2 = g(&no_l2);
+        assert!(v_floor > 0);
+        // floor × no-L2 growth, up to one ulp of rounding.
+        assert!(fp_mul(v_no_l2, 50_000).abs_diff(v_floor) <= 1);
+    }
 
-        // R6 strict behavior (floor = 0): uniform → exactly 0.
-        let g_no_floor = compute_growth_harmonic(&metrics, 0.0, 0.0, 0.0, 3, skew_exp, 0.0);
-        let v_no_floor = g_no_floor.get(&100).copied().unwrap_or(0.0);
+    #[test]
+    fn allocate_budget_remainder_and_ties() {
+        let c: BTreeMap<u64, u128> = [(5u64, 1u128), (3, 1), (9, 1)].into_iter().collect();
+        let out = allocate_budget(&c, 100);
+        // 33 each, remainder 1 to the smallest FID among the tied top.
         assert_eq!(
-            v_no_floor, 0.0,
-            "without floor, uniform distribution → exactly 0 (R6 behavior)"
+            out,
+            vec![
+                RewardEntry { fid: 3, amount: 34 },
+                RewardEntry { fid: 5, amount: 33 },
+                RewardEntry { fid: 9, amount: 33 },
+            ]
         );
+        assert!(allocate_budget(&c, 0).is_empty());
+        assert!(allocate_budget(&BTreeMap::new(), 10).is_empty());
+        // Large budget × large composite uses the 256-bit path exactly.
+        let big: BTreeMap<u64, u128> = [(1u64, u128::MAX / 3), (2, u128::MAX / 3)]
+            .into_iter()
+            .collect();
+        let out = allocate_budget(&big, u128::MAX / 2);
+        assert_eq!(out[0].amount + out[1].amount, u128::MAX / 2);
+    }
 
-        // With production default floor (0.05): uniform keeps a
-        // small slice — `raw_sum × sqrt(N)/N × 0.05`.
-        let g_with_floor = compute_growth_harmonic(&metrics, 0.0, 0.0, 0.0, 3, skew_exp, 0.05);
-        let v_with_floor = g_with_floor.get(&100).copied().unwrap_or(0.0);
-        assert!(
-            v_with_floor > 0.0,
-            "with floor=0.05, uniform legit user should keep a small slice; got {}",
-            v_with_floor
-        );
+    /// Σ composite = 0 → the Growth budget is not minted (empty
+    /// allocation, nothing rolls over).
+    #[test]
+    fn zero_total_composite_mints_nothing() {
+        let zero: BTreeMap<u64, u128> = [(1u64, 0u128), (2, 0)].into_iter().collect();
+        assert!(allocate_budget(&zero, 1_000_000).is_empty());
+        assert!(allocate_budget(&BTreeMap::new(), 1_000_000).is_empty());
 
-        // The floor should be a small slice of the floor-disabled
-        // case (where the full sqrt-damping × raw_sum lands without
-        // distribution penalty). At N=50 with floor=0.05, we expect
-        // `floor × sqrt-damping × raw_sum` ≈ 5% × 0.141 × raw_sum.
-        // Compare against the floor-=1.0 (no distribution damping)
-        // case to bound the slice.
-        let g_no_l2 = compute_growth_harmonic(&metrics, 0.0, 0.0, 0.0, 3, 0.0, 0.0);
-        let v_no_l2 = g_no_l2.get(&100).copied().unwrap_or(0.0);
+        // End to end: FIDs whose composites are all below 1 ulp (here:
+        // no FID has growth) leave the Growth market empty even with a
+        // budget, while the other markets are unaffected.
+        let mut r = InMemoryReader::new();
+        r.add_fid(1, 0);
+        r.add_fid(2, 0);
+        r.set_da_answered(1, 2, 100);
+        let mut params = ScoringParams::default();
+        params.market_budgets.insert(WorkMarket::Growth, 1_000_000);
+        params
+            .market_budgets
+            .insert(WorkMarket::DataAvailability, 1_000_000);
+        let seeds: BTreeSet<u64> = [1u64].into_iter().collect();
+        let out = evaluate_epoch(&r, 1, 1_000, &seeds, &params).unwrap();
+        let growth = out
+            .markets
+            .iter()
+            .find(|m| m.market == WorkMarket::Growth)
+            .unwrap();
         assert!(
-            v_with_floor < v_no_l2 / 10.0,
-            "uniform user with floor must still be heavily damped vs no-L2: \
-             floor={}, no_l2={}",
-            v_with_floor,
-            v_no_l2
+            growth.entries.is_empty(),
+            "unallocated budget is not minted"
         );
-
-        // Ratio should be approximately the floor itself (0.05).
-        let ratio = v_with_floor / v_no_l2;
-        assert!(
-            (ratio - 0.05).abs() < 0.005,
-            "floor ratio expected ≈0.05, got {}",
-            ratio
-        );
+        assert_eq!(amount(&out, WorkMarket::DataAvailability, 2), 1_000_000);
     }
 }

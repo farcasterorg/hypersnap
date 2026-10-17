@@ -246,6 +246,19 @@ impl RocksDB {
         Ok(())
     }
 
+    /// A RocksDB checkpoint of this DB in `dest` (hard-linked SST files, a
+    /// consistent copy). `dest` must not exist. Used for the epoch boundary
+    /// checkpoints (FIP §17.7).
+    pub fn create_checkpoint(&self, dest: &str) -> Result<(), RocksdbError> {
+        match self.db().as_ref() {
+            Some(DBProvider::Transaction(db)) => db
+                .create_checkpoint(dest)
+                .map_err(RocksdbError::InternalError),
+            Some(DBProvider::ReadOnly(_)) => Err(RocksdbError::ReadOnly),
+            None => Err(RocksdbError::DbNotOpen),
+        }
+    }
+
     pub fn open_read_only(&self) -> Result<Self, RocksdbError> {
         let _wl = self.inner.write().unwrap();
 

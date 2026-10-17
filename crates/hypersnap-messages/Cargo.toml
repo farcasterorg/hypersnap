@@ -1,0 +1,21 @@
+[package]
+name = "hypersnap-messages"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+description = "Hypersnap message envelopes, second-signature payloads and EIP-712 forms, shared by the node and wallets"
+
+[dependencies]
+hypersnap-proto = { path = "../../proto" }
+hypersnap-falcon = { path = "../hypersnap-falcon" }
+blake3 = "1.4.1"
+prost = "0.13.3"
+ed25519-dalek = "2.1.1"
+alloy-primitives = "1"
+alloy-sol-types = "1"
+alloy-signer = "2.0"
+alloy-signer-local = "2.0"
+
+[dev-dependencies]
+# rand_chacha 0.3 implements the rand_core 0.6 traits that fn-dsa 0.4 uses.
+rand_chacha = "0.3"
