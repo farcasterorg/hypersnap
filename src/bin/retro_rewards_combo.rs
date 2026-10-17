@@ -414,7 +414,7 @@ fn extract_app_fid_from_signer(signer: &BatchSignerEntry) -> Option<u64> {
     if metadata_bytes.is_empty() {
         return None;
     }
-    let decoded = SignedKeyRequestMetadata::abi_decode(&metadata_bytes, true).ok()?;
+    let decoded = SignedKeyRequestMetadata::abi_decode_validate(&metadata_bytes).ok()?;
     decoded.requestFid.try_into().ok()
 }
 

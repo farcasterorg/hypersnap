@@ -107,7 +107,13 @@ mod tests {
         }
         for &(from, to) in &edge_order {
             let msg = create_link_add(*from, "follow", *to, None, None);
-            link_store.merge(&msg, &mut txn).unwrap();
+            link_store
+                .merge(
+                    &msg,
+                    &mut txn,
+                    &crate::storage::store::test_helper::default_merge_ctx(),
+                )
+                .unwrap();
         }
         db.commit(txn).unwrap();
 
@@ -117,7 +123,13 @@ mod tests {
         for &fid in fid_order {
             let cast = create_cast_add(fid, "hello", None, None);
             cast_hashes.insert(fid, cast.hash.clone());
-            cast_store.merge(&cast, &mut txn).unwrap();
+            cast_store
+                .merge(
+                    &cast,
+                    &mut txn,
+                    &crate::storage::store::test_helper::default_merge_ctx(),
+                )
+                .unwrap();
         }
         db.commit(txn).unwrap();
 
@@ -145,7 +157,13 @@ mod tests {
                 hash: target_hash,
             });
             let r = create_reaction_add(*liker, ReactionType::Like, target, None, None);
-            reaction_store.merge(&r, &mut txn).unwrap();
+            reaction_store
+                .merge(
+                    &r,
+                    &mut txn,
+                    &crate::storage::store::test_helper::default_merge_ctx(),
+                )
+                .unwrap();
         }
         db.commit(txn).unwrap();
 

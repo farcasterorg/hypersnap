@@ -3,7 +3,7 @@ use tracing::warn;
 
 use super::{
     make_user_key_with_prefix,
-    store::{Store, StoreDef},
+    store::{MergeContext, Store, StoreDef},
     StoreEventHandler,
 };
 use crate::{
@@ -412,9 +412,10 @@ impl StorageLendStore {
         store: &Store<StorageLendStoreDef>,
         message: &proto::Message,
         txn: &mut RocksDbTransactionBatch,
+        ctx: &MergeContext,
     ) -> Result<Vec<HubEvent>, HubError> {
         let mut events = vec![];
-        events.push(store.merge(message, txn)?);
+        events.push(store.merge(message, txn, ctx)?);
         match message.data.as_ref().unwrap().body.as_ref().unwrap() {
             proto::message_data::Body::LendStorageBody(lend_storage_body) => {
                 // Prune out the lend messages where storage is revoked so they don't consume storage.

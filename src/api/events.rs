@@ -13,6 +13,24 @@ pub type IndexEventSender = mpsc::Sender<IndexEvent>;
 /// Channel receiver for index events.
 pub type IndexEventReceiver = mpsc::Receiver<IndexEvent>;
 
+/// Why a message reached the indexers.
+///
+/// `MergeMessage`, `PruneMessage` and `RevokeMessage` all deliver the *same*
+/// `Message` value, and prune/revoke carry the original with its original
+/// timestamp. Without this discriminator an indexer that counts occurrences
+/// re-counts a message every time it is pruned or revoked — and, because of the
+/// timestamp, books that count against a historical day. Aggregating indexers
+/// must fold `Merge` only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageEventKind {
+    /// The message was merged into a store — the message genuinely happened.
+    Merge,
+    /// The message was pruned (storage limits). Not new activity.
+    Prune,
+    /// The message was revoked (signer removal). Not new activity.
+    Revoke,
+}
+
 /// Events sent to indexers from the block processing path.
 #[derive(Debug, Clone)]
 pub enum IndexEvent {
@@ -21,6 +39,7 @@ pub enum IndexEvent {
         message: Message,
         shard_id: u32,
         block_height: u64,
+        kind: MessageEventKind,
     },
 
     /// Multiple messages were committed in a batch.
@@ -28,6 +47,7 @@ pub enum IndexEvent {
         messages: Vec<Message>,
         shard_id: u32,
         block_height: u64,
+        kind: MessageEventKind,
     },
 
     /// An on-chain event was processed.
@@ -50,21 +70,33 @@ pub enum IndexEvent {
 }
 
 impl IndexEvent {
-    /// Create event for a single committed message.
+    /// Create a merge event for a single committed message.
     pub fn message(message: Message, shard_id: u32, block_height: u64) -> Self {
+        Self::message_of_kind(message, shard_id, block_height, MessageEventKind::Merge)
+    }
+
+    /// Create an event for a single message, naming why it was delivered.
+    pub fn message_of_kind(
+        message: Message,
+        shard_id: u32,
+        block_height: u64,
+        kind: MessageEventKind,
+    ) -> Self {
         Self::MessageCommitted {
             message,
             shard_id,
             block_height,
+            kind,
         }
     }
 
-    /// Create event for a batch of committed messages.
+    /// Create a merge event for a batch of committed messages.
     pub fn messages(messages: Vec<Message>, shard_id: u32, block_height: u64) -> Self {
         Self::MessagesCommitted {
             messages,
             shard_id,
             block_height,
+            kind: MessageEventKind::Merge,
         }
     }
 

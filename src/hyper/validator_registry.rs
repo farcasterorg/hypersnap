@@ -284,10 +284,8 @@ fn verify_custody_signature(
 
     let v_byte = event.custody_signature[64];
     let parity = v_byte != 0x1b && v_byte != 0x00;
-    let sig = alloy_primitives::PrimitiveSignature::from_bytes_and_parity(
-        &event.custody_signature[0..64],
-        parity,
-    );
+    let sig =
+        alloy_primitives::Signature::from_bytes_and_parity(&event.custody_signature[0..64], parity);
 
     let recovered = sig
         .recover_address_from_prehash(&prehash)

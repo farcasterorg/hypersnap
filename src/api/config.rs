@@ -44,6 +44,10 @@ pub struct ApiConfig {
     /// Mini app push notifications.
     #[serde(default)]
     pub notifications: NotificationsConfig,
+
+    /// Daily network-wide activity rollups (the Dune-query replacement).
+    #[serde(default)]
+    pub daily_stats: DailyStatsConfig,
 }
 
 impl Default for ApiConfig {
@@ -59,6 +63,89 @@ impl Default for ApiConfig {
             ai: AiConfig::default(),
             webhooks: WebhooksConfig::default(),
             notifications: NotificationsConfig::default(),
+            daily_stats: DailyStatsConfig::default(),
+        }
+    }
+}
+
+/// Configuration for daily network-wide activity rollups.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DailyStatsConfig {
+    /// Whether daily rollup indexing is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Whether to run backfill on startup. Required for the series to cover
+    /// history that predates enabling the indexer — without it the chart
+    /// starts on the day the node was upgraded.
+    #[serde(default)]
+    pub backfill_on_startup: bool,
+
+    /// Batch size for backfill operations.
+    #[serde(default = "default_backfill_batch_size")]
+    pub backfill_batch_size: usize,
+
+    /// Force a full flush of accumulated days after this many folded messages.
+    /// Bounds how much unflushed work a crash can lose; day rollover flushes
+    /// anyway, so this only matters within a single very busy day.
+    #[serde(default = "default_flush_every_events")]
+    pub flush_every_events: usize,
+
+    /// How far back the store-walk backfill reaches, in days. Defaults to six
+    /// months, matching the window the Dune query covered.
+    ///
+    /// Messages older than this are skipped rather than folded, which is what
+    /// keeps the walk bounded — the stores hold the node's whole retained
+    /// history, not just the window being charted.
+    #[serde(default = "default_backfill_days")]
+    pub backfill_days: u32,
+
+    /// Longest a folded message may sit unflushed, in seconds.
+    ///
+    /// Without this the current day is only written when an event-count or
+    /// memory threshold trips, so "today" reads as empty or stale on a quiet
+    /// node — and during a backfill the live path inherits the walk's very large
+    /// memory budget, which can be hours. A wall-clock bound makes the series
+    /// current regardless of traffic.
+    #[serde(default = "default_flush_interval_secs")]
+    pub flush_interval_secs: u64,
+
+    /// Resident fid-set entries allowed before the backfill forces a flush.
+    ///
+    /// A store walk is fid-major, so every day in the window stays hot at once;
+    /// this is the knob that trades memory against re-merge cost. ~8M entries
+    /// is on the order of 150MB. Lower it on a memory-constrained node — the
+    /// result is identical, just more write amplification.
+    #[serde(default = "default_backfill_max_pending_fids")]
+    pub backfill_max_pending_fids: usize,
+}
+
+fn default_flush_every_events() -> usize {
+    50_000
+}
+
+fn default_flush_interval_secs() -> u64 {
+    30
+}
+
+fn default_backfill_days() -> u32 {
+    183
+}
+
+fn default_backfill_max_pending_fids() -> usize {
+    8_000_000
+}
+
+impl Default for DailyStatsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            backfill_on_startup: false,
+            backfill_batch_size: default_backfill_batch_size(),
+            flush_every_events: default_flush_every_events(),
+            flush_interval_secs: default_flush_interval_secs(),
+            backfill_days: default_backfill_days(),
+            backfill_max_pending_fids: default_backfill_max_pending_fids(),
         }
     }
 }

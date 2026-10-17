@@ -4,7 +4,7 @@
 //! Two responsibilities here:
 //!
 //!   1. A typed `EcdsaSignature` (65 bytes, `(r ‖ s ‖ v)` with `v ∈ {27, 28}`)
-//!      that wraps `alloy_primitives::PrimitiveSignature`. This is what
+//!      that wraps `alloy_primitives::Signature`. This is what
 //!      every consensus / claim / reward signature field lands as on
 //!      the wire post-migration.
 //!
@@ -34,7 +34,7 @@
 //! post-migration are bit-identical to what the bridge has been
 //! verifying since launch.
 
-use alloy_primitives::{Address, PrimitiveSignature, B256};
+use alloy_primitives::{Address, Signature as AlloySignature, B256};
 
 #[derive(thiserror::Error, Debug)]
 pub enum EcdsaError {
@@ -53,7 +53,7 @@ pub enum EcdsaError {
 /// portal-api signer use.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EcdsaSignature {
-    inner: PrimitiveSignature,
+    inner: AlloySignature,
 }
 
 /// secp256k1 group order N. Used for low-S enforcement.
@@ -80,8 +80,8 @@ impl EcdsaSignature {
         if bytes.len() != 65 {
             return Err(EcdsaError::BadLength(bytes.len()));
         }
-        let inner = PrimitiveSignature::try_from(bytes)
-            .map_err(|e| EcdsaError::ParseFailed(format!("{e}")))?;
+        let inner =
+            AlloySignature::try_from(bytes).map_err(|e| EcdsaError::ParseFailed(format!("{e}")))?;
         // F044: reject high-S. The verifier on the other side of the
         // L1 bridge strict-checks low-S; allowing both forms here
         // creates a malleability primitive that breaks the
@@ -94,7 +94,7 @@ impl EcdsaSignature {
                 "high-S signature rejected (canonical encoding requires s ≤ N/2)"
             )));
         }
-        // Sanity: s must be < N. Already enforced by PrimitiveSignature
+        // Sanity: s must be < N. Already enforced by alloy's Signature
         // construction, but make the bound explicit since we just used
         // SECP256K1_N as a comparison reference.
         let _ = SECP256K1_N;

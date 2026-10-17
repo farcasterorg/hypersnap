@@ -74,7 +74,7 @@
 //! 2. Reject if `(fid, nonce)` was used within the same window (in-memory LRU).
 //! 3. Compute `request_hash = keccak256(body_bytes)`.
 //! 4. Compute the EIP-712 typed-data hash from the headers + request_hash.
-//! 5. Recover signer via `alloy_primitives::PrimitiveSignature`.
+//! 5. Recover signer via `alloy_primitives::Signature`.
 //! 6. Look up the FID's current custody address via the [`auth::CustodyAddressLookup`]
 //!    trait (implemented by `HubUserHydrator`).
 //! 7. Reject if recovered ≠ custody.

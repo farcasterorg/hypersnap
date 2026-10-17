@@ -375,6 +375,7 @@ mod tests {
                 message: cast_msg(42, "hi"),
                 shard_id: 0,
                 block_height: 1,
+                kind: crate::api::events::MessageEventKind::Merge,
             })
             .await
             .unwrap();
@@ -405,6 +406,7 @@ mod tests {
                 message: cast_msg(42, "hi"),
                 shard_id: 0,
                 block_height: 1,
+                kind: crate::api::events::MessageEventKind::Merge,
             })
             .await
             .unwrap();
@@ -429,6 +431,7 @@ mod tests {
                 message: cast_msg(42, "hi"),
                 shard_id: 0,
                 block_height: 1,
+                kind: crate::api::events::MessageEventKind::Merge,
             })
             .await
             .unwrap();
@@ -445,11 +448,11 @@ mod tests {
         let (tx, mut rx) = create_delivery_channel(10);
         let dispatcher = WebhookDispatcher::new(store, tx);
 
-        let batch = IndexEvent::MessagesCommitted {
-            messages: vec![cast_msg(1, "a"), cast_msg(2, "b"), cast_msg(3, "c")],
-            shard_id: 0,
-            block_height: 1,
-        };
+        let batch = IndexEvent::messages(
+            vec![cast_msg(1, "a"), cast_msg(2, "b"), cast_msg(3, "c")],
+            0,
+            1,
+        );
         dispatcher.process_event(&batch).await.unwrap();
 
         let mut count = 0;
@@ -477,6 +480,7 @@ mod tests {
                     message: follow_msg(1, 100 + i),
                     shard_id: 0,
                     block_height: i,
+                    kind: crate::api::events::MessageEventKind::Merge,
                 })
                 .await
                 .unwrap();
@@ -497,6 +501,7 @@ mod tests {
                 message: cast_msg(42, "hi"),
                 shard_id: 0,
                 block_height: 1,
+                kind: crate::api::events::MessageEventKind::Merge,
             })
             .await
             .unwrap();
@@ -526,6 +531,7 @@ mod tests {
                 message: cast_msg(7, "hi"),
                 shard_id: 0,
                 block_height: 1,
+                kind: crate::api::events::MessageEventKind::Merge,
             })
             .await
             .unwrap();
@@ -539,6 +545,7 @@ mod tests {
                 message: follow_msg(7, 99),
                 shard_id: 0,
                 block_height: 2,
+                kind: crate::api::events::MessageEventKind::Merge,
             })
             .await
             .unwrap();

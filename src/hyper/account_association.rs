@@ -28,7 +28,7 @@
 use crate::core::error::HubError;
 use crate::hyper::validator_registry::CustodyResolver;
 use crate::proto;
-use alloy_primitives::{keccak256, Address, PrimitiveSignature};
+use alloy_primitives::{keccak256, Address, Signature};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use serde::Deserialize;
@@ -183,7 +183,7 @@ pub fn verify_account_association(
     let digest = eip191_hash(signing_input.as_bytes());
 
     // Parse the 65-byte signature: r || s || v. `v` is either 0/1
-    // (post-EIP-155 raw parity) or 27/28 (legacy). PrimitiveSignature
+    // (post-EIP-155 raw parity) or 27/28 (legacy). Signature
     // wants parity (bool) so map both forms.
     let parity_byte = proof.signature[64];
     let parity = match parity_byte {
@@ -191,7 +191,7 @@ pub fn verify_account_association(
         1 | 28 => true,
         _ => return Err(AccountAssociationError::BadSignature),
     };
-    let signature = PrimitiveSignature::from_bytes_and_parity(&proof.signature[..64], parity);
+    let signature = Signature::from_bytes_and_parity(&proof.signature[..64], parity);
     let recovered = signature
         .recover_address_from_prehash(&digest)
         .map_err(|_| AccountAssociationError::BadSignature)?;

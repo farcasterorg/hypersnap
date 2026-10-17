@@ -514,8 +514,8 @@ fn cmd_recover(args: RecoverArgs) -> Result<()> {
         );
     }
 
-    let sig = alloy_primitives::PrimitiveSignature::from_raw(&sig_bytes)
-        .context("invalid signature encoding")?;
+    let sig =
+        alloy_primitives::Signature::from_raw(&sig_bytes).context("invalid signature encoding")?;
     let recovered = sig
         .recover_address_from_prehash(&digest)
         .context("ecrecover failed")?;

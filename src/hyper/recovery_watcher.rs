@@ -28,8 +28,8 @@
 use crate::hyper::recovery_store::{RecoveryEventStore, RecoveryStoreError};
 use crate::proto;
 use alloy_primitives::{address, Address, U256};
-use alloy_provider::{Provider, ProviderBuilder};
-use alloy_rpc_types::{BlockNumberOrTag, BlockTransactionsKind, Filter};
+use alloy_provider::{Provider, RootProvider};
+use alloy_rpc_types::{BlockNumberOrTag, Filter};
 use alloy_sol_types::{sol, SolEvent};
 use std::time::Duration;
 use tokio::time;
@@ -106,10 +106,9 @@ pub async fn run(
         info!("recovery watcher: rpc_url empty, watcher not started");
         return Ok(());
     }
-    let provider =
-        ProviderBuilder::new().on_http(cfg.rpc_url.parse().map_err(|e: url::ParseError| {
-            RecoveryWatcherError::Rpc(format!("invalid rpc url: {}", e))
-        })?);
+    let provider = RootProvider::new_http(cfg.rpc_url.parse().map_err(|e: url::ParseError| {
+        RecoveryWatcherError::Rpc(format!("invalid rpc url: {}", e))
+    })?);
 
     // Resume from the highest block we've already persisted, falling
     // back to the configured start block.
@@ -167,7 +166,7 @@ async fn scan_range<P>(
     to: u64,
 ) -> Result<(), RecoveryWatcherError>
 where
-    P: Provider<alloy_transport_http::Http<reqwest::Client>>,
+    P: Provider,
 {
     let filter = Filter::new()
         .address(ID_REGISTRY_ADDRESS_OP)
@@ -192,7 +191,7 @@ where
     let mut block_ts: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
     for bn in &unique_blocks {
         let block = provider
-            .get_block_by_number(BlockNumberOrTag::Number(*bn), BlockTransactionsKind::Hashes)
+            .get_block_by_number(BlockNumberOrTag::Number(*bn))
             .await
             .map_err(|e| RecoveryWatcherError::Rpc(e.to_string()))?;
         if let Some(b) = block {

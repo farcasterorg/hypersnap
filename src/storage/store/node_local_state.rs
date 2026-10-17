@@ -41,6 +41,29 @@ pub enum DataType {
     FnameTransfer = 2,
     BaseOnchainEvent = 3,
     OnchainEventsMigrationPageToken = 4,
+    ShardHalt = 5,
+}
+
+/// Why a shard stopped applying blocks.
+///
+/// `commit_shard_chunk` panics on an unrecoverable commit failure. That panic is
+/// caught by ractor, which stops the `ReadHost` actor — but the *process* keeps
+/// running, unsupervised, so the shard is permanently dead while the node still
+/// looks healthy. The one `error!` naming the cause scrolls out of the log within
+/// minutes, and everything after it is `Messaging(SendErr)` from `read_sync`
+/// talking to the dead actor.
+///
+/// This record is what survives that. Written immediately before the panic, read
+/// back by `/v2/farcaster/_status/halt`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ShardHalt {
+    pub shard_id: u32,
+    /// Block height the commit was attempted at.
+    pub height: u64,
+    /// Wall clock at the moment of the halt, unix seconds.
+    pub unix_seconds: u64,
+    /// The error `replay_proposal` returned — the thing you actually want.
+    pub reason: String,
 }
 
 #[derive(Clone, Copy, strum_macros::Display)]
@@ -58,6 +81,50 @@ pub enum BootstrapDataType {
 impl LocalStateStore {
     pub fn new(db: Arc<RocksDB>) -> Self {
         LocalStateStore { db }
+    }
+
+    fn make_shard_halt_key(shard_id: u32) -> Vec<u8> {
+        let mut key = vec![RootPrefix::NodeLocalState as u8, DataType::ShardHalt as u8];
+        key.extend_from_slice(&shard_id.to_be_bytes());
+        key
+    }
+
+    /// Persist a halt reason. Takes `&RocksDB` rather than `&self` so the engine
+    /// can call it on the way down without owning a store.
+    ///
+    /// Best-effort by construction: the caller is about to panic, so a failure to
+    /// write must not mask the original error. A read-only DB simply can't record
+    /// it, which is fine — a read-only node isn't committing anything either.
+    pub fn record_shard_halt(db: &RocksDB, shard_id: u32, height: u64, reason: &str) {
+        let unix_seconds = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let record = ShardHalt {
+            shard_id,
+            height,
+            unix_seconds,
+            reason: reason.to_string(),
+        };
+        match serde_json::to_vec(&record) {
+            Ok(bytes) => {
+                if let Err(e) = db.put(&Self::make_shard_halt_key(shard_id), &bytes) {
+                    error!(shard_id, "Failed to persist shard halt reason: {}", e);
+                }
+            }
+            Err(e) => error!(shard_id, "Failed to encode shard halt reason: {}", e),
+        }
+    }
+
+    pub fn read_shard_halt(db: &RocksDB, shard_id: u32) -> Option<ShardHalt> {
+        let bytes = db.get(&Self::make_shard_halt_key(shard_id)).ok()??;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    /// Clear a recorded halt. Called on a clean commit so a stale record from a
+    /// previous run can't be mistaken for the current state.
+    pub fn clear_shard_halt(db: &RocksDB, shard_id: u32) {
+        let _ = db.del(&Self::make_shard_halt_key(shard_id));
     }
 
     fn make_onchain_event_primary_key(chain: Chain) -> Vec<u8> {
@@ -298,5 +365,66 @@ impl LocalStateStore {
                     shard_id,
                 ))?)
         }
+    }
+}
+
+#[cfg(test)]
+mod halt_tests {
+    use super::*;
+
+    fn test_db() -> Arc<RocksDB> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().as_os_str().to_str().unwrap().to_string();
+        std::mem::forget(dir);
+        let db = RocksDB::new(&path);
+        db.open().unwrap();
+        Arc::new(db)
+    }
+
+    #[test]
+    fn halt_record_roundtrips_and_is_per_shard() {
+        let db = test_db();
+        assert!(LocalStateStore::read_shard_halt(&db, 1).is_none());
+
+        LocalStateStore::record_shard_halt(&db, 1, 43_650_999, "merkle trie root hash mismatch");
+        LocalStateStore::record_shard_halt(&db, 2, 100, "something else");
+
+        let one = LocalStateStore::read_shard_halt(&db, 1).expect("shard 1 record");
+        assert_eq!(one.shard_id, 1);
+        assert_eq!(one.height, 43_650_999);
+        assert_eq!(one.reason, "merkle trie root hash mismatch");
+        assert!(one.unix_seconds > 0, "halt is stamped with wall clock");
+
+        // Shards must not clobber each other — the key includes the shard id.
+        let two = LocalStateStore::read_shard_halt(&db, 2).expect("shard 2 record");
+        assert_eq!(two.reason, "something else");
+        assert!(LocalStateStore::read_shard_halt(&db, 3).is_none());
+    }
+
+    #[test]
+    fn clearing_a_halt_removes_only_that_shard() {
+        let db = test_db();
+        LocalStateStore::record_shard_halt(&db, 1, 10, "a");
+        LocalStateStore::record_shard_halt(&db, 2, 20, "b");
+
+        LocalStateStore::clear_shard_halt(&db, 1);
+        assert!(
+            LocalStateStore::read_shard_halt(&db, 1).is_none(),
+            "a recovered shard must stop reporting a halt"
+        );
+        assert!(LocalStateStore::read_shard_halt(&db, 2).is_some());
+
+        // Clearing something that was never recorded is a no-op, not an error.
+        LocalStateStore::clear_shard_halt(&db, 99);
+    }
+
+    #[test]
+    fn re_recording_overwrites_rather_than_accumulates() {
+        let db = test_db();
+        LocalStateStore::record_shard_halt(&db, 1, 10, "first");
+        LocalStateStore::record_shard_halt(&db, 1, 11, "second");
+        let r = LocalStateStore::read_shard_halt(&db, 1).unwrap();
+        assert_eq!(r.height, 11);
+        assert_eq!(r.reason, "second");
     }
 }

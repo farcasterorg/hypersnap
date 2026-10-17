@@ -30,7 +30,7 @@ use crate::proto;
 use crate::storage::constants::RootPrefix;
 use crate::storage::db::{RocksDB, RocksDbTransactionBatch};
 use alloy_dyn_abi::TypedData;
-use alloy_primitives::{Address, PrimitiveSignature};
+use alloy_primitives::Address;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -346,7 +346,7 @@ fn recover_custody(prehash: &[u8; 32], signature_bytes: &[u8]) -> Result<Address
     }
     let v_byte = signature_bytes[64];
     let parity = v_byte != 0x1b && v_byte != 0x00;
-    let sig = PrimitiveSignature::from_bytes_and_parity(&signature_bytes[0..64], parity);
+    let sig = alloy_primitives::Signature::from_bytes_and_parity(&signature_bytes[0..64], parity);
     sig.recover_address_from_prehash(&prehash.into())
         .map_err(|_| OnboardError::InvalidCustodySignature)
 }
@@ -828,8 +828,10 @@ pub fn validate_custody_rotation(
         .into();
     let v_byte = body.current_custody_signature[64];
     let parity = v_byte != 0x1b && v_byte != 0x00;
-    let sig =
-        PrimitiveSignature::from_bytes_and_parity(&body.current_custody_signature[0..64], parity);
+    let sig = alloy_primitives::Signature::from_bytes_and_parity(
+        &body.current_custody_signature[0..64],
+        parity,
+    );
     let recovered = sig
         .recover_address_from_prehash(&prehash.into())
         .map_err(|_| CustodyRotationError::InvalidSignature)?;

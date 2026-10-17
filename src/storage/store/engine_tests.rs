@@ -22,7 +22,9 @@ mod tests {
         commit_message, message_exists_in_trie, register_user, FID2_FOR_TEST, FID_FOR_TEST,
     };
     use crate::storage::trie::merkle_trie::TrieKey;
-    use crate::utils::factory::events_factory::create_merge_message_event;
+    use crate::utils::factory::events_factory::{
+        create_merge_message_event, create_merge_message_event_with_timestamp,
+    };
     use crate::utils::factory::signers::generate_signer;
     use crate::utils::factory::{self, events_factory, messages_factory, time, username_factory};
     use crate::version::version::{EngineVersion, ProtocolFeature};
@@ -534,6 +536,99 @@ mod tests {
         assert!(message_exists_in_trie(&mut engine, &link_compact_state));
         assert!(!message_exists_in_trie(&mut engine, &link_add2));
         assert!(!message_exists_in_trie(&mut engine, &link_remove))
+    }
+
+    #[tokio::test]
+    async fn test_engine_block_link_survives_follow_compaction_at_v19() {
+        // End-to-end through the engine on devnet (V19): the engine derives
+        // scope_link_compaction = is_enabled(BlockLinks) = true and threads it down, so a
+        // follow compact state compacts only follows and leaves a block link intact.
+        let timestamp = messages_factory::farcaster_time();
+        let target_fid = 15;
+        let (mut engine, _tmpdir) = test_helper::new_engine().await;
+        test_helper::register_user(
+            FID_FOR_TEST,
+            test_helper::default_signer(),
+            test_helper::default_custody_address(),
+            &mut engine,
+        )
+        .await;
+
+        // A follow add the later compact state will sweep (its target isn't listed), and a
+        // block add to the same target that must survive a follow compaction.
+        let follow_add = messages_factory::links::create_link_add(
+            FID_FOR_TEST,
+            "follow",
+            target_fid,
+            Some(timestamp),
+            None,
+        );
+        commit_message(&mut engine, &follow_add).await;
+        let block_add = messages_factory::links::create_link_add(
+            FID_FOR_TEST,
+            "block",
+            target_fid,
+            Some(timestamp),
+            None,
+        );
+        commit_message(&mut engine, &block_add).await;
+
+        let follow_compact_state = messages_factory::links::create_link_compact_state(
+            FID_FOR_TEST,
+            "follow",
+            vec![target_fid + 100],
+            Some(timestamp + 1),
+            None,
+        );
+        commit_message(&mut engine, &follow_compact_state).await;
+
+        // Compaction ran (the non-target follow is gone) but was type-scoped (block survives).
+        assert!(!message_exists_in_trie(&mut engine, &follow_add));
+        assert!(message_exists_in_trie(&mut engine, &block_add));
+    }
+
+    #[tokio::test]
+    async fn test_engine_block_link_deleted_by_follow_compaction_pre_v19() {
+        // End-to-end on testnet at a pre-V19 timestamp: the engine derives
+        // scope_link_compaction = false, so a follow compact state compacts type-blind and
+        // deletes the block link too — the legacy behavior preserved for deterministic replay.
+        // Pinned to a fixed instant inside the V18 window (unix 1782000000, ~2026-06-20) rather
+        // than wall-clock time, which drifts past the 2026-07-15 14:00 UTC testnet V19 cutover.
+        let timestamp = FarcasterTime::from_unix_seconds(1782000000).to_u64() as u32;
+        let target_fid = 15;
+        let (mut engine, _tmpdir) = test_helper::new_engine_with_options(EngineOptions {
+            network: Some(FarcasterNetwork::Testnet),
+            ..Default::default()
+        })
+        .await;
+        test_helper::register_user(
+            FID_FOR_TEST,
+            test_helper::default_signer(),
+            test_helper::default_custody_address(),
+            &mut engine,
+        )
+        .await;
+
+        let block_add = messages_factory::links::create_link_add(
+            FID_FOR_TEST,
+            "block",
+            target_fid,
+            Some(timestamp),
+            None,
+        );
+        commit_message(&mut engine, &block_add).await;
+
+        let follow_compact_state = messages_factory::links::create_link_compact_state(
+            FID_FOR_TEST,
+            "follow",
+            vec![target_fid + 100],
+            Some(timestamp + 1),
+            None,
+        );
+        commit_message(&mut engine, &follow_compact_state).await;
+
+        // Pre-V19, compaction is type-blind: the follow compact state deletes the block too.
+        assert!(!message_exists_in_trie(&mut engine, &block_add));
     }
 
     #[tokio::test]
@@ -3609,8 +3704,12 @@ mod tests {
             .all(|key| engine.trie_key_exists(&trie_ctx(), &key)));
     }
 
+    /// Embeds stopped being a Pro feature at V20. This engine runs devnet, which is always the
+    /// latest version, so the gate is open — a plain fid with no tier event gets all four, and the
+    /// cap itself still bites at five. The version boundary is pinned separately in
+    /// `cast_test::embed_limit_is_four_for_everyone_from_v20`.
     #[tokio::test]
-    async fn pro_users_get_four_embeds() {
+    async fn all_users_get_four_embeds() {
         let (mut engine, _tmpdir) = test_helper::new_engine().await;
         register_user(
             FID_FOR_TEST,
@@ -3619,50 +3718,50 @@ mod tests {
             &mut engine,
         )
         .await;
-        let pro_event = events_factory::create_pro_user_event(
-            FID_FOR_TEST,
-            1,
-            Some(time::current_timestamp_with_offset(-1)),
-        );
-        let four_embeds = messages_factory::casts::create_cast_add_rich(
-            FID_FOR_TEST,
-            "test",
-            Some(proto::CastType::Cast),
-            vec![
-                Embed {
-                    embed: Some(proto::embed::Embed::Url("abcde".to_string())),
-                },
-                Embed {
-                    embed: Some(proto::embed::Embed::Url("fghi".to_string())),
-                },
-                Embed {
-                    embed: Some(proto::embed::Embed::CastId(CastId {
-                        fid: FID_FOR_TEST + 1,
-                        hash: rand::random::<[u8; 20]>().to_vec(),
-                    })),
-                },
-                Embed {
-                    embed: Some(proto::embed::Embed::Url("jklmn".to_string())),
-                },
-            ],
-            None,
-            vec![],
-            None,
-            None,
-        );
+
+        let cast_with_embeds = |text: &str, count: usize| {
+            let embeds = (0..count)
+                .map(|i| {
+                    // Mix in a CastId embed so the count check is exercised against both variants.
+                    if i == 2 {
+                        Embed {
+                            embed: Some(proto::embed::Embed::CastId(CastId {
+                                fid: FID_FOR_TEST + 1,
+                                hash: rand::random::<[u8; 20]>().to_vec(),
+                            })),
+                        }
+                    } else {
+                        Embed {
+                            embed: Some(proto::embed::Embed::Url(format!(
+                                "https://example.com/{i}"
+                            ))),
+                        }
+                    }
+                })
+                .collect();
+            messages_factory::casts::create_cast_add_rich(
+                FID_FOR_TEST,
+                text,
+                Some(proto::CastType::Cast),
+                embeds,
+                None,
+                vec![],
+                None,
+                None,
+            )
+        };
+
+        // No pro event is ever committed: four embeds must merge on a plain fid.
+        let four_embeds = cast_with_embeds("four", 4);
         commit_message_at(&mut engine, &four_embeds, &FarcasterTime::current()).await;
-        assert!(!TrieKey::for_message(&four_embeds)
+        assert!(TrieKey::for_message(&four_embeds)
             .iter()
             .all(|key| engine.trie_key_exists(&trie_ctx(), &key)));
 
-        commit_event(&mut engine, &pro_event).await;
-        assert!(engine.trie_key_exists(
-            test_helper::trie_ctx(),
-            &TrieKey::for_onchain_event(&pro_event)
-        ));
-
-        commit_message_at(&mut engine, &four_embeds, &FarcasterTime::current()).await;
-        assert!(TrieKey::for_message(&four_embeds)
+        // Four is still a cap, not an invitation.
+        let five_embeds = cast_with_embeds("five", 5);
+        commit_message_at(&mut engine, &five_embeds, &FarcasterTime::current()).await;
+        assert!(!TrieKey::for_message(&five_embeds)
             .iter()
             .all(|key| engine.trie_key_exists(&trie_ctx(), &key)));
     }
@@ -4518,6 +4617,98 @@ mod tests {
             assert!(
                 matches!(active, ActiveKey::Gasless { .. }),
                 "expected gasless active-key variant, got: {:?}",
+                active
+            );
+        }
+
+        // Regression: KEY_ADD/KEY_REMOVE BlockEvents must be gated on GaslessSigners (V16),
+        // NOT StorageLending (V11). A read node replaying a KEY_ADD BlockEvent whose block
+        // timestamp falls in the [V11, V16) window (2025-10-08 .. 2026-05-07 on mainnet) must
+        // SKIP the merge — mainnet/upstream did not fold it into the account root, so merging
+        // it here diverges the trie and panics every hypersnap node at `commit_shard_chunk`.
+        // Before the fix the call site gated the whole dispatch on StorageLending, so any
+        // KEY_ADD replayed after V11 was merged; this test reproduces that fleet-wide wedge.
+        //
+        // The gate reads `block_event.block_timestamp()` independently of the message's own
+        // timestamp, so we hold the message at a current (post-V16) time — where its EIP-712
+        // deadline and gasless validation pass when the merge does run — and vary only the
+        // BlockEvent's block timestamp across the V16 boundary.
+        use crate::core::util::FarcasterTime;
+        use crate::proto::FarcasterNetwork;
+
+        // Testnet V11 = 1758733200 (2025-09-24), V16 = 1777406400 (2026-04-28).
+        const TESTNET_BETWEEN_V11_AND_V16_UNIX: u64 = 1_760_000_000; // 2025-10-09
+        const TESTNET_AFTER_V16_UNIX: u64 = 1_778_000_000; // 2026-05-05
+
+        async fn replay_key_add_at_block_time(block_unix_secs: u64) -> Option<ActiveKey> {
+            let (mut engine, _temp_dir) = test_helper::new_engine_with_options(EngineOptions {
+                network: Some(FarcasterNetwork::Testnet),
+                ..Default::default()
+            })
+            .await;
+            let fid_custody = PrivateKeySigner::random();
+            let app_custody = PrivateKeySigner::random();
+            let gasless = generate_signer();
+
+            register_eth(&mut engine, FID_FOR_TEST, &fid_custody, generate_signer()).await;
+            register_eth(&mut engine, REQUEST_FID, &app_custody, generate_signer()).await;
+
+            let timestamp = factory::time::farcaster_time();
+            let key_add = factory::messages_factory::keys::create_key_add(
+                FID_FOR_TEST,
+                &fid_custody,
+                REQUEST_FID,
+                &app_custody,
+                &gasless,
+                vec![proto::MessageType::CastAdd],
+                3600,
+                1,
+                timestamp + 1_000_000,
+                Some(timestamp),
+            );
+
+            let block_ts = FarcasterTime::from_unix_seconds(block_unix_secs).to_u64();
+            let block_event = create_merge_message_event_with_timestamp(key_add, 1, block_ts);
+            commit_block_events(&mut engine, vec![&block_event]).await;
+
+            // The BlockEvent itself is always persisted (put precedes the dispatch), so the
+            // seqnum advances either way — the wedge is about whether the *message* merged,
+            // which is what get_active_key surfaces.
+            assert!(
+                block_event_exists(&engine, &block_event),
+                "block event should be stored regardless of the feature gate"
+            );
+
+            let txn = RocksDbTransactionBatch::new();
+            let stores = engine.get_stores();
+            let pubkey = gasless.verifying_key().to_bytes();
+            get_active_key(
+                &stores.onchain_event_store,
+                &stores.db,
+                &txn,
+                FID_FOR_TEST,
+                &pubkey,
+            )
+            .unwrap()
+        }
+
+        #[tokio::test]
+        async fn key_add_block_event_skipped_before_gasless_feature() {
+            let active = replay_key_add_at_block_time(TESTNET_BETWEEN_V11_AND_V16_UNIX).await;
+            assert!(
+                active.is_none(),
+                "KEY_ADD BlockEvent before V16 must be skipped, not merged \
+                 (merging it diverges the account root from mainnet); got {:?}",
+                active
+            );
+        }
+
+        #[tokio::test]
+        async fn key_add_block_event_merged_after_gasless_feature() {
+            let active = replay_key_add_at_block_time(TESTNET_AFTER_V16_UNIX).await;
+            assert!(
+                matches!(active, Some(ActiveKey::Gasless { .. })),
+                "KEY_ADD BlockEvent at/after V16 must merge as a gasless key; got {:?}",
                 active
             );
         }

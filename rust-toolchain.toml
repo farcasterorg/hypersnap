@@ -1,0 +1,7 @@
+# Pinned so local builds, CI (.github/workflows/verify.yml) and the Dockerfile
+# builder image (rust:1.95) all agree. The floor is alloy 2.x's MSRV of 1.94.1 —
+# below that the alloy crates refuse to build with a bare "not supported by the
+# following packages" error rather than anything that points at the cause.
+[toolchain]
+channel = "1.95.0"
+profile = "default"

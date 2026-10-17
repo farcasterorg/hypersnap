@@ -209,6 +209,16 @@ pub struct ApiHttpHandler {
     /// Shared per-user token store, same pattern.
     notification_token_store:
         Arc<std::sync::RwLock<Option<Arc<crate::api::notifications::NotificationStore>>>>,
+    /// Per-shard RocksDB handles, used only to read the persisted `ShardHalt`
+    /// record. Late-bound for the same reason as `daily_stats`.
+    shard_dbs: Arc<
+        std::sync::RwLock<Option<std::collections::HashMap<u32, Arc<crate::storage::db::RocksDB>>>>,
+    >,
+    /// Daily network-wide activity rollups. Late-bound via `set_daily_stats`
+    /// rather than a seventh positional on `new` — the constructor already
+    /// takes six same-typed `Option<Arc<…>>` indexers and another one is a
+    /// transposition waiting to happen.
+    daily_stats: Arc<std::sync::RwLock<Option<Arc<crate::api::daily_stats::DailyStatsIndexer>>>>,
 }
 
 impl ApiHttpHandler {
@@ -241,7 +251,23 @@ impl ApiHttpHandler {
             notification_apps: Arc::new(std::sync::RwLock::new(None)),
             notification_app_store: Arc::new(std::sync::RwLock::new(None)),
             notification_token_store: Arc::new(std::sync::RwLock::new(None)),
+            daily_stats: Arc::new(std::sync::RwLock::new(None)),
+            shard_dbs: Arc::new(std::sync::RwLock::new(None)),
         }
+    }
+
+    /// Install per-shard DB handles so `/v2/farcaster/_status/halt` can read the
+    /// persisted halt reason.
+    pub fn set_shard_dbs(
+        &self,
+        dbs: std::collections::HashMap<u32, Arc<crate::storage::db::RocksDB>>,
+    ) {
+        *self.shard_dbs.write().unwrap() = Some(dbs);
+    }
+
+    /// Install the daily-stats indexer (callable after construction).
+    pub fn set_daily_stats(&self, indexer: Arc<crate::api::daily_stats::DailyStatsIndexer>) {
+        *self.daily_stats.write().unwrap() = Some(indexer);
     }
 
     /// Install the webhook management handler (callable after construction).
@@ -468,6 +494,19 @@ impl ApiHttpHandler {
 
         // Admin/status endpoints (not v2 spec, internal)
         if path == "/v2/farcaster/_status/backfill" {
+            return true;
+        }
+
+        // Halt status. Routed unconditionally: the whole point is to be
+        // reachable on a node whose shards have stopped.
+        if path == "/v2/farcaster/_status/halt" {
+            return true;
+        }
+
+        // Daily activity rollups. Routed unconditionally rather than gated on
+        // the indexer being present so a disabled node answers 503 with a
+        // reason, instead of a 404 that looks like a wrong URL.
+        if path == "/v2/farcaster/stats/daily" {
             return true;
         }
 
@@ -1245,6 +1284,11 @@ impl ApiHttpHandler {
             }
 
             // === Status endpoints ===
+            "/v2/farcaster/stats/daily" => {
+                self.handle_daily_stats(params.get("from"), params.get("to"))
+                    .await
+            }
+            "/v2/farcaster/_status/halt" => self.handle_halt_status().await,
             "/v2/farcaster/_status/backfill" => self.handle_backfill_status().await,
 
             _ => Ok(Self::error_response(
@@ -1987,7 +2031,8 @@ impl ApiHttpHandler {
         });
 
         if let Some(msg) = hub.get_cast_by_hash(&hash, fid_hint).await {
-            let cast = self.message_to_cast(&msg).await;
+            let mut cast = self.message_to_cast(&msg).await;
+            self.attach_cast_metrics(&mut cast, &msg.hash);
             return Ok(Self::json_response(StatusCode::OK, &CastResponse { cast }));
         }
 
@@ -2019,7 +2064,9 @@ impl ApiHttpHandler {
                     .as_ref()
                     .and_then(|idx| idx.get_fid_by_hash(&hash));
                 if let Some(msg) = hub.get_cast_by_hash(&hash, fid_hint).await {
-                    casts.push(self.message_to_cast(&msg).await);
+                    let mut cast = self.message_to_cast(&msg).await;
+                    self.attach_cast_metrics(&mut cast, &msg.hash);
+                    casts.push(cast);
                 }
             }
         }
@@ -2028,6 +2075,23 @@ impl ApiHttpHandler {
             StatusCode::OK,
             &BulkCastsResponse { casts },
         ))
+    }
+
+    /// Attach aggregate engagement data maintained by the metrics indexer.
+    ///
+    /// `message_to_cast` only converts the cast message itself, so endpoints
+    /// that return casts directly must explicitly hydrate these derived fields.
+    fn attach_cast_metrics(&self, cast: &mut Cast, hash: &[u8]) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        let Ok(metrics) = metrics.get_cast_metrics(cast.author.fid, hash) else {
+            return;
+        };
+
+        cast.reactions.likes_count = metrics.likes;
+        cast.reactions.recasts_count = metrics.recasts;
+        cast.replies.count = metrics.replies;
     }
 
     /// Handle GET /v2/farcaster/user/bulk-by-address?addresses=0x...,0x...
@@ -3175,6 +3239,132 @@ impl ApiHttpHandler {
     }
 
     /// Handle GET /v2/farcaster/_status/backfill
+    /// `GET /v2/farcaster/stats/daily?from=YYYY-MM-DD&to=YYYY-MM-DD`
+    ///
+    /// Node-derived replacement for the Dune daily-activity query. Both bounds
+    /// are inclusive and optional: `to` defaults to yesterday, `from` to 30 days
+    /// before `to`.
+    ///
+    /// `to` deliberately defaults to **yesterday**, not today. Today is still
+    /// accumulating, so including it puts a partial day at the end of every
+    /// series — which on a chart reads as a cliff rather than as "not finished
+    /// yet". The SQL this replaces did the same thing with a trailing
+    /// `OFFSET 1`. An explicit `to=<today>` still returns it.
+    async fn handle_daily_stats(
+        &self,
+        from: Option<&String>,
+        to: Option<&String>,
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        use crate::api::daily_stats::{date_string_to_day, day_to_date_string, today};
+
+        let indexer = self.daily_stats.read().unwrap().clone();
+        let Some(indexer) = indexer else {
+            return Ok(Self::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Daily stats indexing not enabled",
+            ));
+        };
+
+        let yesterday = today().saturating_sub(1);
+        let to_day = match to {
+            Some(s) => match date_string_to_day(s) {
+                Some(d) => d,
+                None => {
+                    return Ok(Self::error_response(
+                        StatusCode::BAD_REQUEST,
+                        "Invalid `to` date; expected YYYY-MM-DD",
+                    ))
+                }
+            },
+            None => yesterday,
+        };
+        let from_day = match from {
+            Some(s) => match date_string_to_day(s) {
+                Some(d) => d,
+                None => {
+                    return Ok(Self::error_response(
+                        StatusCode::BAD_REQUEST,
+                        "Invalid `from` date; expected YYYY-MM-DD",
+                    ))
+                }
+            },
+            None => to_day.saturating_sub(29),
+        };
+
+        match indexer.range(from_day, to_day) {
+            Ok(days) => {
+                let body = serde_json::json!({
+                    "from": day_to_date_string(from_day),
+                    "to": day_to_date_string(to_day),
+                    "day_count": days.len(),
+                    "notes": {
+                        "retention": "dN = fids that cast on this day AND also cast exactly N days earlier (cast activity only)",
+                        "estimated_fields": ["casts.unique_parent_hashes_estimated", "reactions.unique_target_hashes_estimated"],
+                        "estimate_method": "HyperLogLog p=14, ~0.8% standard error",
+                    },
+                    "days": days,
+                });
+                Ok(Self::json_response(StatusCode::OK, &body))
+            }
+            Err(crate::api::indexer::IndexerError::InvalidData(msg)) => {
+                Ok(Self::error_response(StatusCode::BAD_REQUEST, &msg))
+            }
+            Err(e) => Ok(Self::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to read daily stats: {}", e),
+            )),
+        }
+    }
+
+    /// `GET /v2/farcaster/_status/halt`
+    ///
+    /// Reports any shard that stopped applying blocks, and why.
+    ///
+    /// `commit_shard_chunk` panics on an unrecoverable commit failure. ractor
+    /// catches that panic and stops the `ReadHost` actor, but the process stays
+    /// up unsupervised — so the shard is permanently dead while the node still
+    /// answers requests, and the single `error!` naming the cause is long gone
+    /// from the log by the time anyone looks. This reads the record written
+    /// immediately before the panic.
+    async fn handle_halt_status(&self) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        use crate::storage::store::node_local_state::LocalStateStore;
+
+        let dbs = self.shard_dbs.read().unwrap().clone();
+        let Some(dbs) = dbs else {
+            return Ok(Self::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Shard handles not available",
+            ));
+        };
+
+        let mut shard_ids: Vec<u32> = dbs.keys().copied().collect();
+        shard_ids.sort();
+
+        let mut halted = Vec::new();
+        for shard_id in shard_ids {
+            let Some(db) = dbs.get(&shard_id) else {
+                continue;
+            };
+            if let Some(record) = LocalStateStore::read_shard_halt(db, shard_id) {
+                halted.push(serde_json::json!({
+                    "shard_id": record.shard_id,
+                    "height": record.height,
+                    "halted_at": record.unix_seconds,
+                    "reason": record.reason,
+                }));
+            }
+        }
+
+        let body = serde_json::json!({
+            "halted": !halted.is_empty(),
+            "shards": halted,
+            "note": "A halted shard never recovers on its own — nothing supervises the actor. \
+                     Restart the node once the cause is addressed; the record clears on the \
+                     first successful commit.",
+        });
+        Ok(Self::json_response(StatusCode::OK, &body))
+    }
+
     async fn handle_backfill_status(
         &self,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
@@ -3218,8 +3408,25 @@ impl ApiHttpHandler {
                 indexers.push(collect("search", s.as_ref()));
             }
         }
+        let daily_stats_progress = {
+            let ds = self.daily_stats.read().unwrap().clone();
+            match ds {
+                Some(d) => {
+                    indexers.push(collect("daily_stats", d.as_ref()));
+                    // The generic IndexerStats shape cannot express a fid-major
+                    // store walk, so daily_stats gets its own block with the
+                    // per-shard cursors and the day coverage.
+                    Some(d.backfill_progress())
+                }
+                None => None,
+            }
+        };
 
-        let body = serde_json::json!({ "indexers": indexers });
+        let mut body = serde_json::json!({ "indexers": indexers });
+        if let Some(progress) = daily_stats_progress {
+            body["daily_stats_backfill"] =
+                serde_json::to_value(progress).unwrap_or(serde_json::Value::Null);
+        }
         Ok(Self::json_response(StatusCode::OK, &body))
     }
 
@@ -4374,6 +4581,118 @@ fn format_timestamp(ts: u32) -> String {
 mod tests {
     use super::*;
 
+    async fn collect_json(res: Response<BoxBody<Bytes, Infallible>>) -> serde_json::Value {
+        let body = res.collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&body).expect("valid JSON response")
+    }
+
+    #[test]
+    fn test_halt_route_is_reachable_without_shard_handles() {
+        let handler = ApiHttpHandler::new(None, None, None, None, None, None);
+        // Must route even before anything is bound — the endpoint exists to be
+        // reachable on a node whose shards have died.
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/_status/halt"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/_status/halt/"));
+    }
+
+    #[tokio::test]
+    async fn test_halt_status_reports_the_persisted_reason() {
+        use crate::storage::store::node_local_state::LocalStateStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().as_os_str().to_str().unwrap().to_string();
+        std::mem::forget(dir);
+        let db = crate::storage::db::RocksDB::new(&path);
+        db.open().unwrap();
+        let db = Arc::new(db);
+
+        let handler = ApiHttpHandler::new(None, None, None, None, None, None);
+        handler.set_shard_dbs(std::collections::HashMap::from([
+            (1u32, db.clone()),
+            (2u32, db.clone()),
+        ]));
+
+        // Nothing halted yet.
+        let res = handler.handle_halt_status().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = collect_json(res).await;
+        assert_eq!(body["halted"], serde_json::json!(false));
+        assert_eq!(body["shards"].as_array().unwrap().len(), 0);
+
+        // Record a halt the way commit_shard_chunk does on its way down.
+        LocalStateStore::record_shard_halt(&db, 1, 43_650_999, "merkle trie root hash mismatch");
+
+        let res = handler.handle_halt_status().await.unwrap();
+        let body = collect_json(res).await;
+        assert_eq!(body["halted"], serde_json::json!(true));
+        let shards = body["shards"].as_array().unwrap();
+        assert_eq!(shards.len(), 1, "only the shard that halted is reported");
+        assert_eq!(shards[0]["shard_id"], serde_json::json!(1));
+        assert_eq!(shards[0]["height"], serde_json::json!(43_650_999u64));
+        // The whole point: the cause is readable long after the log rolled.
+        assert_eq!(
+            shards[0]["reason"],
+            serde_json::json!("merkle trie root hash mismatch")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_halt_status_unavailable_without_shard_handles() {
+        let handler = ApiHttpHandler::new(None, None, None, None, None, None);
+        let res = handler.handle_halt_status().await.unwrap();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn test_daily_stats_route_is_reachable() {
+        let handler = ApiHttpHandler::new(None, None, None, None, None, None);
+        // Must be routable even with no indexer bound, so the handler can
+        // answer 503-with-a-reason rather than 404.
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/stats/daily"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/stats/daily/"));
+        assert!(!handler.can_handle(&Method::POST, "/v2/farcaster/stats/daily"));
+    }
+
+    #[tokio::test]
+    async fn test_daily_stats_unavailable_when_not_enabled() {
+        let handler = ApiHttpHandler::new(None, None, None, None, None, None);
+        let response = handler.handle_daily_stats(None, None).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_daily_stats_rejects_malformed_dates() {
+        let handler = ApiHttpHandler::new(None, None, None, None, None, None);
+        let db = {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().as_os_str().to_str().unwrap().to_string();
+            let db = crate::storage::db::RocksDB::new(&path);
+            db.open().unwrap();
+            std::mem::forget(tmp);
+            Arc::new(db)
+        };
+        handler.set_daily_stats(Arc::new(crate::api::daily_stats::DailyStatsIndexer::new(
+            crate::api::config::DailyStatsConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            db,
+        )));
+
+        let bad = "2026-13-99".to_string();
+        let response = handler.handle_daily_stats(Some(&bad), None).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Inverted range is a client error, not a 500.
+        let from = "2026-08-10".to_string();
+        let to = "2026-08-01".to_string();
+        let response = handler
+            .handle_daily_stats(Some(&from), Some(&to))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
     #[test]
     fn test_can_handle() {
         let handler = ApiHttpHandler::new(None, None, None, None, None, None);
@@ -4741,6 +5060,87 @@ mod tests {
         ) -> Result<(Vec<u64>, Option<Vec<u8>>), String> {
             Ok((vec![], None))
         }
+    }
+
+    #[tokio::test]
+    async fn test_cast_lookup_includes_indexed_reaction_counts() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(crate::storage::db::RocksDB::new(
+            temp_dir.path().to_str().unwrap(),
+        ));
+        db.open().unwrap();
+
+        let metrics = Arc::new(MetricsIndexer::new(
+            crate::api::config::MetricsConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            db,
+        ));
+
+        let cast_fid = 15_211;
+        let cast_hash = hex::decode("ed45e6ef3fd1dec7c86b9bd8a9b837faffe628c7").unwrap();
+        let cast = crate::proto::Message {
+            data: Some(crate::proto::MessageData {
+                fid: cast_fid,
+                r#type: crate::proto::MessageType::CastAdd as i32,
+                body: Some(crate::proto::message_data::Body::CastAddBody(
+                    crate::proto::CastAddBody {
+                        text: "cast with likes".into(),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            }),
+            hash: cast_hash.clone(),
+            ..Default::default()
+        };
+
+        let reactions = [230_238, 230_239].map(|reactor_fid| crate::proto::Message {
+            data: Some(crate::proto::MessageData {
+                fid: reactor_fid,
+                r#type: crate::proto::MessageType::ReactionAdd as i32,
+                body: Some(crate::proto::message_data::Body::ReactionBody(
+                    crate::proto::ReactionBody {
+                        r#type: crate::proto::ReactionType::Like as i32,
+                        target: Some(crate::proto::reaction_body::Target::TargetCastId(
+                            crate::proto::CastId {
+                                fid: cast_fid,
+                                hash: cast_hash.clone(),
+                            },
+                        )),
+                    },
+                )),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        metrics
+            .process_batch(&[crate::api::events::IndexEvent::messages(
+                reactions.to_vec(),
+                1,
+                1,
+            )])
+            .await
+            .unwrap();
+
+        let handler = ApiHttpHandler::new(None, None, Some(metrics), None, None, None);
+        handler.set_hub_query(Arc::new(MockHubQuery {
+            notifications: vec![],
+            cast_lookup: Some(cast),
+        }));
+
+        let response = handler
+            .handle_cast_lookup(&hex::encode(cast_hash), "hash", None)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["cast"]["reactions"]["likes_count"], 2);
+        assert_eq!(json["cast"]["reactions"]["recasts_count"], 0);
+        assert_eq!(json["cast"]["reactions"]["likes"], serde_json::json!([]));
     }
 
     #[tokio::test]

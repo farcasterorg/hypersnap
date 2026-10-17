@@ -128,6 +128,17 @@ fn make_shard_checkpoint_key(indexer_name: &str, shard_id: u32) -> Vec<u8> {
     key
 }
 
+/// Key prefix covering every shard's checkpoint for one indexer. Used to clear
+/// them all when an indexer's stored data is discarded and must be rebuilt.
+pub fn shard_checkpoint_prefix(indexer_name: &str) -> Vec<u8> {
+    let name_bytes = indexer_name.as_bytes();
+    let mut key = Vec::with_capacity(2 + name_bytes.len());
+    key.push(BACKFILL_CHECKPOINT_PREFIX);
+    key.push(name_bytes.len() as u8);
+    key.extend_from_slice(name_bytes);
+    key
+}
+
 pub fn load_shard_checkpoint(db: &RocksDB, indexer_name: &str, shard_id: u32) -> u64 {
     let key = make_shard_checkpoint_key(indexer_name, shard_id);
     match db.get(&key) {

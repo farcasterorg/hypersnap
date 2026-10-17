@@ -5,10 +5,12 @@
 //! height, merging user messages into the Hyper-prefixed key space. Progress
 //! is checkpointed per shard so the process can resume after a restart.
 
+use crate::core::util::FarcasterTime;
 use crate::proto::{Message, MessageType};
 use crate::storage::db::RocksDbTransactionBatch;
-use crate::storage::store::account::StorageLendStore;
+use crate::storage::store::account::{MergeContext, StorageLendStore};
 use crate::storage::store::stores::Stores;
+use crate::version::version::EngineVersion;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -176,23 +178,36 @@ fn merge_message_to_hyper(
         Err(_) => return false,
     };
 
+    // Same version derivation as the engine's merge path: historical messages replay with the
+    // version that was active at their timestamp, keeping backfilled merges byte-identical.
+    let version =
+        EngineVersion::version_for(&FarcasterTime::new(data.timestamp as u64), hyper.network);
+    let ctx = MergeContext { version };
+
     let result = match mt {
         MessageType::CastAdd | MessageType::CastRemove => {
-            hyper.cast_store.merge(msg, txn_batch).map(|_| ())
+            hyper.cast_store.merge(msg, txn_batch, &ctx).map(|_| ())
         }
         MessageType::LinkAdd | MessageType::LinkRemove | MessageType::LinkCompactState => {
-            hyper.link_store.merge(msg, txn_batch).map(|_| ())
+            hyper.link_store.merge(msg, txn_batch, &ctx).map(|_| ())
         }
         MessageType::ReactionAdd | MessageType::ReactionRemove => {
-            hyper.reaction_store.merge(msg, txn_batch).map(|_| ())
+            hyper.reaction_store.merge(msg, txn_batch, &ctx).map(|_| ())
         }
-        MessageType::UserDataAdd => hyper.user_data_store.merge(msg, txn_batch).map(|_| ()),
-        MessageType::VerificationAddEthAddress | MessageType::VerificationRemove => {
-            hyper.verification_store.merge(msg, txn_batch).map(|_| ())
-        }
-        MessageType::UsernameProof => hyper.username_proof_store.merge(msg, txn_batch).map(|_| ()),
+        MessageType::UserDataAdd => hyper
+            .user_data_store
+            .merge(msg, txn_batch, &ctx)
+            .map(|_| ()),
+        MessageType::VerificationAddEthAddress | MessageType::VerificationRemove => hyper
+            .verification_store
+            .merge(msg, txn_batch, &ctx)
+            .map(|_| ()),
+        MessageType::UsernameProof => hyper
+            .username_proof_store
+            .merge(msg, txn_batch, &ctx)
+            .map(|_| ()),
         MessageType::LendStorage => {
-            StorageLendStore::merge(&hyper.storage_lend_store, msg, txn_batch).map(|_| ())
+            StorageLendStore::merge(&hyper.storage_lend_store, msg, txn_batch, &ctx).map(|_| ())
         }
         _ => return false,
     };

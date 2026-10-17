@@ -45,7 +45,7 @@
 use crate::hyper::bridge_burn_store::{BridgeBurnStore, BridgeBurnStoreError};
 use crate::proto;
 use alloy_primitives::{Address, FixedBytes, U256};
-use alloy_provider::{Provider, ProviderBuilder};
+use alloy_provider::{Provider, RootProvider};
 use alloy_rpc_types::{BlockNumberOrTag, Filter};
 use alloy_sol_types::{sol, SolEvent};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -140,10 +140,9 @@ pub async fn run(
             "bridge_contract_address is zero — refusing to subscribe to the zero address".into(),
         ));
     }
-    let provider =
-        ProviderBuilder::new().on_http(cfg.rpc_url.parse().map_err(|e: url::ParseError| {
-            BridgeBurnWatcherError::Rpc(format!("invalid rpc url: {}", e))
-        })?);
+    let provider = RootProvider::new_http(cfg.rpc_url.parse().map_err(|e: url::ParseError| {
+        BridgeBurnWatcherError::Rpc(format!("invalid rpc url: {}", e))
+    })?);
 
     let resume_from = match store
         .highest_observed_block(cfg.source_chain_id)
@@ -206,7 +205,7 @@ async fn scan_range<P>(
     to: u64,
 ) -> Result<(), BridgeBurnWatcherError>
 where
-    P: Provider<alloy_transport_http::Http<reqwest::Client>>,
+    P: Provider,
 {
     let filter = Filter::new()
         .address(cfg.bridge_contract_address)

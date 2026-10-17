@@ -28,7 +28,7 @@
 
 use crate::proto;
 use alloy_dyn_abi::TypedData;
-use alloy_primitives::{Address, PrimitiveSignature};
+use alloy_primitives::{Address, Signature};
 use serde_json::{json, Value};
 
 const ESCROW_EIP712_DOMAIN_NAME: &str = "HypersnapEscrow";
@@ -129,7 +129,7 @@ pub fn validate_token_escrow_claim(
 
     let v_byte = body.eip712_signature[64];
     let parity = v_byte != 0x1b && v_byte != 0x00;
-    let sig = PrimitiveSignature::from_bytes_and_parity(&body.eip712_signature[0..64], parity);
+    let sig = Signature::from_bytes_and_parity(&body.eip712_signature[0..64], parity);
     let recovered = sig
         .recover_address_from_prehash(&prehash)
         .map_err(|_| EscrowClaimValidationError::SignatureMismatch)?;

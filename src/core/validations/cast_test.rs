@@ -5,6 +5,7 @@ mod tests {
     use crate::{
         core::validations,
         proto::{cast_add_body, embed, Embed},
+        version::version::EngineVersion,
     };
 
     #[derive(Deserialize)]
@@ -119,13 +120,77 @@ mod tests {
                     };
                     assert!(
                         // Assume pro user is true to avoid failures on casts with 10k characters or 4 embeds.
-                        validations::cast::validate_cast_add_body(&cast, true, true).is_ok(),
+                        validations::cast::validate_cast_add_body(
+                            &cast,
+                            true,
+                            true,
+                            EngineVersion::latest()
+                        )
+                        .is_ok(),
                         "Failed to validate cast {:?}",
                         serde_json::to_string(&cast)
                     );
                 }
                 None => {}
             }
+        }
+    }
+
+    fn cast_with_embeds(count: usize) -> crate::proto::CastAddBody {
+        // Fully qualified: this module already defines its own `CastAddBody`
+        // deserialization fixture, so importing the proto type would shadow it.
+        crate::proto::CastAddBody {
+            embeds: (0..count)
+                .map(|i| Embed {
+                    embed: Some(embed::Embed::Url(format!("https://example.com/{}", i))),
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn validate_embeds(
+        count: usize,
+        is_pro_user: bool,
+        version: EngineVersion,
+    ) -> Result<(), validations::error::ValidationError> {
+        validations::cast::validate_cast_add_body(
+            &cast_with_embeds(count),
+            false,
+            is_pro_user,
+            version,
+        )
+    }
+
+    /// Pins both sides of the `IncreaseEmbedLimitForAllUsers` boundary. The pre-V20 row is what
+    /// makes replay of existing history safe: a non-Pro cast with 3 embeds was invalid when it
+    /// would have been signed, and must stay invalid forever at that version. The post-V20 row
+    /// is what keeps this node in consensus with mainnet, which has merged 4-embed non-Pro casts
+    /// since 2026-08-13.
+    #[test]
+    fn embed_limit_is_four_for_everyone_from_v20() {
+        use validations::error::ValidationError;
+
+        // Below the boundary: Pro gets 4, everyone else gets 2.
+        assert!(validate_embeds(2, false, EngineVersion::V19).is_ok());
+        assert!(matches!(
+            validate_embeds(3, false, EngineVersion::V19),
+            Err(ValidationError::EmbedsExceedsLimit)
+        ));
+        assert!(validate_embeds(4, true, EngineVersion::V19).is_ok());
+        assert!(matches!(
+            validate_embeds(5, true, EngineVersion::V19),
+            Err(ValidationError::EmbedsExceedsLimit)
+        ));
+
+        // At and above the boundary: 4 for everyone, Pro or not.
+        for is_pro_user in [false, true] {
+            assert!(validate_embeds(4, is_pro_user, EngineVersion::V20).is_ok());
+            assert!(matches!(
+                validate_embeds(5, is_pro_user, EngineVersion::V20),
+                Err(ValidationError::EmbedsExceedsLimit)
+            ));
+            assert!(validate_embeds(4, is_pro_user, EngineVersion::latest()).is_ok());
         }
     }
 }

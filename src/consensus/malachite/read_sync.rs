@@ -192,7 +192,27 @@ impl ReadSync {
         ractor::call!(self.host, |reply_to| ReadHostMsg::GetHistoryMinHeight {
             reply_to
         })
-        .map_err(|e| e.into())
+        .map_err(|e| Self::dead_actor("host", "GetHistoryMinHeight", e))
+    }
+
+    /// Turn a bare `Messaging(SendErr)` into something an operator can act on.
+    ///
+    /// A send failure here means the target actor's mailbox is closed, i.e. the
+    /// actor is gone. Nothing supervises these actors, so it never comes back and
+    /// the shard can never advance again — but the process stays up, so the only
+    /// outward sign is this error repeating on every sync tick. The bare
+    /// `Messaging(SendErr)` the `process!` macro logs says none of that, which is
+    /// why the real cause (logged once, by whatever killed the actor) is
+    /// impossible to find afterwards.
+    fn dead_actor(actor: &str, effect: &str, err: impl std::fmt::Display) -> ActorProcessingErr {
+        format!(
+            "cannot reach the {actor} actor while handling {effect} ({err}). \
+             The actor has stopped and nothing restarts it, so this shard will not \
+             advance until the node is restarted. The cause was logged once when the \
+             actor died — see `State change commit failed` earlier in this log, or \
+             GET /v2/farcaster/_status/halt for the persisted reason."
+        )
+        .into()
     }
 
     async fn handle_effect(
@@ -208,10 +228,12 @@ impl ReadSync {
             Effect::BroadcastStatus(height) => {
                 let history_min_height = self.get_history_min_height().await?;
 
-                self.gossip.cast(NetworkMsg::BroadcastStatus(Status::new(
-                    height,
-                    history_min_height,
-                )))?;
+                self.gossip
+                    .cast(NetworkMsg::BroadcastStatus(Status::new(
+                        height,
+                        history_min_height,
+                    )))
+                    .map_err(|e| Self::dead_actor("gossip", "BroadcastStatus", e))?;
             }
 
             Effect::SendValueRequest(peer_id, value_request) => {
@@ -254,12 +276,14 @@ impl ReadSync {
             }
 
             Effect::GetDecidedValue(request_id, height) => {
-                self.host.call_and_forward(
-                    |reply_to| ReadHostMsg::GetDecidedValue { height, reply_to },
-                    myself,
-                    move |synced_value| Msg::GotDecidedBlock(request_id, height, synced_value),
-                    None,
-                )?;
+                self.host
+                    .call_and_forward(
+                        |reply_to| ReadHostMsg::GetDecidedValue { height, reply_to },
+                        myself,
+                        move |synced_value| Msg::GotDecidedBlock(request_id, height, synced_value),
+                        None,
+                    )
+                    .map_err(|e| Self::dead_actor("host", "GetDecidedValue", e))?;
             }
             Effect::SendVoteSetRequest(peer_id, vote_set_request) => {
                 error!(

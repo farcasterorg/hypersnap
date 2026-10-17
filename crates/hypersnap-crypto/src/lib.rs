@@ -6,7 +6,7 @@
 //!   signatures via `ECDSA.recover` against the per-epoch group
 //!   address.
 //! - [`ecdsa`] — `EcdsaSignature` wrapper around
-//!   `alloy_primitives::PrimitiveSignature` with recovery and
+//!   `alloy_primitives::Signature` with recovery and
 //!   address-equality checks.
 //! - [`bls`] — minimal BLS12-381 surface retained for the snapchain
 //!   consensus layer's own validator-set parsing (independent of

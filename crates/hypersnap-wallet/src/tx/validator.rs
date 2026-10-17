@@ -253,7 +253,7 @@ mod tests {
 
         let v_byte = body.custody_signature[64];
         let parity = v_byte != 0x1b && v_byte != 0x00;
-        let sig = alloy_primitives::PrimitiveSignature::from_bytes_and_parity(
+        let sig = alloy_primitives::Signature::from_bytes_and_parity(
             &body.custody_signature[0..64],
             parity,
         );

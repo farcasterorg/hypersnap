@@ -29,6 +29,7 @@ pub mod cast_quotes_index;
 pub mod channels;
 pub mod config;
 pub mod conversations;
+pub mod daily_stats;
 pub mod events;
 pub mod feeds;
 pub mod http;
@@ -52,6 +53,7 @@ pub use channels::ChannelsIndexer;
 pub use config::ApiConfig;
 pub use config::FeatureConfig;
 pub use conversations::ConversationService;
+pub use daily_stats::DailyStatsIndexer;
 pub use events::{IndexEvent, IndexEventReceiver, IndexEventSender};
 pub use feeds::{FeedHandler, FeedService};
 pub use http::{ApiHttpHandler, ChannelFeedHandler, ConversationHandler, HubQueryHandler};
@@ -169,6 +171,14 @@ pub fn initialize(
     chain_client: Option<Arc<dyn crate::connectors::onchain_events::ChainAPI>>,
     statsd: Option<crate::utils::statsd_wrapper::StatsdClientWrapper>,
 ) -> Option<ApiSystem> {
+    // Per-shard DB handles for the halt endpoint. Captured here for the same
+    // reason as the signer store below: `shard_stores` is moved into the
+    // backfill task further down.
+    let shard_dbs: HashMap<u32, Arc<crate::storage::db::RocksDB>> = shard_stores
+        .iter()
+        .map(|(id, s)| (*id, s.db.clone()))
+        .collect();
+
     // Take a clone of one shard's on-chain event store for the JFS
     // signer lookup before `shard_stores` is moved into the backfill
     // task below. All shards see the same on-chain events so any one is
@@ -220,6 +230,16 @@ pub fn initialize(
         tracing::info!("Metrics indexer enabled");
         Some(Arc::new(MetricsIndexer::new(
             config.metrics.clone(),
+            db.clone(),
+        )))
+    } else {
+        None
+    };
+
+    let daily_stats_indexer = if config.daily_stats.enabled {
+        tracing::info!("Daily stats indexer enabled");
+        Some(Arc::new(DailyStatsIndexer::new(
+            config.daily_stats.clone(),
             db.clone(),
         )))
     } else {
@@ -286,9 +306,16 @@ pub fn initialize(
             backfill_indexers.push(idx.clone());
         }
     }
+    // daily_stats is deliberately NOT added to `backfill_indexers`: that path
+    // replays the hub event log, which is pruned to 3 days, so it could only
+    // ever reconstruct the last few days. It gets a store walk below instead.
     // Search backfill is handled separately using hyper stores (includes pruned data)
     let search_needs_backfill = config.search.backfill_on_startup && search_indexer.is_some();
+    let daily_stats_needs_backfill =
+        config.daily_stats.backfill_on_startup && daily_stats_indexer.is_some();
 
+    // Deliberately excludes daily_stats: its walk runs concurrently with the
+    // bridges rather than blocking them (see below).
     let needs_backfill = !backfill_indexers.is_empty() || search_needs_backfill;
 
     // Create worker pool and register indexers
@@ -307,6 +334,10 @@ pub fn initialize(
     }
 
     if let Some(ref indexer) = metrics_indexer {
+        worker_pool.register_arc(indexer.clone());
+    }
+
+    if let Some(ref indexer) = daily_stats_indexer {
         worker_pool.register_arc(indexer.clone());
     }
 
@@ -458,6 +489,33 @@ pub fn initialize(
         let _ = backfill_done_tx.send(true);
     }
 
+    // Daily-stats backfill runs CONCURRENTLY with the bridges, not ahead of them.
+    //
+    // Gating the bridges on this walk was what left a hole at the backfill/live
+    // seam: the walk takes hours, nothing else indexes while it runs, and the
+    // event broadcast is not replayed — so every message committed during the
+    // walk was lost to every indexer, permanently. Running it alongside live
+    // indexing means live owns the present from the moment the node starts.
+    //
+    // The walk is bounded to days strictly before the day it starts, and live
+    // owns that day onward, so the two never fold the same message twice.
+    if let Some(ds) = daily_stats_indexer.clone() {
+        if daily_stats_needs_backfill {
+            let db = db.clone();
+            let stores = hyper_shard_stores.clone();
+            let days = config.daily_stats.backfill_days;
+            tokio::spawn(async move {
+                match stores {
+                    Some(stores) => run_daily_stats_backfill(&db, &stores, &ds, days).await,
+                    None => tracing::warn!(
+                        "Daily stats backfill skipped: no hyper stores available. \
+                         The series will only cover days observed live."
+                    ),
+                }
+            });
+        }
+    }
+
     // Create bridges for each shard, gated on backfill completion
     let mut bridge_handles = Vec::new();
     for (shard_id, hub_event_tx) in hub_event_senders {
@@ -481,6 +539,12 @@ pub fn initialize(
         Some(cast_quotes_indexer),
         Some(user_data_indexer),
     );
+
+    if let Some(ref indexer) = daily_stats_indexer {
+        http_handler.set_daily_stats(indexer.clone());
+    }
+
+    http_handler.set_shard_dbs(shard_dbs);
 
     // Mini app notifications — two stateful HTTP handlers wired here,
     // one more (the registration management handler) wired from
@@ -712,6 +776,283 @@ async fn run_search_backfill(
         total_indexed,
         elapsed = ?start.elapsed(),
         "Search backfill from hyper stores complete"
+    );
+}
+
+use crate::api::daily_stats::BACKFILL_CHECKPOINT_NAME as DAILY_STATS_BACKFILL_CHECKPOINT;
+
+/// Backfill daily rollups by walking every fid's casts, reactions and links in
+/// the hyper stores.
+///
+/// The hub event log is pruned to a few days, so the block-based backfill can
+/// only ever reconstruct the very recent past. Hyper stores retain messages the
+/// event log has dropped, which is what makes a six-month series possible at
+/// all.
+///
+/// **What this produces is not the same series as an event-sourced one.** A
+/// store walk sees only messages that still exist, dated by their creation
+/// timestamp, so anything deleted since is simply absent from its original day
+/// and older days are progressively undercounted. Rows produced here are marked
+/// `reconstructed: true` in the API response for exactly this reason.
+///
+/// Resumes from a per-shard fid checkpoint, so an interrupted run continues
+/// rather than restarting — which also keeps the additive counters from being
+/// double-counted across restarts.
+async fn run_daily_stats_backfill(
+    db: &crate::storage::db::RocksDB,
+    hyper_stores: &HashMap<u32, Stores>,
+    daily_stats: &Arc<DailyStatsIndexer>,
+    backfill_days: u32,
+) {
+    use crate::storage::db::PageOptions;
+    use crate::storage::store::account::{CastStore, LinkStore, ReactionStore};
+
+    // The walk owns [cutoff_day, live_from_day), the live path owns
+    // [live_from_day, ..). The exclusive upper bound is what keeps the two from
+    // folding the same message twice now that they run concurrently — without
+    // it, anything committed today would be counted once by the bridge and again
+    // by the walk when it reached that fid.
+    //
+    // `live_from_day` is the day the walk starts, published up front so the
+    // `reconstructed` flag lines up with the same boundary.
+    let live_from_day = daily_stats::today();
+    let cutoff_day = live_from_day.saturating_sub(backfill_days);
+    daily_stats.set_live_from_day(live_from_day);
+    let in_window = |m: &crate::proto::Message| -> bool {
+        m.data
+            .as_ref()
+            .map(|d| {
+                let day = daily_stats::day_for_message_timestamp(d.timestamp as u64);
+                day >= cutoff_day && day < live_from_day
+            })
+            .unwrap_or(false)
+    };
+
+    tracing::info!(
+        backfill_days,
+        cutoff = %daily_stats::day_to_date_string(cutoff_day),
+        live_from = %daily_stats::day_to_date_string(live_from_day),
+        "Starting daily stats backfill from hyper stores (live path owns live_from onward)"
+    );
+    let start = std::time::Instant::now();
+    let mut total_folded: u64 = 0;
+
+    // Hold the whole window in memory and flush on a budget rather than on day
+    // rollover; see DailyStatsIndexer::set_backfill_mode.
+    daily_stats.set_backfill_mode(true);
+
+    let mut sorted_shards: Vec<_> = hyper_stores.keys().cloned().collect();
+    sorted_shards.sort();
+
+    for shard_id in sorted_shards {
+        let Some(stores) = hyper_stores.get(&shard_id) else {
+            continue;
+        };
+
+        let checkpoint_fid =
+            backfill::load_shard_checkpoint(db, DAILY_STATS_BACKFILL_CHECKPOINT, shard_id);
+        if checkpoint_fid == u64::MAX {
+            tracing::info!(shard_id, "Daily stats backfill already complete for shard");
+            continue;
+        }
+
+        // Publish a cursor up front so the status endpoint reports the walk as
+        // started rather than silent for the first thousand fids.
+        daily_stats.record_backfill_cursor(shard_id, checkpoint_fid);
+
+        let mut fid_page_token: Option<Vec<u8>> = None;
+        let mut fids_processed: u64 = 0;
+        loop {
+            let page_opts = PageOptions {
+                page_size: Some(1000),
+                page_token: fid_page_token.clone(),
+                reverse: false,
+            };
+            let (fids, next_token) = match stores.onchain_event_store.get_fids(&page_opts) {
+                Ok(r) => r,
+                Err(_) => break,
+            };
+            if fids.is_empty() {
+                break;
+            }
+
+            for fid in &fids {
+                if *fid < checkpoint_fid {
+                    continue;
+                }
+
+                // Casts, reactions (all types) and links (all types) for this fid.
+                let mut page_token: Option<Vec<u8>> = None;
+                loop {
+                    let opts = PageOptions {
+                        page_size: Some(500),
+                        page_token: page_token.clone(),
+                        reverse: false,
+                    };
+                    let page =
+                        match CastStore::get_cast_adds_by_fid(&stores.cast_store, *fid, &opts) {
+                            Ok(p) => p,
+                            Err(_) => break,
+                        };
+                    if page.messages.is_empty() {
+                        break;
+                    }
+                    let kept: Vec<_> = page
+                        .messages
+                        .iter()
+                        .filter(|m| in_window(m))
+                        .cloned()
+                        .collect();
+                    if !kept.is_empty() {
+                        total_folded += kept.len() as u64;
+                        let event = IndexEvent::messages(kept, shard_id, 0);
+                        if let Err(e) = daily_stats.process_batch(&[event]).await {
+                            tracing::warn!(error = %e, "Daily stats backfill cast batch error");
+                        }
+                    }
+                    match page.next_page_token {
+                        Some(t) if !t.is_empty() => page_token = Some(t),
+                        _ => break,
+                    }
+                }
+
+                let mut page_token: Option<Vec<u8>> = None;
+                loop {
+                    let opts = PageOptions {
+                        page_size: Some(500),
+                        page_token: page_token.clone(),
+                        reverse: false,
+                    };
+                    let page = match ReactionStore::get_reaction_adds_by_fid(
+                        &stores.reaction_store,
+                        *fid,
+                        0, // 0 = every reaction type
+                        &opts,
+                    ) {
+                        Ok(p) => p,
+                        Err(_) => break,
+                    };
+                    if page.messages.is_empty() {
+                        break;
+                    }
+                    let kept: Vec<_> = page
+                        .messages
+                        .iter()
+                        .filter(|m| in_window(m))
+                        .cloned()
+                        .collect();
+                    if !kept.is_empty() {
+                        total_folded += kept.len() as u64;
+                        let event = IndexEvent::messages(kept, shard_id, 0);
+                        if let Err(e) = daily_stats.process_batch(&[event]).await {
+                            tracing::warn!(error = %e, "Daily stats backfill reaction batch error");
+                        }
+                    }
+                    match page.next_page_token {
+                        Some(t) if !t.is_empty() => page_token = Some(t),
+                        _ => break,
+                    }
+                }
+
+                let mut page_token: Option<Vec<u8>> = None;
+                loop {
+                    let opts = PageOptions {
+                        page_size: Some(500),
+                        page_token: page_token.clone(),
+                        reverse: false,
+                    };
+                    let page = match LinkStore::get_link_adds_by_fid(
+                        &stores.link_store,
+                        *fid,
+                        String::new(), // empty = every link type, matching the SQL
+                        &opts,
+                    ) {
+                        Ok(p) => p,
+                        Err(_) => break,
+                    };
+                    if page.messages.is_empty() {
+                        break;
+                    }
+                    let kept: Vec<_> = page
+                        .messages
+                        .iter()
+                        .filter(|m| in_window(m))
+                        .cloned()
+                        .collect();
+                    if !kept.is_empty() {
+                        total_folded += kept.len() as u64;
+                        let event = IndexEvent::messages(kept, shard_id, 0);
+                        if let Err(e) = daily_stats.process_batch(&[event]).await {
+                            tracing::warn!(error = %e, "Daily stats backfill link batch error");
+                        }
+                    }
+                    match page.next_page_token {
+                        Some(t) if !t.is_empty() => page_token = Some(t),
+                        _ => break,
+                    }
+                }
+
+                fids_processed += 1;
+                if fids_processed % 1000 == 0 {
+                    // Flush before checkpointing: a checkpoint ahead of the data
+                    // it stands for would make a resumed run skip those fids.
+                    if let Err(e) = daily_stats.flush().await {
+                        tracing::warn!(error = %e, "Daily stats backfill flush error");
+                    }
+                    let _ = backfill::save_shard_checkpoint(
+                        db,
+                        DAILY_STATS_BACKFILL_CHECKPOINT,
+                        shard_id,
+                        *fid,
+                    );
+                    // Mirror the cursor into the indexer's own keyspace so the
+                    // status endpoint can report progress without knowing the
+                    // backfill module's key layout or the shard list.
+                    daily_stats.record_backfill_cursor(shard_id, *fid);
+                    if fids_processed % 10_000 == 0 {
+                        tracing::info!(
+                            shard_id,
+                            fids_processed,
+                            total_folded,
+                            "Daily stats backfill progress"
+                        );
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
+
+            match next_token {
+                Some(t) if !t.is_empty() => fid_page_token = Some(t),
+                _ => break,
+            }
+        }
+
+        if let Err(e) = daily_stats.flush().await {
+            tracing::warn!(error = %e, "Daily stats backfill final flush error");
+        }
+        let _ = backfill::save_shard_checkpoint(
+            db,
+            DAILY_STATS_BACKFILL_CHECKPOINT,
+            shard_id,
+            u64::MAX,
+        );
+        daily_stats.record_backfill_cursor(shard_id, u64::MAX);
+        tracing::info!(
+            shard_id,
+            total_folded,
+            "Daily stats backfill complete for shard"
+        );
+    }
+
+    daily_stats.set_backfill_mode(false);
+    if let Err(e) = daily_stats.flush().await {
+        tracing::warn!(error = %e, "Daily stats backfill exit flush error");
+    }
+
+    tracing::info!(
+        total_folded,
+        elapsed = ?start.elapsed(),
+        "Daily stats backfill from hyper stores complete"
     );
 }
 

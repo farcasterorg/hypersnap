@@ -121,8 +121,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy_primitives::{address, U256};
-use alloy_provider::{Provider, ProviderBuilder};
-use alloy_rpc_types::{BlockNumberOrTag, BlockTransactionsKind, Filter};
+use alloy_provider::{Provider, RootProvider};
+use alloy_rpc_types::{BlockNumberOrTag, Filter};
 use alloy_sol_types::{sol, SolEvent, SolType};
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -865,7 +865,7 @@ fn extract_request_fid(s: &BatchSignerEntry) -> Option<u64> {
     if bytes.is_empty() {
         return None;
     }
-    let decoded = SignedKeyRequestMetadata::abi_decode(&bytes, true).ok()?;
+    let decoded = SignedKeyRequestMetadata::abi_decode_validate(&bytes).ok()?;
     decoded.requestFid.try_into().ok()
 }
 
@@ -1395,7 +1395,7 @@ async fn find_deployment_block<P>(
     latest: u64,
 ) -> Result<u64, Box<dyn std::error::Error>>
 where
-    P: Provider<alloy_transport_http::Http<reqwest::Client>>,
+    P: Provider,
 {
     let mut lo: u64 = 1;
     let mut hi: u64 = latest;
@@ -1431,7 +1431,7 @@ async fn fetch_recoveries(
     if rpc_url.is_empty() {
         return Ok(HashSet::new());
     }
-    let provider = ProviderBuilder::new().on_http(rpc_url.parse()?);
+    let provider = RootProvider::new_http(rpc_url.parse()?);
 
     // Resolve "u64::MAX" sentinel to the latest block.
     let resolved_end = if end_block == u64::MAX {
@@ -1504,7 +1504,7 @@ async fn fetch_recoveries(
     let pb = progress_bar(unique_blocks.len() as u64, "block-ts");
     for bn in &unique_blocks {
         let block = provider
-            .get_block_by_number(BlockNumberOrTag::Number(*bn), BlockTransactionsKind::Hashes)
+            .get_block_by_number(BlockNumberOrTag::Number(*bn))
             .await?;
         if let Some(b) = block {
             block_ts.insert(*bn, b.header.timestamp);

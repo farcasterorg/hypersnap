@@ -111,26 +111,32 @@ impl HubEventBridge {
                 None
             }
             HubEventType::PruneMessage => {
-                // Forward pruned messages so indexers can handle per-context
+                // Forward pruned messages so indexers can handle per-context.
+                // Tagged Prune: this is the same Message that was merged earlier,
+                // carrying its original timestamp, so anything that counts
+                // occurrences must not fold it again.
                 if let Some(hub_event::Body::PruneMessageBody(body)) = &hub_event.body {
                     if let Some(message) = &body.message {
-                        return Some(IndexEvent::message(
+                        return Some(IndexEvent::message_of_kind(
                             message.clone(),
                             self.shard_id,
                             self.extract_block_height(hub_event),
+                            crate::api::events::MessageEventKind::Prune,
                         ));
                     }
                 }
                 None
             }
             HubEventType::RevokeMessage => {
-                // Revoked signer messages must be removed from all contexts
+                // Revoked signer messages must be removed from all contexts.
+                // Same reasoning as Prune above.
                 if let Some(hub_event::Body::RevokeMessageBody(body)) = &hub_event.body {
                     if let Some(message) = &body.message {
-                        return Some(IndexEvent::message(
+                        return Some(IndexEvent::message_of_kind(
                             message.clone(),
                             self.shard_id,
                             self.extract_block_height(hub_event),
+                            crate::api::events::MessageEventKind::Revoke,
                         ));
                     }
                 }
