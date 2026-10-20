@@ -21,3 +21,10 @@ Procfile
 /.idea
 node_modules
 grafana/data
+.claude/settings.json
+/.target_local
+.claude/scheduled_tasks.lock
+
+# `make coverage` output
+lcov.info
+/coverage/

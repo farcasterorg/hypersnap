@@ -215,7 +215,7 @@ impl HubEventStorageExt for HubEvent {
 
         Ok(EventsPage {
             events,
-            next_page_token: if last_key.len() > 0 {
+            next_page_token: if !last_key.is_empty() {
                 Some(last_key)
             } else {
                 None
@@ -250,7 +250,7 @@ impl HubEventStorageExt for HubEvent {
         let stop_event_key = make_event_key(stop_event_id);
         // Event pruning is a large cold sweep across HubEvents; bypass the
         // shared block cache so this scan doesn't evict the hot consensus
-        // working set.
+        // working set (see PR #776 / Apr 16-17 halt postmortem).
         let total_pruned = db
             .delete_paginated(
                 Some(start_event_key),

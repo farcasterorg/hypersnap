@@ -123,6 +123,7 @@ enum TransitionType {
   TRANSITION_DEPARTING = 1;
   TRANSITION_JOINING = 2;
   TRANSITION_DELAYED = 3;
+  TRANSITION_INACTIVE = 4;   // §4.8: the set asks new validators to register
 }
 
 // §13.4. In each shard-0 epoch boundary block.
@@ -146,6 +147,7 @@ message PivotRecord {
   uint64 onchain_cursor = 8;                 // Highest Optimism block of an on-chain event in epoch-0 state
   uint64 fname_cursor = 9;                   // Highest fname transfer ID in epoch-0 state
   bytes params_hash = 10;                    // Hash of all consensus parameters
+  uint32 snapchain_engine_version = 11;      // Snapchain rules of shards 1 and 2 after the pivot: the version at the fork block (§17.7)
 }
 
 message ShardForkPoint {

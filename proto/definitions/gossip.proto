@@ -20,6 +20,13 @@ message GossipMessage {
     ContactInfo contact_info_message = 6;
     // Hypersnap `membership` topic (FIP §4.6, §4.10).
     ValidatorTransitionAlert transition_alert = 9;
+    // Hypersnap mempool topics (FIP §4.10): the mempool messages of a
+    // node, many in one gossip message.
+    MempoolBatch mempool_batch = 10;
   }
+}
+
+message MempoolBatch {
+  repeated MempoolMessage messages = 1;
 }
 

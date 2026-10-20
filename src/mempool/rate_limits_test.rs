@@ -5,7 +5,7 @@ mod tests {
     use ractor::concurrency::sleep;
 
     use crate::{
-        mempool::mempool::{LiveAtRateLimits, RateLimits, RateLimitsConfig},
+        mempool::mempool::{KeyAddRateLimits, LiveAtRateLimits, RateLimits, RateLimitsConfig},
         storage::store::{
             engine::ShardEngine,
             stores::{Limits, StoreLimits, Stores},
@@ -273,5 +273,33 @@ mod tests {
         let live_at_limits = LiveAtRateLimits::new(shard_stores, statsd_client(), 1);
 
         assert!(!live_at_limits.consume_for_fid(FID_FOR_TEST));
+    }
+
+    #[tokio::test]
+    async fn key_add_first_call_passes_second_within_window_fails() {
+        let limits = KeyAddRateLimits::new(statsd_client());
+        assert!(limits.consume_for_fid(FID_FOR_TEST));
+        // Second call within the 60s window is rate-limited.
+        assert!(!limits.consume_for_fid(FID_FOR_TEST));
+    }
+
+    #[tokio::test]
+    async fn key_add_rate_limit_does_not_require_storage() {
+        // Unlike the storage-quota limiter, this guardrail is storage-agnostic: a freshly-created
+        // FID with zero storage must still be able to submit its first KEY_ADD. We never build
+        // a `Stores` here — if the implementation ever started reading storage, this test
+        // wouldn't have a store to read from.
+        let limits = KeyAddRateLimits::new(statsd_client());
+        assert!(limits.consume_for_fid(999_999));
+    }
+
+    #[tokio::test]
+    async fn key_add_rate_limit_is_scoped_per_fid() {
+        // The limiter is keyed by FID; one FID consuming its quota must not affect another.
+        let limits = KeyAddRateLimits::new(statsd_client());
+        assert!(limits.consume_for_fid(FID_FOR_TEST));
+        assert!(!limits.consume_for_fid(FID_FOR_TEST));
+        // Different FID has its own bucket.
+        assert!(limits.consume_for_fid(FID_FOR_TEST + 1));
     }
 }

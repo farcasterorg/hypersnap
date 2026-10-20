@@ -529,7 +529,10 @@ impl<S: NodeStore> KTrie<S> {
             .map(|(k, v)| (*k, v.as_ref().map(Node::encode)))
             .collect();
         if self.root != self.committed_root {
-            writes.push((NodeKey::Root, Some(encode_root(&self.root))));
+            // An empty trie has no root record, as a trie that never had a
+            // key: the records depend on the key set only.
+            let record = self.root.as_ref().map(|_| encode_root(&self.root));
+            writes.push((NodeKey::Root, record));
         }
         writes.sort_unstable_by_key(|w| w.0);
 

@@ -8,6 +8,7 @@ pub mod engine_metrics;
 pub mod hyper_backfill;
 pub mod mempool_poller;
 pub mod node_local_state;
+pub mod reconcile;
 pub mod shard;
 pub mod state_context;
 pub mod stores;
@@ -19,6 +20,8 @@ pub mod test_helper;
 
 #[cfg(test)]
 mod block_engine_test;
+#[cfg(test)]
+mod cross_shard_gasless_test;
 #[cfg(test)]
 mod engine_tests;
 #[cfg(test)]

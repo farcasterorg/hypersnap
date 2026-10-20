@@ -22,9 +22,11 @@ use crate::proto::{self, Message};
 use async_trait::async_trait;
 use serde::Serialize;
 use std::collections::BinaryHeap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tonic::Request;
+use tracing::{info, warn};
 
 /// Errors that can occur during feed generation.
 #[derive(Error, Debug)]
@@ -82,12 +84,65 @@ pub trait FeedHandler: Send + Sync {
         limit: usize,
     ) -> Result<FeedResponse, FeedError>;
 
-    /// Get the trending feed.
+    /// Get the trending feed over a time window.
     async fn get_trending_feed(
         &self,
         cursor: Option<&str>,
         limit: usize,
+        window: TrendingWindow,
     ) -> Result<FeedResponse, FeedError>;
+}
+
+/// The time windows the trending feed ranks over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrendingWindow {
+    OneHour,
+    SixHours,
+    TwelveHours,
+    OneDay,
+    SevenDays,
+}
+
+impl TrendingWindow {
+    pub const ALL: [TrendingWindow; 5] = [
+        TrendingWindow::OneHour,
+        TrendingWindow::SixHours,
+        TrendingWindow::TwelveHours,
+        TrendingWindow::OneDay,
+        TrendingWindow::SevenDays,
+    ];
+
+    /// Parse a `time_window` parameter: `1h`, `6h`, `12h`, `24h` or `7d`.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "1h" => Some(Self::OneHour),
+            "6h" => Some(Self::SixHours),
+            "12h" => Some(Self::TwelveHours),
+            "24h" => Some(Self::OneDay),
+            "7d" => Some(Self::SevenDays),
+            _ => None,
+        }
+    }
+
+    pub fn secs(self) -> u64 {
+        3600 * match self {
+            Self::OneHour => 1,
+            Self::SixHours => 6,
+            Self::TwelveHours => 12,
+            Self::OneDay => 24,
+            Self::SevenDays => 24 * 7,
+        }
+    }
+
+    fn index(self) -> usize {
+        Self::ALL.iter().position(|w| *w == self).unwrap()
+    }
+}
+
+impl Default for TrendingWindow {
+    fn default() -> Self {
+        Self::OneDay
+    }
 }
 
 /// Helper struct for merge-sorting casts by timestamp.
@@ -122,12 +177,35 @@ impl PartialOrd for TimestampedCast {
     }
 }
 
+/// Casts kept in a trending ranking snapshot; deeper pages come back empty.
+const TRENDING_RANKING_SIZE: usize = 1000;
+
+/// A trending ranking as `(fid, hash, score)`, highest score first.
+type TrendingRanking = Arc<Vec<(u64, Vec<u8>, f64)>>;
+
+/// A computed trending ranking. Ranking reads every hour bucket in the window
+/// and looks up each candidate cast, so requests share one snapshot per window.
+struct TrendingSnapshot {
+    computed_at: Instant,
+    ranking: TrendingRanking,
+}
+
+/// One window's snapshot, plus the lock held by the task computing it so at
+/// most one refresh per window runs at a time.
+#[derive(Default)]
+struct TrendingSlot {
+    snapshot: Arc<RwLock<Option<TrendingSnapshot>>>,
+    refresh: Arc<tokio::sync::Mutex<()>>,
+}
+
 /// Feed service for generating user feeds.
 pub struct FeedService<S> {
     config: FeedConfig,
     social_graph: Option<Arc<SocialGraphIndexer>>,
     metrics: Option<Arc<MetricsIndexer>>,
     hub_service: Arc<S>,
+    /// One slot per [`TrendingWindow`], in [`TrendingWindow::ALL`] order.
+    trending: Vec<TrendingSlot>,
 }
 
 impl<S> FeedService<S>
@@ -146,12 +224,126 @@ where
             social_graph,
             metrics,
             hub_service,
+            trending: TrendingWindow::ALL
+                .iter()
+                .map(|_| TrendingSlot::default())
+                .collect(),
         }
     }
 
     /// Check if feeds are enabled.
     pub fn is_enabled(&self) -> bool {
         self.config.enabled
+    }
+
+    /// Start computing every window's trending ranking in the background, so
+    /// the first trending requests do not wait for one.
+    pub fn warm_trending(&self) {
+        if let (true, Some(metrics)) = (self.config.enabled, &self.metrics) {
+            for window in TrendingWindow::ALL {
+                self.spawn_trending_refresh(metrics.clone(), window);
+            }
+        }
+    }
+
+    /// The window's current ranking and whether it is still within its TTL.
+    fn cached_trending(&self, window: TrendingWindow) -> Option<(TrendingRanking, bool)> {
+        let ttl = Duration::from_secs(self.config.trending_cache_ttl_secs);
+        self.trending[window.index()]
+            .snapshot
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|snap| (snap.ranking.clone(), snap.computed_at.elapsed() < ttl))
+    }
+
+    /// Recompute the window's ranking in the background, unless a refresh is
+    /// already running. The task owns the window's refresh lock until the
+    /// new snapshot is stored, so waiters on the lock see the result.
+    ///
+    /// Candidates come from the engagement earned inside the window, and only
+    /// casts created inside it are kept.
+    fn spawn_trending_refresh(&self, metrics: Arc<MetricsIndexer>, window: TrendingWindow) {
+        let slot = &self.trending[window.index()];
+        let Ok(guard) = slot.refresh.clone().try_lock_owned() else {
+            return;
+        };
+        let snapshot = slot.snapshot.clone();
+        let hub = self.hub_service.clone();
+        tokio::spawn(async move {
+            let _guard = guard;
+            let started = Instant::now();
+            let now = crate::core::util::get_farcaster_time().unwrap_or(0);
+            let secs = window.secs();
+            let candidates =
+                match tokio::task::spawn_blocking(move || metrics.get_trending_window(secs, now))
+                    .await
+                {
+                    Ok(Ok(candidates)) => candidates,
+                    Ok(Err(e)) => {
+                        warn!(error = ?e, ?window, "Failed to compute trending ranking");
+                        return;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, ?window, "Trending ranking task failed");
+                        return;
+                    }
+                };
+
+            let cutoff = now.saturating_sub(secs);
+            let considered = candidates.len();
+            let mut ranking = Vec::new();
+            for (fid, hash, score) in candidates {
+                if ranking.len() >= TRENDING_RANKING_SIZE {
+                    break;
+                }
+                let cast_id = proto::CastId {
+                    fid,
+                    hash: hash.clone(),
+                };
+                let created = hub
+                    .get_cast(Request::new(cast_id))
+                    .await
+                    .ok()
+                    .and_then(|r| r.into_inner().data.map(|d| d.timestamp as u64));
+                if created.is_some_and(|ts| ts >= cutoff) {
+                    ranking.push((fid, hash, score));
+                }
+            }
+
+            info!(
+                ?window,
+                candidates = considered,
+                casts = ranking.len(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "Refreshed trending ranking"
+            );
+            *snapshot.write().unwrap() = Some(TrendingSnapshot {
+                computed_at: Instant::now(),
+                ranking: Arc::new(ranking),
+            });
+        });
+    }
+
+    /// The window's trending ranking to serve. A stale snapshot is served
+    /// as-is while a background refresh replaces it; with no snapshot yet,
+    /// waits for the in-flight computation.
+    async fn trending_ranking(
+        &self,
+        metrics: &Arc<MetricsIndexer>,
+        window: TrendingWindow,
+    ) -> Result<TrendingRanking, FeedError> {
+        if let Some((ranking, fresh)) = self.cached_trending(window) {
+            if !fresh {
+                self.spawn_trending_refresh(metrics.clone(), window);
+            }
+            return Ok(ranking);
+        }
+        self.spawn_trending_refresh(metrics.clone(), window);
+        drop(self.trending[window.index()].refresh.lock().await);
+        self.cached_trending(window)
+            .map(|(ranking, _)| ranking)
+            .ok_or_else(|| FeedError::ServiceError("Trending ranking unavailable".to_string()))
     }
 
     /// Get the following feed for a user.
@@ -296,11 +488,13 @@ where
 
     /// Get the trending feed.
     ///
-    /// Returns casts sorted by engagement score (highest first).
+    /// Returns casts created within `window`, sorted by the engagement score
+    /// they earned within it (highest first).
     pub async fn get_trending_feed(
         &self,
         cursor: Option<&str>,
         limit: usize,
+        window: TrendingWindow,
     ) -> Result<FeedResponse, FeedError> {
         if !self.config.enabled {
             return Err(FeedError::FeatureDisabled);
@@ -315,13 +509,8 @@ where
         let offset: usize = cursor.and_then(|c| c.parse().ok()).unwrap_or(0);
         let limit = limit.min(100);
 
-        // Get trending casts from metrics indexer
-        let trending = metrics
-            .get_trending_casts(limit + offset)
-            .map_err(|e| FeedError::ServiceError(format!("Failed to get trending: {:?}", e)))?;
-
-        // Skip to offset
-        let trending: Vec<_> = trending.into_iter().skip(offset).take(limit).collect();
+        let ranking = self.trending_ranking(metrics, window).await?;
+        let trending: Vec<_> = ranking.iter().skip(offset).take(limit).cloned().collect();
 
         // Fetch full cast data for each trending cast
         let mut items = Vec::with_capacity(trending.len());
@@ -345,8 +534,9 @@ where
             }
         }
 
-        // Generate next cursor
-        let next_cursor = if items.len() == limit {
+        // Generate next cursor while the ranking has more entries. Deleted
+        // casts are skipped above, so a short page is not the end.
+        let next_cursor = if offset + limit < ranking.len() {
             Some((offset + limit).to_string())
         } else {
             None
@@ -465,8 +655,9 @@ where
         &self,
         cursor: Option<&str>,
         limit: usize,
+        window: TrendingWindow,
     ) -> Result<FeedResponse, FeedError> {
-        FeedService::get_trending_feed(self, cursor, limit).await
+        FeedService::get_trending_feed(self, cursor, limit, window).await
     }
 }
 

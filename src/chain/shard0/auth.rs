@@ -25,9 +25,20 @@ pub use hypersnap_messages::{
     EIP712_TOKEN_ESCROW_CLAIM,
 };
 
-/// Snapchain's limit on `data_bytes`; Hypersnap types may use up to
-/// `MAX_MESSAGE_BYTES` (FIP §4.2).
-const MAX_FARCASTER_DATA_BYTES: usize = 2048;
+/// The limit on `data_bytes`: `MAX_MESSAGE_BYTES` for a Hypersnap type
+/// (FIP §4.2), else the snapchain limit of the type for a Pro FID (every FID
+/// is Pro after the pivot, FIP §17.6). A data shard then applies the
+/// snapchain checks of its engine version.
+fn max_data_bytes(t: MessageType) -> usize {
+    use crate::core::validations::message as snapchain;
+    match t {
+        t if t.is_hypersnap() => crate::chain::block::MAX_MESSAGE_BYTES,
+        MessageType::LinkCompactState => snapchain::MAX_DATA_BYTES_FOR_LINK_COMPACT,
+        MessageType::CastAdd => snapchain::MAX_DATA_BYTES_FOR_10K_CAST,
+        MessageType::UsernameProof => snapchain::MAX_DATA_BYTES_FOR_USERNAME_PROOF,
+        _ => snapchain::MAX_DATA_BYTES,
+    }
+}
 /// How far a message timestamp may be after the block (snapchain rule).
 const MAX_FUTURE_SECONDS: u64 = 10 * 60;
 
@@ -114,12 +125,7 @@ pub fn open(
     };
     let msg_type = MessageType::try_from(data.r#type)
         .map_err(|_| Shard0Error::invalid("unknown message type"))?;
-    let limit = if msg_type.is_hypersnap() {
-        crate::chain::block::MAX_MESSAGE_BYTES
-    } else {
-        MAX_FARCASTER_DATA_BYTES
-    };
-    if data_bytes.len() > limit {
+    if data_bytes.len() > max_data_bytes(msg_type) {
         return Err(Shard0Error::invalid("data_bytes too long"));
     }
     let msg_network = proto::FarcasterNetwork::try_from(data.network)
@@ -279,13 +285,8 @@ pub fn resolve(
         (Scheme::Ed25519, Some(_)) => Err(Shard0Error::invalid(
             "a migrated FID cannot use Ed25519-only messages",
         )),
-        // An FID that is not migrated has no Falcon-512 keys of its own, but
-        // a signer of it can attest a node key (FIP §3).
-        (Scheme::Falcon, None)
-            if txn.exists(&keys::node_attestation(&env.falcon_key_hash.unwrap()))? =>
-        {
-            node_key_role(txn, env)
-        }
+        // An FID that is not migrated signs no Falcon-512 message, also not
+        // with a node key that it attests (FIP §3, §14.1).
         (Scheme::Dual | Scheme::Falcon, None) => Err(Shard0Error::invalid(
             "an FID that is not migrated has no Falcon-512 keys",
         )),
@@ -393,8 +394,8 @@ pub fn recover_eip712(
         .map_err(|e| Shard0Error::invalid(e.to_string()))
 }
 
-#[cfg(test)]
-pub(crate) mod test_keys {
+#[cfg(any(test, feature = "fuzzing"))]
+pub mod test_keys {
     //! Keys and signed messages for shard-0 tests, over the shared encoders
     //! of `hypersnap_messages`. Each Falcon-512 signature uses a fresh seeded
     //! RNG, so the signatures are deterministic.

@@ -1,6 +1,7 @@
 pub use self::active_key::*;
 pub use self::block_event_store::*;
 pub use self::cast_store::*;
+pub use self::channel_store::*;
 pub use self::event::*;
 pub use self::gasless_key_merge::*;
 pub use self::key_add_store::*;
@@ -19,7 +20,9 @@ pub use self::username_proof_store::*;
 pub use self::verification_store::*;
 
 mod cast_store;
+mod channel_store;
 mod event;
+mod index_read;
 mod link_store;
 mod message;
 mod onchain_event_store;
@@ -42,6 +45,8 @@ mod verification_store;
 
 #[cfg(test)]
 mod cast_store_test;
+#[cfg(test)]
+mod channel_store_test;
 #[cfg(test)]
 mod gasless_key_merge_tests;
 #[cfg(test)]

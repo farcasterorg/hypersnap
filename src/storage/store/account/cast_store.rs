@@ -1,6 +1,8 @@
 use super::{
-    get_many_messages, make_cast_id_key, make_fid_key, make_message_primary_key,
-    make_user_key_with_prefix, read_fid_key, read_ts_hash,
+    get_many_messages,
+    index_read::{count_union_index_entries, get_union_index_page, index_roots},
+    make_cast_id_key, make_fid_key, make_message_primary_key, make_user_key_with_prefix,
+    read_fid_key, read_ts_hash,
     store::{Store, StoreDef},
     MessagesPage, StoreEventHandler, HASH_LENGTH, PAGE_SIZE_MAX, TRUE_VALUE, TS_HASH_LENGTH,
 };
@@ -494,7 +496,7 @@ impl CastStore {
             ..Default::default()
         };
 
-        store.get_remove(&partial_message)
+        store.get_remove(&partial_message, None)
     }
 
     pub fn get_cast_adds_by_fid(
@@ -519,6 +521,22 @@ impl CastStore {
         page_options: &PageOptions,
     ) -> Result<MessagesPage, HubError> {
         let prefix = CastStoreDef::make_cast_by_parent_key(parent, 0, None);
+        let ctx = store.state_context();
+        if ctx.is_hyper() {
+            return get_union_index_page(
+                &store.db(),
+                &index_roots(
+                    ctx.root_prefix(RootPrefix::CastsByParent),
+                    RootPrefix::CastsByParent as u8,
+                ),
+                &index_roots(ctx.root_prefix(RootPrefix::User), RootPrefix::User as u8),
+                &prefix[1..],
+                store.postfix(),
+                page_options,
+                page_options.page_size.unwrap_or(PAGE_SIZE_MAX),
+                |_| true,
+            );
+        }
 
         let mut message_keys = vec![];
         let mut last_key = vec![];
@@ -559,12 +577,51 @@ impl CastStore {
         })
     }
 
+    /// Count live direct replies using the casts-by-parent index without loading messages.
+    pub fn count_casts_by_parent(
+        store: &Store<CastStoreDef>,
+        parent: &Parent,
+    ) -> Result<u64, HubError> {
+        // TODO: If this O(reply count) scan becomes a bottleneck, maintain counts
+        // when updating the parent index instead. That requires a larger refactor
+        // covering removals, pruning, and backfilling counts for existing data.
+        let prefix = CastStoreDef::make_cast_by_parent_key(parent, 0, None);
+        let ctx = store.state_context();
+        if ctx.is_hyper() {
+            return count_union_index_entries(
+                &store.db(),
+                &index_roots(
+                    ctx.root_prefix(RootPrefix::CastsByParent),
+                    RootPrefix::CastsByParent as u8,
+                ),
+                &prefix[1..],
+            );
+        }
+        store.db().count_keys_at_prefix(prefix).map(u64::from)
+    }
+
     pub fn get_casts_by_mention(
         store: &Store<CastStoreDef>,
         mention: u64,
         page_options: &PageOptions,
     ) -> Result<MessagesPage, HubError> {
         let prefix = CastStoreDef::make_cast_by_mention_key(mention, 0, None);
+        let ctx = store.state_context();
+        if ctx.is_hyper() {
+            return get_union_index_page(
+                &store.db(),
+                &index_roots(
+                    ctx.root_prefix(RootPrefix::CastsByMention),
+                    RootPrefix::CastsByMention as u8,
+                ),
+                &index_roots(ctx.root_prefix(RootPrefix::User), RootPrefix::User as u8),
+                &prefix[1..],
+                store.postfix(),
+                page_options,
+                page_options.page_size.unwrap_or(PAGE_SIZE_MAX),
+                |_| true,
+            );
+        }
 
         let mut message_keys = vec![];
         let mut last_key = vec![];

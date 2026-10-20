@@ -2,6 +2,95 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.14.3] - 2026-10-15
+
+### 🐛 Bug Fixes
+
+- *(mempool)* Validate gossiped ENS proofs and contract verifications on validators (#1029)
+
+### 📚 Documentation
+
+- Document snapchain.sh and validator vs. read node differences (#1034)
+
+### ⚙️ Validator Set
+
+- Add registry v18 validator sets to validators.toml (#1038)
+- h/t @christopherwxyz and @marcinlad for running snapchain validators
+
+## [0.14.2] - 2026-08-13
+
+### 🚀 Features
+
+- *(cli)* `fc config pull` — merge onchain-managed config from SnapchainConfigRegistry (#1002)
+- Rollout safety — version-gated restart, stagger, rollback, default-on (#1007)
+- *(scripts)* Env knob for the bootstrap-peers opt-out flag (#1011)
+- *(cli)* Bake the canonical mainnet registry address (#1022)
+
+### 🐛 Bug Fixes
+
+- *(compose)* Thread the accept-local-bootstrap-peers knob through environment (#1012)
+
+### 💼 Other
+
+- Apply-onchain-config.sh plus image and compose wiring (#1005)
+
+## [0.14.1] - 2026-08-06
+
+### 🚀 Features
+
+- Add http-served ui for checking network health (#977)
+- Ingest channel registrations as onchain events (#957)
+- Redesign verification by-address index to support multiple verifiers (#958)
+- Add channel owner resolution and read APIs (#960)
+- Emit channel ownership-change hint events (#964)
+- Add channel message protos (#973)
+- Merge verifications on shard 0 and replay them onto data shards (#974)
+- Admit and merge channel messages on shard 0 (#975)
+- Fan out channel messages to data shards and add channel read APIs (#976)
+- *(channels)* Channel follows via reactions (#993)
+- *(cli)* Add fc verification and devnet bootstrap commands (#996)
+- *(cast)* Allow 4 embeds for all users, not just Pro (#1001)
+
+### 🐛 Bug Fixes
+
+- (reactions): replace flaky live test with a representative fixture set (#981)
+- Sort block engine onchain replay events (V21-gated) (#959)
+- *(devnet)* Enable block_receiver in generated node configs (#990)
+- *(onchain_events)* Watch both channel registry contracts (#992)
+
+### 🚜 Refactor
+
+- *(ens)* Inline ENS glue, drop foundry-common git pin [NEYN-12731] (#984)
+
+### 📚 Documentation
+
+- Use gasless signers in the writing-messages guide (#989)
+
+### 🧪 Testing
+
+- Stop test storage fixtures aging out against the wall clock (#971)
+- Replace flaky live cast & link validation tests with fixtures (#983)
+- Bump wait_for_block timeout in shard-decoupling test (#988)
+
+## [0.14.0] - 2026-07-16
+
+### 🚀 Features
+
+- *(link)* Block links (FIP-263) with V19-gated type-scoped compaction (#946)
+
+### 🐛 Bug Fixes
+
+- Subscribe read nodes to MEMPOOL_TOPIC (#866)
+- Confirm block events against the store, not just the broadcast (#949)
+- Wait for shard-chunk replication in read-node relay test (#952)
+- *(test)* Use rolling timestamp for default_storage_event grant (#962)
+- Pin unit test timestamp for protocol-version cutover test (#967)
+
+### ⚙️ Miscellaneous Tasks
+
+- Cache cargo artifacts in verify workflow (#951)
+- Reuse cached malachite artifacts in verify workflow (#966)
+
 ## [0.13.2] - 2026-06-24
 
 ### ⚙️ Miscellaneous Tasks

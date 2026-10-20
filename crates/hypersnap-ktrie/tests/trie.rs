@@ -214,8 +214,8 @@ fn delete_everything_returns_to_empty() {
         t.commit_to_store().unwrap();
     }
     assert_eq!(t.root(), ZERO);
-    // Only the root record (marking "empty") remains.
-    assert_eq!(t.store().records().len(), 1);
+    // No record remains, as in a trie that never had a key.
+    assert_eq!(t.store().records().len(), 0);
     let t = KTrie::open(t.into_store()).unwrap();
     assert_eq!(t.root(), ZERO);
 }

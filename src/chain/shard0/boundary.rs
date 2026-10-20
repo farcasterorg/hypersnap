@@ -6,7 +6,6 @@ use super::ledger;
 use super::state::MsgTxn;
 use super::validators::write_set_record;
 use super::{BlockCtx, Shard0Error};
-use crate::chain::epoch::epoch_seed;
 use crate::proto::{
     EpochBoundaryRecord, FeeSettlement, ScoringResult, VouchEvaluation, VouchRecord, VouchStatus,
 };
@@ -16,7 +15,8 @@ fn invalid(reason: &str) -> Shard0Error {
 }
 
 /// The state changes of the first block of epoch `ctx.epoch`:
-/// - `epoch_seed(e)` from the parent (the last block of epoch e−1);
+/// - `epoch_seed(e)` from the seed beacon, or from the parent (the last
+///   block of epoch e−1) (§4.9);
 /// - `set(e + 1)` from the registry (the announcement buffer makes it known);
 /// - the `EpochBoundaryRecord`, with the state root after epoch e−1;
 /// - the unstakes whose period ends.
@@ -27,7 +27,9 @@ pub fn on_boundary(
     parent_state_root: &[u8; 32],
 ) -> Result<EpochBoundaryRecord, Shard0Error> {
     let e = ctx.epoch;
-    txn.put(keys::epoch_seed(e), epoch_seed(e, parent_hash).to_vec());
+    let seed = super::seed::on_boundary(txn, e, parent_hash)?;
+    txn.put(keys::epoch_seed(e), seed.to_vec());
+    super::bridge_actions::on_boundary(txn, e)?;
     let next = write_set_record(txn, e + 1)?;
     let record = EpochBoundaryRecord {
         epoch: e,

@@ -1,6 +1,6 @@
 use crate::core::error::HubError;
 use crate::storage::util::increment_vec_u8;
-use rocksdb::{Options, TransactionDB, DB};
+use rocksdb::{Options, Transaction, TransactionDB, DB};
 use std::collections::HashMap;
 use std::fs::{self};
 use std::path::Path;
@@ -70,7 +70,16 @@ pub enum SnapchainDbOptimizationType {
     #[default]
     Default, // Default read-write DB
     BulkWriteOptimized, // Optimized for very large bulk writes
+    /// A Hypersnap shard DB: `Default`, and each value of `MIN_BLOB_BYTES`
+    /// or more (a block, an undecided proposal) in a blob file. In an SST
+    /// file, the small keys before a large value share its data block, so
+    /// a read of one of them read the whole value (10 MB for a proposal,
+    /// larger than a shard of the block cache, so on each read).
+    Hypersnap,
 }
+
+/// The values that a `Hypersnap` DB keeps in blob files.
+pub const MIN_BLOB_BYTES: u64 = 64 * 1024;
 
 pub enum DBProvider {
     Transaction(TransactionDB),
@@ -221,6 +230,14 @@ impl RocksDB {
         } else {
             // Default mode: bound memtable memory to 16MB × 2 = 32MB per DB instance
             opts.set_write_buffer_size(16 * 1024 * 1024);
+        }
+        if self.db_options_type == SnapchainDbOptimizationType::Hypersnap {
+            opts.set_enable_blob_files(true);
+            opts.set_min_blob_size(MIN_BLOB_BYTES);
+            opts.set_blob_compression_type(rocksdb::DBCompressionType::Lz4);
+            // Compaction rewrites the old blob files, so the blobs of
+            // deleted values (decided proposals, pruned blocks) go.
+            opts.set_enable_blob_gc(true);
         }
 
         opts.create_if_missing(true); // Creates a database if it does not exist
@@ -392,7 +409,22 @@ impl RocksDB {
             Some(DBProvider::Transaction(db)) => {
                 let txn = db.transaction();
 
-                for (key, value) in batch.batch {
+                // Apply the batch in ascending key order. RocksDB's pessimistic
+                // TransactionDB takes a row lock on each key as it is written and
+                // holds it until commit (two-phase locking), so the write order
+                // *is* the lock-acquisition order. Committing in the batch's
+                // HashMap (i.e. random) order lets two transactions that touch
+                // the same keys acquire them in opposite orders and deadlock
+                // until the lock timeout. Sorting gives every transaction one
+                // global lock order, which makes such cycles impossible. It is
+                // state-neutral: each key appears once, so ordering changes only
+                // lock acquisition, never the committed values. Any reader/writer
+                // that hand-rolls a transaction (see `transaction_with`) must
+                // acquire its keys in the same ascending order to stay compatible.
+                let mut entries: Vec<_> = batch.batch.into_iter().collect();
+                entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+                for (key, value) in entries {
                     if value.is_none() {
                         txn.delete(key)?;
                     } else {
@@ -401,6 +433,35 @@ impl RocksDB {
                 }
 
                 txn.commit().map_err(|e| RocksdbError::InternalError(e))
+            }
+            Some(DBProvider::ReadOnly(_)) => Err(RocksdbError::ReadOnly),
+            None => Err(RocksdbError::DbNotOpen),
+        }
+    }
+
+    /// Run `f` inside a single pessimistic transaction and commit iff it returns
+    /// `Ok`. Unlike [`commit`](Self::commit), which flushes a pre-built batch,
+    /// this exposes the live transaction so `f` can call
+    /// `txn.get_for_update(key, true)` to take a write-lock on keys it reads. A
+    /// concurrent writer to a locked key between the read and the commit is then
+    /// serialized against this transaction instead of silently overwriting it —
+    /// the read-modify-write primitive `commit` cannot express. On any `Err` the
+    /// transaction is dropped without committing (auto-rollback).
+    ///
+    /// Locks (via `get_for_update` or writes) are held until commit. To avoid
+    /// deadlocking against other transactions, `f` MUST acquire keys in ascending
+    /// byte order — the same global order [`commit`](Self::commit) enforces by
+    /// sorting its batch.
+    pub fn transaction_with<R>(
+        &self,
+        f: impl FnOnce(&Transaction<'_, TransactionDB>) -> Result<R, RocksdbError>,
+    ) -> Result<R, RocksdbError> {
+        match self.db().as_ref() {
+            Some(DBProvider::Transaction(db)) => {
+                let txn = db.transaction();
+                let out = f(&txn)?;
+                txn.commit()?;
+                Ok(out)
             }
             Some(DBProvider::ReadOnly(_)) => Err(RocksdbError::ReadOnly),
             None => Err(RocksdbError::DbNotOpen),
@@ -1117,5 +1178,217 @@ mod tests {
         }
 
         test_pagination_helper(&db, 10, 3, Some(vec![0u8]), Some(vec![1u8]));
+    }
+
+    /// A read of a small key next to large values (FIP §4.2 blocks and
+    /// proposals of about 10 MB) stays a small read in a `Hypersnap` DB. In
+    /// a `Default` DB it reads the data block of the large value: about
+    /// 4 ms instead of 5 µs on an aarch64 Mac.
+    #[test]
+    fn a_small_key_next_to_large_values_is_a_small_read() {
+        use crate::storage::db::SnapchainDbOptimizationType;
+        let lookup = |kind: SnapchainDbOptimizationType| {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().to_str().unwrap();
+            let cache = rocksdb::Cache::new_lru_cache(512 * 1024 * 1024);
+            let db = RocksDB::new_with_cache(path, kind, Some(cache.clone()));
+            db.open().unwrap();
+            db.put(&[12u8, 52, 3], &[7u8; 40]).unwrap();
+            let large: Vec<u8> = (0..10 * 1024 * 1024u32)
+                .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+                .collect();
+            for h in 0u8..3 {
+                db.put(&[17u8, 8, h], &large).unwrap();
+            }
+            // Reopen: the recovery writes the WAL to SST files.
+            db.close();
+            let db = RocksDB::new_with_cache(path, kind, Some(cache));
+            db.open().unwrap();
+            assert_eq!(db.get(&[17u8, 8, 1]).unwrap().unwrap(), large);
+            let t = std::time::Instant::now();
+            for _ in 0..100 {
+                assert!(db.get(&[12u8, 52, 3]).unwrap().is_some());
+            }
+            t.elapsed() / 100
+        };
+        let hypersnap = lookup(SnapchainDbOptimizationType::Hypersnap);
+        let default = lookup(SnapchainDbOptimizationType::Default);
+        assert!(
+            hypersnap * 20 < default,
+            "Hypersnap {:?}, Default {:?}",
+            hypersnap,
+            default
+        );
+    }
+
+    #[test]
+    fn test_shared_block_cache_across_db_instances() {
+        let cache = rocksdb::Cache::new_lru_cache(64 * 1024 * 1024); // 64MB for test
+
+        let tmp1 = tempfile::tempdir().unwrap();
+        let tmp2 = tempfile::tempdir().unwrap();
+
+        let db1 = RocksDB::new_with_cache(
+            tmp1.path().to_str().unwrap(),
+            super::SnapchainDbOptimizationType::Default,
+            Some(cache.clone()),
+        );
+        db1.open().unwrap();
+
+        let db2 = RocksDB::new_with_cache(
+            tmp2.path().to_str().unwrap(),
+            super::SnapchainDbOptimizationType::Default,
+            Some(cache.clone()),
+        );
+        db2.open().unwrap();
+
+        // Write data to db1
+        let value = vec![0u8; 4096];
+        for i in 0..1000u32 {
+            db1.put(&i.to_be_bytes(), &value).unwrap();
+        }
+
+        // Read all keys from db1 to populate the cache
+        for i in 0..1000u32 {
+            let _ = db1.get(&i.to_be_bytes()).unwrap();
+        }
+
+        let usage_after_db1 = cache.get_usage();
+        assert!(
+            usage_after_db1 > 0,
+            "Cache should have data after db1 reads"
+        );
+
+        // Write and read data from db2
+        for i in 0..1000u32 {
+            db2.put(&i.to_be_bytes(), &value).unwrap();
+        }
+        for i in 0..1000u32 {
+            let _ = db2.get(&i.to_be_bytes()).unwrap();
+        }
+
+        let usage_after_db2 = cache.get_usage();
+        assert!(
+            usage_after_db2 > 0,
+            "Cache should have data after db2 reads"
+        );
+
+        // Both DBs should be able to read their data correctly
+        let val1 = db1.get(&0u32.to_be_bytes()).unwrap().unwrap();
+        let val2 = db2.get(&0u32.to_be_bytes()).unwrap().unwrap();
+        assert_eq!(val1, value);
+        assert_eq!(val2, value);
+
+        db1.destroy().unwrap();
+        db2.destroy().unwrap();
+    }
+
+    #[test]
+    fn test_block_cache_respects_capacity() {
+        let cache_size = 1024 * 1024; // 1MB
+        let cache = rocksdb::Cache::new_lru_cache(cache_size);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = RocksDB::new_with_cache(
+            tmp.path().to_str().unwrap(),
+            super::SnapchainDbOptimizationType::Default,
+            Some(cache.clone()),
+        );
+        db.open().unwrap();
+
+        // Write much more data than the cache can hold
+        let value = vec![0u8; 4096];
+        for i in 0..10_000u32 {
+            db.put(&i.to_be_bytes(), &value).unwrap();
+        }
+
+        // Force reads to populate cache
+        for i in 0..10_000u32 {
+            let _ = db.get(&i.to_be_bytes()).unwrap();
+        }
+
+        // Cache usage should stay bounded (with some overhead for metadata)
+        let usage = cache.get_usage();
+        let max_expected = cache_size * 3; // allow headroom for index/filter blocks
+        assert!(
+            usage < max_expected,
+            "Cache usage {} should stay roughly bounded near capacity {}",
+            usage,
+            cache_size
+        );
+
+        db.destroy().unwrap();
+    }
+
+    #[test]
+    fn test_default_write_buffer_size_is_bounded() {
+        // Non-bulk-write DB should use 16MB write buffer
+        let tmp = tempfile::tempdir().unwrap();
+        let db = RocksDB::new(tmp.path().to_str().unwrap());
+        db.open().unwrap();
+
+        // Just verify the DB opens and works — the write buffer size is set
+        // internally and not directly queryable, but we can verify no regression
+        let value = vec![0u8; 1024];
+        for i in 0..100u32 {
+            db.put(&i.to_be_bytes(), &value).unwrap();
+        }
+        let result = db.get(&0u32.to_be_bytes()).unwrap().unwrap();
+        assert_eq!(result, value);
+
+        db.destroy().unwrap();
+    }
+
+    #[test]
+    fn test_open_shard_db_with_cache() {
+        let cache = rocksdb::Cache::new_lru_cache(32 * 1024 * 1024);
+        let tmp = tempfile::tempdir().unwrap();
+        let db_dir = tmp.path().to_str().unwrap();
+
+        let db = RocksDB::open_shard_db_with_cache(db_dir, 1, Some(cache.clone()));
+
+        // Write and read back
+        db.put(b"test_key", b"test_value").unwrap();
+        let result = db.get(b"test_key").unwrap().unwrap();
+        assert_eq!(result, b"test_value");
+
+        // Verify cache is being used
+        let _ = db.get(b"test_key").unwrap();
+        assert!(cache.get_usage() > 0, "Shared cache should be populated");
+
+        db.destroy().unwrap();
+    }
+
+    #[test]
+    fn test_open_global_db_with_cache() {
+        let cache = rocksdb::Cache::new_lru_cache(32 * 1024 * 1024);
+        let tmp = tempfile::tempdir().unwrap();
+        let db_dir = tmp.path().to_str().unwrap();
+
+        let db = RocksDB::open_global_db_with_cache(db_dir, Some(cache.clone()));
+
+        db.put(b"global_key", b"global_value").unwrap();
+        let result = db.get(b"global_key").unwrap().unwrap();
+        assert_eq!(result, b"global_value");
+
+        db.destroy().unwrap();
+    }
+
+    #[test]
+    fn test_no_cache_still_works() {
+        // Passing None should work the same as before
+        let tmp = tempfile::tempdir().unwrap();
+        let db = RocksDB::new_with_cache(
+            tmp.path().to_str().unwrap(),
+            super::SnapchainDbOptimizationType::Default,
+            None,
+        );
+        db.open().unwrap();
+
+        db.put(b"key", b"value").unwrap();
+        let result = db.get(b"key").unwrap().unwrap();
+        assert_eq!(result, b"value");
+
+        db.destroy().unwrap();
     }
 }

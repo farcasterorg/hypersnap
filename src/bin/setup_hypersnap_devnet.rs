@@ -1,7 +1,9 @@
 //! Write a local Hypersnap devnet (after the pivot, synthetic genesis): one
-//! directory for each validator with its config, its Falcon-512 consensus
-//! and node keys (`consensus.falcon`, `node.falcon`) and its libp2p key, and
-//! one genesis file with the bootstrap set and the node attestations.
+//! directory for each validator with its config, its Falcon-512 consensus,
+//! node and custody keys (`consensus.falcon`, `node.falcon`,
+//! `account.falcon`) and its libp2p key, and one genesis file with the
+//! bootstrap set, the custody keys (the bootstrap FIDs are migrated, so their
+//! node keys sign, FIP §3) and the node attestations.
 //!
 //! ```text
 //! cargo run --bin setup_hypersnap_devnet -- --num-nodes 4
@@ -48,17 +50,23 @@ fn main() {
     let mut validators = Vec::new();
     let mut secrets = Vec::new();
     for i in 1..=args.num_nodes {
-        let (consensus_seed, node_seed) = (new_seed(), new_seed());
+        let (consensus_seed, node_seed, account_seed) = (new_seed(), new_seed(), new_seed());
         let key = hypersnap_falcon::keygen_from_seed(consensus_seed);
         let node = hypersnap_falcon::keygen_from_seed(node_seed);
+        let account = hypersnap_falcon::keygen_from_seed(account_seed);
         let node_public = node.public_key().as_bytes().to_vec();
         validators.push(DevnetValidator {
             fid: i as u64,
             consensus_key: hex::encode(key.public_key().as_bytes()),
             node_key_hash: hex::encode(hypersnap_messages::falcon_key_hash(&node_public)),
             node_key: hex::encode(&node_public),
+            custody_key: hex::encode(account.public_key().as_bytes()),
         });
-        secrets.push((hex::encode(consensus_seed), hex::encode(node_seed)));
+        secrets.push((
+            hex::encode(consensus_seed),
+            hex::encode(node_seed),
+            hex::encode(account_seed),
+        ));
     }
     let genesis = DevnetGenesis {
         fork_hash: hex::encode([7u8; 32]),
@@ -80,9 +88,11 @@ fn main() {
         std::fs::create_dir_all(&dir).expect("create node directory");
         let key_file = dir.join("consensus.falcon");
         let node_key_file = dir.join("node.falcon");
-        let (consensus_seed, node_seed) = &secrets[i as usize - 1];
+        let (consensus_seed, node_seed, account_seed) = &secrets[i as usize - 1];
         std::fs::write(&key_file, consensus_seed).expect("write consensus key");
         std::fs::write(&node_key_file, node_seed).expect("write node key");
+        // The custody (account) key of the FID; the node does not read it.
+        std::fs::write(dir.join("account.falcon"), account_seed).expect("write custody key");
         let libp2p_key = hex::encode(SecretKey::generate());
         let peers: Vec<String> = addresses
             .iter()
@@ -119,6 +129,7 @@ genesis_file = "{genesis}"
 pivot_height = 1
 epoch_length = {epoch_length}
 scoring_delay = {scoring_delay}
+seed_reveal_margin = {seed_reveal_margin}
 submit_address = "127.0.0.1:{submit}"
 min_difficulty_bits = 8
 "#,
@@ -131,6 +142,13 @@ min_difficulty_bits = 8
             genesis = genesis_path.display(),
             epoch_length = args.epoch_length,
             scoring_delay = args.scoring_delay,
+            // A quarter of a short devnet epoch (the release margin, 300
+            // blocks, is longer); 0 = the release value with the FIP epoch.
+            seed_reveal_margin = if args.epoch_length == 0 {
+                0
+            } else {
+                (args.epoch_length / 4).max(1)
+            },
             submit = args.base_submit_port + i,
             rpc = args.base_rpc_port + i,
             http = args.base_http_port + i,

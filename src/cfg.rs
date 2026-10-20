@@ -97,6 +97,7 @@ pub struct Config {
     pub consensus: consensus::consensus::Config,
     pub gossip: network::gossip::Config,
     pub mempool: mempool::mempool::Config,
+    pub l1_gate: mempool::l1_gate::Config,
     pub snapshot: storage::db::snapshot::Config,
     pub rpc_auth: String,
     pub admin_rpc_auth: String,
@@ -104,12 +105,14 @@ pub struct Config {
     pub http_address: String,
     pub rocksdb_dir: String,
     pub clear_db: bool,
+    pub check_config: bool,
     pub statsd: StatsdConfig,
     pub l1_rpc_url: String,
     pub fc_network: FarcasterNetwork,
     pub read_node: bool,
     pub pruning: PruningConfig,
     pub http_server: http_server::Config,
+    pub mesh: network::mesh::config::Config,
     pub replication: ReplicationConfig,
     pub block_receiver: block_receiver::Config,
     #[serde(default)]
@@ -129,6 +132,7 @@ impl Default for Config {
             consensus: consensus::consensus::Config::default(),
             gossip: network::gossip::Config::default(),
             mempool: mempool::mempool::Config::default(),
+            l1_gate: mempool::l1_gate::Config::default(),
             rpc_auth: "".to_string(),
             admin_rpc_auth: "".to_string(),
             // Bind gRPC + HTTP RPC to localhost by default (audit
@@ -140,6 +144,7 @@ impl Default for Config {
             http_address: format!("127.0.0.1:{}", DEFAULT_HTTP_PORT),
             rocksdb_dir: ".rocks".to_string(),
             clear_db: false,
+            check_config: false,
             statsd: StatsdConfig::default(),
             l1_rpc_url: "".to_string(),
             fc_network: FarcasterNetwork::Devnet,
@@ -147,6 +152,7 @@ impl Default for Config {
             read_node: false,
             pruning: PruningConfig::default(),
             http_server: http_server::Config::default(),
+            mesh: network::mesh::config::Config::default(),
             replication: ReplicationConfig::default(),
             block_receiver: block_receiver::Config::default(),
             api: api::ApiConfig::default(),
@@ -165,6 +171,14 @@ pub struct CliArgs {
 
     #[arg(long, action, help = "Start the node with a clean database")]
     clear_db: bool,
+
+    #[arg(
+        long,
+        action,
+        help = "Load and validate the configuration, then exit without starting the node \
+                (exit code 0 if valid, 1 if not)"
+    )]
+    check_config: bool,
     // All new arguments that are to override values from config files or environment variables
     // should be probably be optional (`Option<T>`) and without a default. Setting a default
     // in this case will have the effect of automatically overriding all previous configuration
@@ -177,6 +191,28 @@ pub fn load_and_merge_config(args: Vec<String>) -> Result<Config, Box<dyn Error>
     let mut figment = Figment::from(Serialized::defaults(Config::default()));
 
     if Path::new(&cli_args.config_path).exists() {
+        // Syntax-check the file ourselves before handing it to figment:
+        // figment's TOML error echoes the offending source line, and this
+        // file carries the consensus private key — a stray token on that line
+        // must not put the key into captured stderr. Report position and
+        // message only.
+        let raw = std::fs::read_to_string(&cli_args.config_path)?;
+        if let Err(e) = raw.parse::<toml::Table>() {
+            let position = match e.span() {
+                Some(span) => {
+                    let line = raw[..span.start.min(raw.len())].matches('\n').count() + 1;
+                    format!(" at line {}", line)
+                }
+                None => String::new(),
+            };
+            return Err(format!(
+                "config file {}: TOML parse error{}: {}",
+                &cli_args.config_path,
+                position,
+                e.message()
+            )
+            .into());
+        }
         figment = figment.merge(Toml::file(&cli_args.config_path));
     } else {
         return Err(format!("config file not found: {}", &cli_args.config_path).into());
@@ -190,6 +226,7 @@ pub fn load_and_merge_config(args: Vec<String>) -> Result<Config, Box<dyn Error>
         config.log_format = log_format;
     }
     config.clear_db = cli_args.clear_db;
+    config.check_config = cli_args.check_config;
 
     Ok(config)
 }

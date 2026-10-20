@@ -41,6 +41,80 @@ use std::sync::Arc;
 /// `RECOVERY_EXEMPTION_CUTOFF` (FIP §2): 2026-11-01T00:00:00Z, exclusive.
 pub const RECOVERY_EXEMPTION_CUTOFF: u64 = 1_793_491_200;
 
+/// keccak256 of the consensus constants that the release compiles in (FIP
+/// §15) and that `Shard0Params` does not have: the PoQ scoring parameters
+/// and base fees, the emission schedule, the block limits, the confirmation
+/// depths and the recovery cutoff. `params_hash` contains it, so a node of
+/// another release makes another `PivotRecord`.
+pub fn release_constants_hash() -> [u8; 32] {
+    use crate::chain::shard0::emission;
+    use proof_of_quality::fees;
+    let values: [u64; 25] = [
+        emission::TOTAL_SUPPLY,
+        emission::EPOCHS_PER_HALVING,
+        emission::E0,
+        emission::DA_SHARE_PERCENT,
+        emission::GROWTH_SHARE_PERCENT,
+        emission::APP_SHARE_PERCENT,
+        fees::BASE_FEE_CAST_ADD,
+        fees::BASE_FEE_LINK_ADD,
+        fees::BASE_FEE_REACTION_ADD,
+        fees::BASE_FEE_USER_DATA_ADD,
+        fees::BASE_FEE_VERIFICATION_ADD,
+        fees::DISCOUNT_ENC_SCALE as u64,
+        fees::BURN_BPS,
+        fees::PROPOSER_BPS,
+        crate::chain::block::MAX_BLOCK_BYTES as u64,
+        crate::chain::block::MAX_MESSAGE_BYTES as u64,
+        crate::chain::block::BLOCK_VERSION as u64,
+        crate::chain::shard0::engine::BLOCK_RESERVE_BYTES as u64,
+        crate::chain::epoch::MAX_EPOCH_REF_LAG,
+        crate::chain::watchers::ONCHAIN_CONFIRMATIONS,
+        crate::chain::watchers::ONCHAIN_RESCAN_DEPTH,
+        crate::chain::watchers::PROPOSAL_MARGIN,
+        crate::chain::watchers::BURN_PROPOSAL_DELAY_SECS,
+        crate::chain::bridge_burn_watcher::DEFAULT_FINALITY_CONFIRMATIONS,
+        RECOVERY_EXEMPTION_CUTOFF,
+    ];
+    let mut pre = b"hypersnap-release-constants-v1".to_vec();
+    for v in values {
+        pre.extend_from_slice(&v.to_be_bytes());
+    }
+    // The struct fields in their declared order; the maps are ordered.
+    pre.extend_from_slice(
+        &serde_json::to_vec(&proof_of_quality::ScoringParams::default())
+            .expect("ScoringParams serializes"),
+    );
+    keccak256(&pre).0
+}
+
+/// The snapchain rules of shards 1 and 2 after the pivot (FIP §17.7): the
+/// snapchain engine version at the fork block. A later snapchain version
+/// does not change Hypersnap.
+pub fn snapchain_engine_version(
+    network: crate::proto::FarcasterNetwork,
+    fork_timestamp: u64,
+) -> crate::version::version::EngineVersion {
+    crate::version::version::EngineVersion::version_for(
+        &crate::core::util::FarcasterTime::new(fork_timestamp),
+        network,
+    )
+}
+
+/// The engine version of a `PivotRecord`.
+pub fn record_engine_version(
+    record: &PivotRecord,
+) -> Result<crate::version::version::EngineVersion, Shard0Error> {
+    crate::version::version::EngineVersion::from_u32(record.snapchain_engine_version).ok_or_else(
+        || {
+            Shard0Error::invalid(format!(
+                "unknown snapchain engine version {}",
+                record.snapchain_engine_version
+            ))
+        },
+    )
+}
+
 fn internal(e: impl std::fmt::Display) -> Shard0Error {
     Shard0Error::Internal(e.to_string())
 }
@@ -71,10 +145,12 @@ pub fn genesis_validators_hash(file: &GenesisValidatorFile) -> [u8; 32] {
 
 impl Shard0Params {
     /// `params_hash` (FIP §17.4): keccak256 of the consensus parameters in a
-    /// fixed order, each a big-endian u64, the bridge chain IDs, and the
-    /// hash of `EXEMPT_RECOVERIES`.
+    /// fixed order, each a big-endian u64, the bridge chain IDs, the hash of
+    /// `EXEMPT_RECOVERIES`, and the hash of the consensus constants that the
+    /// release compiles in (`release_constants_hash`).
     pub fn params_hash(&self) -> [u8; 32] {
-        let values: [u64; 22] = [
+        let values: [u64; 33] = [
+            self.network as u64,
             self.epochs.pivot_height_0,
             self.epochs.epoch_length,
             self.num_shards as u64,
@@ -97,6 +173,16 @@ impl Shard0Params {
             self.challenge_response_window,
             self.fee_burn_percent,
             self.scoring_delay,
+            self.max_memo_bytes as u64,
+            self.protocol_chain_id,
+            self.onboard_anchor_window,
+            self.min_difficulty_bits as u64,
+            self.onboarding_stake_gate as u64,
+            self.min_onboarding_stake,
+            self.min_onboarding_stake_duration,
+            self.retro_minted,
+            self.pause_duration_secs,
+            self.seed_reveal_margin,
         ];
         let mut pre = b"hypersnap-params-v1".to_vec();
         for v in values {
@@ -108,6 +194,7 @@ impl Shard0Params {
         pre.extend_from_slice(&crate::chain::exempt_recoveries::list_hash(
             &self.exempt_recoveries,
         ));
+        pre.extend_from_slice(&release_constants_hash());
         keccak256(&pre).0
     }
 }
@@ -296,7 +383,7 @@ pub fn build_genesis(
     let trust = write_trust_snapshot(shard0, params, inputs.social.clone(), now_unix)?;
 
     // Step 3: the genesis entries, in the order of the file.
-    let engine = Shard0Engine::new(
+    let mut engine = Shard0Engine::new(
         shard0.clone(),
         params.clone(),
         ParentInfo {
@@ -307,6 +394,7 @@ pub fn build_genesis(
             shard_links: vec![],
         },
     )?;
+    engine.snapchain_version = snapchain_engine_version(params.network, inputs.fork_timestamp);
     let ctx = BlockCtx {
         params,
         height: inputs.pivot_height,
@@ -379,5 +467,7 @@ pub fn build_genesis(
         onchain_cursor: onchain_cursor(shard0)?,
         fname_cursor: inputs.fname_cursor,
         params_hash: params.params_hash().to_vec(),
+        snapchain_engine_version: snapchain_engine_version(params.network, inputs.fork_timestamp)
+            as u32,
     })
 }

@@ -420,3 +420,57 @@ impl SnapchainStateReader for InMemoryReader {
             .unwrap_or_default())
     }
 }
+
+/// Run `read` for each FID on all cores and return the results in FID order.
+/// The reads of one FID do not depend on those of another, so the results
+/// are the same for any number of threads. The threads take FIDs in blocks
+/// from a shared counter: the FIDs with the most messages are not spread
+/// evenly. With an error, the error of the lowest block is returned.
+/// `POQ_READ_THREADS` limits the threads (default: the cores, at most 16).
+pub fn read_per_fid<T, F>(fids: &[u64], read: F) -> Result<Vec<(u64, T)>, ScoringError>
+where
+    T: Send,
+    F: Fn(u64) -> Result<T, ScoringError> + Sync,
+{
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    const BLOCK: usize = 64;
+    let threads = std::env::var("POQ_READ_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+        .min(16)
+        .min(fids.len().div_ceil(BLOCK))
+        .max(1);
+    if threads == 1 {
+        return fids.iter().map(|&fid| Ok((fid, read(fid)?))).collect();
+    }
+    let next = AtomicUsize::new(0);
+    let mut blocks: Vec<(usize, Result<Vec<(u64, T)>, ScoringError>)> = std::thread::scope(|s| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                s.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let start = next.fetch_add(BLOCK, Ordering::Relaxed);
+                        if start >= fids.len() {
+                            return done;
+                        }
+                        let block = &fids[start..(start + BLOCK).min(fids.len())];
+                        let result = block.iter().map(|&fid| Ok((fid, read(fid)?))).collect();
+                        done.push((start, result));
+                    }
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|w| w.join().expect("a scoring read thread panicked"))
+            .collect()
+    });
+    blocks.sort_unstable_by_key(|(start, _)| *start);
+    let mut out = Vec::with_capacity(fids.len());
+    for (_, result) in blocks {
+        out.extend(result?);
+    }
+    Ok(out)
+}

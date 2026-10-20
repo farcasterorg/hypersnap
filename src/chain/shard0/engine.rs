@@ -91,6 +91,8 @@ struct Executed {
     messages: Vec<proto::Message>,
     epoch_record_hash: Vec<u8>,
     bridge_lock_root: [u8; 32],
+    /// The bridge action that the block decides (FIP §13.7), or empty.
+    bridge_action_hash: Vec<u8>,
 }
 
 struct Pending {
@@ -104,6 +106,13 @@ pub struct Shard0Engine {
     params: Shard0Params,
     store: HypersnapBlockStore,
     onchain: OnchainEventStore,
+    /// The verifications, when the snapchain rules put them on shard 0
+    /// (FIP §17.7).
+    verifications:
+        crate::storage::store::account::Store<crate::storage::store::account::VerificationStoreDef>,
+    /// The snapchain rules of the network: the version of the fork block
+    /// (FIP §17.7).
+    pub snapchain_version: crate::version::version::EngineVersion,
     /// The parent of the pivot block (the snapchain fork block).
     genesis_parent: ParentInfo,
     pending: Option<Pending>,
@@ -140,6 +149,13 @@ impl Shard0Engine {
             trie: Shard0Trie::open(db.clone())?,
             store: HypersnapBlockStore::new(db.clone()),
             onchain: OnchainEventStore::new(db.clone(), StoreEventHandler::new()),
+            // Shard 0 does not prune.
+            verifications: crate::storage::store::account::VerificationStore::new(
+                db.clone(),
+                StoreEventHandler::new(),
+                u32::MAX,
+            ),
+            snapchain_version: crate::version::version::EngineVersion::latest(),
             db,
             params,
             genesis_parent,
@@ -346,6 +362,11 @@ impl Shard0Engine {
             }
             Sys::InboundBurn(burn) => {
                 let mut txn = state.txn();
+                // A pause holds the burns of its chain (§13.7): the watcher
+                // keeps them for a later block.
+                if super::bridge_actions::paused(&txn, burn.source_chain_id, ctx.timestamp)? {
+                    return Err(Shard0Error::invalid("the inbound bridge is paused"));
+                }
                 ledger::inbound_burn(&mut txn, &self.onchain, burn)?;
                 let writes = txn.into_writes();
                 state.apply(writes);
@@ -354,6 +375,15 @@ impl Shard0Engine {
             Sys::FeeSettlement(s) => {
                 let mut txn = state.txn();
                 boundary::apply_fee_settlement(ctx, &mut txn, s)?;
+                // The proposals of the shard-s height (§4.7).
+                let set = validators::epoch_set(&txn, s.epoch)?
+                    .ok_or_else(|| Shard0Error::invalid("no set for the settlement epoch"))?;
+                if set.proposer(s.shard_id, s.height, s.round).fid != s.proposer_fid {
+                    return Err(Shard0Error::invalid(
+                        "proposer_fid is not the proposer of the round",
+                    ));
+                }
+                validators::record_proposals(ctx, &mut txn, &set, s.shard_id, s.height, s.round)?;
                 let writes = txn.into_writes();
                 outbox.record_writes(ctx.params, &writes);
                 state.apply(writes);
@@ -418,6 +448,26 @@ impl Shard0Engine {
                     _ => Err(Shard0Error::invalid("body does not match the type")),
                 };
                 return result.map_err(|e| {
+                    outbox.truncate(outbox_len);
+                    (e, true)
+                });
+            }
+            // Verifications, when the snapchain rules put them on the block
+            // shard (FIP §17.7).
+            MessageType::VerificationAddEthAddress | MessageType::VerificationRemove
+                if super::verifications::on_shard0(self.snapchain_version) =>
+            {
+                return super::verifications::verification(
+                    ctx,
+                    state,
+                    &self.verifications,
+                    &self.onchain,
+                    self.snapchain_version,
+                    message,
+                    &env,
+                    outbox,
+                )
+                .map_err(|e| {
                     outbox.truncate(outbox_len);
                     (e, true)
                 });
@@ -494,6 +544,15 @@ impl Shard0Engine {
             (MessageType::DaChallengeResponse, Body::DaChallengeResponseBody(b)) => {
                 work::da_response(ctx, &mut txn, &env, &role, b, checkpoints)
             }
+            (MessageType::BridgeActionVote, Body::BridgeActionVoteBody(b)) => {
+                super::bridge_actions::vote(ctx, &mut txn, &env, &role, b)
+            }
+            (MessageType::SeedCommit, Body::SeedCommitBody(b)) => {
+                super::seed::commit(ctx, &mut txn, &env, &role, b)
+            }
+            (MessageType::SeedReveal, Body::SeedRevealBody(b)) => {
+                super::seed::reveal(ctx, &mut txn, &env, &role, b)
+            }
             (MessageType::AppUsageReceipt, Body::AppUsageReceiptBody(b)) => {
                 work::app_receipt(ctx, &mut txn, &env, &role, b)
             }
@@ -550,9 +609,12 @@ impl Shard0Engine {
         let txn = state.txn();
         for link in &header.shard_links {
             let after = txn.get_u64(&keys::settled_height(link.shard_id))?;
-            if link.height > after {
+            // Each shard-s block that the link passes, below the linked block:
+            // the next block has its certificate round (§12).
+            let upto = link.height.saturating_sub(1);
+            if upto > after {
                 let settlements = inputs
-                    .fee_settlements(link.shard_id, after, link.height)
+                    .fee_settlements(link.shard_id, after, upto)
                     .ok_or_else(|| Shard0Error::Internal("shard blocks missing".into()))?;
                 out.extend(settlements.into_iter().map(|s| sys(Sys::FeeSettlement(s))));
             }
@@ -737,19 +799,21 @@ impl Shard0Engine {
             }
         }
 
-        // 4. The settlement point of each linked shard is its link. Shard
-        // `s` gets it in its replica, to drop the settled charges (§12).
+        // 4. The settlement point of each linked shard is the block below its
+        // link (§12). Shard `s` gets it in its replica, to drop the settled
+        // charges.
         {
             let mut txn = state.txn();
             for (link, (_, before)) in header.shard_links.iter().zip(&settled_before) {
-                if link.height > *before {
-                    txn.put_u64(keys::settled_height(link.shard_id), link.height);
+                let settled = link.height.saturating_sub(1);
+                if settled > *before {
+                    txn.put_u64(keys::settled_height(link.shard_id), settled);
                     outbox.push(proto::OutboxEntry {
                         shard_id: link.shard_id,
                         fid: 0,
                         writes: vec![proto::ReplicaWrite {
                             key: keys::settled_height(link.shard_id),
-                            value: keys::u64_value(link.height),
+                            value: keys::u64_value(settled),
                             delete: false,
                         }],
                         ..Default::default()
@@ -809,7 +873,12 @@ impl Shard0Engine {
             );
         }
 
-        // 6. The outbox and the bridge lock root.
+        // 6. A bridge action whose votes passed 2/3 (§13.7).
+        let bridge_action_hash = super::bridge_actions::decide(&ctx, &mut state)?
+            .map(|h| h.to_vec())
+            .unwrap_or_default();
+
+        // 7. The outbox and the bridge lock root.
         {
             let mut txn = state.txn();
             for (i, entry) in outbox.into_entries().into_iter().enumerate() {
@@ -828,6 +897,7 @@ impl Shard0Engine {
             messages: accepted,
             epoch_record_hash,
             bridge_lock_root,
+            bridge_action_hash,
         })
     }
 
@@ -894,6 +964,7 @@ impl Shard0Engine {
         header.state_root = state_root.to_vec();
         header.bridge_lock_root = executed.bridge_lock_root.to_vec();
         header.epoch_record_hash = executed.epoch_record_hash.clone();
+        header.bridge_action_hash = executed.bridge_action_hash.clone();
         header.pivot_record_hash = executed
             .system
             .iter()
@@ -1017,6 +1088,9 @@ impl Shard0Engine {
         if executed.epoch_record_hash != header.epoch_record_hash {
             return Err(Shard0Error::invalid("epoch_record_hash mismatch"));
         }
+        if executed.bridge_action_hash != header.bridge_action_hash {
+            return Err(Shard0Error::invalid("bridge_action_hash mismatch"));
+        }
         Ok(())
     }
 
@@ -1090,7 +1164,7 @@ impl Shard0Engine {
 struct NoCheckpoints;
 
 impl DaCheckpoints for NoCheckpoints {
-    fn expected_leaf(&self, _: u64, _: u32, _: &[u8; 32]) -> Option<(Vec<u8>, Vec<u8>, [u8; 32])> {
+    fn expected_leaf(&self, _: u64, _: u32, _: &[u8; 32]) -> Option<(Vec<u8>, [u8; 32], [u8; 32])> {
         None
     }
 }
@@ -1099,7 +1173,7 @@ impl DaCheckpoints for NoCheckpoints {
 struct Certified;
 
 impl DaCheckpoints for Certified {
-    fn expected_leaf(&self, _: u64, _: u32, _: &[u8; 32]) -> Option<(Vec<u8>, Vec<u8>, [u8; 32])> {
+    fn expected_leaf(&self, _: u64, _: u32, _: &[u8; 32]) -> Option<(Vec<u8>, [u8; 32], [u8; 32])> {
         None
     }
 

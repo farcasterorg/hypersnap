@@ -47,6 +47,9 @@ pub enum DataType {
     PivotMarker = 6,
     /// A Hypersnap validator's view of Optimism (`chain::watchers`).
     HypersnapOnchainView = 7,
+    /// The undecided proposed values of a Hypersnap shard
+    /// (`chain::undecided`).
+    HypersnapUndecidedValue = 8,
 }
 
 /// Why a shard stopped applying blocks.

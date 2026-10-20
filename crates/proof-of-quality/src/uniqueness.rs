@@ -19,30 +19,36 @@ pub const POQ_SIMHASH_NGRAM: usize = 3;
 /// substitution without flagging unrelated short replies.
 pub const NEAR_DUP_HAMMING_THRESHOLD: u32 = 6;
 
-/// 128-bit SimHash over char n-grams (Charikar 2002).
+/// 128-bit SimHash over char n-grams (Charikar 2002): bit `b` is set when
+/// more than half of the n-gram hashes have bit `b` set. An n-gram is the
+/// UTF-8 bytes of `n` consecutive chars of `text`.
 pub fn simhash_128(text: &str, n: usize) -> u128 {
     if text.is_empty() {
         return 0;
     }
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() < n {
+    let starts: Vec<usize> = text
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(text.len()))
+        .collect();
+    let chars = starts.len() - 1;
+    if chars < n {
         return xxhash_128(text.as_bytes());
     }
-    let mut bits = [0i64; 128];
-    for i in 0..=(chars.len() - n) {
-        let ngram: String = chars[i..i + n].iter().collect();
-        let h = xxhash_128(ngram.as_bytes());
-        for (b, bit) in bits.iter_mut().enumerate() {
-            if (h >> b) & 1 == 1 {
-                *bit += 1;
-            } else {
-                *bit -= 1;
-            }
+    let bytes = text.as_bytes();
+    let grams = chars - n + 1;
+    let mut ones = [0u32; 128];
+    for i in 0..grams {
+        let h = xxhash_128(&bytes[starts[i]..starts[i + n]]);
+        let (lo, hi) = (h as u64, (h >> 64) as u64);
+        for b in 0..64 {
+            ones[b] += ((lo >> b) & 1) as u32;
+            ones[64 + b] += ((hi >> b) & 1) as u32;
         }
     }
     let mut out: u128 = 0;
-    for (b, &s) in bits.iter().enumerate() {
-        if s > 0 {
+    for (b, &c) in ones.iter().enumerate() {
+        if 2 * c as u64 > grams as u64 {
             out |= 1u128 << b;
         }
     }
@@ -134,5 +140,86 @@ mod tests {
     #[test]
     fn empty_text_zero_fingerprint() {
         assert_eq!(fingerprint(""), 0);
+    }
+
+    /// The first implementation: a `String` for each n-gram and a ±1 sum
+    /// for each bit.
+    fn reference_simhash_128(text: &str, n: usize) -> u128 {
+        if text.is_empty() {
+            return 0;
+        }
+        let chars: Vec<char> = text.chars().collect();
+        if chars.len() < n {
+            return xxhash_128(text.as_bytes());
+        }
+        let mut bits = [0i64; 128];
+        for i in 0..=(chars.len() - n) {
+            let ngram: String = chars[i..i + n].iter().collect();
+            let h = xxhash_128(ngram.as_bytes());
+            for (b, bit) in bits.iter_mut().enumerate() {
+                if (h >> b) & 1 == 1 {
+                    *bit += 1;
+                } else {
+                    *bit -= 1;
+                }
+            }
+        }
+        let mut out: u128 = 0;
+        for (b, &s) in bits.iter().enumerate() {
+            if s > 0 {
+                out |= 1u128 << b;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn simhash_matches_the_reference() {
+        // Texts of 0 to 400 chars of 1- to 4-byte chars, and every n-gram
+        // width up to 5.
+        let alphabet = ['a', 'b', ' ', 'é', 'ß', '€', '中', '😀', '🎉', '\u{0}'];
+        let mut state = 0x5eed_u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as usize
+        };
+        for _ in 0..2_000 {
+            let len = next() % 400;
+            let text: String = (0..len)
+                .map(|_| alphabet[next() % alphabet.len()])
+                .collect();
+            for n in 0..=5 {
+                assert_eq!(
+                    simhash_128(&text, n),
+                    reference_simhash_128(&text, n),
+                    "{:?}, n = {}",
+                    text,
+                    n
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "timing: run in release with --ignored --nocapture"]
+    fn simhash_of_a_10k_cast() {
+        let text: String = (0..10_000u32)
+            .map(|i| char::from(b'a' + (i * 7 % 26) as u8))
+            .collect();
+        for (name, f) in [
+            (
+                "reference",
+                reference_simhash_128 as fn(&str, usize) -> u128,
+            ),
+            ("simhash_128", simhash_128),
+        ] {
+            let t = std::time::Instant::now();
+            for _ in 0..100 {
+                std::hint::black_box(f(std::hint::black_box(&text), POQ_SIMHASH_NGRAM));
+            }
+            println!("{name}: {:?} per 10,000 chars", t.elapsed() / 100);
+        }
     }
 }

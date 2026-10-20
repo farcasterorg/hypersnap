@@ -65,7 +65,23 @@ pub struct PoqReader {
     /// store) — for those FIDs the original Register/Transfer
     /// timestamp is used instead of the recovery one.
     effective_ts_overrides: BTreeMap<u64, u64>,
+    /// The cast scans that `total_casts`, `active_days` and the replies of
+    /// `engagement_from` share: PoQ calls them in a row for an FID, so the
+    /// casts of an FID are read once. `engagement_from` drops the entry.
+    cast_scans: std::sync::Mutex<BTreeMap<u64, CastScan>>,
 }
+
+/// One read of the casts of an FID.
+#[derive(Clone, Default)]
+struct CastScan {
+    count: u32,
+    days: u32,
+    /// (parent FID, Unix time) of each reply to a cast of another FID.
+    replies: Vec<(u64, u64)>,
+}
+
+/// Cast scans kept at the same time; more than the threads of a scoring run.
+const MAX_CAST_SCANS: usize = 4_096;
 
 fn map_err(e: impl std::fmt::Display) -> ScoringError {
     ScoringError::Reader(format!("{}", e))
@@ -84,7 +100,8 @@ impl PoqReader {
         let handler = StoreEventHandler::new_no_persist();
         let cast_store = CastStore::new(db.clone(), handler.clone(), READER_PRUNE_LIMIT);
         let link_store = LinkStore::new(db.clone(), handler.clone(), READER_PRUNE_LIMIT);
-        let reaction_store = ReactionStore::new(db.clone(), handler.clone(), READER_PRUNE_LIMIT);
+        let reaction_store =
+            ReactionStore::new(db.clone(), handler.clone(), READER_PRUNE_LIMIT, None);
         let onchain = OnchainEventStore::new(db.clone(), handler);
         Self {
             db,
@@ -95,7 +112,58 @@ impl PoqReader {
             onchain,
             recovery_blocks: HashSet::new(),
             effective_ts_overrides: BTreeMap::new(),
+            cast_scans: std::sync::Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// The cast scan of `fid`, read once and kept until `engagement_from`.
+    fn cast_scan<T>(
+        &self,
+        fid: u64,
+        take: bool,
+        f: impl FnOnce(&CastScan) -> T,
+    ) -> Result<T, ScoringError> {
+        let cached = {
+            let mut scans = self.cast_scans.lock().unwrap_or_else(|e| e.into_inner());
+            if take {
+                scans.remove(&fid)
+            } else {
+                scans.get(&fid).cloned()
+            }
+        };
+        let scan = match cached {
+            Some(scan) => scan,
+            None => {
+                let mut scan = CastScan::default();
+                let mut days: BTreeSet<u64> = BTreeSet::new();
+                self.for_each_cast_add(fid, |msg| {
+                    scan.count = scan.count.saturating_add(1);
+                    if let Some(data) = &msg.data {
+                        let ts_unix = farcaster_ts_to_unix(data.timestamp);
+                        days.insert(ts_unix / (24 * 60 * 60));
+                        if let Some(proto::message_data::Body::CastAddBody(cab)) = &data.body {
+                            if let Some(proto::cast_add_body::Parent::ParentCastId(cid)) =
+                                &cab.parent
+                            {
+                                if cid.fid != fid {
+                                    scan.replies.push((cid.fid, ts_unix));
+                                }
+                            }
+                        }
+                    }
+                })?;
+                scan.days = days.len() as u32;
+                if !take {
+                    let mut scans = self.cast_scans.lock().unwrap_or_else(|e| e.into_inner());
+                    if scans.len() >= MAX_CAST_SCANS {
+                        scans.clear();
+                    }
+                    scans.insert(fid, scan.clone());
+                }
+                scan
+            }
+        };
+        Ok(f(&scan))
     }
 
     /// Override the FID universe.
@@ -346,16 +414,9 @@ impl SnapchainStateReader for PoqReader {
         }
 
         // --- Reply casts (cast with parent_cast_id) ---
-        self.for_each_cast_add(from, |msg| {
-            if let Some(data) = &msg.data {
-                let ts_unix = farcaster_ts_to_unix(data.timestamp);
-                if let Some(proto::message_data::Body::CastAddBody(cab)) = &data.body {
-                    if let Some(proto::cast_add_body::Parent::ParentCastId(cid)) = &cab.parent {
-                        if cid.fid != from {
-                            bump(&mut counts, cid.fid, ts_unix);
-                        }
-                    }
-                }
+        self.cast_scan(from, true, |scan| {
+            for &(parent, ts_unix) in &scan.replies {
+                bump(&mut counts, parent, ts_unix);
             }
         })?;
 
@@ -363,23 +424,11 @@ impl SnapchainStateReader for PoqReader {
     }
 
     fn total_casts(&self, fid: u64) -> Result<u32, ScoringError> {
-        let mut count: u32 = 0;
-        self.for_each_cast_add(fid, |_| {
-            count = count.saturating_add(1);
-        })?;
-        Ok(count)
+        self.cast_scan(fid, false, |scan| scan.count)
     }
 
     fn active_days(&self, fid: u64) -> Result<u32, ScoringError> {
-        let mut days: BTreeSet<u64> = BTreeSet::new();
-        self.for_each_cast_add(fid, |msg| {
-            if let Some(data) = &msg.data {
-                let ts_unix = farcaster_ts_to_unix(data.timestamp);
-                let day = ts_unix / (24 * 60 * 60);
-                days.insert(day);
-            }
-        })?;
-        Ok(days.len() as u32)
+        self.cast_scan(fid, false, |scan| scan.days)
     }
 
     /// Count of reply-casts that target any cast authored by `fid`.

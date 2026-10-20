@@ -2,8 +2,11 @@ use base64::prelude::*;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::header::HeaderValue;
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
 use hyper::{body::Bytes, Method};
 use hyper::{HeaderMap, Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
 use libp2p::PeerId;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::HashMap;
@@ -11,10 +14,13 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::str::FromStr;
 use std::sync::Arc;
+use tokio::net::TcpListener;
 use tonic::async_trait;
 use tonic::metadata::MetadataValue;
+use tracing::error;
 
 use crate::api::ApiHttpHandler;
+use crate::network::mesh::nodes::NodeRegistry;
 use crate::proto::{
     self, embed, hub_service_server::HubService, link_body::Target, message_data::Body, CastType,
     FarcasterNetwork, HashScheme, MessageType, ReactionType, SignatureScheme, UserDataType,
@@ -92,7 +98,7 @@ mod serdebase64opt {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
         let base64 = String::deserialize(d)?.replace(" ", "+");
-        if base64.len() == 0 {
+        if base64.is_empty() {
             Ok(None)
         } else {
             let decoded = BASE64_STANDARD
@@ -179,6 +185,17 @@ pub struct MessageData {
     pub key_add_body: Option<KeyAddBody>,
     #[serde(rename = "keyRemoveBody", skip_serializing_if = "Option::is_none")]
     pub key_remove_body: Option<KeyRemoveBody>,
+    #[serde(rename = "channelUpdateBody", skip_serializing_if = "Option::is_none")]
+    pub channel_update_body: Option<ChannelUpdateBody>,
+    #[serde(rename = "channelMemberBody", skip_serializing_if = "Option::is_none")]
+    pub channel_member_body: Option<ChannelMemberBody>,
+    #[serde(rename = "channelPinBody", skip_serializing_if = "Option::is_none")]
+    pub channel_pin_body: Option<ChannelPinBody>,
+    #[serde(
+        rename = "channelModerateBody",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub channel_moderate_body: Option<ChannelModerateBody>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -348,6 +365,88 @@ pub struct KeyRemoveBody {
     pub signature_type: u32,
     pub deadline: u32,
     pub nonce: u32,
+}
+
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub enum CastingMode {
+    CASTING_MODE_NONE = 0,
+    CASTING_MODE_EVERYONE = 1,
+    CASTING_MODE_MEMBERS_ONLY = 2,
+    CASTING_MODE_RECOMMENDED = 3,
+}
+
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub enum MembershipMode {
+    MEMBERSHIP_MODE_NONE = 0,
+    MEMBERSHIP_MODE_OPEN = 1,
+    MEMBERSHIP_MODE_APPROVAL = 2,
+}
+
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub enum ChannelMemberAction {
+    CHANNEL_MEMBER_ACTION_NONE = 0,
+    CHANNEL_MEMBER_ACTION_ADD_MEMBER = 1,
+    CHANNEL_MEMBER_ACTION_REMOVE_MEMBER = 2,
+    CHANNEL_MEMBER_ACTION_ADD_MODERATOR = 3,
+    CHANNEL_MEMBER_ACTION_REMOVE_MODERATOR = 4,
+    CHANNEL_MEMBER_ACTION_BAN = 5,
+    CHANNEL_MEMBER_ACTION_UNBAN = 6,
+}
+
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub enum ChannelModerateAction {
+    CHANNEL_MODERATE_ACTION_NONE = 0,
+    CHANNEL_MODERATE_ACTION_HIDE = 1,
+    CHANNEL_MODERATE_ACTION_UNHIDE = 2,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChannelUpdateBody {
+    #[serde(with = "serdehex", rename = "channelId")]
+    pub channel_id: Vec<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(rename = "imageUrl", skip_serializing_if = "Option::is_none")]
+    pub image_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rules: Option<String>,
+    #[serde(rename = "castingMode", skip_serializing_if = "Option::is_none")]
+    pub casting_mode: Option<CastingMode>,
+    #[serde(rename = "membershipMode", skip_serializing_if = "Option::is_none")]
+    pub membership_mode: Option<MembershipMode>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChannelMemberBody {
+    #[serde(with = "serdehex", rename = "channelId")]
+    pub channel_id: Vec<u8>,
+    pub fid: u64,
+    pub action: ChannelMemberAction,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChannelPinBody {
+    #[serde(with = "serdehex", rename = "channelId")]
+    pub channel_id: Vec<u8>,
+    #[serde(with = "serdehex", rename = "castHash")]
+    pub cast_hash: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChannelModerateBody {
+    #[serde(with = "serdehex", rename = "channelId")]
+    pub channel_id: Vec<u8>,
+    #[serde(with = "serdehex", rename = "castHash")]
+    pub cast_hash: Vec<u8>,
+    pub action: ChannelModerateAction,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -947,6 +1046,7 @@ impl NameLookupRequest {
             return Err(ErrorResponse {
                 error: "Name is required".to_string(),
                 error_detail: None,
+                status: None,
             });
         }
 
@@ -954,6 +1054,7 @@ impl NameLookupRequest {
             parse_user_name_type(name_type_str).ok_or_else(|| ErrorResponse {
                 error: "Invalid name type".to_string(),
                 error_detail: Some(format!("unknown name type: {}", name_type_str)),
+                status: None,
             })?
         } else {
             infer_user_name_type_from_name(&self.name)?
@@ -1003,6 +1104,7 @@ impl AddressLookupRequest {
             return Err(ErrorResponse {
                 error: "Address is required".to_string(),
                 error_detail: None,
+                status: None,
             });
         }
 
@@ -1058,6 +1160,7 @@ fn infer_user_name_type_from_name(name: &str) -> Result<UserNameType, ErrorRespo
         return Err(ErrorResponse {
             error: "Name is required".to_string(),
             error_detail: None,
+            status: None,
         });
     }
 
@@ -1080,6 +1183,7 @@ pub enum OnChainEventType {
     EVENT_TYPE_ID_REGISTER = 3,
     EVENT_TYPE_STORAGE_RENT = 4,
     EVENT_TYPE_TIER_PURCHASE = 5,
+    EVENT_TYPE_CHANNEL_REGISTER = 6,
 }
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1152,6 +1256,28 @@ pub struct TierPurchaseEventBody {
     pub tier_type: TierType,
 }
 
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub enum ChannelRegisterEventType {
+    CHANNEL_REGISTER_EVENT_TYPE_NONE = 0,
+    CHANNEL_REGISTER_EVENT_TYPE_REGISTER = 1,
+    CHANNEL_REGISTER_EVENT_TYPE_RENEW = 2,
+    CHANNEL_REGISTER_EVENT_TYPE_TRANSFER = 3,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChannelRegisterEventBody {
+    #[serde(rename = "channelKey")]
+    pub channel_key: String,
+    pub expiry: u64,
+    #[serde(with = "serdehex", rename = "ownerAddress")]
+    pub owner_address: Vec<u8>,
+    #[serde(rename = "eventType")]
+    pub event_type: ChannelRegisterEventType,
+    #[serde(with = "serdehex")]
+    pub label: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OnChainEvent {
     pub r#type: OnChainEventType,
@@ -1186,6 +1312,11 @@ pub struct OnChainEvent {
     )]
     pub storage_rent_event_body: Option<StorageRentEventBody>,
     pub tier_purchase_event_body: Option<TierPurchaseEventBody>,
+    #[serde(
+        rename = "channelRegisterEventBody",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub channel_register_event_body: Option<ChannelRegisterEventBody>,
     #[serde(rename = "txIndex")]
     pub tx_index: u32,
     pub version: u32,
@@ -1384,6 +1515,554 @@ impl OnChainEventRequest {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChannelOwnerRequest {
+    pub channel_key: String,
+}
+
+impl ChannelOwnerRequest {
+    pub fn to_proto(self) -> proto::ChannelOwnerRequest {
+        proto::ChannelOwnerRequest {
+            channel_key: self.channel_key,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChannelOwnerResponse {
+    /// 0 = registered but no verified owner in shard-0 consensus state
+    /// ("parked"). Parking is computed at read time, never stored.
+    pub fid: u64,
+    /// Raw 20-byte EVM address from the channel registry fold, hex-encoded.
+    #[serde(with = "serdehex", rename = "ownerAddress")]
+    pub owner_address: Vec<u8>,
+    /// Absolute expiry, unix seconds, as emitted by the registry contract.
+    pub expiry: u64,
+}
+
+#[allow(non_snake_case)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChannelsByAddressRequest {
+    #[serde(with = "serdehex", rename = "address")]
+    pub owner_address: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<u32>,
+    #[serde(
+        default,
+        with = "serdebase64opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub page_token: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reverse: Option<bool>,
+
+    // For backwards compatibility
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pageSize: Option<u32>,
+    #[serde(
+        default,
+        with = "serdebase64opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub pageToken: Option<Vec<u8>>,
+}
+
+impl ChannelsByAddressRequest {
+    pub fn to_proto(self) -> proto::ChannelsByAddressRequest {
+        proto::ChannelsByAddressRequest {
+            owner_address: self.owner_address,
+            page_size: self.page_size.or(self.pageSize),
+            page_token: self.page_token.or(self.pageToken),
+            reverse: self.reverse,
+        }
+    }
+}
+
+#[allow(non_snake_case)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChannelsByFidRequest {
+    pub fid: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<u32>,
+    #[serde(
+        default,
+        with = "serdebase64opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub page_token: Option<Vec<u8>>,
+
+    // For backwards compatibility
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pageSize: Option<u32>,
+    #[serde(
+        default,
+        with = "serdebase64opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub pageToken: Option<Vec<u8>>,
+}
+
+impl ChannelsByFidRequest {
+    pub fn to_proto(self) -> proto::ChannelsByFidRequest {
+        proto::ChannelsByFidRequest {
+            fid: self.fid,
+            page_size: self.page_size.or(self.pageSize),
+            page_token: self.page_token.or(self.pageToken),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChannelInfo {
+    #[serde(rename = "channelKey")]
+    pub channel_key: String,
+    /// Resolved winner; 0 = parked.
+    pub fid: u64,
+    #[serde(with = "serdehex", rename = "ownerAddress")]
+    pub owner_address: Vec<u8>,
+    /// Absolute expiry, unix seconds, as emitted by the registry contract.
+    pub expiry: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChannelsResponse {
+    pub channels: Vec<ChannelInfo>,
+    #[serde(rename = "nextPageToken", skip_serializing_if = "Option::is_none")]
+    pub next_page_token: Option<String>,
+}
+
+impl From<proto::ChannelInfo> for ChannelInfo {
+    fn from(channel: proto::ChannelInfo) -> Self {
+        ChannelInfo {
+            channel_key: channel.channel_key,
+            fid: channel.fid,
+            owner_address: channel.owner_address,
+            expiry: channel.expiry,
+        }
+    }
+}
+
+impl From<proto::ChannelsResponse> for ChannelsResponse {
+    fn from(response: proto::ChannelsResponse) -> Self {
+        ChannelsResponse {
+            channels: response
+                .channels
+                .into_iter()
+                .map(ChannelInfo::from)
+                .collect(),
+            next_page_token: response
+                .next_page_token
+                .map(|token| BASE64_STANDARD.encode(token)),
+        }
+    }
+}
+
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+pub enum ChannelMemberState {
+    CHANNEL_MEMBER_STATE_NONE = 0,
+    CHANNEL_MEMBER_STATE_MEMBER = 1,
+    CHANNEL_MEMBER_STATE_MODERATOR = 2,
+    CHANNEL_MEMBER_STATE_REMOVED = 3,
+    CHANNEL_MEMBER_STATE_BANNED = 4,
+}
+
+fn channel_member_state_from_proto(state: i32) -> Result<ChannelMemberState, ErrorResponse> {
+    match proto::ChannelMemberState::try_from(state).map_err(|_| ErrorResponse {
+        error: "Invalid channel member state".to_string(),
+        error_detail: Some(state.to_string()),
+        status: None,
+    })? {
+        proto::ChannelMemberState::None => Ok(ChannelMemberState::CHANNEL_MEMBER_STATE_NONE),
+        proto::ChannelMemberState::Member => Ok(ChannelMemberState::CHANNEL_MEMBER_STATE_MEMBER),
+        proto::ChannelMemberState::Moderator => {
+            Ok(ChannelMemberState::CHANNEL_MEMBER_STATE_MODERATOR)
+        }
+        proto::ChannelMemberState::Removed => Ok(ChannelMemberState::CHANNEL_MEMBER_STATE_REMOVED),
+        proto::ChannelMemberState::Banned => Ok(ChannelMemberState::CHANNEL_MEMBER_STATE_BANNED),
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChannelIdRequest {
+    #[serde(with = "serdehex", rename = "channelId")]
+    pub channel_id: Vec<u8>,
+}
+
+impl ChannelIdRequest {
+    fn to_proto(self) -> proto::ChannelRequest {
+        proto::ChannelRequest {
+            channel_id: self.channel_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChannelMemberRequest {
+    #[serde(with = "serdehex", rename = "channelId")]
+    pub channel_id: Vec<u8>,
+    pub fid: u64,
+}
+
+impl ChannelMemberRequest {
+    fn to_proto(self) -> proto::ChannelMemberRequest {
+        proto::ChannelMemberRequest {
+            channel_id: self.channel_id,
+            fid: self.fid,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChannelMemberResponse {
+    pub state: ChannelMemberState,
+    #[serde(rename = "lastActionTs", skip_serializing_if = "Option::is_none")]
+    pub last_action_ts: Option<u32>,
+}
+
+#[allow(non_snake_case)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChannelMembersRequest {
+    #[serde(with = "serdehex", rename = "channelId")]
+    pub channel_id: Vec<u8>,
+    #[serde(
+        default,
+        rename = "stateFilter",
+        alias = "state_filter",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub state_filter: Option<ChannelMemberState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<u32>,
+    #[serde(
+        default,
+        with = "serdebase64opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub page_token: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reverse: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pageSize: Option<u32>,
+    #[serde(
+        default,
+        with = "serdebase64opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub pageToken: Option<Vec<u8>>,
+}
+
+impl ChannelMembersRequest {
+    fn to_proto(self) -> proto::ChannelMembersRequest {
+        proto::ChannelMembersRequest {
+            channel_id: self.channel_id,
+            state_filter: self.state_filter.map(|state| state as i32),
+            page_size: self.page_size.or(self.pageSize),
+            page_token: self.page_token.or(self.pageToken),
+            reverse: self.reverse,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChannelMember {
+    pub fid: u64,
+    pub state: ChannelMemberState,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChannelMembersResponse {
+    pub members: Vec<ChannelMember>,
+    #[serde(rename = "nextPageToken", skip_serializing_if = "Option::is_none")]
+    pub next_page_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChannelPin {
+    #[serde(with = "serdehex", rename = "castHash")]
+    pub cast_hash: Vec<u8>,
+    #[serde(rename = "authorFid")]
+    pub author_fid: u64,
+}
+
+/// `pin: null` means the channel has no pin — never pinned, or pinned and then
+/// cleared. Nesting the pair keeps a half-populated pin unrepresentable.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChannelPinResponse {
+    pub pin: Option<ChannelPin>,
+}
+
+// Channel follows. A follow is an ordinary ReactionAdd(LIKE) targeting the
+// channel's CAIP-19 asset id; these endpoints read the index derived from it.
+// See the contract on GetChannelFollowers in rpc.proto — notably that
+// `pageSize` is per shard on `channelFollowers` (the only paginated fan-out
+// read), and that a node not hosting every shard refuses rather than answering
+// partially.
+
+#[allow(non_snake_case)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChannelFollowersRequest {
+    #[serde(with = "serdehex", rename = "channelId")]
+    pub channel_id: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<u32>,
+    #[serde(
+        default,
+        with = "serdebase64opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub page_token: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reverse: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pageSize: Option<u32>,
+    #[serde(
+        default,
+        with = "serdebase64opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub pageToken: Option<Vec<u8>>,
+}
+
+impl ChannelFollowersRequest {
+    fn to_proto(self) -> proto::ChannelFollowersRequest {
+        proto::ChannelFollowersRequest {
+            channel_id: self.channel_id,
+            page_size: self.page_size.or(self.pageSize),
+            page_token: self.page_token.or(self.pageToken),
+            reverse: self.reverse,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChannelFollower {
+    pub fid: u64,
+    #[serde(rename = "followedAt")]
+    pub followed_at: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChannelFollowersResponse {
+    pub followers: Vec<ChannelFollower>,
+    #[serde(rename = "nextPageToken", skip_serializing_if = "Option::is_none")]
+    pub next_page_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChannelFollowerCountRequest {
+    #[serde(with = "serdehex", rename = "channelId")]
+    pub channel_id: Vec<u8>,
+}
+
+impl ChannelFollowerCountRequest {
+    fn to_proto(self) -> proto::ChannelFollowerCountRequest {
+        proto::ChannelFollowerCountRequest {
+            channel_id: self.channel_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChannelFollowerCountResponse {
+    pub count: u64,
+}
+
+#[allow(non_snake_case)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChannelFollowsRequest {
+    pub fid: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<u32>,
+    #[serde(
+        default,
+        with = "serdebase64opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub page_token: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reverse: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pageSize: Option<u32>,
+    #[serde(
+        default,
+        with = "serdebase64opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub pageToken: Option<Vec<u8>>,
+}
+
+impl ChannelFollowsRequest {
+    fn to_proto(self) -> proto::ChannelFollowsRequest {
+        proto::ChannelFollowsRequest {
+            fid: self.fid,
+            page_size: self.page_size.or(self.pageSize),
+            page_token: self.page_token.or(self.pageToken),
+            reverse: self.reverse,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChannelFollow {
+    #[serde(with = "serdehex", rename = "channelId")]
+    pub channel_id: Vec<u8>,
+    #[serde(rename = "followedAt")]
+    pub followed_at: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChannelFollowsResponse {
+    pub follows: Vec<ChannelFollow>,
+    #[serde(rename = "nextPageToken", skip_serializing_if = "Option::is_none")]
+    pub next_page_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct IsFollowingChannelRequest {
+    pub fid: u64,
+    #[serde(with = "serdehex", rename = "channelId")]
+    pub channel_id: Vec<u8>,
+}
+
+impl IsFollowingChannelRequest {
+    fn to_proto(self) -> proto::IsFollowingChannelRequest {
+        proto::IsFollowingChannelRequest {
+            fid: self.fid,
+            channel_id: self.channel_id,
+        }
+    }
+}
+
+/// `followedAt` is present exactly when `following` is true.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct IsFollowingChannelResponse {
+    pub following: bool,
+    #[serde(rename = "followedAt", skip_serializing_if = "Option::is_none")]
+    pub followed_at: Option<u32>,
+}
+
+#[allow(non_snake_case)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChannelModerationsRequest {
+    #[serde(with = "serdehex", rename = "channelId")]
+    pub channel_id: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<u32>,
+    #[serde(
+        default,
+        with = "serdebase64opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub page_token: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reverse: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pageSize: Option<u32>,
+    #[serde(
+        default,
+        with = "serdebase64opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub pageToken: Option<Vec<u8>>,
+}
+
+impl ChannelModerationsRequest {
+    fn to_proto(self) -> proto::ChannelModerationsRequest {
+        proto::ChannelModerationsRequest {
+            channel_id: self.channel_id,
+            page_size: self.page_size.or(self.pageSize),
+            page_token: self.page_token.or(self.pageToken),
+            reverse: self.reverse,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChannelModeration {
+    #[serde(with = "serdehex", rename = "castHash")]
+    pub cast_hash: Vec<u8>,
+    pub action: ChannelModerateAction,
+    #[serde(rename = "authorFid")]
+    pub author_fid: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChannelModerationsResponse {
+    pub moderations: Vec<ChannelModeration>,
+    #[serde(rename = "nextPageToken", skip_serializing_if = "Option::is_none")]
+    pub next_page_token: Option<String>,
+}
+
+/// The five string fields deliberately do NOT use `skip_serializing_if`, unlike
+/// most response types here. ChannelUpdate is a whole-replace fold, so an absent
+/// field means the latest update cleared it — omitting it from the JSON would
+/// make a deliberately cleared description byte-identical to one that never
+/// existed, and any consumer doing `if let Some(v) = resp.name` would keep
+/// deleted metadata forever. Serializing explicit `null` makes the clear visible.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChannelMetadataResponse {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    #[serde(rename = "imageUrl")]
+    pub image_url: Option<String>,
+    pub header: Option<String>,
+    pub rules: Option<String>,
+    #[serde(rename = "castingMode")]
+    pub casting_mode: CastingMode,
+    #[serde(rename = "membershipMode")]
+    pub membership_mode: MembershipMode,
+}
+
+#[allow(non_snake_case)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChannelMembershipsByFidRequest {
+    pub fid: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<u32>,
+    #[serde(
+        default,
+        with = "serdebase64opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub page_token: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reverse: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pageSize: Option<u32>,
+    #[serde(
+        default,
+        with = "serdebase64opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub pageToken: Option<Vec<u8>>,
+}
+
+impl ChannelMembershipsByFidRequest {
+    fn to_proto(self) -> proto::ChannelMembershipsByFidRequest {
+        proto::ChannelMembershipsByFidRequest {
+            fid: self.fid,
+            page_size: self.page_size.or(self.pageSize),
+            page_token: self.page_token.or(self.pageToken),
+            reverse: self.reverse,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChannelMembership {
+    #[serde(with = "serdehex", rename = "channelId")]
+    pub channel_id: Vec<u8>,
+    pub state: ChannelMemberState,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChannelMembershipsResponse {
+    pub memberships: Vec<ChannelMembership>,
+    #[serde(rename = "nextPageToken", skip_serializing_if = "Option::is_none")]
+    pub next_page_token: Option<String>,
+}
+
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub enum HubEventType {
@@ -1395,6 +2074,7 @@ pub enum HubEventType {
     HUB_EVENT_TYPE_MERGE_ON_CHAIN_EVENT = 9,
     HUB_EVENT_TYPE_MERGE_FAILURE = 10,
     HUB_EVENT_TYPE_BLOCK_CONFIRMED = 11,
+    HUB_EVENT_TYPE_CHANNEL_OWNER_CHANGE_HINT = 12,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1461,6 +2141,25 @@ pub struct BlockConfirmedBody {
     pub total_events: u64,
 }
 
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub enum ChannelOwnerChangeCause {
+    CHANNEL_OWNER_CHANGE_CAUSE_NONE = 0,
+    CHANNEL_OWNER_CHANGE_CAUSE_REGISTER = 1,
+    CHANNEL_OWNER_CHANGE_CAUSE_TRANSFER = 2,
+    CHANNEL_OWNER_CHANGE_CAUSE_VERIFICATION_ADD = 3,
+    CHANNEL_OWNER_CHANGE_CAUSE_VERIFICATION_REMOVE = 4,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChannelOwnerChangeHintBody {
+    #[serde(rename = "channelKey")]
+    pub channel_key: String,
+    #[serde(with = "serdehex", rename = "ownerAddress")]
+    pub owner_address: Vec<u8>,
+    pub cause: ChannelOwnerChangeCause,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct HubEvent {
     #[serde(rename = "type")]
@@ -1486,6 +2185,11 @@ pub struct HubEvent {
     pub merge_failure_body: Option<MergeFailureBody>,
     #[serde(rename = "blockConfirmedBody", skip_serializing_if = "Option::is_none")]
     pub block_confirmed_body: Option<BlockConfirmedBody>,
+    #[serde(
+        rename = "channelOwnerChangeHintBody",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub channel_owner_change_hint_body: Option<ChannelOwnerChangeHintBody>,
     #[serde(rename = "blockNumber")]
     pub block_number: u64,
     #[serde(rename = "shardIndex")]
@@ -1595,6 +2299,7 @@ impl TryFrom<proto::ContactInfoBody> for ContactInfoBody {
                 .map_err(|err| ErrorResponse {
                     error: "Invalid peer id".to_string(),
                     error_detail: Some(err.to_string()),
+                    status: None,
                 })?
                 .to_string(),
             snapchain_version: value.snapchain_version.clone(),
@@ -1705,6 +2410,57 @@ pub struct ValidationResult {
 pub struct ErrorResponse {
     pub error: String,
     pub error_detail: Option<String>,
+    /// Transport-only and never serialized into the body: the HTTP status
+    /// `handle_request` should return. `None` keeps the historical behavior of
+    /// 400 for every handler error.
+    ///
+    /// Set it when the failure is a server fault rather than caller input.
+    /// Flattening both into 400 means an operator watching 4xx/5xx rates sees
+    /// store corruption — a dangling slot pointer, a malformed counter — as
+    /// client-error-shaped traffic.
+    #[serde(skip)]
+    pub status: Option<StatusCode>,
+}
+
+impl ErrorResponse {
+    /// Maps a gRPC `Status` from an in-process service call to an HTTP error,
+    /// preserving the server/caller distinction the gRPC layer already drew.
+    /// Anything the service classified as `Internal`, `DataLoss`, or `Unknown` is
+    /// a server fault and becomes 500; everything else stays 400.
+    pub(crate) fn from_status(err: &tonic::Status, error: &str) -> Self {
+        let status = match err.code() {
+            tonic::Code::Internal | tonic::Code::DataLoss | tonic::Code::Unknown => {
+                Some(StatusCode::INTERNAL_SERVER_ERROR)
+            }
+            _ => None,
+        };
+        ErrorResponse {
+            error: error.to_string(),
+            error_detail: Some(err.to_string()),
+            status,
+        }
+    }
+}
+
+/// Build the in-process gRPC mesh request, forwarding the caller's
+/// `authorization` header into gRPC metadata so the service's admin check runs.
+fn mesh_grpc_request(
+    headers: &HeaderMap,
+    validators_only: bool,
+) -> tonic::Request<proto::GetMeshViewRequest> {
+    let mut grpc_req = tonic::Request::new(proto::GetMeshViewRequest {
+        validators_only,
+        ttl: 0,
+        visited_peer_ids: vec![],
+    });
+    if let Some(auth) = headers.get("authorization") {
+        if let Ok(s) = auth.to_str() {
+            if let Ok(v) = MetadataValue::from_str(s) {
+                grpc_req.metadata_mut().insert("authorization", v);
+            }
+        }
+    }
+    grpc_req
 }
 
 // Shared response builders for the mesh endpoints (local view + crawl topology).
@@ -1724,7 +2480,22 @@ fn json_ok(json: serde_json::Value) -> Response<BoxBody<Bytes, Infallible>> {
         .unwrap()
 }
 
+fn html_ok(body: &'static str) -> Response<BoxBody<Bytes, Infallible>> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/html; charset=utf-8")
+        // The page is static, but the data it fetches is admin-gated — don't let
+        // a shared cache hold it.
+        .header("cache-control", "no-store")
+        .body(Full::new(Bytes::from(body)).boxed())
+        .unwrap()
+}
+
 fn mesh_error_response(status: tonic::Status) -> Response<BoxBody<Bytes, Infallible>> {
+    // Deliberately no `WWW-Authenticate` header: the dashboard collects
+    // credentials in its own form, and a challenge header would make the browser
+    // pop a redundant native Basic-auth modal. The page's fetch() handles the
+    // 401 body itself.
     let code = if status.code() == tonic::Code::Unauthenticated {
         StatusCode::UNAUTHORIZED
     } else {
@@ -1733,6 +2504,7 @@ fn mesh_error_response(status: tonic::Status) -> Response<BoxBody<Bytes, Infalli
     let err = ErrorResponse {
         error: status.message().to_string(),
         error_detail: None,
+        status: None,
     };
     Response::builder()
         .status(code)
@@ -1831,6 +2603,7 @@ fn map_proto_cast_add_body_to_json_cast_add_body(
             .map_err(|_| ErrorResponse {
                 error: "Invalid cast type".to_string(),
                 error_detail: None,
+                status: None,
             })?,
     })
 }
@@ -1846,6 +2619,7 @@ fn map_proto_link_body_to_json_link_body(
                 Err(ErrorResponse {
                     error: "Invalid link target".to_string(),
                     error_detail: None,
+                    status: None,
                 })
             },
             |t| match t {
@@ -1872,6 +2646,7 @@ fn map_proto_reaction_body_to_json_reaction_body(
             .map_err(|_| ErrorResponse {
                 error: "Invalid reaction type".to_string(),
                 error_detail: None,
+                status: None,
             })?
             .as_str_name()
             .to_owned(),
@@ -1903,6 +2678,7 @@ fn map_proto_user_data_body_to_json_user_data_body(
             .map_err(|_| ErrorResponse {
                 error: "Invalid user data type".to_string(),
                 error_detail: None,
+                status: None,
             })?
             .as_str_name()
             .to_owned(),
@@ -1918,6 +2694,7 @@ fn map_proto_username_proof_body_to_json_username_proof_body(
             .map_err(|_| ErrorResponse {
                 error: "Invalid username proof type".to_string(),
                 error_detail: None,
+                status: None,
             })?
             .as_str_name()
             .to_owned(),
@@ -1926,6 +2703,7 @@ fn map_proto_username_proof_body_to_json_username_proof_body(
             .map_err(|_| ErrorResponse {
                 error: "Invalid name".to_string(),
                 error_detail: None,
+                status: None,
             })?
             .to_string(),
         owner: format!("0x{}", hex::encode(username_proof_body.owner)),
@@ -1958,6 +2736,7 @@ fn map_proto_verification_add_body_to_json_verification_add_body(
             .map_err(|_| ErrorResponse {
                 error: "Invalid protocol type".to_string(),
                 error_detail: None,
+                status: None,
             })?
             .as_str_name()
             .to_owned(),
@@ -1977,6 +2756,7 @@ fn map_proto_verification_remove_body_to_json_verification_remove_body(
             .map_err(|_| ErrorResponse {
                 error: "Invalid protocol type".to_string(),
                 error_detail: None,
+                status: None,
             })?
             .as_str_name()
             .to_owned(),
@@ -2000,6 +2780,9 @@ fn map_proto_lend_storage_body_to_json_lend_storage_body(
 fn map_proto_key_add_body_to_json_key_add_body(
     key_add_body: proto::KeyAddBody,
 ) -> Result<KeyAddBody, ErrorResponse> {
+    // Mirror the Signer mapper: scopes are raw `MessageType` ints over the wire;
+    // expand to variant names and drop unknown ints (validation rejects unknown
+    // scopes at merge time, so anything reaching here is a known variant).
     let scopes: Vec<String> = key_add_body
         .scopes
         .iter()
@@ -2073,6 +2856,184 @@ fn map_proto_signer_to_json_signer(
     })
 }
 
+fn map_proto_casting_mode_to_json_casting_mode(
+    casting_mode: i32,
+) -> Result<CastingMode, ErrorResponse> {
+    Ok(
+        match proto::CastingMode::try_from(casting_mode).map_err(|_| ErrorResponse {
+            error: "Invalid casting mode".to_string(),
+            error_detail: None,
+            status: None,
+        })? {
+            proto::CastingMode::None => CastingMode::CASTING_MODE_NONE,
+            proto::CastingMode::Everyone => CastingMode::CASTING_MODE_EVERYONE,
+            proto::CastingMode::MembersOnly => CastingMode::CASTING_MODE_MEMBERS_ONLY,
+            proto::CastingMode::Recommended => CastingMode::CASTING_MODE_RECOMMENDED,
+        },
+    )
+}
+
+fn map_proto_membership_mode_to_json_membership_mode(
+    membership_mode: i32,
+) -> Result<MembershipMode, ErrorResponse> {
+    Ok(
+        match proto::MembershipMode::try_from(membership_mode).map_err(|_| ErrorResponse {
+            error: "Invalid membership mode".to_string(),
+            error_detail: None,
+            status: None,
+        })? {
+            proto::MembershipMode::None => MembershipMode::MEMBERSHIP_MODE_NONE,
+            proto::MembershipMode::Open => MembershipMode::MEMBERSHIP_MODE_OPEN,
+            proto::MembershipMode::Approval => MembershipMode::MEMBERSHIP_MODE_APPROVAL,
+        },
+    )
+}
+
+fn map_proto_channel_member_action_to_json_channel_member_action(
+    action: i32,
+) -> Result<ChannelMemberAction, ErrorResponse> {
+    Ok(
+        match proto::ChannelMemberAction::try_from(action).map_err(|_| ErrorResponse {
+            error: "Invalid channel member action".to_string(),
+            error_detail: None,
+            status: None,
+        })? {
+            proto::ChannelMemberAction::None => ChannelMemberAction::CHANNEL_MEMBER_ACTION_NONE,
+            proto::ChannelMemberAction::AddMember => {
+                ChannelMemberAction::CHANNEL_MEMBER_ACTION_ADD_MEMBER
+            }
+            proto::ChannelMemberAction::RemoveMember => {
+                ChannelMemberAction::CHANNEL_MEMBER_ACTION_REMOVE_MEMBER
+            }
+            proto::ChannelMemberAction::AddModerator => {
+                ChannelMemberAction::CHANNEL_MEMBER_ACTION_ADD_MODERATOR
+            }
+            proto::ChannelMemberAction::RemoveModerator => {
+                ChannelMemberAction::CHANNEL_MEMBER_ACTION_REMOVE_MODERATOR
+            }
+            proto::ChannelMemberAction::Ban => ChannelMemberAction::CHANNEL_MEMBER_ACTION_BAN,
+            proto::ChannelMemberAction::Unban => ChannelMemberAction::CHANNEL_MEMBER_ACTION_UNBAN,
+        },
+    )
+}
+
+fn map_proto_channel_moderate_action_to_json_channel_moderate_action(
+    action: i32,
+) -> Result<ChannelModerateAction, ErrorResponse> {
+    Ok(
+        match proto::ChannelModerateAction::try_from(action).map_err(|_| ErrorResponse {
+            error: "Invalid channel moderate action".to_string(),
+            error_detail: None,
+            status: None,
+        })? {
+            proto::ChannelModerateAction::None => {
+                ChannelModerateAction::CHANNEL_MODERATE_ACTION_NONE
+            }
+            proto::ChannelModerateAction::Hide => {
+                ChannelModerateAction::CHANNEL_MODERATE_ACTION_HIDE
+            }
+            proto::ChannelModerateAction::Unhide => {
+                ChannelModerateAction::CHANNEL_MODERATE_ACTION_UNHIDE
+            }
+        },
+    )
+}
+
+fn map_proto_channel_update_body_to_json_channel_update_body(
+    body: proto::ChannelUpdateBody,
+) -> Result<ChannelUpdateBody, ErrorResponse> {
+    Ok(ChannelUpdateBody {
+        channel_id: body.channel_id,
+        name: body.name,
+        description: body.description,
+        image_url: body.image_url,
+        header: body.header,
+        rules: body.rules,
+        casting_mode: body
+            .casting_mode
+            .map(map_proto_casting_mode_to_json_casting_mode)
+            .transpose()?,
+        membership_mode: body
+            .membership_mode
+            .map(map_proto_membership_mode_to_json_membership_mode)
+            .transpose()?,
+    })
+}
+
+fn map_proto_channel_member_body_to_json_channel_member_body(
+    body: proto::ChannelMemberBody,
+) -> Result<ChannelMemberBody, ErrorResponse> {
+    Ok(ChannelMemberBody {
+        channel_id: body.channel_id,
+        fid: body.fid,
+        action: map_proto_channel_member_action_to_json_channel_member_action(body.action)?,
+    })
+}
+
+fn map_proto_channel_pin_body_to_json_channel_pin_body(
+    body: proto::ChannelPinBody,
+) -> ChannelPinBody {
+    ChannelPinBody {
+        channel_id: body.channel_id,
+        cast_hash: body.cast_hash,
+    }
+}
+
+fn map_proto_channel_moderate_body_to_json_channel_moderate_body(
+    body: proto::ChannelModerateBody,
+) -> Result<ChannelModerateBody, ErrorResponse> {
+    Ok(ChannelModerateBody {
+        channel_id: body.channel_id,
+        cast_hash: body.cast_hash,
+        action: map_proto_channel_moderate_action_to_json_channel_moderate_action(body.action)?,
+    })
+}
+
+fn map_proto_message_data_without_body(
+    message_type: i32,
+    fid: u64,
+    timestamp: u32,
+    network: i32,
+) -> Result<MessageData, ErrorResponse> {
+    Ok(MessageData {
+        message_type: MessageType::try_from(message_type)
+            .map_err(|_| ErrorResponse {
+                error: "Invalid message type".to_string(),
+                error_detail: None,
+                status: None,
+            })?
+            .as_str_name()
+            .to_owned(),
+        fid,
+        timestamp,
+        network: FarcasterNetwork::try_from(network)
+            .map_err(|_| ErrorResponse {
+                error: "Invalid network".to_string(),
+                error_detail: None,
+                status: None,
+            })?
+            .as_str_name()
+            .to_owned(),
+        cast_add_body: None,
+        cast_remove_body: None,
+        reaction_body: None,
+        verification_add_address_body: None,
+        verification_remove_body: None,
+        user_data_body: None,
+        link_body: None,
+        username_proof_body: None,
+        frame_action_body: None,
+        link_compact_state_body: None,
+        lend_storage_body: None,
+        key_add_body: None,
+        key_remove_body: None,
+        channel_update_body: None,
+        channel_member_body: None,
+        channel_pin_body: None,
+        channel_moderate_body: None,
+    })
+}
+
 fn map_proto_message_data_to_json_message_data(
     message_data: proto::MessageData,
 ) -> Result<MessageData, ErrorResponse> {
@@ -2084,6 +3045,7 @@ fn map_proto_message_data_to_json_message_data(
                     .map_err(|_| ErrorResponse {
                         error: "Invalid message type".to_string(),
                         error_detail: None,
+                        status: None,
                     })?
                     .as_str_name()
                     .to_owned(),
@@ -2092,6 +3054,7 @@ fn map_proto_message_data_to_json_message_data(
                     .map_err(|_| ErrorResponse {
                         error: "Invalid network".to_string(),
                         error_detail: None,
+                        status: None,
                     })?
                     .as_str_name()
                     .to_owned(),
@@ -2109,6 +3072,10 @@ fn map_proto_message_data_to_json_message_data(
                 lend_storage_body: None,
                 key_add_body: None,
                 key_remove_body: None,
+                channel_update_body: None,
+                channel_member_body: None,
+                channel_pin_body: None,
+                channel_moderate_body: None,
             })
         }
         Some(Body::CastRemoveBody(cast_remove_body)) => Ok(MessageData {
@@ -2116,6 +3083,7 @@ fn map_proto_message_data_to_json_message_data(
                 .map_err(|_| ErrorResponse {
                     error: "Invalid message type".to_string(),
                     error_detail: None,
+                    status: None,
                 })?
                 .as_str_name()
                 .to_owned(),
@@ -2124,6 +3092,7 @@ fn map_proto_message_data_to_json_message_data(
                 .map_err(|_| ErrorResponse {
                     error: "Invalid network".to_string(),
                     error_detail: None,
+                    status: None,
                 })?
                 .as_str_name()
                 .to_owned(),
@@ -2143,6 +3112,10 @@ fn map_proto_message_data_to_json_message_data(
             lend_storage_body: None,
             key_add_body: None,
             key_remove_body: None,
+            channel_update_body: None,
+            channel_member_body: None,
+            channel_pin_body: None,
+            channel_moderate_body: None,
         }),
         Some(Body::FrameActionBody(frame_action_body)) => {
             return Ok(MessageData {
@@ -2150,6 +3123,7 @@ fn map_proto_message_data_to_json_message_data(
                     .map_err(|_| ErrorResponse {
                         error: "Invalid message type".to_string(),
                         error_detail: None,
+                        status: None,
                     })?
                     .as_str_name()
                     .to_owned(),
@@ -2158,6 +3132,7 @@ fn map_proto_message_data_to_json_message_data(
                     .map_err(|_| ErrorResponse {
                         error: "Invalid network".to_string(),
                         error_detail: None,
+                        status: None,
                     })?
                     .as_str_name()
                     .to_owned(),
@@ -2186,6 +3161,10 @@ fn map_proto_message_data_to_json_message_data(
                 lend_storage_body: None,
                 key_add_body: None,
                 key_remove_body: None,
+                channel_update_body: None,
+                channel_member_body: None,
+                channel_pin_body: None,
+                channel_moderate_body: None,
             });
         }
         Some(Body::LinkBody(link_body)) => {
@@ -2195,6 +3174,7 @@ fn map_proto_message_data_to_json_message_data(
                     .map_err(|_| ErrorResponse {
                         error: "Invalid message type".to_string(),
                         error_detail: None,
+                        status: None,
                     })?
                     .as_str_name()
                     .to_owned(),
@@ -2203,6 +3183,7 @@ fn map_proto_message_data_to_json_message_data(
                     .map_err(|_| ErrorResponse {
                         error: "Invalid network".to_string(),
                         error_detail: None,
+                        status: None,
                     })?
                     .as_str_name()
                     .to_owned(),
@@ -2220,6 +3201,10 @@ fn map_proto_message_data_to_json_message_data(
                 lend_storage_body: None,
                 key_add_body: None,
                 key_remove_body: None,
+                channel_update_body: None,
+                channel_member_body: None,
+                channel_pin_body: None,
+                channel_moderate_body: None,
             });
         }
         Some(Body::LinkCompactStateBody(link_compact_state_body)) => {
@@ -2230,6 +3215,7 @@ fn map_proto_message_data_to_json_message_data(
                     .map_err(|_| ErrorResponse {
                         error: "Invalid message type".to_string(),
                         error_detail: None,
+                        status: None,
                     })?
                     .as_str_name()
                     .to_owned(),
@@ -2238,6 +3224,7 @@ fn map_proto_message_data_to_json_message_data(
                     .map_err(|_| ErrorResponse {
                         error: "Invalid network".to_string(),
                         error_detail: None,
+                        status: None,
                     })?
                     .as_str_name()
                     .to_owned(),
@@ -2255,6 +3242,10 @@ fn map_proto_message_data_to_json_message_data(
                 link_compact_state_body: Some(result),
                 key_add_body: None,
                 key_remove_body: None,
+                channel_update_body: None,
+                channel_member_body: None,
+                channel_pin_body: None,
+                channel_moderate_body: None,
             });
         }
         Some(Body::ReactionBody(reaction_body)) => {
@@ -2264,6 +3255,7 @@ fn map_proto_message_data_to_json_message_data(
                     .map_err(|_| ErrorResponse {
                         error: "Invalid message type".to_string(),
                         error_detail: None,
+                        status: None,
                     })?
                     .as_str_name()
                     .to_owned(),
@@ -2272,6 +3264,7 @@ fn map_proto_message_data_to_json_message_data(
                     .map_err(|_| ErrorResponse {
                         error: "Invalid network".to_string(),
                         error_detail: None,
+                        status: None,
                     })?
                     .as_str_name()
                     .to_owned(),
@@ -2289,6 +3282,10 @@ fn map_proto_message_data_to_json_message_data(
                 lend_storage_body: None,
                 key_add_body: None,
                 key_remove_body: None,
+                channel_update_body: None,
+                channel_member_body: None,
+                channel_pin_body: None,
+                channel_moderate_body: None,
             });
         }
         Some(Body::UserDataBody(user_data_body)) => {
@@ -2298,6 +3295,7 @@ fn map_proto_message_data_to_json_message_data(
                     .map_err(|_| ErrorResponse {
                         error: "Invalid message type".to_string(),
                         error_detail: None,
+                        status: None,
                     })?
                     .as_str_name()
                     .to_owned(),
@@ -2306,6 +3304,7 @@ fn map_proto_message_data_to_json_message_data(
                     .map_err(|_| ErrorResponse {
                         error: "Invalid network".to_string(),
                         error_detail: None,
+                        status: None,
                     })?
                     .as_str_name()
                     .to_owned(),
@@ -2323,6 +3322,10 @@ fn map_proto_message_data_to_json_message_data(
                 lend_storage_body: None,
                 key_add_body: None,
                 key_remove_body: None,
+                channel_update_body: None,
+                channel_member_body: None,
+                channel_pin_body: None,
+                channel_moderate_body: None,
             });
         }
         Some(Body::UsernameProofBody(username_proof_body)) => {
@@ -2333,6 +3336,7 @@ fn map_proto_message_data_to_json_message_data(
                     .map_err(|_| ErrorResponse {
                         error: "Invalid message type".to_string(),
                         error_detail: None,
+                        status: None,
                     })?
                     .as_str_name()
                     .to_owned(),
@@ -2341,6 +3345,7 @@ fn map_proto_message_data_to_json_message_data(
                     .map_err(|_| ErrorResponse {
                         error: "Invalid network".to_string(),
                         error_detail: None,
+                        status: None,
                     })?
                     .as_str_name()
                     .to_owned(),
@@ -2358,6 +3363,10 @@ fn map_proto_message_data_to_json_message_data(
                 lend_storage_body: None,
                 key_add_body: None,
                 key_remove_body: None,
+                channel_update_body: None,
+                channel_member_body: None,
+                channel_pin_body: None,
+                channel_moderate_body: None,
             });
         }
         Some(Body::VerificationAddAddressBody(verification_add_address_body)) => {
@@ -2369,6 +3378,7 @@ fn map_proto_message_data_to_json_message_data(
                     .map_err(|_| ErrorResponse {
                         error: "Invalid message type".to_string(),
                         error_detail: None,
+                        status: None,
                     })?
                     .as_str_name()
                     .to_owned(),
@@ -2377,6 +3387,7 @@ fn map_proto_message_data_to_json_message_data(
                     .map_err(|_| ErrorResponse {
                         error: "Invalid network".to_string(),
                         error_detail: None,
+                        status: None,
                     })?
                     .as_str_name()
                     .to_owned(),
@@ -2394,6 +3405,10 @@ fn map_proto_message_data_to_json_message_data(
                 lend_storage_body: None,
                 key_add_body: None,
                 key_remove_body: None,
+                channel_update_body: None,
+                channel_member_body: None,
+                channel_pin_body: None,
+                channel_moderate_body: None,
             });
         }
         Some(Body::VerificationRemoveBody(verification_remove_body)) => {
@@ -2405,6 +3420,7 @@ fn map_proto_message_data_to_json_message_data(
                     .map_err(|_| ErrorResponse {
                         error: "Invalid message type".to_string(),
                         error_detail: None,
+                        status: None,
                     })?
                     .as_str_name()
                     .to_owned(),
@@ -2413,6 +3429,7 @@ fn map_proto_message_data_to_json_message_data(
                     .map_err(|_| ErrorResponse {
                         error: "Invalid network".to_string(),
                         error_detail: None,
+                        status: None,
                     })?
                     .as_str_name()
                     .to_owned(),
@@ -2430,6 +3447,10 @@ fn map_proto_message_data_to_json_message_data(
                 lend_storage_body: None,
                 key_add_body: None,
                 key_remove_body: None,
+                channel_update_body: None,
+                channel_member_body: None,
+                channel_pin_body: None,
+                channel_moderate_body: None,
             });
         }
         Some(Body::LendStorageBody(lend_storage_body)) => {
@@ -2439,6 +3460,7 @@ fn map_proto_message_data_to_json_message_data(
                     .map_err(|_| ErrorResponse {
                         error: "Invalid message type".to_string(),
                         error_detail: None,
+                        status: None,
                     })?
                     .as_str_name()
                     .to_owned(),
@@ -2447,6 +3469,7 @@ fn map_proto_message_data_to_json_message_data(
                     .map_err(|_| ErrorResponse {
                         error: "Invalid network".to_string(),
                         error_detail: None,
+                        status: None,
                     })?
                     .as_str_name()
                     .to_owned(),
@@ -2464,15 +3487,20 @@ fn map_proto_message_data_to_json_message_data(
                 lend_storage_body: Some(result),
                 key_add_body: None,
                 key_remove_body: None,
+                channel_update_body: None,
+                channel_member_body: None,
+                channel_pin_body: None,
+                channel_moderate_body: None,
             });
         }
         Some(Body::KeyAddBody(key_add_body)) => {
             let result = map_proto_key_add_body_to_json_key_add_body(key_add_body)?;
-            Ok(MessageData {
+            return Ok(MessageData {
                 message_type: MessageType::try_from(message_data.r#type)
                     .map_err(|_| ErrorResponse {
                         error: "Invalid message type".to_string(),
                         error_detail: None,
+                        status: None,
                     })?
                     .as_str_name()
                     .to_owned(),
@@ -2481,6 +3509,7 @@ fn map_proto_message_data_to_json_message_data(
                     .map_err(|_| ErrorResponse {
                         error: "Invalid network".to_string(),
                         error_detail: None,
+                        status: None,
                     })?
                     .as_str_name()
                     .to_owned(),
@@ -2498,15 +3527,20 @@ fn map_proto_message_data_to_json_message_data(
                 lend_storage_body: None,
                 key_add_body: Some(result),
                 key_remove_body: None,
-            })
+                channel_update_body: None,
+                channel_member_body: None,
+                channel_pin_body: None,
+                channel_moderate_body: None,
+            });
         }
         Some(Body::KeyRemoveBody(key_remove_body)) => {
             let result = map_proto_key_remove_body_to_json_key_remove_body(key_remove_body)?;
-            Ok(MessageData {
+            return Ok(MessageData {
                 message_type: MessageType::try_from(message_data.r#type)
                     .map_err(|_| ErrorResponse {
                         error: "Invalid message type".to_string(),
                         error_detail: None,
+                        status: None,
                     })?
                     .as_str_name()
                     .to_owned(),
@@ -2515,6 +3549,7 @@ fn map_proto_message_data_to_json_message_data(
                     .map_err(|_| ErrorResponse {
                         error: "Invalid network".to_string(),
                         error_detail: None,
+                        status: None,
                     })?
                     .as_str_name()
                     .to_owned(),
@@ -2532,16 +3567,68 @@ fn map_proto_message_data_to_json_message_data(
                 lend_storage_body: None,
                 key_add_body: None,
                 key_remove_body: Some(result),
-            })
+                channel_update_body: None,
+                channel_member_body: None,
+                channel_pin_body: None,
+                channel_moderate_body: None,
+            });
+        }
+        Some(Body::ChannelUpdateBody(body)) => {
+            let mut result = map_proto_message_data_without_body(
+                message_data.r#type,
+                message_data.fid,
+                message_data.timestamp,
+                message_data.network,
+            )?;
+            result.channel_update_body = Some(
+                map_proto_channel_update_body_to_json_channel_update_body(body)?,
+            );
+            Ok(result)
+        }
+        Some(Body::ChannelMemberBody(body)) => {
+            let mut result = map_proto_message_data_without_body(
+                message_data.r#type,
+                message_data.fid,
+                message_data.timestamp,
+                message_data.network,
+            )?;
+            result.channel_member_body = Some(
+                map_proto_channel_member_body_to_json_channel_member_body(body)?,
+            );
+            Ok(result)
+        }
+        Some(Body::ChannelPinBody(body)) => {
+            let mut result = map_proto_message_data_without_body(
+                message_data.r#type,
+                message_data.fid,
+                message_data.timestamp,
+                message_data.network,
+            )?;
+            result.channel_pin_body =
+                Some(map_proto_channel_pin_body_to_json_channel_pin_body(body));
+            Ok(result)
+        }
+        Some(Body::ChannelModerateBody(body)) => {
+            let mut result = map_proto_message_data_without_body(
+                message_data.r#type,
+                message_data.fid,
+                message_data.timestamp,
+                message_data.network,
+            )?;
+            result.channel_moderate_body =
+                Some(map_proto_channel_moderate_body_to_json_channel_moderate_body(body)?);
+            Ok(result)
         }
         // Hypersnap message types have no JSON form here yet (FIP §14).
         Some(_) => Err(ErrorResponse {
             error: "Unsupported message body".to_string(),
             error_detail: Some("Hypersnap message types are served by the gRPC API".to_string()),
+            status: None,
         }),
         None => Err(ErrorResponse {
             error: "No message data".to_string(),
             error_detail: None,
+            status: None,
         }),
     }
 }
@@ -2557,6 +3644,7 @@ fn map_proto_message_to_json_message(message: proto::Message) -> Result<Message,
                     .map_err(|_| ErrorResponse {
                         error: "Invalid hash scheme".to_string(),
                         error_detail: None,
+                        status: None,
                     })?
                     .as_str_name()
                     .to_owned(),
@@ -2565,6 +3653,7 @@ fn map_proto_message_to_json_message(message: proto::Message) -> Result<Message,
                     .map_err(|_| ErrorResponse {
                         error: "Invalid signature scheme".to_string(),
                         error_detail: None,
+                        status: None,
                     })?
                     .as_str_name()
                     .to_owned(),
@@ -2574,6 +3663,7 @@ fn map_proto_message_to_json_message(message: proto::Message) -> Result<Message,
         None => Err(ErrorResponse {
             error: "No message data".to_string(),
             error_detail: None,
+            status: None,
         }),
     }
 }
@@ -2604,8 +3694,23 @@ fn map_proto_on_chain_event_to_json_on_chain_event(
     let mut id_register_event_body: Option<IdRegisterEventBody> = None;
     let mut storage_rent_event_body: Option<StorageRentEventBody> = None;
     let mut tier_purchase_event_body: Option<TierPurchaseEventBody> = None;
+    let mut channel_register_event_body: Option<ChannelRegisterEventBody> = None;
     match &onchain_event.body {
         None => {}
+        Some(on_chain_event::Body::ChannelRegisterEventBody(body)) => {
+            channel_register_event_body = Some(ChannelRegisterEventBody {
+                channel_key: body.channel_key.clone(),
+                expiry: body.expiry,
+                owner_address: body.owner_address.clone(),
+                event_type: match body.event_type {
+                    1 => ChannelRegisterEventType::CHANNEL_REGISTER_EVENT_TYPE_REGISTER,
+                    2 => ChannelRegisterEventType::CHANNEL_REGISTER_EVENT_TYPE_RENEW,
+                    3 => ChannelRegisterEventType::CHANNEL_REGISTER_EVENT_TYPE_TRANSFER,
+                    _ => ChannelRegisterEventType::CHANNEL_REGISTER_EVENT_TYPE_NONE,
+                },
+                label: body.label.clone(),
+            });
+        }
         Some(on_chain_event::Body::SignerEventBody(body)) => {
             signer_event_body = Some(SignerEventBody {
                 key: body.key.clone(),
@@ -2663,6 +3768,7 @@ fn map_proto_on_chain_event_to_json_on_chain_event(
             3 => OnChainEventType::EVENT_TYPE_ID_REGISTER,
             4 => OnChainEventType::EVENT_TYPE_STORAGE_RENT,
             5 => OnChainEventType::EVENT_TYPE_TIER_PURCHASE,
+            6 => OnChainEventType::EVENT_TYPE_CHANNEL_REGISTER,
             _ => OnChainEventType::EVENT_TYPE_NONE,
         },
         chain_id: onchain_event.chain_id,
@@ -2679,6 +3785,7 @@ fn map_proto_on_chain_event_to_json_on_chain_event(
         id_register_event_body,
         storage_rent_event_body,
         tier_purchase_event_body,
+        channel_register_event_body,
     })
 }
 
@@ -2692,6 +3799,7 @@ pub fn map_proto_hub_event_to_json_hub_event(
     let mut merge_on_chain_event_body: Option<MergeOnChainEventBody> = None;
     let mut merge_failure_body: Option<MergeFailureBody> = None;
     let mut block_confirmed_body: Option<BlockConfirmedBody> = None;
+    let mut channel_owner_change_hint_body: Option<ChannelOwnerChangeHintBody> = None;
     match &hub_event.body {
         None => {}
         Some(hub_event::Body::MergeMessageBody(body)) => {
@@ -2761,6 +3869,34 @@ pub fn map_proto_hub_event_to_json_hub_event(
                 total_events: body.total_events,
             });
         }
+        Some(hub_event::Body::ChannelOwnerChangeHintBody(body)) => {
+            channel_owner_change_hint_body = Some(ChannelOwnerChangeHintBody {
+                channel_key: body.channel_key.clone(),
+                owner_address: body.owner_address.clone(),
+                // Anchored to the proto enum (not raw ints) so a proto renumber/rename
+                // fails to compile here instead of silently mis-mapping, and adding a
+                // proto variant forces a decision at this arm. Runtime forward-compat is
+                // preserved: an unset cause (None) or an integer a newer producer added
+                // that this binary doesn't know (`Err`) both degrade to NONE.
+                cause: match proto::ChannelOwnerChangeCause::try_from(body.cause) {
+                    Ok(proto::ChannelOwnerChangeCause::Register) => {
+                        ChannelOwnerChangeCause::CHANNEL_OWNER_CHANGE_CAUSE_REGISTER
+                    }
+                    Ok(proto::ChannelOwnerChangeCause::Transfer) => {
+                        ChannelOwnerChangeCause::CHANNEL_OWNER_CHANGE_CAUSE_TRANSFER
+                    }
+                    Ok(proto::ChannelOwnerChangeCause::VerificationAdd) => {
+                        ChannelOwnerChangeCause::CHANNEL_OWNER_CHANGE_CAUSE_VERIFICATION_ADD
+                    }
+                    Ok(proto::ChannelOwnerChangeCause::VerificationRemove) => {
+                        ChannelOwnerChangeCause::CHANNEL_OWNER_CHANGE_CAUSE_VERIFICATION_REMOVE
+                    }
+                    Ok(proto::ChannelOwnerChangeCause::None) | Err(_) => {
+                        ChannelOwnerChangeCause::CHANNEL_OWNER_CHANGE_CAUSE_NONE
+                    }
+                },
+            });
+        }
     }
 
     Ok(HubEvent {
@@ -2768,6 +3904,7 @@ pub fn map_proto_hub_event_to_json_hub_event(
             .map_err(|_| ErrorResponse {
                 error: "Invalid hub event type".to_string(),
                 error_detail: None,
+                status: None,
             })?
             .as_str_name()
             .to_owned(),
@@ -2779,6 +3916,7 @@ pub fn map_proto_hub_event_to_json_hub_event(
         merge_on_chain_event_body,
         merge_failure_body,
         block_confirmed_body,
+        channel_owner_change_hint_body,
         block_number: hub_event.block_number,
         shard_index: hub_event.shard_index,
     })
@@ -2879,6 +4017,58 @@ pub trait HubHttpService {
         &self,
         req: OnChainEventRequest,
     ) -> Result<OnChainEventResponse, ErrorResponse>;
+    async fn get_channel_owner(
+        &self,
+        req: ChannelOwnerRequest,
+    ) -> Result<ChannelOwnerResponse, ErrorResponse>;
+    async fn get_channels_by_address(
+        &self,
+        req: ChannelsByAddressRequest,
+    ) -> Result<ChannelsResponse, ErrorResponse>;
+    async fn get_channels_by_fid(
+        &self,
+        req: ChannelsByFidRequest,
+    ) -> Result<ChannelsResponse, ErrorResponse>;
+    async fn get_channel_member(
+        &self,
+        req: ChannelMemberRequest,
+    ) -> Result<ChannelMemberResponse, ErrorResponse>;
+    async fn get_channel_members(
+        &self,
+        req: ChannelMembersRequest,
+    ) -> Result<ChannelMembersResponse, ErrorResponse>;
+    async fn get_channel_pin(
+        &self,
+        req: ChannelIdRequest,
+    ) -> Result<ChannelPinResponse, ErrorResponse>;
+    async fn get_channel_moderations(
+        &self,
+        req: ChannelModerationsRequest,
+    ) -> Result<ChannelModerationsResponse, ErrorResponse>;
+    async fn get_channel_metadata(
+        &self,
+        req: ChannelIdRequest,
+    ) -> Result<ChannelMetadataResponse, ErrorResponse>;
+    async fn get_channel_memberships_by_fid(
+        &self,
+        req: ChannelMembershipsByFidRequest,
+    ) -> Result<ChannelMembershipsResponse, ErrorResponse>;
+    async fn get_channel_followers(
+        &self,
+        req: ChannelFollowersRequest,
+    ) -> Result<ChannelFollowersResponse, ErrorResponse>;
+    async fn get_channel_follower_count(
+        &self,
+        req: ChannelFollowerCountRequest,
+    ) -> Result<ChannelFollowerCountResponse, ErrorResponse>;
+    async fn get_channel_follows(
+        &self,
+        req: ChannelFollowsRequest,
+    ) -> Result<ChannelFollowsResponse, ErrorResponse>;
+    async fn is_following_channel(
+        &self,
+        req: IsFollowingChannelRequest,
+    ) -> Result<IsFollowingChannelResponse, ErrorResponse>;
     async fn get_fid_address_type(
         &self,
         req: FidAddressTypeRequest,
@@ -2913,6 +4103,7 @@ where
             .map_err(|e| ErrorResponse {
                 error: "Failed to get shadow roots".to_string(),
                 error_detail: Some(e.to_string()),
+                status: None,
             })?;
         let json = |r: proto::ShadowRoot| ShadowRootJson {
             shard_id: r.shard_id,
@@ -2939,6 +4130,7 @@ where
             .map_err(|e| ErrorResponse {
                 error: "Failed to get info".to_string(),
                 error_detail: Some(e.to_string()),
+                status: None,
             })?;
         let proto = response.into_inner();
         map_get_info_response_to_json_info_response(proto)
@@ -2954,6 +4146,7 @@ where
             .map_err(|e| ErrorResponse {
                 error: "Failed to get fids".to_string(),
                 error_detail: Some(e.to_string()),
+                status: None,
             })?;
         let proto = response.into_inner();
 
@@ -2967,11 +4160,13 @@ where
         let fid = req.fid.parse::<u64>().map_err(|e| ErrorResponse {
             error: "Invalid fid".to_string(),
             error_detail: Some(e.to_string()),
+            status: None,
         })?;
 
         let hash = hex::decode(&req.hash.replace("0x", "")).map_err(|e| ErrorResponse {
             error: "Invalid hash".to_string(),
             error_detail: Some(e.to_string()),
+            status: None,
         })?;
 
         let service = &self.service;
@@ -2984,6 +4179,7 @@ where
             .map_err(|e| ErrorResponse {
                 error: "Failed to get cast".to_string(),
                 error_detail: Some(e.to_string()),
+                status: None,
             })?;
 
         let message = response.into_inner();
@@ -3003,6 +4199,7 @@ where
             .map_err(|e| ErrorResponse {
                 error: "Failed to get casts".to_string(),
                 error_detail: Some(e.to_string()),
+                status: None,
             })?;
 
         let response_body = response.into_inner();
@@ -3019,6 +4216,7 @@ where
             .map_err(|e| ErrorResponse {
                 error: "Failed to get casts by mention".to_string(),
                 error_detail: Some(e.to_string()),
+                status: None,
             })?;
         let proto_resp = response.into_inner();
         map_proto_messages_response_to_json_paged_response(proto_resp)
@@ -3037,6 +4235,7 @@ where
                         |e| ErrorResponse {
                             error: "Invalid request".to_string(),
                             error_detail: Some(e.to_string()),
+                            status: None,
                         },
                     )?,
                 },
@@ -3051,6 +4250,7 @@ where
                 error_detail: Some(
                     "fid and hash must be specified or url must be specified".to_string(),
                 ),
+                status: None,
             })
         }?;
 
@@ -3061,6 +4261,7 @@ where
             .map_err(|e| ErrorResponse {
                 error: "Failed to get casts by mention".to_string(),
                 error_detail: Some(e.to_string()),
+                status: None,
             })?;
 
         let proto_resp = response.into_inner();
@@ -3074,6 +4275,7 @@ where
                 hex::decode(hash_str.trim_start_matches("0x")).map_err(|e| ErrorResponse {
                     error: "Invalid hash".to_string(),
                     error_detail: Some(e.to_string()),
+                    status: None,
                 })?
             } else {
                 Vec::new()
@@ -3089,6 +4291,7 @@ where
             return Err(ErrorResponse {
                 error: "target not specified".to_string(),
                 error_detail: None,
+                status: None,
             });
         };
         let grpc_req = tonic::Request::new(proto::ReactionRequest {
@@ -3102,6 +4305,7 @@ where
             .map_err(|e| ErrorResponse {
                 error: "Failed to get reaction".to_string(),
                 error_detail: Some(e.to_string()),
+                status: None,
             })?;
         let proto_msg = response.into_inner();
         map_proto_message_to_json_message(proto_msg)
@@ -3120,6 +4324,7 @@ where
             .map_err(|e| ErrorResponse {
                 error: "Failed to get reactions by fid".to_string(),
                 error_detail: Some(e.to_string()),
+                status: None,
             })?;
         let proto_resp = response.into_inner();
         map_proto_messages_response_to_json_paged_response(proto_resp)
@@ -3134,6 +4339,7 @@ where
             hex::decode(hash_str.trim_start_matches("0x")).map_err(|e| ErrorResponse {
                 error: "Invalid hash".to_string(),
                 error_detail: Some(e.to_string()),
+                status: None,
             })?
         } else {
             Vec::new()
@@ -3153,6 +4359,7 @@ where
             .map_err(|e| ErrorResponse {
                 error: "Failed to get reactions by cast".to_string(),
                 error_detail: Some(e.to_string()),
+                status: None,
             })?;
 
         let proto_resp = response.into_inner();
@@ -3172,6 +4379,7 @@ where
                 return Err(ErrorResponse {
                     error: hash.unwrap_err().to_string(),
                     error_detail: None,
+                    status: None,
                 });
             }
             reactions_by_target_request::Target::TargetCastId(proto::CastId {
@@ -3184,6 +4392,7 @@ where
             return Err(ErrorResponse {
                 error: "target not specified".to_string(),
                 error_detail: None,
+                status: None,
             });
         };
         let grpc_req = tonic::Request::new(req.to_proto(target));
@@ -3193,6 +4402,7 @@ where
             .map_err(|e| ErrorResponse {
                 error: "Failed to get reactions by target".to_string(),
                 error_detail: Some(e.to_string()),
+                status: None,
             })?;
         let proto_resp = response.into_inner();
         map_proto_messages_response_to_json_paged_response(proto_resp)
@@ -3207,6 +4417,7 @@ where
             return Err(ErrorResponse {
                 error: "target not specified".to_string(),
                 error_detail: None,
+                status: None,
             });
         };
         let grpc_req = tonic::Request::new(proto::LinkRequest {
@@ -3220,6 +4431,7 @@ where
             .map_err(|e| ErrorResponse {
                 error: "Failed to get link".to_string(),
                 error_detail: Some(e.to_string()),
+                status: None,
             })?;
         let proto_msg = response.into_inner();
         map_proto_message_to_json_message(proto_msg)
@@ -3238,6 +4450,7 @@ where
             .map_err(|e| ErrorResponse {
                 error: "Failed to get links by fid".to_string(),
                 error_detail: Some(e.to_string()),
+                status: None,
             })?;
         let proto_resp = response.into_inner();
         map_proto_messages_response_to_json_paged_response(proto_resp)
@@ -3256,6 +4469,7 @@ where
             return Err(ErrorResponse {
                 error: "target not specified".to_string(),
                 error_detail: None,
+                status: None,
             });
         };
         let grpc_req = tonic::Request::new(req.to_proto(target));
@@ -3265,6 +4479,7 @@ where
             .map_err(|e| ErrorResponse {
                 error: "Failed to get links by target fid".to_string(),
                 error_detail: Some(e.to_string()),
+                status: None,
             })?;
         let proto_resp = response.into_inner();
         map_proto_messages_response_to_json_paged_response(proto_resp)
@@ -3280,6 +4495,7 @@ where
             .map_err(|e| ErrorResponse {
                 error: "Failed to get user data by fid".to_string(),
                 error_detail: Some(e.to_string()),
+                status: None,
             })?;
         let proto_resp = response.into_inner();
         map_proto_messages_response_to_json_paged_response(proto_resp)
@@ -3298,6 +4514,7 @@ where
             .map_err(|e| ErrorResponse {
                 error: "Failed to get storage limits".to_string(),
                 error_detail: Some(e.to_string()),
+                status: None,
             })?;
         let limits = response.into_inner();
         Ok(StorageLimitsResponse {
@@ -3363,6 +4580,7 @@ where
             .map_err(|e| ErrorResponse {
                 error: "Failed to get username proof".to_string(),
                 error_detail: Some(e.to_string()),
+                status: None,
             })?;
         let proof = response.into_inner();
         let proof_type = proof.r#type().as_str_name().to_owned();
@@ -3391,6 +4609,7 @@ where
             .map_err(|e| ErrorResponse {
                 error: "Failed to get username proofs".to_string(),
                 error_detail: Some(e.to_string()),
+                status: None,
             })?;
         let proof = response.into_inner();
         Ok(UsernameProofsResponse {
@@ -3418,6 +4637,7 @@ where
             .map_err(|e| ErrorResponse {
                 error: "Failed to get fid by name".to_string(),
                 error_detail: Some(e.to_string()),
+                status: None,
             })?;
         Ok(FidResponse::from(response.into_inner()))
     }
@@ -3434,6 +4654,7 @@ where
             .map_err(|e| ErrorResponse {
                 error: "Failed to get addresses by name".to_string(),
                 error_detail: Some(e.to_string()),
+                status: None,
             })?;
         Ok(NameToAddressResponse::from(response.into_inner()))
     }
@@ -3450,6 +4671,7 @@ where
             .map_err(|e| ErrorResponse {
                 error: "Failed to get fid by address".to_string(),
                 error_detail: Some(e.to_string()),
+                status: None,
             })?;
         Ok(AddressToFidResponse::from(response.into_inner()))
     }
@@ -3467,6 +4689,7 @@ where
             .map_err(|e| ErrorResponse {
                 error: "Failed to validate message".to_string(),
                 error_detail: Some(e.to_string()),
+                status: None,
             })?;
         let proto_resp = response.into_inner();
         return Ok(ValidationResult {
@@ -3492,6 +4715,7 @@ where
                     return Err(ErrorResponse {
                         error: "Invalid auth header".to_string(),
                         error_detail: Some(err.to_string()),
+                        status: None,
                     })
                 }
                 Ok(auth) => {
@@ -3508,6 +4732,7 @@ where
             .map_err(|e| ErrorResponse {
                 error: "Failed to submit message".to_string(),
                 error_detail: Some(e.to_string()),
+                status: None,
             })?;
         let proto_resp = response.into_inner();
         map_proto_message_to_json_message(proto_resp)
@@ -3529,6 +4754,7 @@ where
                     return Err(ErrorResponse {
                         error: "Invalid auth header".to_string(),
                         error_detail: Some(err.to_string()),
+                        status: None,
                     })
                 }
                 Ok(auth) => {
@@ -3545,6 +4771,7 @@ where
             .map_err(|e| ErrorResponse {
                 error: "Failed to submit bulk messages".to_string(),
                 error_detail: Some(e.to_string()),
+                status: None,
             })?;
 
         let proto_resp = response.into_inner();
@@ -3566,6 +4793,7 @@ where
                 None => Err(ErrorResponse {
                     error: "Invalid bulk message response from server".to_string(),
                     error_detail: None,
+                    status: None,
                 }),
             })
             .collect::<Result<Vec<BulkMessageResponse>, _>>()?;
@@ -3588,6 +4816,7 @@ where
             .map_err(|e| ErrorResponse {
                 error: "Failed to get verifications by fid".to_string(),
                 error_detail: Some(e.to_string()),
+                status: None,
             })?;
         let proto_resp = response.into_inner();
         map_proto_messages_response_to_json_paged_response(proto_resp)
@@ -3606,6 +4835,7 @@ where
             .map_err(|e| ErrorResponse {
                 error: "Failed to get on chain signers".to_string(),
                 error_detail: Some(e.to_string()),
+                status: None,
             })?;
         let onchain_event_response = response.into_inner();
         Ok(OnChainEventResponse {
@@ -3633,11 +4863,13 @@ where
             .map_err(|e| ErrorResponse {
                 error: "Failed to get signer".to_string(),
                 error_detail: Some(e.to_string()),
+                status: None,
             })?;
         let inner = response.into_inner();
         let signer = inner.signer.ok_or_else(|| ErrorResponse {
             error: "Signer not found".to_string(),
             error_detail: None,
+            status: None,
         })?;
         Ok(HttpSignerResponse {
             signer: map_proto_signer_to_json_signer(signer)?,
@@ -3657,6 +4889,7 @@ where
             .map_err(|e| ErrorResponse {
                 error: "Failed to get signers by fid".to_string(),
                 error_detail: Some(e.to_string()),
+                status: None,
             })?;
         let inner = response.into_inner();
         let signers = inner
@@ -3687,6 +4920,7 @@ where
             .map_err(|e| ErrorResponse {
                 error: "Failed to get on chain events".to_string(),
                 error_detail: Some(e.to_string()),
+                status: None,
             })?;
         let onchain_event_response = response.into_inner();
         Ok(OnChainEventResponse {
@@ -3701,6 +4935,299 @@ where
         })
     }
 
+    /// GET /v1/channelOwner
+    async fn get_channel_owner(
+        &self,
+        req: ChannelOwnerRequest,
+    ) -> Result<ChannelOwnerResponse, ErrorResponse> {
+        let service = &self.service;
+        let grpc_req = tonic::Request::new(req.to_proto());
+        let response = service
+            .get_channel_owner(grpc_req)
+            .await
+            .map_err(|e| ErrorResponse {
+                error: "Failed to get channel owner".to_string(),
+                error_detail: Some(e.to_string()),
+                status: None,
+            })?;
+        let channel_owner = response.into_inner();
+        Ok(ChannelOwnerResponse {
+            fid: channel_owner.fid,
+            owner_address: channel_owner.owner_address,
+            expiry: channel_owner.expiry,
+        })
+    }
+
+    /// GET /v1/channelsByAddress
+    async fn get_channels_by_address(
+        &self,
+        req: ChannelsByAddressRequest,
+    ) -> Result<ChannelsResponse, ErrorResponse> {
+        let service = &self.service;
+        let grpc_req = tonic::Request::new(req.to_proto());
+        let response = service
+            .get_channels_by_address(grpc_req)
+            .await
+            .map_err(|e| ErrorResponse {
+                error: "Failed to get channels by address".to_string(),
+                error_detail: Some(e.to_string()),
+                status: None,
+            })?;
+        Ok(response.into_inner().into())
+    }
+
+    /// GET /v1/channelsByFid
+    async fn get_channels_by_fid(
+        &self,
+        req: ChannelsByFidRequest,
+    ) -> Result<ChannelsResponse, ErrorResponse> {
+        let service = &self.service;
+        let grpc_req = tonic::Request::new(req.to_proto());
+        let response = service
+            .get_channels_by_fid(grpc_req)
+            .await
+            .map_err(|e| ErrorResponse {
+                error: "Failed to get channels by fid".to_string(),
+                error_detail: Some(e.to_string()),
+                status: None,
+            })?;
+        Ok(response.into_inner().into())
+    }
+
+    /// GET /v1/channelMember
+    async fn get_channel_member(
+        &self,
+        req: ChannelMemberRequest,
+    ) -> Result<ChannelMemberResponse, ErrorResponse> {
+        let response = self
+            .service
+            .get_channel_member(tonic::Request::new(req.to_proto()))
+            .await
+            .map_err(|e| ErrorResponse::from_status(&e, "Failed to get channel member"))?
+            .into_inner();
+        Ok(ChannelMemberResponse {
+            state: channel_member_state_from_proto(response.state)?,
+            last_action_ts: response.last_action_ts,
+        })
+    }
+
+    /// GET /v1/channelMembers
+    async fn get_channel_members(
+        &self,
+        req: ChannelMembersRequest,
+    ) -> Result<ChannelMembersResponse, ErrorResponse> {
+        let response = self
+            .service
+            .get_channel_members(tonic::Request::new(req.to_proto()))
+            .await
+            .map_err(|e| ErrorResponse::from_status(&e, "Failed to get channel members"))?
+            .into_inner();
+        Ok(ChannelMembersResponse {
+            members: response
+                .members
+                .into_iter()
+                .map(|member| {
+                    Ok(ChannelMember {
+                        fid: member.fid,
+                        state: channel_member_state_from_proto(member.state)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, ErrorResponse>>()?,
+            next_page_token: response
+                .next_page_token
+                .map(|token| BASE64_STANDARD.encode(token)),
+        })
+    }
+
+    /// GET /v1/channelPin
+    async fn get_channel_pin(
+        &self,
+        req: ChannelIdRequest,
+    ) -> Result<ChannelPinResponse, ErrorResponse> {
+        let response = self
+            .service
+            .get_channel_pin(tonic::Request::new(req.to_proto()))
+            .await
+            .map_err(|e| ErrorResponse::from_status(&e, "Failed to get channel pin"))?
+            .into_inner();
+        Ok(ChannelPinResponse {
+            pin: response.pin.map(|pin| ChannelPin {
+                cast_hash: pin.cast_hash,
+                author_fid: pin.author_fid,
+            }),
+        })
+    }
+
+    /// GET /v1/channelModerations
+    async fn get_channel_moderations(
+        &self,
+        req: ChannelModerationsRequest,
+    ) -> Result<ChannelModerationsResponse, ErrorResponse> {
+        let response = self
+            .service
+            .get_channel_moderations(tonic::Request::new(req.to_proto()))
+            .await
+            .map_err(|e| ErrorResponse::from_status(&e, "Failed to get channel moderations"))?
+            .into_inner();
+        Ok(ChannelModerationsResponse {
+            moderations: response
+                .moderations
+                .into_iter()
+                .map(|moderation| {
+                    Ok(ChannelModeration {
+                        cast_hash: moderation.cast_hash,
+                        action: map_proto_channel_moderate_action_to_json_channel_moderate_action(
+                            moderation.action,
+                        )?,
+                        author_fid: moderation.author_fid,
+                    })
+                })
+                .collect::<Result<Vec<_>, ErrorResponse>>()?,
+            next_page_token: response
+                .next_page_token
+                .map(|token| BASE64_STANDARD.encode(token)),
+        })
+    }
+
+    /// GET /v1/channelMetadata
+    async fn get_channel_metadata(
+        &self,
+        req: ChannelIdRequest,
+    ) -> Result<ChannelMetadataResponse, ErrorResponse> {
+        let response = self
+            .service
+            .get_channel_metadata(tonic::Request::new(req.to_proto()))
+            .await
+            .map_err(|e| ErrorResponse::from_status(&e, "Failed to get channel metadata"))?
+            .into_inner();
+        Ok(ChannelMetadataResponse {
+            name: response.name,
+            description: response.description,
+            image_url: response.image_url,
+            header: response.header,
+            rules: response.rules,
+            casting_mode: map_proto_casting_mode_to_json_casting_mode(response.casting_mode)?,
+            membership_mode: map_proto_membership_mode_to_json_membership_mode(
+                response.membership_mode,
+            )?,
+        })
+    }
+
+    /// GET /v1/channelMembershipsByFid
+    async fn get_channel_memberships_by_fid(
+        &self,
+        req: ChannelMembershipsByFidRequest,
+    ) -> Result<ChannelMembershipsResponse, ErrorResponse> {
+        let response = self
+            .service
+            .get_channel_memberships_by_fid(tonic::Request::new(req.to_proto()))
+            .await
+            .map_err(|e| {
+                ErrorResponse::from_status(&e, "Failed to get channel memberships by fid")
+            })?
+            .into_inner();
+        Ok(ChannelMembershipsResponse {
+            memberships: response
+                .memberships
+                .into_iter()
+                .map(|membership| {
+                    Ok(ChannelMembership {
+                        channel_id: membership.channel_id,
+                        state: channel_member_state_from_proto(membership.state)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, ErrorResponse>>()?,
+            next_page_token: response
+                .next_page_token
+                .map(|token| BASE64_STANDARD.encode(token)),
+        })
+    }
+
+    /// GET /v1/channelFollowers
+    async fn get_channel_followers(
+        &self,
+        req: ChannelFollowersRequest,
+    ) -> Result<ChannelFollowersResponse, ErrorResponse> {
+        let response = self
+            .service
+            .get_channel_followers(tonic::Request::new(req.to_proto()))
+            .await
+            .map_err(|e| ErrorResponse::from_status(&e, "Failed to get channel followers"))?
+            .into_inner();
+        Ok(ChannelFollowersResponse {
+            followers: response
+                .followers
+                .into_iter()
+                .map(|follower| ChannelFollower {
+                    fid: follower.fid,
+                    followed_at: follower.followed_at,
+                })
+                .collect(),
+            next_page_token: response
+                .next_page_token
+                .map(|token| BASE64_STANDARD.encode(token)),
+        })
+    }
+
+    /// GET /v1/channelFollowerCount
+    async fn get_channel_follower_count(
+        &self,
+        req: ChannelFollowerCountRequest,
+    ) -> Result<ChannelFollowerCountResponse, ErrorResponse> {
+        let response = self
+            .service
+            .get_channel_follower_count(tonic::Request::new(req.to_proto()))
+            .await
+            .map_err(|e| ErrorResponse::from_status(&e, "Failed to get channel follower count"))?
+            .into_inner();
+        Ok(ChannelFollowerCountResponse {
+            count: response.count,
+        })
+    }
+
+    /// GET /v1/channelFollows
+    async fn get_channel_follows(
+        &self,
+        req: ChannelFollowsRequest,
+    ) -> Result<ChannelFollowsResponse, ErrorResponse> {
+        let response = self
+            .service
+            .get_channel_follows(tonic::Request::new(req.to_proto()))
+            .await
+            .map_err(|e| ErrorResponse::from_status(&e, "Failed to get channel follows"))?
+            .into_inner();
+        Ok(ChannelFollowsResponse {
+            follows: response
+                .follows
+                .into_iter()
+                .map(|follow| ChannelFollow {
+                    channel_id: follow.channel_id,
+                    followed_at: follow.followed_at,
+                })
+                .collect(),
+            next_page_token: response
+                .next_page_token
+                .map(|token| BASE64_STANDARD.encode(token)),
+        })
+    }
+
+    /// GET /v1/isFollowingChannel
+    async fn is_following_channel(
+        &self,
+        req: IsFollowingChannelRequest,
+    ) -> Result<IsFollowingChannelResponse, ErrorResponse> {
+        let response = self
+            .service
+            .is_following_channel(tonic::Request::new(req.to_proto()))
+            .await
+            .map_err(|e| ErrorResponse::from_status(&e, "Failed to check channel follow"))?
+            .into_inner();
+        Ok(IsFollowingChannelResponse {
+            following: response.following,
+            followed_at: response.followed_at,
+        })
+    }
+
     async fn get_events(&self, req: EventsRequest) -> Result<EventsResponse, ErrorResponse> {
         let service = &self.service;
 
@@ -3711,6 +5238,7 @@ where
             .map_err(|e| ErrorResponse {
                 error: "Failed to get events".to_string(),
                 error_detail: Some(e.to_string()),
+                status: None,
             })?;
         let events_response = response.into_inner();
         Ok(EventsResponse {
@@ -3732,6 +5260,7 @@ where
             .map_err(|e| ErrorResponse {
                 error: "Failed to get event".to_string(),
                 error_detail: Some(e.to_string()),
+                status: None,
             })?;
         Ok(map_proto_hub_event_to_json_hub_event(
             response.into_inner(),
@@ -3749,6 +5278,7 @@ where
             .map_err(|e| ErrorResponse {
                 error: "Failed to get id registry event".to_string(),
                 error_detail: Some(e.to_string()),
+                status: None,
             })?;
         let onchain = response.into_inner();
         map_proto_on_chain_event_to_json_on_chain_event(onchain)
@@ -3767,6 +5297,7 @@ where
             .map_err(|e| ErrorResponse {
                 error: "Failed to get fid address type".to_string(),
                 error_detail: Some(e.to_string()),
+                status: None,
             })?;
         let proto_resp = response.into_inner();
         Ok(FidAddressTypeResponse {
@@ -3788,6 +5319,7 @@ where
             .map_err(|e| ErrorResponse {
                 error: "Failed to get connected peers".to_string(),
                 error_detail: Some(e.to_string()),
+                status: None,
             })?;
         Ok(GetConnectedPeersResponse::try_from(response.into_inner())?)
     }
@@ -3805,18 +5337,21 @@ pub struct Router<Service: HubService> {
         std::sync::Arc<crate::network::rate_limit::IpRateLimiter>,
         std::net::IpAddr,
     )>,
+    /// Known-node metadata for annotating mesh JSON with human-readable names.
+    nodes: Arc<NodeRegistry>,
 }
 
 impl<Service> Router<Service>
 where
     Service: HubService,
 {
-    pub fn new(service: HubHttpServiceImpl<Service>) -> Self {
+    pub fn new(service: HubHttpServiceImpl<Service>, nodes: Arc<NodeRegistry>) -> Self {
         Self {
             service: Arc::new(service),
             api_handler: None,
             hyper_handler: None,
             rate_limiter: None,
+            nodes,
         }
     }
 
@@ -4147,6 +5682,106 @@ where
                 )
                 .await
             }
+            (&Method::GET, "/v1/channelOwner") => {
+                self.handle_request::<ChannelOwnerRequest, ChannelOwnerResponse, _>(
+                    req,
+                    |service, req| Box::pin(async move { service.get_channel_owner(req).await }),
+                )
+                .await
+            }
+            (&Method::GET, "/v1/channelsByAddress") => {
+                self.handle_request::<ChannelsByAddressRequest, ChannelsResponse, _>(
+                    req,
+                    |service, req| {
+                        Box::pin(async move { service.get_channels_by_address(req).await })
+                    },
+                )
+                .await
+            }
+            (&Method::GET, "/v1/channelsByFid") => {
+                self.handle_request::<ChannelsByFidRequest, ChannelsResponse, _>(
+                    req,
+                    |service, req| Box::pin(async move { service.get_channels_by_fid(req).await }),
+                )
+                .await
+            }
+            (&Method::GET, "/v1/channelMember") => {
+                self.handle_request::<ChannelMemberRequest, ChannelMemberResponse, _>(
+                    req,
+                    |service, req| Box::pin(async move { service.get_channel_member(req).await }),
+                )
+                .await
+            }
+            (&Method::GET, "/v1/channelMembers") => {
+                self.handle_request::<ChannelMembersRequest, ChannelMembersResponse, _>(
+                    req,
+                    |service, req| Box::pin(async move { service.get_channel_members(req).await }),
+                )
+                .await
+            }
+            (&Method::GET, "/v1/channelPin") => {
+                self.handle_request::<ChannelIdRequest, ChannelPinResponse, _>(
+                    req,
+                    |service, req| Box::pin(async move { service.get_channel_pin(req).await }),
+                )
+                .await
+            }
+            (&Method::GET, "/v1/channelModerations") => {
+                self.handle_request::<ChannelModerationsRequest, ChannelModerationsResponse, _>(
+                    req,
+                    |service, req| {
+                        Box::pin(async move { service.get_channel_moderations(req).await })
+                    },
+                )
+                .await
+            }
+            (&Method::GET, "/v1/channelMetadata") => {
+                self.handle_request::<ChannelIdRequest, ChannelMetadataResponse, _>(
+                    req,
+                    |service, req| Box::pin(async move { service.get_channel_metadata(req).await }),
+                )
+                .await
+            }
+            (&Method::GET, "/v1/channelMembershipsByFid") => self
+                .handle_request::<ChannelMembershipsByFidRequest, ChannelMembershipsResponse, _>(
+                    req,
+                    |service, req| {
+                        Box::pin(async move { service.get_channel_memberships_by_fid(req).await })
+                    },
+                )
+                .await,
+            (&Method::GET, "/v1/channelFollowers") => {
+                self.handle_request::<ChannelFollowersRequest, ChannelFollowersResponse, _>(
+                    req,
+                    |service, req| {
+                        Box::pin(async move { service.get_channel_followers(req).await })
+                    },
+                )
+                .await
+            }
+            (&Method::GET, "/v1/channelFollowerCount") => {
+                self.handle_request::<ChannelFollowerCountRequest, ChannelFollowerCountResponse, _>(
+                    req,
+                    |service, req| {
+                        Box::pin(async move { service.get_channel_follower_count(req).await })
+                    },
+                )
+                .await
+            }
+            (&Method::GET, "/v1/channelFollows") => {
+                self.handle_request::<ChannelFollowsRequest, ChannelFollowsResponse, _>(
+                    req,
+                    |service, req| Box::pin(async move { service.get_channel_follows(req).await }),
+                )
+                .await
+            }
+            (&Method::GET, "/v1/isFollowingChannel") => {
+                self.handle_request::<IsFollowingChannelRequest, IsFollowingChannelResponse, _>(
+                    req,
+                    |service, req| Box::pin(async move { service.is_following_channel(req).await }),
+                )
+                .await
+            }
             (&Method::GET, "/v1/onChainIdRegistryEventByAddress") => {
                 self.handle_request::<IdRegistryEventByAddressRequest, OnChainEvent, _>(
                     req,
@@ -4185,6 +5820,7 @@ where
                 .await
             }
             (&Method::GET, "/v1/mesh") => self.handle_mesh_view(req).await,
+            (&Method::GET, "/v1/mesh/ui") => self.handle_mesh_ui(req).await,
             _ => Ok(Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .body(Full::new(Bytes::from("Not Found")).boxed())
@@ -4308,19 +5944,7 @@ where
         // consensus,mempool); the JSON always carries every topic.
         let topics = crate::network::mesh::render::parse_topics(topics_param.as_deref());
 
-        let auth = req.headers().get("authorization").cloned();
-        let mut grpc_req = tonic::Request::new(proto::GetMeshViewRequest {
-            validators_only,
-            ttl: 0,
-            visited_peer_ids: vec![],
-        });
-        if let Some(auth) = auth {
-            if let Ok(s) = auth.to_str() {
-                if let Ok(v) = MetadataValue::from_str(s) {
-                    grpc_req.metadata_mut().insert("authorization", v);
-                }
-            }
-        }
+        let grpc_req = mesh_grpc_request(req.headers(), validators_only);
 
         // `?crawl=true` assembles the network-wide topology over the gossip port;
         // otherwise return this node's local view.
@@ -4332,7 +5956,7 @@ where
                         let body = crate::network::mesh::render::render_topology(&topo, &topics);
                         Ok(text_plain_ok(body))
                     } else {
-                        let json = crate::network::mesh::render::topology_json(&topo);
+                        let json = crate::network::mesh::render::topology_json(&topo, &self.nodes);
                         Ok(json_ok(json))
                     }
                 }
@@ -4346,13 +5970,29 @@ where
                         let body = crate::network::mesh::render::render_mesh_view(&view, &topics);
                         Ok(text_plain_ok(body))
                     } else {
-                        let json = crate::network::mesh::render::mesh_view_json(&view);
+                        let json = crate::network::mesh::render::mesh_view_json(&view, &self.nodes);
                         Ok(json_ok(json))
                     }
                 }
                 Err(status) => Ok(mesh_error_response(status)),
             }
         }
+    }
+
+    /// Serve the self-contained mesh dashboard HTML at `/v1/mesh/ui`.
+    ///
+    /// The page shell carries no mesh data — every byte of that comes from the
+    /// admin-gated `/v1/mesh` JSON the page fetches with credentials entered in
+    /// its own form. So the shell itself is served ungated: gating it would make
+    /// the browser pop a native Basic-auth modal on navigation (a second,
+    /// redundant credential prompt), and would also make the diagnostics page
+    /// fail to load in exactly the situations — a wedged gossip loop — where an
+    /// operator most needs it. `_req` is unused; auth lives on the data path.
+    async fn handle_mesh_ui(
+        &self,
+        _req: Request<hyper::body::Incoming>,
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        Ok(html_ok(crate::network::mesh::ui::UI_HTML))
     }
 
     async fn handle_request<Req, Resp, F>(
@@ -4384,7 +6024,9 @@ where
                 .body(Full::new(Bytes::from(serde_json::to_vec(&resp).unwrap())).boxed())
                 .unwrap()),
             Err(err) => Ok(Response::builder()
-                .status(StatusCode::BAD_REQUEST)
+                // Handlers that can tell a server fault from caller input say so
+                // via `ErrorResponse::status`; everything else keeps 400.
+                .status(err.status.unwrap_or(StatusCode::BAD_REQUEST))
                 .header("content-type", "application/json")
                 .body(Full::new(Bytes::from(serde_json::to_vec(&err).unwrap())).boxed())
                 .unwrap()),
@@ -4527,5 +6169,597 @@ where
                 .body(Bytes::from(format!("Invalid request format: {}", e)))
                 .unwrap()),
         }
+    }
+}
+
+/// Spawns the HTTP accept loop against an already-bound `TcpListener`. Identical
+/// in behaviour to the inline server in `start_servers` (`src/main.rs`); extracted
+/// so integration tests can boot the same code path without duplicating it.
+pub fn spawn_http_server<S>(
+    listener: TcpListener,
+    http_service: HubHttpServiceImpl<S>,
+    config: Config,
+    nodes: Arc<NodeRegistry>,
+) -> tokio::task::JoinHandle<()>
+where
+    S: HubService + 'static,
+{
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    let io = TokioIo::new(stream);
+                    let config = config.clone();
+                    let service_clone = http_service.clone();
+                    let nodes = nodes.clone();
+                    tokio::spawn(async move {
+                        let router = Router::new(service_clone, nodes);
+                        if let Err(err) = http1::Builder::new()
+                            .serve_connection(io, service_fn(|r| router.handle(r, &config)))
+                            .await
+                        {
+                            error!("Error serving connection: {}", err);
+                        }
+                    });
+                }
+                Err(e) => {
+                    error!("Error accepting connection: {}", e);
+                    break;
+                }
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::{self, message_data::Body, MessageType};
+
+    fn sample_message_data(body: Body) -> proto::MessageData {
+        let r#type = match &body {
+            Body::KeyAddBody(_) => MessageType::KeyAdd as i32,
+            Body::KeyRemoveBody(_) => MessageType::KeyRemove as i32,
+            Body::ChannelUpdateBody(_) => MessageType::ChannelUpdate as i32,
+            Body::ChannelMemberBody(_) => MessageType::ChannelMember as i32,
+            Body::ChannelPinBody(_) => MessageType::ChannelPin as i32,
+            Body::ChannelModerateBody(_) => MessageType::ChannelModerate as i32,
+            _ => MessageType::None as i32,
+        };
+        proto::MessageData {
+            r#type,
+            fid: 1108653,
+            timestamp: 100_000,
+            network: proto::FarcasterNetwork::Testnet as i32,
+            body: Some(body),
+        }
+    }
+
+    #[test]
+    fn channel_update_body_round_trips_to_json_message_data() {
+        let json = map_proto_message_data_to_json_message_data(sample_message_data(
+            Body::ChannelUpdateBody(proto::ChannelUpdateBody {
+                channel_id: vec![0x11; 32],
+                name: Some("Pets".to_string()),
+                description: None,
+                image_url: Some("https://example.com/pets.png".to_string()),
+                header: Some("Welcome".to_string()),
+                rules: Some("Be kind".to_string()),
+                casting_mode: Some(proto::CastingMode::Recommended as i32),
+                membership_mode: Some(proto::MembershipMode::Approval as i32),
+            }),
+        ))
+        .expect("CHANNEL_UPDATE body must map cleanly");
+
+        assert_eq!(json.message_type, "MESSAGE_TYPE_CHANNEL_UPDATE");
+        let serialized = serde_json::to_value(&json).expect("serialize MessageData");
+        let body = &serialized["channelUpdateBody"];
+        assert_eq!(body["channelId"], format!("0x{}", "11".repeat(32)));
+        assert_eq!(body["name"], "Pets");
+        assert!(body.get("description").is_none());
+        assert_eq!(body["imageUrl"], "https://example.com/pets.png");
+        assert_eq!(body["header"], "Welcome");
+        assert_eq!(body["rules"], "Be kind");
+        assert_eq!(body["castingMode"], "CASTING_MODE_RECOMMENDED");
+        assert_eq!(body["membershipMode"], "MEMBERSHIP_MODE_APPROVAL");
+
+        let parsed: MessageData =
+            serde_json::from_value(serialized).expect("deserialize MessageData");
+        let body = parsed
+            .channel_update_body
+            .expect("channelUpdateBody survives round trip");
+        assert_eq!(body.channel_id, vec![0x11; 32]);
+        assert_eq!(body.name.as_deref(), Some("Pets"));
+        assert!(body.description.is_none());
+        assert_eq!(
+            body.image_url.as_deref(),
+            Some("https://example.com/pets.png")
+        );
+        assert!(matches!(
+            body.casting_mode,
+            Some(CastingMode::CASTING_MODE_RECOMMENDED)
+        ));
+        assert!(matches!(
+            body.membership_mode,
+            Some(MembershipMode::MEMBERSHIP_MODE_APPROVAL)
+        ));
+    }
+
+    #[test]
+    fn channel_member_body_round_trips_to_json_message_data() {
+        let json = map_proto_message_data_to_json_message_data(sample_message_data(
+            Body::ChannelMemberBody(proto::ChannelMemberBody {
+                channel_id: vec![0x22; 32],
+                fid: 42,
+                action: proto::ChannelMemberAction::Ban as i32,
+            }),
+        ))
+        .expect("CHANNEL_MEMBER body must map cleanly");
+
+        assert_eq!(json.message_type, "MESSAGE_TYPE_CHANNEL_MEMBER");
+        let serialized = serde_json::to_value(&json).expect("serialize MessageData");
+        let body = &serialized["channelMemberBody"];
+        assert_eq!(body["channelId"], format!("0x{}", "22".repeat(32)));
+        assert_eq!(body["fid"], 42);
+        assert_eq!(body["action"], "CHANNEL_MEMBER_ACTION_BAN");
+
+        let parsed: MessageData =
+            serde_json::from_value(serialized).expect("deserialize MessageData");
+        let body = parsed
+            .channel_member_body
+            .expect("channelMemberBody survives round trip");
+        assert_eq!(body.channel_id, vec![0x22; 32]);
+        assert_eq!(body.fid, 42);
+        assert!(matches!(
+            body.action,
+            ChannelMemberAction::CHANNEL_MEMBER_ACTION_BAN
+        ));
+    }
+
+    #[test]
+    fn channel_pin_body_round_trips_to_json_message_data() {
+        let json = map_proto_message_data_to_json_message_data(sample_message_data(
+            Body::ChannelPinBody(proto::ChannelPinBody {
+                channel_id: vec![0x33; 32],
+                cast_hash: vec![0x44; 20],
+            }),
+        ))
+        .expect("CHANNEL_PIN body must map cleanly");
+
+        assert_eq!(json.message_type, "MESSAGE_TYPE_CHANNEL_PIN");
+        let serialized = serde_json::to_value(&json).expect("serialize MessageData");
+        let body = &serialized["channelPinBody"];
+        assert_eq!(body["channelId"], format!("0x{}", "33".repeat(32)));
+        assert_eq!(body["castHash"], format!("0x{}", "44".repeat(20)));
+
+        let parsed: MessageData =
+            serde_json::from_value(serialized).expect("deserialize MessageData");
+        let body = parsed
+            .channel_pin_body
+            .expect("channelPinBody survives round trip");
+        assert_eq!(body.channel_id, vec![0x33; 32]);
+        assert_eq!(body.cast_hash, vec![0x44; 20]);
+    }
+
+    #[test]
+    fn channel_moderate_body_round_trips_to_json_message_data() {
+        let json = map_proto_message_data_to_json_message_data(sample_message_data(
+            Body::ChannelModerateBody(proto::ChannelModerateBody {
+                channel_id: vec![0x55; 32],
+                cast_hash: vec![0x66; 20],
+                action: proto::ChannelModerateAction::Unhide as i32,
+            }),
+        ))
+        .expect("CHANNEL_MODERATE body must map cleanly");
+
+        assert_eq!(json.message_type, "MESSAGE_TYPE_CHANNEL_MODERATE");
+        let serialized = serde_json::to_value(&json).expect("serialize MessageData");
+        let body = &serialized["channelModerateBody"];
+        assert_eq!(body["channelId"], format!("0x{}", "55".repeat(32)));
+        assert_eq!(body["castHash"], format!("0x{}", "66".repeat(20)));
+        assert_eq!(body["action"], "CHANNEL_MODERATE_ACTION_UNHIDE");
+
+        let parsed: MessageData =
+            serde_json::from_value(serialized).expect("deserialize MessageData");
+        let body = parsed
+            .channel_moderate_body
+            .expect("channelModerateBody survives round trip");
+        assert_eq!(body.channel_id, vec![0x55; 32]);
+        assert_eq!(body.cast_hash, vec![0x66; 20]);
+        assert!(matches!(
+            body.action,
+            ChannelModerateAction::CHANNEL_MODERATE_ACTION_UNHIDE
+        ));
+    }
+
+    #[test]
+    fn channel_enums_map_every_variant_and_reject_unknown_ints() {
+        // Each proto->JSON channel enum is a hand-written int->variant table, and the round-trip
+        // tests above exercise exactly one variant apiece (13 of 17 were otherwise unpinned). A
+        // transposition — ADD_MODERATOR rendering as ADD_MEMBER, say — is precisely the bug this
+        // shape invites, and on a public read API it would ship green. Pin every arm and the
+        // exact serialized string.
+        //
+        // Unknown ints ERROR here, unlike `ChannelOwnerChangeCause`, which deliberately degrades
+        // to NONE. Freeze the difference: a later "simplification" to `unwrap_or_default()` would
+        // otherwise silently render an unrecognized mode as NONE rather than failing the read.
+        fn name_of<T: Serialize>(v: &T) -> String {
+            serde_json::to_value(v)
+                .expect("enum serializes")
+                .as_str()
+                .expect("enum is a string")
+                .to_owned()
+        }
+
+        for (raw, expected) in [
+            (0, "CASTING_MODE_NONE"),
+            (1, "CASTING_MODE_EVERYONE"),
+            (2, "CASTING_MODE_MEMBERS_ONLY"),
+            (3, "CASTING_MODE_RECOMMENDED"),
+        ] {
+            let mapped = map_proto_casting_mode_to_json_casting_mode(raw).expect("known variant");
+            assert_eq!(name_of(&mapped), expected, "casting mode {}", raw);
+        }
+        assert!(map_proto_casting_mode_to_json_casting_mode(99).is_err());
+
+        for (raw, expected) in [
+            (0, "MEMBERSHIP_MODE_NONE"),
+            (1, "MEMBERSHIP_MODE_OPEN"),
+            (2, "MEMBERSHIP_MODE_APPROVAL"),
+        ] {
+            let mapped =
+                map_proto_membership_mode_to_json_membership_mode(raw).expect("known variant");
+            assert_eq!(name_of(&mapped), expected, "membership mode {}", raw);
+        }
+        assert!(map_proto_membership_mode_to_json_membership_mode(99).is_err());
+
+        for (raw, expected) in [
+            (0, "CHANNEL_MEMBER_ACTION_NONE"),
+            (1, "CHANNEL_MEMBER_ACTION_ADD_MEMBER"),
+            (2, "CHANNEL_MEMBER_ACTION_REMOVE_MEMBER"),
+            (3, "CHANNEL_MEMBER_ACTION_ADD_MODERATOR"),
+            (4, "CHANNEL_MEMBER_ACTION_REMOVE_MODERATOR"),
+            (5, "CHANNEL_MEMBER_ACTION_BAN"),
+            (6, "CHANNEL_MEMBER_ACTION_UNBAN"),
+        ] {
+            let mapped = map_proto_channel_member_action_to_json_channel_member_action(raw)
+                .expect("known variant");
+            assert_eq!(name_of(&mapped), expected, "member action {}", raw);
+        }
+        assert!(map_proto_channel_member_action_to_json_channel_member_action(99).is_err());
+
+        for (raw, expected) in [
+            (0, "CHANNEL_MODERATE_ACTION_NONE"),
+            (1, "CHANNEL_MODERATE_ACTION_HIDE"),
+            (2, "CHANNEL_MODERATE_ACTION_UNHIDE"),
+        ] {
+            let mapped = map_proto_channel_moderate_action_to_json_channel_moderate_action(raw)
+                .expect("known variant");
+            assert_eq!(name_of(&mapped), expected, "moderate action {}", raw);
+        }
+        assert!(map_proto_channel_moderate_action_to_json_channel_moderate_action(99).is_err());
+    }
+
+    #[test]
+    fn channel_update_body_json_keeps_empty_distinct_from_absent() {
+        // The whole reason ChannelUpdateBody's fields carry proto3 `optional` presence is that
+        // "set to empty" and "absent" are different intents (clear the field vs leave it alone),
+        // and presence cannot be added back after the wire format freezes. The round-trip test
+        // above only covers absent. Pin the other half: `skip_serializing_if = "Option::is_none"`
+        // must skip only None — swapping it for a skip-if-empty predicate, a common instinct when
+        // tidying JSON output, would collapse the two and erase the distinction on the read API.
+        let json = map_proto_message_data_to_json_message_data(sample_message_data(
+            Body::ChannelUpdateBody(proto::ChannelUpdateBody {
+                channel_id: vec![0x77; 32],
+                name: Some(String::new()),
+                description: None,
+                ..Default::default()
+            }),
+        ))
+        .expect("CHANNEL_UPDATE body must map cleanly");
+
+        let serialized = serde_json::to_value(&json).expect("serialize MessageData");
+        let body = &serialized["channelUpdateBody"];
+        assert_eq!(body["name"], "", "set-to-empty must serialize, not vanish");
+        assert!(body.get("description").is_none(), "absent must stay absent");
+
+        let parsed: MessageData =
+            serde_json::from_value(serialized).expect("deserialize MessageData");
+        let body = parsed
+            .channel_update_body
+            .expect("body survives round trip");
+        assert_eq!(body.name.as_deref(), Some(""));
+        assert!(body.description.is_none());
+    }
+
+    #[test]
+    fn key_add_body_round_trips_to_json_message_data() {
+        let proto_body = proto::KeyAddBody {
+            key: vec![0x11; 32],
+            key_type: 1,
+            custody_signature: vec![0x22; 65],
+            deadline: 1_700_000_000,
+            nonce: 4,
+            metadata: vec![0x33, 0x44, 0x55],
+            metadata_type: 1,
+            registration_tx_hash: vec![0x66; 32],
+            scopes: vec![MessageType::CastAdd as i32, MessageType::ReactionAdd as i32],
+            ttl: 86_400,
+        };
+        let json = map_proto_message_data_to_json_message_data(sample_message_data(
+            Body::KeyAddBody(proto_body),
+        ))
+        .expect("KEY_ADD body must map cleanly");
+
+        assert_eq!(json.message_type, "MESSAGE_TYPE_KEY_ADD");
+        assert!(json.key_remove_body.is_none());
+        let key_add = json.key_add_body.clone().expect("key_add_body present");
+        assert_eq!(key_add.key, vec![0x11; 32]);
+        assert_eq!(key_add.key_type, 1);
+        assert_eq!(key_add.custody_signature, vec![0x22; 65]);
+        assert_eq!(key_add.deadline, 1_700_000_000);
+        assert_eq!(key_add.nonce, 4);
+        assert_eq!(key_add.metadata, vec![0x33, 0x44, 0x55]);
+        assert_eq!(key_add.metadata_type, 1);
+        assert_eq!(key_add.registration_tx_hash, vec![0x66; 32]);
+        assert_eq!(
+            key_add.scopes,
+            vec![
+                "MESSAGE_TYPE_CAST_ADD".to_string(),
+                "MESSAGE_TYPE_REACTION_ADD".to_string(),
+            ]
+        );
+        assert_eq!(key_add.ttl, 86_400);
+
+        // Confirm wire shape: bytes are emitted as 0x-prefixed hex and the
+        // `keyAddBody` wrapper is present at the top level of the JSON object.
+        let serialized = serde_json::to_value(&json).expect("serialize MessageData");
+        let body = &serialized["keyAddBody"];
+        assert_eq!(body["key"], format!("0x{}", "11".repeat(32)));
+        assert_eq!(body["custodySignature"], format!("0x{}", "22".repeat(65)));
+        assert_eq!(body["metadata"], "0x334455");
+        assert_eq!(body["registrationTxHash"], format!("0x{}", "66".repeat(32)));
+        assert_eq!(body["keyType"], 1);
+        assert_eq!(body["metadataType"], 1);
+        assert_eq!(body["ttl"], 86_400);
+    }
+
+    #[test]
+    fn channel_register_event_round_trips_to_json_on_chain_event() {
+        let proto_event = proto::OnChainEvent {
+            r#type: 6, // EVENT_TYPE_CHANNEL_REGISTER
+            chain_id: 8453,
+            block_number: 100,
+            block_hash: vec![0x0A; 32],
+            block_timestamp: 1_800_000_000,
+            transaction_hash: vec![0x0B; 32],
+            log_index: 3,
+            fid: 0,
+            tx_index: 1,
+            version: 0,
+            body: Some(proto::on_chain_event::Body::ChannelRegisterEventBody(
+                proto::ChannelRegisterBody {
+                    channel_key: "pets".to_string(),
+                    expiry: 1_900_000_000,
+                    owner_address: vec![0xCC; 20],
+                    event_type: 1, // CHANNEL_REGISTER_EVENT_TYPE_REGISTER
+                    label: vec![0xDD; 32],
+                },
+            )),
+        };
+        let json = map_proto_on_chain_event_to_json_on_chain_event(proto_event)
+            .expect("channel register event must map cleanly");
+
+        assert!(matches!(
+            json.r#type,
+            OnChainEventType::EVENT_TYPE_CHANNEL_REGISTER
+        ));
+        assert!(json.signer_event_body.is_none());
+        let body = json
+            .channel_register_event_body
+            .clone()
+            .expect("channel_register_event_body present");
+        assert_eq!(body.channel_key, "pets");
+        assert_eq!(body.expiry, 1_900_000_000);
+        assert_eq!(body.owner_address, vec![0xCC; 20]);
+        assert!(matches!(
+            body.event_type,
+            ChannelRegisterEventType::CHANNEL_REGISTER_EVENT_TYPE_REGISTER
+        ));
+        assert_eq!(body.label, vec![0xDD; 32]);
+
+        // Confirm wire shape: camelCase wrapper key, 0x-prefixed hex bytes, enum as
+        // its variant name, and absent sibling bodies omitted via skip_serializing_if.
+        let serialized = serde_json::to_value(&json).expect("serialize OnChainEvent");
+        let body_json = &serialized["channelRegisterEventBody"];
+        assert_eq!(body_json["channelKey"], "pets");
+        assert_eq!(body_json["expiry"], 1_900_000_000u64);
+        assert_eq!(body_json["ownerAddress"], format!("0x{}", "cc".repeat(20)));
+        assert_eq!(
+            body_json["eventType"],
+            "CHANNEL_REGISTER_EVENT_TYPE_REGISTER"
+        );
+        assert_eq!(body_json["label"], format!("0x{}", "dd".repeat(32)));
+        assert!(serialized.get("signerEventBody").is_none());
+
+        // Deserialize leg: the emitted wire shape parses back into the same body,
+        // so the Deserialize derives (serdehex included) stay symmetric.
+        let parsed: OnChainEvent =
+            serde_json::from_value(serialized).expect("deserialize OnChainEvent");
+        let parsed_body = parsed
+            .channel_register_event_body
+            .expect("body survives round trip");
+        assert_eq!(parsed_body.channel_key, "pets");
+        assert_eq!(parsed_body.expiry, 1_900_000_000);
+        assert_eq!(parsed_body.owner_address, vec![0xCC; 20]);
+        assert_eq!(parsed_body.label, vec![0xDD; 32]);
+    }
+
+    #[test]
+    fn channel_owner_change_hint_round_trips_to_json_hub_event() {
+        let proto_event = proto::HubEvent {
+            r#type: proto::HubEventType::ChannelOwnerChangeHint as i32,
+            id: 42,
+            body: Some(proto::hub_event::Body::ChannelOwnerChangeHintBody(
+                proto::ChannelOwnerChangeHintBody {
+                    channel_key: "pets".to_string(),
+                    owner_address: vec![0xCC; 20],
+                    cause: proto::ChannelOwnerChangeCause::Transfer as i32,
+                },
+            )),
+            block_number: 100,
+            shard_index: 2,
+            timestamp: 1_800_000_000,
+        };
+        let json = map_proto_hub_event_to_json_hub_event(proto_event)
+            .expect("channel owner change hint must map cleanly");
+
+        assert_eq!(
+            json.hub_event_type,
+            "HUB_EVENT_TYPE_CHANNEL_OWNER_CHANGE_HINT"
+        );
+        assert!(json.merge_message_body.is_none());
+        let body = json
+            .channel_owner_change_hint_body
+            .clone()
+            .expect("channel_owner_change_hint_body present");
+        assert_eq!(body.channel_key, "pets");
+        assert_eq!(body.owner_address, vec![0xCC; 20]);
+        assert!(matches!(
+            body.cause,
+            ChannelOwnerChangeCause::CHANNEL_OWNER_CHANGE_CAUSE_TRANSFER
+        ));
+
+        // Confirm wire shape: camelCase wrapper key, 0x-prefixed hex bytes, enum as its variant
+        // name, and absent sibling bodies omitted via skip_serializing_if.
+        let serialized = serde_json::to_value(&json).expect("serialize HubEvent");
+        assert_eq!(
+            serialized["type"],
+            "HUB_EVENT_TYPE_CHANNEL_OWNER_CHANGE_HINT"
+        );
+        let body_json = &serialized["channelOwnerChangeHintBody"];
+        assert_eq!(body_json["channelKey"], "pets");
+        assert_eq!(body_json["ownerAddress"], format!("0x{}", "cc".repeat(20)));
+        assert_eq!(body_json["cause"], "CHANNEL_OWNER_CHANGE_CAUSE_TRANSFER");
+        assert!(serialized.get("mergeMessageBody").is_none());
+
+        // Deserialize leg: the emitted wire shape parses back into the same body, so the
+        // Deserialize derives (serdehex included) stay symmetric with Serialize.
+        let parsed: HubEvent = serde_json::from_value(serialized).expect("deserialize HubEvent");
+        let parsed_body = parsed
+            .channel_owner_change_hint_body
+            .expect("body survives round trip");
+        assert_eq!(parsed_body.channel_key, "pets");
+        assert_eq!(parsed_body.owner_address, vec![0xCC; 20]);
+        assert!(matches!(
+            parsed_body.cause,
+            ChannelOwnerChangeCause::CHANNEL_OWNER_CHANGE_CAUSE_TRANSFER
+        ));
+    }
+
+    #[test]
+    fn channel_owner_change_hint_cause_maps_every_variant() {
+        // The proto->JSON cause conversion is a hand-written int->variant table; the round-trip
+        // test above only exercises TRANSFER. Pin every arm (0..=4) plus the unknown-int
+        // fallback: the ownership-hint feature emits REGISTER/VERIFICATION_* hints, so the
+        // arms about to go live are otherwise untested, and a transposition or a wrong fallback
+        // on this public wire contract would ship silently. The unknown case also freezes the
+        // intended forward-compat behavior (a future proto cause degrades to NONE, not a panic).
+        use ChannelOwnerChangeCause::*;
+        let cases = [
+            (0, CHANNEL_OWNER_CHANGE_CAUSE_NONE),
+            (1, CHANNEL_OWNER_CHANGE_CAUSE_REGISTER),
+            (2, CHANNEL_OWNER_CHANGE_CAUSE_TRANSFER),
+            (3, CHANNEL_OWNER_CHANGE_CAUSE_VERIFICATION_ADD),
+            (4, CHANNEL_OWNER_CHANGE_CAUSE_VERIFICATION_REMOVE),
+            (99, CHANNEL_OWNER_CHANGE_CAUSE_NONE),
+        ];
+        for (proto_cause, expected) in cases {
+            let proto_event = proto::HubEvent {
+                r#type: proto::HubEventType::ChannelOwnerChangeHint as i32,
+                id: 1,
+                body: Some(proto::hub_event::Body::ChannelOwnerChangeHintBody(
+                    proto::ChannelOwnerChangeHintBody {
+                        channel_key: "pets".to_string(),
+                        owner_address: vec![0xCC; 20],
+                        cause: proto_cause,
+                    },
+                )),
+                block_number: 1,
+                shard_index: 2,
+                timestamp: 0,
+            };
+            let json = map_proto_hub_event_to_json_hub_event(proto_event)
+                .expect("cause mapping must not fail");
+            let body = json
+                .channel_owner_change_hint_body
+                .expect("hint body present");
+            assert_eq!(
+                std::mem::discriminant(&body.cause),
+                std::mem::discriminant(&expected),
+                "proto cause {} must map to {:?}",
+                proto_cause,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn key_remove_body_round_trips_to_json_message_data() {
+        let proto_body = proto::KeyRemoveBody {
+            key: vec![0xAA; 32],
+            signature: vec![0xBB; 65],
+            signature_type: 2,
+            deadline: 1_700_000_500,
+            nonce: 7,
+        };
+        let json = map_proto_message_data_to_json_message_data(sample_message_data(
+            Body::KeyRemoveBody(proto_body),
+        ))
+        .expect("KEY_REMOVE body must map cleanly");
+
+        assert_eq!(json.message_type, "MESSAGE_TYPE_KEY_REMOVE");
+        assert!(json.key_add_body.is_none());
+        let key_remove = json
+            .key_remove_body
+            .clone()
+            .expect("key_remove_body present");
+        assert_eq!(key_remove.key, vec![0xAA; 32]);
+        assert_eq!(key_remove.signature, vec![0xBB; 65]);
+        assert_eq!(key_remove.signature_type, 2);
+        assert_eq!(key_remove.deadline, 1_700_000_500);
+        assert_eq!(key_remove.nonce, 7);
+
+        let serialized = serde_json::to_value(&json).expect("serialize MessageData");
+        let body = &serialized["keyRemoveBody"];
+        assert_eq!(body["key"], format!("0x{}", "aa".repeat(32)));
+        assert_eq!(body["signature"], format!("0x{}", "bb".repeat(65)));
+        assert_eq!(body["signatureType"], 2);
+        assert_eq!(body["nonce"], 7);
+    }
+
+    #[test]
+    fn key_add_body_drops_unknown_scope_ints() {
+        // Forward-compat: if a future protobuf adds a MessageType variant, the
+        // mapper should silently drop the unknown int rather than failing the
+        // whole response. Validation rejects unknown scopes at merge time.
+        let proto_body = proto::KeyAddBody {
+            key: vec![0x01; 32],
+            key_type: 1,
+            custody_signature: vec![],
+            deadline: 0,
+            nonce: 0,
+            metadata: vec![],
+            metadata_type: 1,
+            registration_tx_hash: vec![],
+            scopes: vec![MessageType::CastAdd as i32, 9999],
+            ttl: 1,
+        };
+        let json = map_proto_message_data_to_json_message_data(sample_message_data(
+            Body::KeyAddBody(proto_body),
+        ))
+        .unwrap();
+        let scopes = json.key_add_body.unwrap().scopes;
+        assert_eq!(scopes, vec!["MESSAGE_TYPE_CAST_ADD".to_string()]);
     }
 }

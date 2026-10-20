@@ -434,7 +434,7 @@ pub fn key_add(
             if body.ttl == 0 || body.ttl > key_rules::MAX_KEY_TTL_SECONDS {
                 return Err(invalid("ttl is out of range"));
             }
-            key_rules::validate_key_add_scopes(&body.scopes).map_err(hub)?;
+            key_rules::validate_falcon_signer_scopes(&body.scopes).map_err(hub)?;
             let payload = env.second_signature_payload(hypersnap_messages::clear_key_add_falcon);
             auth::verify_falcon_body(
                 &custody.falcon_custody_key,
@@ -481,7 +481,9 @@ fn merge_snapchain_key_add(
         .map_err(hub)
 }
 
-fn replay(ctx: &BlockCtx, fid: u64, message: &proto::Message) -> OutboxEntry {
+/// An outbox entry that sends `message` to the shard of `fid` in its
+/// snapchain form, for shard `s` to merge it again (FIP §17.7).
+pub(crate) fn replay(ctx: &BlockCtx, fid: u64, message: &proto::Message) -> OutboxEntry {
     let mut relay = message.clone();
     // The replica merges the snapchain form: the Ed25519 half only.
     if relay.signature_scheme == proto::SignatureScheme::Ed25519Falcon512 as i32 {

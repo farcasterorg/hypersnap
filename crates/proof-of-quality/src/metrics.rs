@@ -219,16 +219,16 @@ pub fn engagement_per_cast_fp(unique_engagers: u32, total_casts: u32) -> u64 {
 /// keyed by FID (BTreeMap → ascending iteration). Trust-dependent
 /// fields (`trust_fp`, `credibility_weight_fp`, the F5 new-user count
 /// and share) are left at 0; see the module docs.
-pub fn build_metrics<R: SnapchainStateReader + ?Sized>(
+pub fn build_metrics<R: SnapchainStateReader + Sync + ?Sized>(
     reader: &R,
     now_unix: u64,
 ) -> Result<BTreeMap<u64, FidMetrics>, ScoringError> {
-    let fids = reader.all_active_fids()?;
+    let fids: Vec<u64> = reader.all_active_fids()?.into_iter().collect();
     let mut out: BTreeMap<u64, FidMetrics> = BTreeMap::new();
 
-    // First pass: per-FID reads.
+    // First pass: per-FID reads, on all cores.
     let mut outbound: BTreeMap<u64, BTreeMap<u64, EngagementCount>> = BTreeMap::new();
-    for &fid in &fids {
+    let reads = crate::reader::read_per_fid(&fids, |fid| {
         let mut m = FidMetrics::new(fid);
         m.effective_ts = reader.effective_ts(fid)?;
         m.age_factor_fp = compute_age_factor_fp(m.effective_ts, now_unix);
@@ -240,8 +240,11 @@ pub fn build_metrics<R: SnapchainStateReader + ?Sized>(
         m.signer_authorizations = reader.signer_authorizations(fid)?;
         m.signer_authorizations_clustered = reader.signer_authorizations_clustered(fid)?;
         m.miniapp_author_count = reader.miniapp_author_count(fid)?;
+        Ok((m, reader.engagement_from(fid)?))
+    })?;
+    for (fid, (m, engagement)) in reads {
         out.insert(fid, m);
-        outbound.insert(fid, reader.engagement_from(fid)?);
+        outbound.insert(fid, engagement);
     }
 
     // §6.7 option (b): vouch stake received, summed over the vouchers

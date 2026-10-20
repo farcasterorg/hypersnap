@@ -7,8 +7,9 @@
 
 use super::certificate;
 use super::shard_blocks::{ProposalInputs, ShardBlockProducer, ValidationInputs};
+use super::undecided::UndecidedValues;
 use super::validator_sets::EpochSet;
-use crate::consensus::proposer::{ProposedValues, Proposer};
+use crate::consensus::proposer::Proposer;
 use crate::core::types::{Address, CommitsExt, SnapchainValidatorSet};
 use crate::core::util::FarcasterTime;
 use crate::proto::{
@@ -19,7 +20,7 @@ use informalsystems_malachitebft_core_types::{Round, Validity};
 use prost::Message as _;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 /// Epoch validator sets (shard-0 state, or the genesis file for epochs 1, 2).
 pub trait EpochSetSource: Send + Sync {
@@ -30,6 +31,11 @@ pub trait EpochSetSource: Send + Sync {
 pub trait Shard0Tip: Send + Sync {
     fn highest_certified(&self) -> u64;
 }
+
+/// How long a data-shard proposer waits for the messages of its block: a
+/// pull of 12,000 messages checks each of them (a small part of the 6-second
+/// propose time).
+const PULL_WAIT: Duration = Duration::from_secs(1);
 
 /// Bundled certificate → snapchain `Commits`, for the Malachite sync path.
 pub fn commits_from_certificate(set: &EpochSet, cert: &CommitCertificate) -> Commits {
@@ -60,7 +66,7 @@ pub fn commits_from_certificate(set: &EpochSet, cert: &CommitCertificate) -> Com
 pub struct HypersnapShardProposer {
     shard_id: u32,
     address: Address,
-    proposed: ProposedValues,
+    proposed: UndecidedValues,
     producer: ShardBlockProducer,
     sets: Arc<dyn EpochSetSource>,
     shard0: Arc<dyn Shard0Tip>,
@@ -90,8 +96,9 @@ impl HypersnapShardProposer {
             Some(h) => h.height,
             None => return Validity::Invalid,
         };
+        let next = self.producer.next_height();
         if Some(height) != full_proposal.height.map(|h| h.block_number)
-            || height != self.producer.next_height()
+            || !(next..=next + 1).contains(&height)
         {
             warn!(
                 shard = self.shard_id,
@@ -99,7 +106,16 @@ impl HypersnapShardProposer {
             );
             return Validity::Invalid;
         }
-        self.proposed.add_proposed_value(full_proposal.clone());
+        // A proposal for the height after the next one comes while the commit
+        // of the next height runs: keep it, so that its decision finds it.
+        self.proposed.add(full_proposal.clone());
+        if height != next {
+            warn!(
+                shard = self.shard_id,
+                height, "Hypersnap proposal is for a height that this node has not reached"
+            );
+            return Validity::Invalid;
+        }
         let parent_set = self.parent_set();
         let inputs = ValidationInputs {
             // A synced block has no bound from the local shard 0 (both sides
@@ -138,7 +154,7 @@ impl HypersnapShardProposer {
         HypersnapShardProposer {
             shard_id: producer.shard_id(),
             address,
-            proposed: ProposedValues::new(),
+            proposed: UndecidedValues::new(producer.store().db().clone()),
             producer,
             sets,
             shard0,
@@ -147,6 +163,14 @@ impl HypersnapShardProposer {
             decided_tx: None,
             statsd: None,
         }
+    }
+
+    /// Keep the undecided values in `db`, the node-local DB: they are not
+    /// state, and in the shard DB they stayed in blob files until blob GC and
+    /// went into each checkpoint.
+    pub fn with_undecided_db(mut self, db: Arc<crate::storage::db::RocksDB>) -> Self {
+        self.proposed = UndecidedValues::new(db);
+        self
     }
 
     /// Gauges of the committed blocks (`chain::metrics`).
@@ -193,8 +217,8 @@ impl HypersnapShardProposer {
     }
 
     fn parent_set(&self) -> Option<EpochSet> {
-        let tip = self.producer.tip()?;
-        self.sets.set(tip.header?.epoch)
+        let (tip, _) = self.producer.tip_header()?;
+        self.sets.set(tip.epoch)
     }
 
     fn decode(full_proposal: &FullProposal) -> Option<HypersnapBlock> {
@@ -209,13 +233,15 @@ impl Proposer for HypersnapShardProposer {
         round: Round,
         _timeout: Duration,
     ) -> FullProposal {
+        let started = std::time::Instant::now();
         let messages = self
             .producer
             .engine
             .mempool_poller
-            .pull_messages(Duration::from_millis(200))
+            .pull_messages(PULL_WAIT)
             .await
             .unwrap_or_default();
+        let pulled = started.elapsed();
         let block = self
             .producer
             .propose(ProposalInputs {
@@ -232,15 +258,28 @@ impl Proposer for HypersnapShardProposer {
             })
             .expect("a proposal from local state");
         debug_assert_eq!(block.header.as_ref().unwrap().height, height.block_number);
+        let encoded = block.encode_to_vec();
+        info!(
+            shard = self.shard_id,
+            height = height.block_number,
+            round = round.as_i64(),
+            messages = block
+                .transactions
+                .iter()
+                .map(|t| t.user_messages.len())
+                .sum::<usize>(),
+            bytes = encoded.len(),
+            pull_ms = pulled.as_millis() as u64,
+            ms = started.elapsed().as_millis() as u64,
+            "Proposed a shard block"
+        );
         let proposal = FullProposal {
             height: Some(height),
             round: round.as_i64(),
             proposer: self.address.to_vec(),
-            proposed_value: Some(full_proposal::ProposedValue::HypersnapBlock(
-                block.encode_to_vec(),
-            )),
+            proposed_value: Some(full_proposal::ProposedValue::HypersnapBlock(encoded)),
         };
-        self.proposed.add_proposed_value(proposal.clone());
+        self.proposed.add(proposal.clone());
         proposal
     }
 
@@ -251,8 +290,8 @@ impl Proposer for HypersnapShardProposer {
     async fn decide(&mut self, commits: Commits) {
         let value = commits.value.clone().unwrap();
         let height = commits.height.unwrap();
-        let proposal = match self.proposed.get_by_shard_hash(&value) {
-            Some(p) => p.clone(),
+        let proposal = match self.proposed.get(&value) {
+            Some(p) => p,
             None => panic!(
                 "Unable to find proposal for decided value. height {}, shard_hash {}",
                 height,
@@ -322,7 +361,7 @@ impl Proposer for HypersnapShardProposer {
     }
 
     fn get_proposed_value(&self, shard_hash: &ShardHash) -> Option<FullProposal> {
-        self.proposed.get_by_shard_hash(shard_hash).cloned()
+        self.proposed.get(shard_hash)
     }
 }
 

@@ -10,6 +10,37 @@ use prost::Message as _;
 /// FIP §4.2.
 pub const MAX_BLOCK_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
+
+/// Drop `data_bytes` when it is the encoding of `data` (and set `data` from
+/// it if absent): the hash and the signatures cover the same bytes (FIP
+/// §16.8), and a block carries the content once (FIP §4.2). Other messages do
+/// not change.
+pub fn compact_message(message: &mut proto::Message) {
+    let Some(bytes) = message.data_bytes.as_ref().filter(|b| !b.is_empty()) else {
+        return;
+    };
+    let Ok(decoded) = proto::MessageData::decode(bytes.as_slice()) else {
+        return;
+    };
+    if decoded.encode_to_vec() != *bytes || message.data.as_ref().is_some_and(|d| *d != decoded) {
+        return;
+    }
+    message.data = Some(decoded);
+    message.data_bytes = None;
+}
+
+/// The encoded bytes of the messages that a proposer takes from its mempool
+/// for one block: `MAX_BLOCK_BYTES` less 1 MiB for the header, the parent
+/// certificate, the system messages and the encoding of the transactions.
+pub const PULL_BYTES: usize = MAX_BLOCK_BYTES - 1024 * 1024;
+
+/// The consensus timing (FIP §4.2). Release values: a devnet uses its
+/// `[consensus]` values.
+pub const BLOCK_TIME: std::time::Duration = std::time::Duration::from_millis(12_000);
+pub const PROPOSE_TIME: std::time::Duration = std::time::Duration::from_millis(6_000);
+pub const PREVOTE_TIME: std::time::Duration = std::time::Duration::from_millis(3_000);
+pub const PRECOMMIT_TIME: std::time::Duration = std::time::Duration::from_millis(3_000);
+pub const STEP_DELTA: std::time::Duration = std::time::Duration::from_millis(1_000);
 /// Protocol version of the first Hypersnap release.
 pub const BLOCK_VERSION: u32 = 1;
 /// Shards whose links a shard-0 block carries.
@@ -249,6 +280,65 @@ pub fn validate_header(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_message_carries_its_content_once() {
+        let data = proto::MessageData {
+            r#type: proto::MessageType::CastAdd as i32,
+            fid: 7,
+            timestamp: 100,
+            network: proto::FarcasterNetwork::Devnet as i32,
+            body: Some(proto::message_data::Body::CastAddBody(proto::CastAddBody {
+                text: "once".into(),
+                ..Default::default()
+            })),
+        };
+        let bytes = data.encode_to_vec();
+        let both = proto::Message {
+            data: Some(data.clone()),
+            data_bytes: Some(bytes.clone()),
+            ..Default::default()
+        };
+        let mut m = both.clone();
+        compact_message(&mut m);
+        assert_eq!(
+            (m.data.as_ref(), m.data_bytes.as_ref()),
+            (Some(&data), None)
+        );
+        assert!(m.encoded_len() < both.encoded_len());
+
+        // `data_bytes` alone: `data` comes from it.
+        let mut m = proto::Message {
+            data_bytes: Some(bytes.clone()),
+            ..Default::default()
+        };
+        compact_message(&mut m);
+        assert_eq!(
+            (m.data.as_ref(), m.data_bytes.as_ref()),
+            (Some(&data), None)
+        );
+
+        // Bytes that are not the canonical encoding, or that differ from
+        // `data`, stay.
+        let mut padded = bytes.clone();
+        padded.extend_from_slice(&[0x98, 0x3e, 0x01]); // an unknown field (995)
+        let mut m = proto::Message {
+            data: Some(data.clone()),
+            data_bytes: Some(padded.clone()),
+            ..Default::default()
+        };
+        compact_message(&mut m);
+        assert_eq!(m.data_bytes, Some(padded));
+        let mut other = data.clone();
+        other.fid = 8;
+        let mut m = proto::Message {
+            data: Some(other),
+            data_bytes: Some(bytes.clone()),
+            ..Default::default()
+        };
+        compact_message(&mut m);
+        assert_eq!(m.data_bytes, Some(bytes));
+    }
 
     fn shard1_block(parent: &ParentInfo, epoch_ref: u64) -> HypersnapBlock {
         let mut block = HypersnapBlock {

@@ -6,7 +6,8 @@ use super::engine::{Shard0Engine, Shard0Inputs, Shard0Proposal};
 use super::reader::Shard0Reader;
 use crate::chain::certificate;
 use crate::chain::proposer::commits_from_certificate;
-use crate::consensus::proposer::{ProposedValues, Proposer};
+use crate::chain::undecided::UndecidedValues;
+use crate::consensus::proposer::Proposer;
 use crate::core::types::{Address, CommitsExt, SnapchainValidatorSet};
 use crate::core::util::FarcasterTime;
 use crate::proto::{self, full_proposal, Commits, FullProposal, Height, HypersnapBlock, ShardHash};
@@ -15,11 +16,11 @@ use informalsystems_malachitebft_core_types::{Round, Validity};
 use prost::Message as _;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 pub struct Shard0Proposer {
     address: Address,
-    proposed: ProposedValues,
+    proposed: UndecidedValues,
     engine: Shard0Engine,
     reader: Shard0Reader,
     inputs: Arc<dyn Shard0Inputs>,
@@ -43,13 +44,23 @@ impl Shard0Proposer {
             Some(h) => h.height,
             None => return Validity::Invalid,
         };
+        let next = self.engine.next_height();
         if Some(height) != full_proposal.height.map(|h| h.block_number)
-            || height != self.engine.next_height()
+            || !(next..=next + 1).contains(&height)
         {
             warn!(height, "Shard-0 proposal is not for the next height");
             return Validity::Invalid;
         }
-        self.proposed.add_proposed_value(full_proposal.clone());
+        // A proposal for the height after the next one comes while the commit
+        // of the next height runs: keep it, so that its decision finds it.
+        self.proposed.add(full_proposal.clone());
+        if height != next {
+            warn!(
+                height,
+                "Shard-0 proposal is for a height that this node has not reached"
+            );
+            return Validity::Invalid;
+        }
         let parent_set = match &block.parent_certificate {
             Some(cert) => match self.reader.epoch_set(cert.epoch) {
                 Ok(Some(set)) => Some(set),
@@ -87,7 +98,7 @@ impl Shard0Proposer {
         let reader = engine.reader();
         Shard0Proposer {
             address,
-            proposed: ProposedValues::new(),
+            proposed: UndecidedValues::new(engine.db().clone()),
             engine,
             reader,
             inputs,
@@ -96,6 +107,14 @@ impl Shard0Proposer {
             decided_tx: None,
             statsd: None,
         }
+    }
+
+    /// Keep the undecided values in `db`, the node-local DB: they are not
+    /// state, and in the shard DB they stayed in blob files until blob GC and
+    /// went into each checkpoint.
+    pub fn with_undecided_db(mut self, db: Arc<crate::storage::db::RocksDB>) -> Self {
+        self.proposed = UndecidedValues::new(db);
+        self
     }
 
     /// Publish each committed block (for the mempool).
@@ -170,15 +189,24 @@ impl Proposer for Shard0Proposer {
             match self.engine.propose(self.inputs.as_ref(), proposal) {
                 Ok(block) => {
                     debug_assert_eq!(block.header.as_ref().unwrap().height, height.block_number);
+                    let encoded = block.encode_to_vec();
+                    info!(
+                        shard = 0,
+                        height = height.block_number,
+                        round = round.as_i64(),
+                        messages = block.messages.len(),
+                        system_messages = block.system_messages.len(),
+                        bytes = encoded.len(),
+                        ms = started.elapsed().as_millis() as u64,
+                        "Proposed a shard block"
+                    );
                     let full = FullProposal {
                         height: Some(height),
                         round: round.as_i64(),
                         proposer: self.address.to_vec(),
-                        proposed_value: Some(full_proposal::ProposedValue::HypersnapBlock(
-                            block.encode_to_vec(),
-                        )),
+                        proposed_value: Some(full_proposal::ProposedValue::HypersnapBlock(encoded)),
                     };
-                    self.proposed.add_proposed_value(full.clone());
+                    self.proposed.add(full.clone());
                     return full;
                 }
                 Err(e) => {
@@ -204,8 +232,8 @@ impl Proposer for Shard0Proposer {
     async fn decide(&mut self, commits: Commits) {
         let value = commits.value.clone().unwrap();
         let height = commits.height.unwrap();
-        let proposal = match self.proposed.get_by_shard_hash(&value) {
-            Some(p) => p.clone(),
+        let proposal = match self.proposed.get(&value) {
+            Some(p) => p,
             None => panic!(
                 "Unable to find proposal for decided value. height {}, shard_hash {}",
                 height,
@@ -259,7 +287,7 @@ impl Proposer for Shard0Proposer {
     }
 
     fn get_proposed_value(&self, shard_hash: &ShardHash) -> Option<FullProposal> {
-        self.proposed.get_by_shard_hash(shard_hash).cloned()
+        self.proposed.get(shard_hash)
     }
 }
 

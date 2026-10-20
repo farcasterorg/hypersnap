@@ -120,6 +120,7 @@ impl ShadowEntries {
             }
             Some(proto::hub_event::Body::MergeFailure(_))
             | Some(proto::hub_event::Body::BlockConfirmedBody(_))
+            | Some(proto::hub_event::Body::ChannelOwnerChangeHintBody(_))
             | None => {}
         }
         entries

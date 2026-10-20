@@ -61,6 +61,16 @@ pub enum RootPrefix {
      * "Gasless" distinguishes these from on-chain signer events and from storage-layer "keys". */
     GaslessKey = 23,
 
+    /* Shard-0 channel slot indexes and per-channel counters. */
+    Channel = 24,
+
+    /* Channel-follow index derived from reactions, on the author's own data shard.
+     * Deliberately NOT a sub-index of `Channel` above: that prefix holds shard-0
+     * channel authority and its data-shard replicas, is scanned wholesale as a test
+     * fixture, and is the natural target of any future "reset the channel replica"
+     * range delete — none of which should touch rows derived from local reactions. */
+    ChannelFollow = 25,
+
     /// Imported HyperBlocks indexed by canonical_block_id. Key: `[40][height BE u64]`,
     /// value: encoded `proto::HyperBlock`.
     HyperBlockByHeight = 40,
@@ -473,6 +483,20 @@ pub enum RootPrefix {
     /// (FIP §16.10). Key: `[146][fid BE u64][keccak256(falcon_key)]`, value:
     /// Farcaster time, BE u64. In the state trie as the stored bytes.
     HyperFalconSignerLastUse = 146,
+    /// Shard 0: the verification records of an FID when shard 0 takes the
+    /// verifications (FIP §17.7). Key: `[147][fid BE u64]`, value: live
+    /// verifications BE u32 ++ removals BE u32.
+    HyperVerificationCount = 147,
+    /// Shard 0: bridge actions (FIP §13.7). `[148][0x01][epoch][action]` →
+    /// vote count, `[148][0x02][epoch][action][node key hash]` → a vote,
+    /// `[148][0x03][epoch][action]` → the action, `[148][0x04][epoch][action]`
+    /// → the height that decided it, `[148][0x05][chain_id BE u32]` → the end
+    /// of a pause (Farcaster time).
+    HyperBridgeAction = 148,
+    /// Shard 0: the epoch seed beacon (FIP §4.9). `[149][0x01][t][node key
+    /// hash]` → a commitment, `[149][0x02][t][node key hash]` → a secret,
+    /// `[149][0x03][e][node key hash]` → a forfeit of the DA reward of `e`.
+    HyperSeedBeacon = 149,
 }
 
 /** Copied from the JS code */
@@ -488,6 +512,10 @@ pub enum UserPostfix {
     UserDataMessage = 6,
     UsernameProofMessage = 7,
     LendStorageMessage = 8,
+    ChannelUpdateMessage = 9,
+    ChannelMemberMessage = 10,
+    ChannelPinMessage = 11,
+    ChannelModerateMessage = 12,
 
     // Add new message types here
     // NOTE: If you add a new message type, make sure that it is only used to store Message protobufs.
@@ -556,6 +584,11 @@ pub enum UserPostfix {
      * counted here — they have their own cap at the L2 KeyRegistry. Absent entry == 0;
      * decrementing to 0 deletes the entry to keep the index sparse. */
     GaslessKeyCountByFid = 107,
+
+    ChannelUpdateAdds = 108,
+    ChannelMemberAdds = 109,
+    ChannelPinAdds = 110,
+    ChannelModerateAdds = 111,
 }
 
 impl UserPostfix {
@@ -575,4 +608,13 @@ pub enum OnChainEventPostfix {
 
     #[allow(dead_code)] // TODO
     IdRegisterByCustodyAddress = 53,
+
+    // Reserved: no by-fid channel index is materialized — the record stores the owner
+    // address only, and resolving it to an fid is left to the read/query layer. Kept to
+    // reserve the discriminant against accidental reuse.
+    #[allow(dead_code)]
+    ChannelRegisterByFid = 54,
+    ChannelRegisterByChannelKey = 55,
+    ChannelRegisterChannelKeyByLabel = 56,
+    ChannelRegisterByOwnerAddress = 57,
 }

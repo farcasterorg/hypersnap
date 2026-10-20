@@ -56,14 +56,16 @@ pub fn challenge(
 
 /// The epoch-start state of each shard (FIP §5.2, §17.7 checkpoints).
 pub trait DaCheckpoints {
-    /// The challenged leaf (`key`, `value`) and the root of the checkpoint
-    /// of `shard_id` for `epoch`. `None` if this node has no checkpoint.
+    /// The challenged leaf (`key`, `value_hash`) and the root of the
+    /// checkpoint of `shard_id` for `epoch`, from the checkpoint trie: the
+    /// check of an answer reads no store. `None` if this node has no
+    /// checkpoint.
     fn expected_leaf(
         &self,
         epoch: u64,
         shard_id: u32,
         target_path: &[u8; 32],
-    ) -> Option<(Vec<u8>, Vec<u8>, [u8; 32])>;
+    ) -> Option<(Vec<u8>, [u8; 32], [u8; 32])>;
 
     /// True if the node runs a certified block without its views (FIP
     /// §4.3): the certificate covers the check of the leaf.
@@ -116,13 +118,18 @@ pub fn da_response(
         ctx.params.num_shards,
     );
     if !checkpoints.certified() {
-        let (key, value, root) = checkpoints
+        let (key, value_hash, root) = checkpoints
             .expected_leaf(ctx.epoch, c.shard_id, &c.target_path)
             .ok_or_else(|| Shard0Error::Internal("no checkpoint for the challenge".into()))?;
-        if body.leaf_key != key || body.leaf_value != value {
+        if body.leaf_key != key || hypersnap_ktrie::value_hash(&body.leaf_value) != value_hash {
             return Err(invalid("the response is not the challenged leaf"));
         }
-        if !hypersnap_ktrie::proof::verify_proof_bytes(&root, &key, Some(&value), &body.proof) {
+        if !hypersnap_ktrie::proof::verify_proof_bytes(
+            &root,
+            &key,
+            Some(&body.leaf_value),
+            &body.proof,
+        ) {
             return Err(invalid(
                 "the proof does not verify against the checkpoint root",
             ));

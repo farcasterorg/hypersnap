@@ -142,7 +142,11 @@ impl HyperV1 {
             }
             ["epoch"] => {
                 let tip = HypersnapBlockStore::new(self.shard0.clone()).last();
-                Ok(json!({ "epoch": tip.and_then(|b| b.header).map_or(0, |h| h.epoch) }))
+                let epoch = tip.and_then(|b| b.header).map_or(0, |h| h.epoch);
+                let seed = crate::chain::shard0::validators::epoch_seed(&txn, epoch)
+                    .map_err(internal)?
+                    .map(|s| hex0x(&s));
+                Ok(json!({ "epoch": epoch, "seed": seed }))
             }
             ["block", height] => {
                 let block = HypersnapBlockStore::new(self.shard0.clone())
@@ -157,6 +161,7 @@ impl HyperV1 {
                     "timestamp": h.timestamp,
                     "state_root": hex0x(&h.state_root),
                     "bridge_lock_root": hex0x(&h.bridge_lock_root),
+                    "bridge_action_hash": hex0x(&h.bridge_action_hash),
                     "messages": block.messages.len(),
                     "system_messages": block.system_messages.len(),
                 }))

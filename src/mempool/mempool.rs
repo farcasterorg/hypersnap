@@ -39,7 +39,7 @@ use crate::version::version::{EngineVersion, ProtocolFeature};
 use governor::{Quota, RateLimiter};
 use moka::sync::{Cache, CacheBuilder};
 use std::num::NonZeroU32;
-use tracing::{error, warn};
+use tracing::{debug, error, info, warn};
 
 type DirectRateLimiter = RateLimiter<NotKeyed, InMemoryState, QuantaClock>;
 
@@ -396,6 +396,10 @@ pub struct MempoolMessagesRequest {
     pub shard_id: u32,
     pub message_tx: oneshot::Sender<Vec<MempoolMessage>>,
     pub max_messages_per_block: u32,
+    /// The encoded bytes of the messages of one pull (a Hypersnap block
+    /// fills by bytes, FIP §4.2). A message that does not fit stays in the
+    /// mempool for a later block. `None`: no limit (snapchain).
+    pub max_bytes: Option<usize>,
 }
 
 pub struct ReadNodeMempool {
@@ -409,6 +413,9 @@ pub struct ReadNodeMempool {
     network: FarcasterNetwork,
     /// After the pivot: the Hypersnap routing of on-chain events (FIP §17.6).
     hypersnap: bool,
+    /// After the pivot: the snapchain engine version of the fork block
+    /// (FIP §17.7).
+    frozen_version: Option<EngineVersion>,
 }
 
 impl ReadNodeMempool {
@@ -431,7 +438,15 @@ impl ReadNodeMempool {
             statsd_client,
             network,
             hypersnap: false,
+            frozen_version: None,
         }
+    }
+
+    /// The snapchain rules version for routing and admission: the fork
+    /// block's version on a Hypersnap node, else the current one.
+    pub fn engine_version(&self) -> EngineVersion {
+        self.frozen_version
+            .unwrap_or_else(|| EngineVersion::current(self.network))
     }
 
     fn message_already_exists(&self, shard: u32, message: &MempoolMessage) -> bool {
@@ -512,11 +527,11 @@ impl ReadNodeMempool {
         let fid_shard = self
             .message_router
             .route_fid(message.fid(), self.num_shards);
+        let version = self.engine_version();
 
         // Fname transfers are mirrored to both the sender and receiver shard.
         match message {
             MempoolMessage::FnameTransfer(_fname_transfer) => {
-                let version = EngineVersion::current(self.network);
                 // Send the username transfer to all other shards, transfers from a->b->c are
                 // correctly tracked. Due to current limitations of the engine, if we transfer from
                 // shard 1 to shard 2, and then transfer within shard 2, we will keep the transfer
@@ -556,6 +571,7 @@ impl ReadNodeMempool {
                     &self.message_router,
                     message,
                     self.num_shards,
+                    version,
                 )]
             }
         }
@@ -663,9 +679,17 @@ pub struct Mempool {
 
 impl Mempool {
     /// Run with the Hypersnap rules (after the pivot).
-    pub fn set_hypersnap(&mut self, shard0_params: crate::chain::shard0::Shard0Params) {
+    /// A Hypersnap node: shard-0 checks with `shard0_params`, and the
+    /// snapchain rules of `engine_version`, the version of the fork block
+    /// (FIP §17.7).
+    pub fn set_hypersnap(
+        &mut self,
+        shard0_params: crate::chain::shard0::Shard0Params,
+        engine_version: EngineVersion,
+    ) {
         self.hypersnap = true;
         self.read_node_mempool.hypersnap = true;
+        self.read_node_mempool.frozen_version = Some(engine_version);
         self.shard0_params = Some(shard0_params);
     }
 
@@ -763,6 +787,8 @@ impl Mempool {
                 // re-propagation when over limit. KEY_REMOVE is intentionally NEVER rate-limited:
                 // revocation of a compromised key must not be blockable. Non-key user messages
                 // fall through to the storage-quota limiter below.
+                // TODO(#10): this is also the hook for lazy `registration_tx_hash` replacement
+                // eviction — wire in once the pending-FID flow lands.
                 if is_key_add(user_msg) {
                     if !self.key_add_rate_limits.consume_for_fid(fid) {
                         self.statsd_client
@@ -800,11 +826,19 @@ impl Mempool {
 
     async fn pull_messages(&mut self, request: MempoolMessagesRequest) {
         let mut messages = vec![];
+        let mut bytes = 0usize;
         while messages.len() < request.max_messages_per_block as usize {
             let shard_messages = self.messages.get_mut(&request.shard_id);
             match shard_messages {
                 None => break,
                 Some(shard_messages) => {
+                    if let (Some(max), Some((_, next))) =
+                        (request.max_bytes, shard_messages.first_key_value())
+                    {
+                        if !messages.is_empty() && bytes + next.encoded_len() > max {
+                            break;
+                        }
+                    }
                     match shard_messages.pop_first() {
                         None => break,
                         Some((key, next_message)) => {
@@ -820,6 +854,7 @@ impl Mempool {
                             let result =
                                 self.message_is_valid(request.shard_id, &next_message, false);
                             if result.is_ok() {
+                                bytes += next_message.encoded_len();
                                 messages.push(next_message);
                             }
                         }
@@ -828,8 +863,20 @@ impl Mempool {
             }
         }
 
-        if let Err(_) = request.message_tx.send(messages) {
-            error!("Unable to send message from mempool");
+        if let Err(messages) = request.message_tx.send(messages) {
+            // The proposer stopped waiting: the messages stay for a later
+            // pull.
+            warn!(
+                count = messages.len(),
+                "A proposer did not wait for its messages; they stay in the mempool"
+            );
+            for message in messages {
+                self.index_live_at_insert(request.shard_id, &message);
+                self.messages
+                    .entry(request.shard_id)
+                    .or_default()
+                    .insert(message.mempool_key(), message);
+            }
         }
     }
 
@@ -851,11 +898,27 @@ impl Mempool {
                 ));
             }
         }
-        // Pre-feature admission gate for KEY_ADD / KEY_REMOVE.
+        // Pre-feature admission gate for KEY_ADD / KEY_REMOVE. Provisional until
+        // NEYN-10619 consolidates feature-gating into a single validate_user_message
+        // hook at mempool admission.
         if let MempoolMessage::UserMessage(user_msg) = message {
             let msg_type = user_msg.msg_type();
+            if matches!(
+                msg_type,
+                MessageType::ChannelUpdate
+                    | MessageType::ChannelMember
+                    | MessageType::ChannelPin
+                    | MessageType::ChannelModerate
+            ) {
+                let version = self.read_node_mempool.engine_version();
+                if !version.is_enabled(ProtocolFeature::ChannelMessages) {
+                    return Err(HubError::validation_failure(
+                        "channel messages not yet active",
+                    ));
+                }
+            }
             if matches!(msg_type, MessageType::KeyAdd | MessageType::KeyRemove) {
-                let version = EngineVersion::current(self.read_node_mempool.network);
+                let version = self.read_node_mempool.engine_version();
                 if !version.is_enabled(ProtocolFeature::GaslessSigners) {
                     return Err(HubError::validation_failure(
                         "gasless signers not yet active",
@@ -885,8 +948,11 @@ impl Mempool {
         if at_admission {
             self.check_fid0(shard, message)?;
         }
-        // Rate-limit checks are token-consuming. Run only at admission; re-running
-        // at pull time would double-charge the 1/min KEY_ADD quota.
+        // Rate-limit checks are token-consuming (the KEY_ADD limiter uses
+        // `governor::RateLimiter::check`, which decrements the bucket). They must run
+        // exactly once, at admission. Re-running them at pull time would double-charge
+        // the 1/min KEY_ADD quota and silently drop every accepted message before it
+        // ever reached the engine.
         if at_admission && self.message_exceeds_rate_limits(message) {
             self.statsd_client
                 .count_with_shard(shard, "mempool.rate_limit_hit", 1, vec![]);
@@ -970,9 +1036,14 @@ impl Mempool {
 
     async fn insert(
         &mut self,
-        message: MempoolMessage,
+        mut message: MempoolMessage,
         source: MempoolSource,
     ) -> Result<(), HubError> {
+        if self.hypersnap {
+            if let MempoolMessage::UserMessage(m) = &mut message {
+                crate::chain::block::compact_message(m);
+            }
+        }
         let shard_ids = self.read_node_mempool.route_mempool_message(&message);
 
         let mut errors = vec![];
@@ -981,11 +1052,20 @@ impl Mempool {
                 .insert_into_shard(shard_id, message.clone(), source.clone())
                 .await
             {
-                error!(
-                    shard_id = shard_id.to_string(),
-                    "Unable to insert message into mempool for shard: {}",
-                    err.to_string()
-                );
+                // A duplicate is normal: a message comes from several peers.
+                if err.code == "bad_request.duplicate" {
+                    debug!(
+                        shard_id = shard_id.to_string(),
+                        "Message already in the mempool: {}",
+                        err.to_string()
+                    );
+                } else {
+                    error!(
+                        shard_id = shard_id.to_string(),
+                        "Unable to insert message into mempool for shard: {}",
+                        err.to_string()
+                    );
+                }
                 errors.push(err)
             }
         }
@@ -1007,12 +1087,20 @@ impl Mempool {
         match self.messages.get_mut(&shard_id) {
             Some(shard_messages) => {
                 if shard_messages.contains_key(&message.mempool_key()) {
+                    // Exit early if the message already exists in the mempool
                     return Err(HubError::duplicate("message already in the mempool"));
                 }
             }
             None => {}
         }
 
+        // TODO(topocount): Maybe we don't need to run validations here? Related: rate-limit
+        // checks (the only token-consuming part of `message_is_valid`) should ideally be
+        // pulled out of `message_is_valid` entirely and run once, inline at this admission
+        // entry point. That would let `pull_messages` drop the `at_admission` flag and call
+        // a pure idempotent `message_is_valid` with no risk of accidentally re-charging the
+        // limiter. The flag exists today as the minimal-surgery fix; the cleaner split is
+        // deferred until the surrounding admission validations are reworked.
         // FIP-268 LIVE_AT mempool parity with upstream snapchain
         // (farcasterxyz/snapchain#899, c292bfd): the old pending
         // LIVE_AT must be evicted ONLY in the `result.is_ok()`
@@ -1020,7 +1108,6 @@ impl Mempool {
         // (feature gate, post-merge duplicate, rate limit) must
         // not displace the prior pending one.
         let live_at_to_replace = self.prepare_live_at_insert(shard_id, &message)?;
-
         let result = self.message_is_valid(shard_id, &message, true);
         if result.is_ok() {
             if let Some(old_key) = live_at_to_replace {
@@ -1191,7 +1278,9 @@ impl Mempool {
                                     }
                                 }
                                 Err(mpsc::error::TryRecvError::Disconnected) => {
-                                    panic!("Mempool tx is disconnected")
+                                    // Every sender is gone: the node is stopping.
+                                    info!("Mempool request channel closed; stopping the mempool");
+                                    return;
                                 }
                                 Err(mpsc::error::TryRecvError::Empty) => {
                                     break;

@@ -51,6 +51,41 @@ impl CastHashIndexer {
         }
     }
 
+    /// Record a hash → FID mapping found outside the event stream, such as by
+    /// a store probe for a cast older than the indexed event window.
+    pub fn record(&self, hash: &[u8], fid: u64) {
+        if let Err(e) = self.db.put(&Self::make_key(hash), &fid.to_be_bytes()) {
+            tracing::warn!(error = %e, "Failed to record cast hash mapping");
+        }
+    }
+
+    /// Record hash → FID mappings for casts authored by `fid`, writing only
+    /// the hashes the index does not already hold.
+    pub fn record_many(&self, fid: u64, hashes: &[Vec<u8>]) {
+        if hashes.is_empty() {
+            return;
+        }
+        let keys: Vec<Vec<u8>> = hashes.iter().map(|hash| Self::make_key(hash)).collect();
+        let existing = match self.db.get_many(&keys) {
+            Ok(values) => values,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to check cast hash mappings");
+                return;
+            }
+        };
+        let mut txn = RocksDbTransactionBatch::new();
+        for (key, value) in keys.into_iter().zip(existing) {
+            if value.is_empty() {
+                txn.put(key, fid.to_be_bytes().to_vec());
+            }
+        }
+        if txn.len() > 0 {
+            if let Err(e) = self.db.commit(txn) {
+                tracing::warn!(error = %e, "Failed to record cast hash mappings");
+            }
+        }
+    }
+
     fn process_message(&self, message: &Message, txn: &mut RocksDbTransactionBatch) {
         let Some(data) = &message.data else { return };
 

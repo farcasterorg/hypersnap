@@ -333,6 +333,7 @@ impl BackfillManager {
                 Some(IndexEvent::hub_event(event.clone(), shard_id))
             }
             hub_event::Body::MergeFailure(_) => None,
+            hub_event::Body::ChannelOwnerChangeHintBody(_) => None,
             hub_event::Body::BlockConfirmedBody(body) => Some(IndexEvent::block_committed(
                 body.shard_index,
                 body.block_number,

@@ -469,24 +469,25 @@ pub struct ScoringState {
 }
 
 /// Build the post-transfer follow graph for the FIDs of `metrics`.
-fn follow_graph<R: SnapchainStateReader + ?Sized>(
+fn follow_graph<R: SnapchainStateReader + Sync + ?Sized>(
     reader: &R,
     fids: impl Iterator<Item = u64>,
 ) -> Result<BTreeMap<u64, Vec<u64>>, ScoringError> {
-    let mut graph: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
-    for f in fids {
+    let fids: Vec<u64> = fids.collect();
+    let reads = crate::reader::read_per_fid(&fids, |f| {
         let mut followees = reader.followees(f)?;
         followees.sort_unstable();
         followees.dedup();
-        if !followees.is_empty() {
-            graph.insert(f, followees);
-        }
-    }
-    Ok(graph)
+        Ok(followees)
+    })?;
+    Ok(reads
+        .into_iter()
+        .filter(|(_, followees)| !followees.is_empty())
+        .collect())
 }
 
 /// Run the PoQ + Growth pipeline (steps 1–7 of the module docs).
-pub fn score_fids<R: SnapchainStateReader + ?Sized>(
+pub fn score_fids<R: SnapchainStateReader + Sync + ?Sized>(
     reader: &R,
     now_unix: u64,
     seed_set: &BTreeSet<u64>,
@@ -522,7 +523,7 @@ pub fn score_fids<R: SnapchainStateReader + ?Sized>(
 /// - DataAvailability: [`crate::da_pow::compute_da_pow_rewards`] with
 ///   `boundary_height = PIVOT_HEIGHT_0 + (epoch − 1) · EPOCH_LENGTH`
 ///   from `params.pivot_height_0` / `params.epoch_length_blocks`.
-pub fn evaluate_epoch<R: SnapchainStateReader + ?Sized>(
+pub fn evaluate_epoch<R: SnapchainStateReader + Sync + ?Sized>(
     reader: &R,
     epoch: u64,
     now_unix: u64,

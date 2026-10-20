@@ -92,20 +92,24 @@ impl Shard0Inputs for NodeViews {
         let local = self.shards.get(&shard)?;
         let mut out = Vec::new();
         for height in after.max(local.genesis.height) + 1..=upto {
-            let block = local.store.get(height)?;
-            let charges = crate::chain::replica::charges_of_block(&local.db, height).ok()?;
-            if charges.is_empty() {
-                continue;
+            // The round of block `height` is the one of the parent
+            // certificate of the next block: the same on every node. Nodes
+            // that decided the block can have certificates of different
+            // rounds (§4.7, §12).
+            let cert = local.store.get(height + 1)?.parent_certificate?;
+            if cert.height != height {
+                return None;
             }
-            let header = block.header?;
-            let cert = block.certificate?;
-            let set = self.reader.epoch_set(header.epoch).ok()??;
+            let charges = crate::chain::replica::charges_of_block(&local.db, height).ok()?;
+            let set = self.reader.epoch_set(cert.epoch).ok()??;
             let proposer = set.proposer(shard, height, cert.round);
             out.push(FeeSettlement {
                 shard_id: shard,
                 height,
                 charges,
                 proposer_fid: proposer.fid,
+                epoch: cert.epoch,
+                round: cert.round,
             });
         }
         Some(out)

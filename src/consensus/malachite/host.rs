@@ -265,13 +265,16 @@ impl Host {
 
                 // Only publish decided values if you're the proposer to reduce network traffic
                 if proposed_value.proposer_address() == state.shard_validator.get_address() {
-                    state
+                    // The gossip task is gone only at shutdown.
+                    if let Err(e) = state
                         .gossip_tx
                         .send(GossipEvent::BroadcastDecidedValue(proto::DecidedValue {
                             value: decided_value,
                         }))
                         .await
-                        .unwrap();
+                    {
+                        warn!("Could not publish a decided value: {}", e);
+                    }
                 }
 
                 let elapsed = now.elapsed();

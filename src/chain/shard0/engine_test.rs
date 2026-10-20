@@ -7,156 +7,14 @@ use super::state::BlockState;
 use super::test_support::*;
 use crate::chain::block::seal;
 use crate::proto::{
-    self, message_data::Body, CustodyMigrationBody, CustodyRotationBody, FarcasterNetwork,
-    HyperInboundBurn, HyperValidatorEventBody, HyperValidatorEventType, IdRegisterEventType,
-    KeyAddBody, MessageData, MessageType, NodeAttestationBody, OnChainEvent, SpendKeyAddBody,
-    TokenEscrowClaimBody, TokenTransferBody, ValidatorRecord,
+    self, message_data::Body, CustodyRotationBody, FarcasterNetwork, HyperInboundBurn,
+    HyperValidatorEventBody, HyperValidatorEventType, KeyAddBody, MessageData, MessageType,
+    NodeAttestationBody, OnChainEvent, SpendKeyAddBody, TokenEscrowClaimBody, TokenTransferBody,
+    ValidatorRecord,
 };
 use alloy_signer_local::PrivateKeySigner;
 use hypersnap_falcon::{domains, FalconSecretKey};
 use prost::Message as _;
-
-fn data(fid: u64, t: MessageType, body: Body, timestamp: u64) -> MessageData {
-    MessageData {
-        r#type: t as i32,
-        fid,
-        timestamp: timestamp as u32,
-        network: FarcasterNetwork::Devnet as i32,
-        body: Some(body),
-    }
-}
-
-fn id_register(fid: u64, custody: &[u8], n: u8) -> OnChainEvent {
-    OnChainEvent {
-        r#type: proto::OnChainEventType::EventTypeIdRegister as i32,
-        chain_id: 10,
-        block_number: 1_000 + n as u32,
-        block_timestamp: 1_700_000_000,
-        transaction_hash: vec![n; 32],
-        log_index: 0,
-        fid,
-        version: 1,
-        body: Some(proto::on_chain_event::Body::IdRegisterEventBody(
-            proto::IdRegisterEventBody {
-                to: custody.to_vec(),
-                event_type: IdRegisterEventType::Register as i32,
-                ..Default::default()
-            },
-        )),
-        ..Default::default()
-    }
-}
-
-fn burn(fid: u64, amount: u64, n: u8) -> HyperInboundBurn {
-    HyperInboundBurn {
-        source_chain_id: 1,
-        burn_id: vec![n; 32],
-        recipient_fid: fid,
-        amount,
-        ..Default::default()
-    }
-}
-
-fn eth(seed: u8) -> PrivateKeySigner {
-    PrivateKeySigner::from_bytes(&[seed; 32].into()).unwrap()
-}
-
-fn balance(net: &Net, fid: u64) -> u64 {
-    let state = BlockState::new(net.nodes[0].engine.db().clone());
-    let txn = state.txn();
-    txn.get_u64(&keys::balance(fid)).unwrap()
-}
-
-fn read<T: prost::Message + Default>(net: &Net, key: &[u8]) -> Option<T> {
-    let state = BlockState::new(net.nodes[0].engine.db().clone());
-    let txn = state.txn();
-    txn.get_proto(key).unwrap()
-}
-
-fn block_time(net: &Net) -> u64 {
-    net.proposal(vec![]).timestamp
-}
-
-fn migration(
-    net: &Net,
-    fid: u64,
-    custody: &FalconSecretKey,
-    eth_signer: &PrivateKeySigner,
-) -> proto::Message {
-    let mut body = CustodyMigrationBody {
-        falcon_custody_key: falcon_public(custody),
-        nonce: 0,
-        deadline: (block_time(net) + 3_600) as u32,
-        ..Default::default()
-    };
-    let unsigned = data(
-        fid,
-        MessageType::CustodyMigration,
-        Body::CustodyMigrationBody(body.clone()),
-        block_time(net),
-    );
-    body.eip712_signature = eip712_sign(
-        eth_signer,
-        super::auth::EIP712_CUSTODY_MIGRATION,
-        &unsigned.encode_to_vec(),
-    );
-    falcon_message(
-        custody,
-        data(
-            fid,
-            MessageType::CustodyMigration,
-            Body::CustodyMigrationBody(body),
-            block_time(net),
-        ),
-    )
-}
-
-fn transfer(
-    net: &Net,
-    fid: u64,
-    key: &FalconSecretKey,
-    to: u64,
-    amount: u64,
-    nonce: u64,
-) -> proto::Message {
-    falcon_message(
-        key,
-        data(
-            fid,
-            MessageType::TokenTransfer,
-            Body::TokenTransferBody(TokenTransferBody {
-                recipient_fid: to,
-                amount,
-                nonce,
-                memo: vec![],
-            }),
-            block_time(net),
-        ),
-    )
-}
-
-/// Pivot block, then FIDs 1000 (migrated, funded) and 2000.
-fn funded_net() -> (Net, FalconSecretKey, PrivateKeySigner) {
-    let mut net = Net::new(3);
-    net.run_empty();
-    let owner = eth(5);
-    let other = eth(6);
-    let mut p = net.proposal(vec![]);
-    p.onchain_events = vec![
-        id_register(1000, owner.address().as_slice(), 1),
-        id_register(2000, other.address().as_slice(), 2),
-    ];
-    p.inbound_burns = vec![burn(1000, 100_000_000, 1)];
-    let b = net.run(p);
-    assert_eq!(b.system_messages.len(), 3);
-    assert_eq!(balance(&net, 1000), 100_000_000);
-
-    let custody = falcon(11);
-    let m = migration(&net, 1000, &custody, &owner);
-    let b = net.run(net.proposal(vec![m]));
-    assert_eq!(b.messages.len(), 1, "migration accepted");
-    (net, custody, owner)
-}
 
 #[test]
 fn pivot_and_epoch_boundaries_agree_across_nodes() {
@@ -442,36 +300,46 @@ fn registration(
     )
 }
 
-#[test]
-fn validator_registration_joins_two_epochs_later() {
-    let (mut net, custody, _) = funded_net();
-    let node_key = falcon(31);
+/// FID 1000 attests `node_key` (account nonce `nonce`).
+fn attest_node_key(
+    net: &mut Net,
+    custody: &FalconSecretKey,
+    node_key: &FalconSecretKey,
+    nonce: u64,
+) {
     let mut body = NodeAttestationBody {
-        node_public_key: falcon_public(&node_key),
-        nonce: 1,
+        node_public_key: falcon_public(node_key),
+        nonce,
         ..Default::default()
     };
     let unsigned = data(
         1000,
         MessageType::NodeAttestation,
         Body::NodeAttestationBody(body.clone()),
-        block_time(&net),
+        block_time(net),
     );
     body.node_signature = falcon_sign(
-        &node_key,
+        node_key,
         domains::NODE_ATTESTATION_POP,
         &unsigned.encode_to_vec(),
     );
     let att = falcon_message(
-        &custody,
+        custody,
         data(
             1000,
             MessageType::NodeAttestation,
             Body::NodeAttestationBody(body),
-            block_time(&net),
+            block_time(net),
         ),
     );
     assert_eq!(net.run(net.proposal(vec![att])).messages.len(), 1);
+}
+
+#[test]
+fn validator_registration_joins_two_epochs_later() {
+    let (mut net, custody, _) = funded_net();
+    let node_key = falcon(31);
+    attest_node_key(&mut net, &custody, &node_key, 1);
 
     let consensus = falcon(77);
     let consensus_hash = super::auth::falcon_key_hash(&falcon_public(&consensus));
@@ -532,6 +400,321 @@ fn validator_registration_joins_two_epochs_later() {
     }
     let set = net.nodes[0].engine.epoch_set(epoch + 2).unwrap().unwrap();
     assert!(set.record.members.iter().any(|m| m.fid == 1000));
+}
+
+fn tip_epoch(net: &Net) -> u64 {
+    net.nodes[0].engine.tip().unwrap().header.unwrap().epoch
+}
+
+fn validator_record(net: &Net, hash: &[u8]) -> ValidatorRecord {
+    read(net, &keys::validator(hash)).unwrap()
+}
+
+/// Run one block. If `missing` is the round-0 proposer of the block, the
+/// block is decided in round 1, so that `missing` misses its proposal
+/// (§4.7). The next block records the miss.
+fn run_missing(net: &mut Net, missing: &[u8]) {
+    let height = net.next_height();
+    let epoch = params().epochs.epoch_of(height).unwrap();
+    let set = net.nodes[0].engine.epoch_set(epoch).unwrap().unwrap();
+    let round = u32::from(set.proposer(0, height, 0).consensus_key_hash == missing);
+    let p = net.proposal(vec![]);
+    net.run_at_round(p, round);
+}
+
+/// Run blocks with `missing` missing its proposals until `done`.
+fn miss_until(net: &mut Net, missing: &[u8], done: impl Fn(&ValidatorRecord) -> bool) {
+    for _ in 0..200 {
+        if done(&validator_record(net, missing)) {
+            return;
+        }
+        run_missing(net, missing);
+    }
+    panic!("{:?}", validator_record(net, missing));
+}
+
+/// Register FID 1000 as a validator (node key 31, consensus key 77, account
+/// nonce `nonce`): it joins two epochs later. Returns the consensus key hash.
+fn register_1000(net: &mut Net, custody: &FalconSecretKey, nonce: u64) -> Vec<u8> {
+    let node_key = falcon(31);
+    attest_node_key(net, custody, &node_key, nonce);
+    let consensus = falcon(77);
+    let reg = registration(
+        net,
+        custody,
+        &consensus,
+        domains::VALIDATOR_CONSENSUS_POP,
+        &node_key,
+    );
+    assert_eq!(net.run(net.proposal(vec![reg])).messages.len(), 1);
+    super::auth::falcon_key_hash(&falcon_public(&consensus)).to_vec()
+}
+
+/// A `VALIDATOR_DEREGISTER` of `validator` by the account key of FID 1000.
+fn deregistration(net: &Net, custody: &FalconSecretKey, validator: &[u8]) -> proto::Message {
+    falcon_message(
+        custody,
+        data(
+            1000,
+            MessageType::ValidatorDeregister,
+            Body::ValidatorEventBody(HyperValidatorEventBody {
+                event_type: HyperValidatorEventType::Deregister as i32,
+                validator_key: validator.to_vec(),
+                registration_epoch: tip_epoch(net),
+                ..Default::default()
+            }),
+            block_time(net),
+        ),
+    )
+}
+
+fn members(net: &Net, epoch: u64) -> Vec<Vec<u8>> {
+    net.nodes[0]
+        .engine
+        .set_record(epoch)
+        .unwrap()
+        .unwrap()
+        .members
+        .into_iter()
+        .map(|m| m.consensus_key_hash)
+        .collect()
+}
+
+/// §4.7: a validator that misses `AUTO_DEREGISTER_THRESHOLD` consecutive
+/// proposals leaves the set two epochs after the block that finds it.
+#[test]
+fn a_validator_that_misses_its_proposals_leaves_two_epochs_later() {
+    let mut p = params();
+    p.auto_deregister_threshold = 3;
+    let mut net = Net::with_params(3, p);
+    net.run_empty();
+    let x = members(&net, 1)[0].clone();
+
+    miss_until(&mut net, &x, |r| r.auto_deregistered);
+    let record = validator_record(&net, &x);
+    assert_eq!(record.consecutive_missed, 3);
+    assert_eq!(record.leave_epoch, tip_epoch(&net) + 2);
+    assert!(!record.inactive);
+
+    while tip_epoch(&net) < record.leave_epoch {
+        net.run_empty();
+    }
+    let set = members(&net, record.leave_epoch);
+    assert_eq!(set.len(), 3);
+    assert!(!set.contains(&x));
+}
+
+/// §4.7: the missed proposals of shards 1 and 2 count too. Shard 0 reads
+/// the round of each shard-s block from its `FeeSettlement`.
+#[test]
+fn missed_proposals_of_shards_1_and_2_count() {
+    let mut net = Net::new(3);
+    net.run_empty();
+    let set = net.nodes[0].engine.epoch_set(1).unwrap().unwrap();
+    let x = members(&net, 1)[0].clone();
+    // The shard-1 heights 1 to 12 that `x` proposes in round 0 are decided
+    // in round 1.
+    let mut shard1_misses = 0;
+    for k in 1..=12u64 {
+        if set.proposer(1, k, 0).consensus_key_hash == x {
+            net.inputs.settlements.lock().unwrap().insert(
+                (1, k),
+                proto::FeeSettlement {
+                    shard_id: 1,
+                    height: k,
+                    proposer_fid: set.proposer(1, k, 1).fid,
+                    epoch: 1,
+                    round: 1,
+                    ..Default::default()
+                },
+            );
+            shard1_misses += 1;
+        }
+    }
+    assert!(shard1_misses >= 2);
+    // Shard 0 also decides the heights of `x` in round 1, so that no
+    // proposal of `x` is decided.
+    let mut shard0_misses = 0;
+    for h in 101..=115u64 {
+        if h <= 114 && set.proposer(0, h, 0).consensus_key_hash == x {
+            shard0_misses += 1;
+        }
+        run_missing(&mut net, &x);
+    }
+    assert_eq!(
+        validator_record(&net, &x).consecutive_missed,
+        shard0_misses + shard1_misses
+    );
+
+    // A settlement with a wrong proposer is not valid.
+    let settled = BlockState::new(net.nodes[0].engine.db().clone())
+        .txn()
+        .get_u64(&keys::settled_height(1))
+        .unwrap();
+    assert_eq!(settled, 14, "the block below the link");
+    let k = settled + 1;
+    net.inputs.settlements.lock().unwrap().insert(
+        (1, k),
+        proto::FeeSettlement {
+            shard_id: 1,
+            height: k,
+            proposer_fid: set.proposer(1, k, 0).fid + 1,
+            epoch: 1,
+            round: 0,
+            ..Default::default()
+        },
+    );
+    let p = net.proposal(vec![]);
+    let e = net.nodes[0].engine.propose(&net.inputs, p).unwrap_err();
+    assert!(e.to_string().contains("proposer_fid"), "{}", e);
+}
+
+/// §4.8: an auto-deregistration that leaves fewer than `MIN_VALIDATORS`
+/// marks the validator `INACTIVE`; it stays in the set and the rebalance
+/// window asks for new validators. A proposal does not end `INACTIVE`.
+#[test]
+fn an_inactive_validator_stays_in_the_set() {
+    let mut p = params();
+    p.auto_deregister_threshold = 3;
+    p.min_validators = 4;
+    let mut net = Net::with_params(3, p);
+    net.run_empty();
+    let x = members(&net, 1)[0].clone();
+
+    miss_until(&mut net, &x, |r| r.inactive);
+    let record = validator_record(&net, &x);
+    assert_eq!(record.leave_epoch, 0);
+    assert!(!record.auto_deregistered);
+    let epoch = tip_epoch(&net);
+    assert_eq!(
+        crate::chain::transitions::transition(&record, epoch + 1),
+        proto::TransitionType::TransitionInactive
+    );
+    // It misses more proposals and stays.
+    miss_until(&mut net, &x, |r| r.consecutive_missed >= 5);
+    assert!(validator_record(&net, &x).inactive);
+    while tip_epoch(&net) < epoch + 2 {
+        run_missing(&mut net, &x);
+    }
+    assert!(members(&net, epoch + 2).contains(&x));
+
+    // Its next proposal is decided: the count of misses starts again, and it
+    // stays `INACTIVE`.
+    for _ in 0..8 {
+        net.run_empty();
+    }
+    let record = validator_record(&net, &x);
+    assert!(record.inactive);
+    assert_eq!(record.consecutive_missed, 0);
+}
+
+/// §4.8: a new registration of the key ends `INACTIVE`.
+#[test]
+fn a_registration_ends_inactive() {
+    let mut p = params();
+    p.auto_deregister_threshold = 3;
+    p.min_validators = 5;
+    let (mut net, custody, _) = funded_net_with(p);
+    let new = register_1000(&mut net, &custody, 1);
+    let join = validator_record(&net, &new).join_epoch;
+    while tip_epoch(&net) < join {
+        net.run_empty();
+    }
+    miss_until(&mut net, &new, |r| r.inactive);
+    assert_eq!(validator_record(&net, &new).leave_epoch, 0);
+
+    let reg = registration(
+        &net,
+        &custody,
+        &falcon(77),
+        domains::VALIDATOR_CONSENSUS_POP,
+        &falcon(31),
+    );
+    assert_eq!(net.run(net.proposal(vec![reg])).messages.len(), 1);
+    let record = validator_record(&net, &new);
+    assert!(!record.inactive);
+    assert_eq!(record.consecutive_missed, 0);
+    assert_eq!(record.leave_epoch, 0);
+}
+
+/// §4.8: an `INACTIVE` validator leaves when the set has room for its
+/// departure; a deregistration that leaves fewer than `MIN_VALIDATORS` is
+/// not valid.
+#[test]
+fn an_inactive_validator_leaves_when_a_new_validator_registers() {
+    let mut p = params();
+    p.auto_deregister_threshold = 3;
+    p.min_validators = 4;
+    let (mut net, custody, _) = funded_net_with(p);
+    let x = members(&net, 1)[0].clone();
+    miss_until(&mut net, &x, |r| r.inactive);
+
+    let new = register_1000(&mut net, &custody, 1);
+    miss_until(&mut net, &x, |r| r.auto_deregistered);
+    let record = validator_record(&net, &x);
+    assert!(!record.inactive);
+    while tip_epoch(&net) < record.leave_epoch {
+        net.run_empty();
+    }
+    let set = members(&net, record.leave_epoch);
+    assert_eq!(set.len(), 4);
+    assert!(set.contains(&new) && !set.contains(&x));
+
+    // FID 1000 cannot leave now: the set would have 3 validators.
+    let m = deregistration(&net, &custody, &new);
+    let r = net.nodes[0]
+        .engine
+        .simulate_messages(&[m], block_time(&net));
+    assert!(
+        matches!(&r[0], Err(e) if e.to_string().contains("fewer than MIN_VALIDATORS")),
+        "{:?}",
+        r[0]
+    );
+}
+
+/// §4.7: a registration during the two-epoch buffer cancels the
+/// auto-deregistration; §4.5: a voluntary deregistration leaves two epochs
+/// later.
+#[test]
+fn a_registration_in_the_buffer_cancels_the_auto_deregistration() {
+    let mut p = params();
+    p.auto_deregister_threshold = 3;
+    let (mut net, custody, _) = funded_net_with(p);
+    let new = register_1000(&mut net, &custody, 1);
+    let join = validator_record(&net, &new).join_epoch;
+    while tip_epoch(&net) < join {
+        net.run_empty();
+    }
+
+    miss_until(&mut net, &new, |r| r.auto_deregistered);
+    let leave = validator_record(&net, &new).leave_epoch;
+    assert_eq!(leave, tip_epoch(&net) + 2);
+    let reg = registration(
+        &net,
+        &custody,
+        &falcon(77),
+        domains::VALIDATOR_CONSENSUS_POP,
+        &falcon(31),
+    );
+    assert_eq!(net.run(net.proposal(vec![reg])).messages.len(), 1);
+    let record = validator_record(&net, &new);
+    assert_eq!(record.leave_epoch, 0);
+    assert!(!record.auto_deregistered);
+    assert_eq!(record.consecutive_missed, 0);
+    while tip_epoch(&net) < leave {
+        net.run_empty();
+    }
+    assert!(members(&net, leave).contains(&new));
+
+    // A voluntary deregistration (4 validators stay).
+    let m = deregistration(&net, &custody, &new);
+    assert_eq!(net.run(net.proposal(vec![m])).messages.len(), 1);
+    let leave = validator_record(&net, &new).leave_epoch;
+    assert_eq!(leave, tip_epoch(&net) + 2);
+    while tip_epoch(&net) < leave {
+        net.run_empty();
+    }
+    assert!(!members(&net, leave).contains(&new));
 }
 
 #[test]
@@ -1321,7 +1504,9 @@ fn signature_acceptance_matrix() {
     );
 
     // FID 1000 (migrated): a signer pair (gasless Ed25519 key P with
-    // Falcon-512 key PF; request FID 2000) and a Falcon-512 signer F.
+    // Falcon-512 key PF; request FID 2000) and a Falcon-512 signer F. A pair
+    // has snapchain scopes only, so that snapchain accepts its relayed
+    // KEY_ADD; a Hypersnap type is a scope of a Falcon-512 signer.
     let p_key = ed25519_dalek::SigningKey::from_bytes(&[22u8; 32]);
     let pf = falcon(23);
     let t = block_time(&net) as u32;
@@ -1331,7 +1516,7 @@ fn signature_acceptance_matrix() {
         2000,
         &other_owner,
         &p_key,
-        vec![MessageType::NodeAttestation, MessageType::CastAdd],
+        vec![MessageType::CastAdd],
         3_600,
         1,
         t + 3_600,
@@ -1480,13 +1665,13 @@ fn signature_acceptance_matrix() {
         "1000 Ed25519 half"
     );
     assert!(
-        attest(&mut net, 1000, &|d| dual_message(
+        !attest(&mut net, 1000, &|d| dual_message(
             &p_key,
             &pf,
             d,
             Default::default()
         )),
-        "1000 pair"
+        "1000 pair: NODE_ATTESTATION is not in its scopes"
     );
     assert!(
         !attest(&mut net, 1000, &|d| dual_message(
@@ -1510,7 +1695,7 @@ fn signature_acceptance_matrix() {
         "1000 account key"
     );
     assert!(
-        pay(&mut net, 1000, 4, &|d| falcon_message(&custody, d)),
+        pay(&mut net, 1000, 3, &|d| falcon_message(&custody, d)),
         "1000 transfer by account key"
     );
 
@@ -1761,4 +1946,531 @@ fn hyper_v1_reads_the_shard0_state() {
 
     assert_eq!(read("nope"), Err(ReadError::NotFound));
     assert!(matches!(read("rewards/x"), Err(ReadError::BadRequest(_))));
+}
+
+/// FIP §17.7: when the snapchain rules put verifications on the block shard
+/// (V21), shard 0 merges them with no fee, keeps the records of each FID
+/// under `MAX_VERIFICATIONS_PER_FID`, and sends each one to the FID's shard.
+#[test]
+fn shard0_takes_verifications_when_the_rules_put_them_there() {
+    use super::verifications::MAX_VERIFICATIONS_PER_FID;
+    let (mut net, _custody, _owner) = funded_net();
+    let s2 = signer_of_2000(&mut net);
+
+    let address = |i: u32| {
+        let mut a = vec![0xA5u8; 20];
+        a[..4].copy_from_slice(&i.to_be_bytes());
+        a
+    };
+    // Contract verifications: the claim is checked by an L1 call at
+    // admission, not by the block rules.
+    let add = |net: &Net, i: u32| {
+        ed25519_message(
+            &s2,
+            data(
+                2000,
+                MessageType::VerificationAddEthAddress,
+                Body::VerificationAddAddressBody(proto::VerificationAddAddressBody {
+                    address: address(i),
+                    verification_type: 1,
+                    block_hash: vec![0xB6; 32],
+                    ..Default::default()
+                }),
+                block_time(net),
+            ),
+        )
+    };
+    let remove = |net: &Net, i: u32| {
+        ed25519_message(
+            &s2,
+            data(
+                2000,
+                MessageType::VerificationRemove,
+                Body::VerificationRemoveBody(proto::VerificationRemoveBody {
+                    address: address(i),
+                    protocol: 0,
+                }),
+                block_time(net),
+            ),
+        )
+    };
+    let counts = |net: &Net| {
+        let state = BlockState::new(net.nodes[0].engine.db().clone());
+        state
+            .txn()
+            .get(&keys::verification_counts(2000))
+            .unwrap()
+            .map(|v| {
+                (
+                    u32::from_be_bytes(v[0..4].try_into().unwrap()),
+                    u32::from_be_bytes(v[4..8].try_into().unwrap()),
+                )
+            })
+            .unwrap_or((0, 0))
+    };
+
+    let b = net.run(net.proposal(vec![add(&net, 0)]));
+    assert_eq!(b.messages.len(), 1, "verification on shard 0");
+    assert_eq!(counts(&net), (1, 0));
+    // It goes to the FID's shard, in its snapchain form.
+    let state = BlockState::new(net.nodes[0].engine.db().clone());
+    let height = b.header.unwrap().height;
+    let entries: Vec<proto::OutboxEntry> = state
+        .txn()
+        .scan(&keys::outbox_of_height(height))
+        .unwrap()
+        .values()
+        .map(|v| proto::OutboxEntry::decode(v.as_slice()).unwrap())
+        .filter(|e| e.fid == 2000)
+        .collect();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].replay_message.as_ref().unwrap().msg_type(),
+        MessageType::VerificationAddEthAddress
+    );
+    // No fee: FID 2000 has no fee balance.
+    assert_eq!(
+        state.txn().get(&keys::fee_balance(2000)).unwrap(),
+        None,
+        "no fee balance is needed"
+    );
+
+    // A removal of the verification, and a new verification of the address.
+    assert_eq!(
+        net.run(net.proposal(vec![remove(&net, 0)])).messages.len(),
+        1
+    );
+    assert_eq!(counts(&net), (0, 1));
+    assert_eq!(net.run(net.proposal(vec![add(&net, 0)])).messages.len(), 1);
+    assert_eq!(
+        counts(&net),
+        (1, 0),
+        "the record of the removal is used again"
+    );
+
+    // The cap: MAX_VERIFICATIONS_PER_FID live verifications.
+    for i in 1..MAX_VERIFICATIONS_PER_FID {
+        let m = add(&net, i);
+        assert_eq!(net.run(net.proposal(vec![m])).messages.len(), 1, "add {i}");
+    }
+    assert_eq!(counts(&net), (MAX_VERIFICATIONS_PER_FID, 0));
+    let over = add(&net, MAX_VERIFICATIONS_PER_FID);
+    let r = net.nodes[0]
+        .engine
+        .simulate_messages(&[over], block_time(&net));
+    assert!(
+        matches!(&r[0], Err(e) if e.to_string().contains("maximum of verifications")),
+        "{:?}",
+        r[0]
+    );
+    // A removal of an existing verification is always valid.
+    assert_eq!(
+        net.run(net.proposal(vec![remove(&net, 5)])).messages.len(),
+        1
+    );
+    assert_eq!(counts(&net), (MAX_VERIFICATIONS_PER_FID - 1, 1));
+}
+
+/// FIP §17.7: on a network whose snapchain rules keep verifications on the
+/// FID's shard (V20), shard 0 does not take them.
+#[test]
+fn shard0_rejects_verifications_under_v20_rules() {
+    let (mut net, _custody, _owner) = funded_net();
+    for node in net.nodes.iter_mut() {
+        node.engine.snapchain_version = crate::version::version::EngineVersion::V20;
+    }
+    let s2 = ed25519_dalek::SigningKey::from_bytes(&[21u8; 32]);
+    let m = ed25519_message(
+        &s2,
+        data(
+            2000,
+            MessageType::VerificationRemove,
+            Body::VerificationRemoveBody(proto::VerificationRemoveBody {
+                address: vec![1u8; 20],
+                protocol: 0,
+            }),
+            block_time(&net),
+        ),
+    );
+    let r = net.nodes[0]
+        .engine
+        .simulate_messages(&[m], block_time(&net));
+    assert!(
+        matches!(&r[0], Err(e) if e.to_string().contains("not a shard-0 message type")),
+        "{:?}",
+        r[0]
+    );
+}
+
+/// FID 2000 (not migrated) gets an on-chain Ed25519 signer.
+fn signer_of_2000(net: &mut Net) -> ed25519_dalek::SigningKey {
+    let s2 = ed25519_dalek::SigningKey::from_bytes(&[21u8; 32]);
+    let mut signer_event = crate::utils::factory::events_factory::create_signer_event(
+        2000,
+        s2.clone(),
+        proto::SignerEventType::Add,
+        Some(1_700_000_100),
+        None,
+    );
+    signer_event.transaction_hash = vec![77u8; 32];
+    let mut p = net.proposal(vec![]);
+    p.onchain_events = vec![signer_event];
+    net.run(p);
+    s2
+}
+
+/// FIP §17.7: shard 0 does not take the snapchain channel messages and
+/// registrar events, also when the snapchain rules put them on the block
+/// shard (V21). Hypersnap channels are the ones of FIP-native-channels.
+#[test]
+fn shard0_rejects_snapchain_channels() {
+    let (mut net, _custody, _owner) = funded_net();
+    let s2 = signer_of_2000(&mut net);
+    let label = alloy_primitives::keccak256(b"hypersnap").to_vec();
+
+    let event = crate::utils::factory::events_factory::create_channel_register_event(
+        "hypersnap",
+        label.clone(),
+        vec![0xC1u8; 20],
+        4_000_000_000,
+        proto::ChannelRegisterEventType::Register,
+        1_000,
+        0,
+    );
+    let mut p = net.proposal(vec![]);
+    p.onchain_events = vec![event];
+    assert!(
+        net.run(p).system_messages.is_empty(),
+        "no registrar event on shard 0"
+    );
+
+    let m = ed25519_message(
+        &s2,
+        data(
+            2000,
+            MessageType::ChannelUpdate,
+            Body::ChannelUpdateBody(proto::ChannelUpdateBody {
+                channel_id: label,
+                name: Some("hypersnap".to_string()),
+                ..Default::default()
+            }),
+            block_time(&net),
+        ),
+    );
+    let r = net.nodes[0]
+        .engine
+        .simulate_messages(&[m], block_time(&net));
+    assert!(
+        matches!(&r[0], Err(e) if e.to_string().contains("not a shard-0 message type")),
+        "{:?}",
+        r[0]
+    );
+}
+
+// ---- Bridge actions (§13.7) and the seed beacon (§4.9) ----
+
+/// A message of bootstrap validator `s` (FID 1001 + s), signed by its node
+/// key.
+fn node_message(net: &Net, s: usize, t: MessageType, body: Body) -> proto::Message {
+    falcon_message(
+        &net.genesis.node_keys[s],
+        data(1001 + s as u64, t, body, block_time(net)),
+    )
+}
+
+fn bridge_vote(net: &Net, s: usize, kind: u32, chain_id: u32) -> proto::Message {
+    node_message(
+        net,
+        s,
+        MessageType::BridgeActionVote,
+        Body::BridgeActionVoteBody(proto::BridgeActionVoteBody {
+            kind,
+            chain_id,
+            target: vec![0; 20],
+            epoch: tip_epoch(net),
+        }),
+    )
+}
+
+fn burns_in(block: &proto::HypersnapBlock) -> Vec<u32> {
+    block
+        .system_messages
+        .iter()
+        .filter_map(|m| match &m.message {
+            Some(proto::hypersnap_system_message::Message::InboundBurn(b)) => {
+                Some(b.source_chain_id)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// FIP §13.7: 3 of 4 votes decide a pause; the pause holds the inbound burns
+/// of its chain until `PAUSE_DURATION` ends, and the watcher keeps them.
+#[test]
+fn a_bridge_pause_holds_the_inbound_burns_of_its_chain() {
+    use super::bridge_actions::{action_hash, KIND_PAUSE};
+    let mut p = params();
+    p.pause_duration_secs = 120;
+    let (mut net, _, _) = funded(Net::with_genesis(3, p, Genesis::with_node_keys(4)));
+
+    let votes = vec![
+        bridge_vote(&net, 0, KIND_PAUSE, 1),
+        bridge_vote(&net, 1, KIND_PAUSE, 1),
+    ];
+    let b = net.run(net.proposal(votes));
+    assert_eq!(b.messages.len(), 2);
+    assert!(b.header.unwrap().bridge_action_hash.is_empty(), "2 of 4");
+    let b = net.run(net.proposal(vec![bridge_vote(&net, 2, KIND_PAUSE, 1)]));
+    assert_eq!(
+        b.header.unwrap().bridge_action_hash,
+        action_hash(KIND_PAUSE, 1, &[0; 20]).to_vec()
+    );
+    let late = bridge_vote(&net, 3, KIND_PAUSE, 1);
+    let r = net.nodes[0]
+        .engine
+        .simulate_messages(&[late], block_time(&net));
+    assert!(
+        matches!(&r[0], Err(e) if e.to_string().contains("decided")),
+        "{:?}",
+        r[0]
+    );
+
+    // A burn from chain 1 waits; a burn from chain 10 is credited.
+    let held = burn(1000, 5_000_000, 7);
+    let other = HyperInboundBurn {
+        source_chain_id: 10,
+        ..burn(1000, 6_000_000, 8)
+    };
+    let before = balance(&net, 1000);
+    let mut p = net.proposal(vec![]);
+    p.inbound_burns = vec![held.clone(), other];
+    assert_eq!(burns_in(&net.run(p)), vec![10]);
+    assert_eq!(balance(&net, 1000), before + 6_000_000);
+
+    // 120 s are 10 blocks: then the held burn is credited.
+    for _ in 0..10 {
+        net.run_empty();
+    }
+    let mut p = net.proposal(vec![]);
+    p.inbound_burns = vec![held];
+    assert_eq!(burns_in(&net.run(p)), vec![1]);
+    assert_eq!(balance(&net, 1000), before + 11_000_000);
+}
+
+/// FIP §13.7: a block decides at most one action; the next block decides
+/// the other one that passed.
+#[test]
+fn a_block_decides_one_bridge_action() {
+    use super::bridge_actions::{action_hash, KIND_PAUSE};
+    let mut net = Net::with_genesis(3, params(), Genesis::with_node_keys(4));
+    net.run_empty();
+    let mut votes = vec![];
+    for s in 0..3 {
+        votes.push(bridge_vote(&net, s, KIND_PAUSE, 1));
+        votes.push(bridge_vote(&net, s, KIND_PAUSE, 10));
+    }
+    let b = net.run(net.proposal(votes));
+    assert_eq!(b.messages.len(), 6);
+    let (a1, a10) = (
+        action_hash(KIND_PAUSE, 1, &[0; 20]).to_vec(),
+        action_hash(KIND_PAUSE, 10, &[0; 20]).to_vec(),
+    );
+    let (first, second) = if a1 < a10 { (a1, a10) } else { (a10, a1) };
+    assert_eq!(b.header.unwrap().bridge_action_hash, first);
+    assert_eq!(net.run_empty().header.unwrap().bridge_action_hash, second);
+    assert!(net
+        .run_empty()
+        .header
+        .unwrap()
+        .bridge_action_hash
+        .is_empty());
+}
+
+fn seed_commit(net: &Net, s: usize, t: u64, secret: &[u8; 32]) -> proto::Message {
+    node_message(
+        net,
+        s,
+        MessageType::SeedCommit,
+        Body::SeedCommitBody(proto::SeedCommitBody {
+            target_epoch: t,
+            commitment: super::seed::commitment(t, secret).to_vec(),
+        }),
+    )
+}
+
+fn seed_reveal(net: &Net, s: usize, t: u64, secret: &[u8; 32]) -> proto::Message {
+    node_message(
+        net,
+        s,
+        MessageType::SeedReveal,
+        Body::SeedRevealBody(proto::SeedRevealBody {
+            target_epoch: t,
+            secret: secret.to_vec(),
+        }),
+    )
+}
+
+fn stored_seed(net: &Net, epoch: u64) -> [u8; 32] {
+    let state = BlockState::new(net.nodes[0].engine.db().clone());
+    super::validators::epoch_seed(&state.txn(), epoch)
+        .unwrap()
+        .unwrap()
+}
+
+fn run_to_height(net: &mut Net, height: u64) {
+    while net.next_height() < height {
+        net.run_empty();
+    }
+}
+
+/// FIP §4.9: the members of `set(t − 1)` commit in `t − 2` and reveal in
+/// `t − 1`; the boundary of `t` makes the seed from the reveals; a member
+/// that does not reveal forfeits its DA reward of `t − 1`; an epoch with no
+/// reveal keeps the seed of the last block.
+#[test]
+fn the_epoch_seed_comes_from_the_reveals() {
+    let mut net = Net::with_genesis(3, params(), Genesis::with_node_keys(4));
+    net.run_empty();
+    let secrets: Vec<[u8; 32]> = (0..4u8).map(|i| [i + 1; 32]).collect();
+    let t = 3;
+
+    // Epoch 1: the commits for epoch 3. A commit for epoch 4 is not valid.
+    let commits: Vec<_> = (0..4)
+        .map(|s| seed_commit(&net, s, t, &secrets[s]))
+        .collect();
+    assert_eq!(net.run(net.proposal(commits)).messages.len(), 4);
+    let early = seed_commit(&net, 0, t + 1, &secrets[0]);
+    let r = net.nodes[0]
+        .engine
+        .simulate_messages(&[early], block_time(&net));
+    assert!(r[0].is_err());
+
+    // Epoch 2: three members reveal; a wrong secret is not valid.
+    run_to_height(&mut net, PIVOT + EPOCH_LEN);
+    let wrong = seed_reveal(&net, 3, t, &[9; 32]);
+    let r = net.nodes[0]
+        .engine
+        .simulate_messages(&[wrong], block_time(&net));
+    assert!(
+        matches!(&r[0], Err(e) if e.to_string().contains("does not match")),
+        "{:?}",
+        r[0]
+    );
+    let reveals: Vec<_> = (0..3)
+        .map(|s| seed_reveal(&net, s, t, &secrets[s]))
+        .collect();
+    assert_eq!(net.run(net.proposal(reveals)).messages.len(), 3);
+
+    // The window closes SEED_REVEAL_MARGIN blocks before the boundary.
+    run_to_height(
+        &mut net,
+        PIVOT + 2 * EPOCH_LEN - params().seed_reveal_margin,
+    );
+    let late = seed_reveal(&net, 3, t, &secrets[3]);
+    let r = net.nodes[0]
+        .engine
+        .simulate_messages(&[late], block_time(&net));
+    assert!(
+        matches!(&r[0], Err(e) if e.to_string().contains("window has closed")),
+        "{:?}",
+        r[0]
+    );
+
+    // The boundary of epoch 3.
+    run_to_height(&mut net, PIVOT + 2 * EPOCH_LEN + 1);
+    let mut revealed: Vec<([u8; 32], [u8; 32])> = (0..3)
+        .map(|s| {
+            (
+                super::auth::falcon_key_hash(&falcon_public(&net.genesis.node_keys[s])),
+                secrets[s],
+            )
+        })
+        .collect();
+    revealed.sort();
+    let mut pre = b"hypersnap-epoch-seed-v2".to_vec();
+    pre.extend_from_slice(&t.to_be_bytes());
+    for (_, secret) in &revealed {
+        pre.extend_from_slice(secret);
+    }
+    assert_eq!(
+        stored_seed(&net, t),
+        alloy_primitives::keccak256(&pre).0,
+        "the seed of the reveals"
+    );
+    let state = BlockState::new(net.nodes[0].engine.db().clone());
+    let hash = |s: usize| super::auth::falcon_key_hash(&falcon_public(&net.genesis.node_keys[s]));
+    assert!(super::seed::forfeited(&state.txn(), t - 1, &hash(3)).unwrap());
+    assert!(!super::seed::forfeited(&state.txn(), t - 1, &hash(0)).unwrap());
+
+    // Epoch 4 has no reveal: the seed of the last block of epoch 3.
+    run_to_height(&mut net, PIVOT + 3 * EPOCH_LEN + 1);
+    let last = net.nodes[0]
+        .engine
+        .store()
+        .get(PIVOT + 3 * EPOCH_LEN - 1)
+        .unwrap();
+    assert_eq!(
+        stored_seed(&net, 4),
+        crate::chain::epoch::epoch_seed(4, &last.hash.as_slice().try_into().unwrap())
+    );
+}
+
+/// FIP §4.9: the node of each validator commits and reveals by itself; a
+/// node that restarts between its commit and its reveal reveals the secret
+/// that it committed.
+#[test]
+fn the_validator_nodes_commit_and_reveal_the_seed() {
+    use crate::chain::seed_responder::{secret, SeedResponder};
+    let mut net = Net::with_genesis(3, params(), Genesis::with_node_keys(4));
+    net.run_empty();
+    let reload = |net: &Net, s: usize| {
+        FalconSecretKey::from_bytes(net.genesis.node_keys[s].as_bytes()).unwrap()
+    };
+    let mut responders: Vec<SeedResponder> = (0..4)
+        .map(|s| SeedResponder::new(reload(&net, s)))
+        .collect();
+    while net.next_height() <= PIVOT + 2 * EPOCH_LEN {
+        if net.next_height() == PIVOT + EPOCH_LEN {
+            responders[3] = SeedResponder::new(reload(&net, 3));
+        }
+        let tip = net.nodes[0].engine.tip().unwrap().header.unwrap();
+        let db = net.nodes[0].engine.db().clone();
+        let mut messages = vec![];
+        for r in responders.iter_mut() {
+            messages.extend(
+                r.after_block(
+                    &db,
+                    &params(),
+                    tip.height,
+                    tip.timestamp,
+                    &mut rand::rngs::OsRng,
+                )
+                .unwrap(),
+            );
+        }
+        net.run(net.proposal(messages));
+    }
+    let mut revealed: Vec<([u8; 32], [u8; 32])> = (0..4)
+        .map(|s| {
+            let key = &net.genesis.node_keys[s];
+            (
+                super::auth::falcon_key_hash(&falcon_public(key)),
+                secret(key, 3),
+            )
+        })
+        .collect();
+    revealed.sort();
+    let mut pre = b"hypersnap-epoch-seed-v2".to_vec();
+    pre.extend_from_slice(&3u64.to_be_bytes());
+    for (_, s) in &revealed {
+        pre.extend_from_slice(s);
+    }
+    assert_eq!(stored_seed(&net, 3), alloy_primitives::keccak256(&pre).0);
+    let state = BlockState::new(net.nodes[0].engine.db().clone());
+    assert!(state
+        .txn()
+        .scan(&keys::seed_records(keys::SEED_FORFEIT, 2))
+        .unwrap()
+        .is_empty());
 }

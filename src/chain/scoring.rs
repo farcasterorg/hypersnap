@@ -90,6 +90,18 @@ impl HypersnapReader {
             .map_err(err)
     }
 
+    /// The FID of a DA answer of `epoch`, unless the validator forfeited
+    /// its DA reward of the epoch (a seed commit with no reveal, FIP §4.9).
+    fn da_fid(&self, epoch: u64, node_key_hash: &[u8]) -> Option<u64> {
+        let state = BlockState::new(self.shard0.clone());
+        if crate::chain::shard0::seed::forfeited(&state.txn(), epoch, node_key_hash)
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        self.fid_of_node_key(node_key_hash)
+    }
+
     fn fid_of_node_key(&self, node_key_hash: &[u8]) -> Option<u64> {
         self.set
             .members
@@ -241,7 +253,7 @@ impl SnapchainStateReader for HypersnapReader {
         let mut out: BTreeMap<u64, u32> = BTreeMap::new();
         // [80][epoch][node_key_hash][index] → response height
         for k in self.scan(&keys::da_answered_of_epoch(epoch))?.keys() {
-            if let Some(fid) = k.get(9..41).and_then(|h| self.fid_of_node_key(h)) {
+            if let Some(fid) = k.get(9..41).and_then(|h| self.da_fid(epoch, h)) {
                 *out.entry(fid).or_default() += 1;
             }
         }
@@ -254,7 +266,7 @@ impl SnapchainStateReader for HypersnapReader {
     ) -> Result<BTreeMap<u64, u128>, ScoringError> {
         let mut out: BTreeMap<u64, u128> = BTreeMap::new();
         for (k, v) in self.scan(&keys::da_answered_of_epoch(epoch))? {
-            if let Some(fid) = k.get(9..41).and_then(|h| self.fid_of_node_key(h)) {
+            if let Some(fid) = k.get(9..41).and_then(|h| self.da_fid(epoch, h)) {
                 *out.entry(fid).or_default() += keys::decode_u64(&v) as u128;
             }
         }
@@ -289,7 +301,7 @@ fn market(m: WorkMarket) -> proto::WorkMarket {
 /// boundary state (the boundary block of `epoch + 1`). The vouch evaluations
 /// are left to the shard-0 engine, which derives them from its state.
 pub fn compute(
-    reader: &dyn SnapchainStateReader,
+    reader: &(dyn SnapchainStateReader + Sync),
     epoch: u64,
     now_unix: u64,
     params: &ScoringParams,
@@ -446,5 +458,45 @@ impl ScoringService {
 impl ScoringSource for ScoringService {
     fn scoring_result(&self, epoch: u64) -> Option<ScoringResult> {
         self.results.lock().unwrap().get(&epoch).cloned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// FIP §4.9: a validator that committed to a seed and did not reveal it
+    /// has no DA answers in the scoring of the epoch.
+    #[test]
+    fn a_seed_forfeit_removes_the_da_answers_of_the_epoch() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Arc::new(RocksDB::new(dir.path().to_str().unwrap()));
+        db.open().unwrap();
+        let (a, b) = ([1u8; 32], [2u8; 32]);
+        let mut txn = db.txn();
+        for index in 0..3 {
+            txn.put(keys::da_answered(2, &a, index), keys::u64_value(10));
+            txn.put(keys::da_answered(2, &b, index), keys::u64_value(10));
+        }
+        txn.put(keys::seed_record(keys::SEED_FORFEIT, 2, &b), vec![]);
+        db.commit(txn).unwrap();
+        let member = |hash: [u8; 32], fid| proto::HyperValidatorSetMember {
+            consensus_key_hash: vec![fid as u8; 32],
+            weight: 1,
+            node_key_hash: hash.to_vec(),
+            fid,
+        };
+        let set = proto::HyperValidatorSetRecord {
+            epoch: 2,
+            members: vec![member(a, 1001), member(b, 1002)],
+            ..Default::default()
+        };
+        let params = Shard0Params::new(proto::FarcasterNetwork::Devnet, 1);
+        let reader = HypersnapReader::new(db, BTreeMap::new(), params, set).unwrap();
+        let counts = reader.da_answered_counts_for_epoch(2).unwrap();
+        assert_eq!(counts.get(&1001), Some(&3));
+        assert_eq!(counts.get(&1002), None, "the forfeit");
+        let sums = reader.da_response_block_sum_for_epoch(2).unwrap();
+        assert!(sums.contains_key(&1001) && !sums.contains_key(&1002));
     }
 }

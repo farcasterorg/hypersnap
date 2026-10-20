@@ -72,6 +72,16 @@ async fn each_leaf_of_a_shard_state_has_a_da_answer() {
             Some(&answer.value),
             &answer.proof
         ));
+        // The check of an answer reads the same leaf from the trie alone.
+        use crate::chain::shard0::work::DaCheckpoints;
+        assert_eq!(
+            checkpoints.expected_leaf(3, 1, &leaf.path),
+            Some((
+                answer.key.clone(),
+                hypersnap_ktrie::value_hash(&answer.value),
+                answer.root
+            ))
+        );
         leaves += 1;
         if is_gasless_state_key(&leaf.key) {
             gasless_state += 1;
@@ -87,4 +97,31 @@ async fn each_leaf_of_a_shard_state_has_a_da_answer() {
     assert_eq!(key_removes, 2);
     assert!(leaves > 20, "{} leaves", leaves);
     assert!(is_shard0_consensus_prefix(RootPrefix::User as u8));
+}
+
+#[test]
+fn an_open_checkpoint_reads_through_the_block_cache_of_the_node() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = crate::storage::db::RocksDB::new(dir.path().join("shard1").to_str().unwrap());
+    db.open().unwrap();
+    let mut txn = crate::storage::db::RocksDbTransactionBatch::new();
+    for i in 0..1_000u32 {
+        txn.put(i.to_be_bytes().to_vec(), vec![7u8; 100]);
+    }
+    db.commit(txn).unwrap();
+    let root = dir.path().join("checkpoints");
+    Checkpoints::new(&root, FarcasterNetwork::Devnet)
+        .take(&db, 1, 3)
+        .unwrap();
+
+    let cache = rocksdb::Cache::new_lru_cache(8 * 1024 * 1024);
+    let plain = Checkpoints::new(&root, FarcasterNetwork::Devnet);
+    let value = plain.open(1, 3).unwrap().get(&7u32.to_be_bytes()).unwrap();
+    assert_eq!(value, Some(vec![7u8; 100]));
+    assert_eq!(cache.get_usage(), 0);
+
+    let cached = Checkpoints::new(&root, FarcasterNetwork::Devnet).with_block_cache(cache.clone());
+    let value = cached.open(1, 3).unwrap().get(&7u32.to_be_bytes()).unwrap();
+    assert_eq!(value, Some(vec![7u8; 100]));
+    assert!(cache.get_usage() > 0);
 }

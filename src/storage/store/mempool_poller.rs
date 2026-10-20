@@ -22,6 +22,8 @@ pub enum MempoolPollerError {
 pub struct MempoolPoller {
     pub messages_request_tx: Option<mpsc::Sender<MempoolMessagesRequest>>,
     pub max_messages_per_block: u32,
+    /// The encoded bytes of the messages of one pull (`None`: no limit).
+    pub max_bytes: Option<usize>,
     pub network: FarcasterNetwork,
     pub shard_id: u32,
     pub statsd_client: StatsdClientWrapper,
@@ -54,11 +56,28 @@ impl MempoolMessage {
                     Some(block_event_data::Body::MergeMessageEventBody(body)) => {
                         body.message.as_ref().unwrap().fid()
                     }
+                    Some(block_event_data::Body::MergeOnChainEventEventBody(body)) => {
+                        // BlockEvents route by `for_shard`, not fid; this is only used for
+                        // grouping/telemetry. Channel-register onchain events carry fid 0.
+                        body.on_chain_event.as_ref().map_or(0, |e| e.fid)
+                    }
                     Some(block_event_data::Body::HeartbeatEventBody(_)) => 0,
                     None => 0,
                 },
                 None => 0,
             },
+        }
+    }
+
+    /// The encoded size of the message.
+    pub fn encoded_len(&self) -> usize {
+        use prost::Message as _;
+        match self {
+            MempoolMessage::UserMessage(msg) => msg.encoded_len(),
+            MempoolMessage::OnchainEvent(event)
+            | MempoolMessage::OnchainEventForMigration(event) => event.encoded_len(),
+            MempoolMessage::FnameTransfer(transfer) => transfer.encoded_len(),
+            MempoolMessage::BlockEvent { message, .. } => message.encoded_len(),
         }
     }
 
@@ -98,6 +117,7 @@ impl MempoolPoller {
                     shard_id: self.shard_id,
                     message_tx,
                     max_messages_per_block: self.max_messages_per_block,
+                    max_bytes: self.max_bytes,
                 })
                 .await
             {

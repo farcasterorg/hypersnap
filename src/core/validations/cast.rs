@@ -39,7 +39,7 @@ pub fn validate_cast_add_body(
         _ => {}
     }
 
-    // Pro used to be the only way past 2. Keep honoring it below the boundary so pre-V20
+    // Pro used to be the only way to get past 2. Keep honoring it below the boundary so pre-V20
     // history replays identically — a Pro cast with 3 embeds was valid then and must stay valid.
     let num_embeds =
         if is_pro_user || version.is_enabled(ProtocolFeature::IncreaseEmbedLimitForAllUsers) {

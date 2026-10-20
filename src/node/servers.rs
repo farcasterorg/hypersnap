@@ -3,8 +3,9 @@
 //! servers over their stores.
 
 use crate::connectors::fname::FnameRequest;
-use crate::connectors::onchain_events::{ChainClients, OnchainEventsRequest};
+use crate::connectors::onchain_events::OnchainEventsRequest;
 use crate::core::types::SnapchainValidatorContext;
+use crate::mempool::l1_validator::L1Validator;
 use crate::mempool::mempool::MempoolRequest;
 use crate::mempool::routing;
 use crate::network::admin_server::MyAdminService;
@@ -31,7 +32,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc};
 use tonic::transport::Server;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 const VERSION: Option<&str> = option_env!("CARGO_PKG_VERSION");
 
@@ -124,7 +125,7 @@ pub async fn start_servers(
     shard_stores: HashMap<u32, Stores>,
     shard_senders: HashMap<u32, Senders>,
     block_stores: BlockStores,
-    chain_clients: ChainClients,
+    l1_validator: Arc<L1Validator>,
     replicator: Option<Arc<replication::replicator::Replicator>>,
     api_handler: Option<crate::api::ApiHttpHandler>,
     api_system_search_indexer: Option<Arc<crate::api::SearchIndexer>>,
@@ -177,7 +178,8 @@ pub async fn start_servers(
             .collect()
     };
 
-    // Spawn hyper backfill to populate shadow stores from historical blocks
+    // Spawn hyper backfill to populate shadow stores from historical blocks,
+    // then reconcile them against the legacy stores for anything replay missed.
     if hypersnap.is_none() {
         let backfill_db = block_stores.db.clone();
         let backfill_shard_stores = shard_stores.clone();
@@ -189,6 +191,24 @@ pub async fn start_servers(
                 &backfill_hyper_stores,
             )
             .await;
+            let cast_hash = crate::api::cast_hash_index::CastHashIndexer::new(
+                crate::api::config::FeatureConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+                backfill_db.clone(),
+            );
+            let reconcile = tokio::task::spawn_blocking(move || {
+                crate::storage::store::reconcile::run_hyper_reconcile(
+                    &backfill_db,
+                    &backfill_shard_stores,
+                    &backfill_hyper_stores,
+                    &cast_hash,
+                );
+            });
+            if let Err(e) = reconcile.await {
+                warn!(error = %e, "Hyper reconciliation task failed");
+            }
         });
     }
 
@@ -228,10 +248,11 @@ pub async fn start_servers(
         Box::new(routing::ShardRouter {}),
         mempool_tx.clone(),
         gossip_tx.clone(),
-        chain_clients,
+        l1_validator.clone(),
         VERSION.unwrap_or("unknown").to_string(),
         local_peer_id.to_string(),
         fname_lookup.clone(),
+        app_config.mesh.clone(),
     ));
     let service = match hypersnap {
         Some(rpc) => Arc::new(
@@ -266,12 +287,11 @@ pub async fn start_servers(
         Box::new(routing::ShardRouter {}),
         mempool_tx.clone(),
         gossip_tx.clone(),
-        ChainClients {
-            chain_api_map: HashMap::new(),
-        },
+        l1_validator,
         VERSION.unwrap_or("unknown").to_string(),
         local_peer_id.to_string(),
         fname_lookup,
+        app_config.mesh.clone(),
     ));
 
     // Wire late-bound API handlers that depend on the hub service
@@ -306,6 +326,7 @@ pub async fn start_servers(
                 metrics,
                 api_service.clone(),
             ));
+            feeds.warm_trending();
             handler.set_feeds(feeds.clone());
             handler.set_channel_feeds(feeds);
         }
@@ -444,6 +465,15 @@ pub async fn start_servers(
 
     let http_shutdown_tx = shutdown_tx.clone();
     let http_server_config = app_config.http_server.clone();
+    // Built once and shared across all connections — maps peers to human-readable
+    // names for the mesh JSON / UI.
+    let mesh_nodes = Arc::new(crate::network::mesh::nodes::NodeRegistry::from_config(
+        &app_config.mesh,
+    ));
+    info!(
+        known_nodes = mesh_nodes.len(),
+        "Mesh known-node registry loaded"
+    );
     // Filled in after the gossip layer + hyper actor are constructed
     // (see further down). Until then, /hyper/v1/* routes 404.
     let hyper_handler_slot: std::sync::Arc<
@@ -491,9 +521,11 @@ pub async fn start_servers(
                     // not just the accept.
                     let rl = rate_limiter.clone();
                     let peer_ip = peer_addr.ip();
+                    let nodes = mesh_nodes.clone();
                     tokio::spawn(async move {
-                        let mut router = crate::network::http_server::Router::new(service_clone)
-                            .with_rate_limiter(rl, peer_ip);
+                        let mut router =
+                            crate::network::http_server::Router::new(service_clone, nodes)
+                                .with_rate_limiter(rl, peer_ip);
                         if let Some(handler) = api {
                             router = router.with_api_handler(handler);
                         }

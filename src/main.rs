@@ -1,10 +1,14 @@
 use hypersnap::connectors::onchain_events::ChainClients;
 use hypersnap::consensus::consensus::SystemMessage;
 use hypersnap::mempool::block_receiver::BlockReceiver;
+use hypersnap::mempool::l1_gate::GossipL1Gate;
+use hypersnap::mempool::l1_validator::L1Validator;
 use hypersnap::mempool::mempool::{Mempool, ReadNodeMempool};
+use hypersnap::mempool::routing;
 use hypersnap::network::gossip::{GossipEvent, SnapchainGossip};
 use hypersnap::network::replication::{self, Replicator};
 use hypersnap::node::servers::{api_handlers, init_api, start_servers, AdminInputs};
+use hypersnap::node::shutdown::{close_gossip_connections, shut_down_api, shutdown_signal};
 use hypersnap::node::snapchain_node::SnapchainNode;
 use hypersnap::node::snapchain_read_node::SnapchainReadNode;
 use hypersnap::storage::db::snapshot::{download_snapshots, BootstrapMethod};
@@ -19,9 +23,9 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::process;
 use std::sync::Arc;
+use std::time::Duration;
 use std::{fs, net};
 use tokio::select;
-use tokio::signal::ctrl_c;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio_cron_scheduler::JobScheduler;
 use tracing::{error, info, warn};
@@ -130,8 +134,23 @@ fn create_replicator(
 
     Ok(Arc::new(replicator))
 }
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+/// How long the runtime waits for blocking-pool work after `run` returns.
+const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(run());
+    // The hyper reconcile and the API backfills run on the blocking pool for hours with
+    // no cancellation point, and dropping a runtime waits for blocking tasks. Bound the
+    // wait so a SIGTERM finishes inside the supervisor's grace period (docker: 10s)
+    // instead of ending in SIGKILL.
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+    result
+}
+
+async fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().collect();
 
     let app_config = match hypersnap::cfg::load_and_merge_config(args) {
@@ -166,23 +185,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    if app_config.clear_db {
-        let db_dir = format!("{}", app_config.rocksdb_dir);
-        if std::path::Path::new(&db_dir).exists() {
-            let remove_result = std::fs::remove_dir_all(db_dir.clone());
-            if let Err(e) = remove_result {
-                error!("Failed to clear db at {:?}: {}", db_dir, e);
-            }
-            let create_result = std::fs::create_dir_all(db_dir.clone());
-            if let Err(e) = create_result {
-                error!("Failed to create db dir at {:?}: {}", db_dir, e);
-            }
-            warn!("Cleared db at {:?}", db_dir);
-        } else {
-            warn!("No db to clear at {:?}", db_dir);
-        }
-    }
-
     if app_config.statsd.prefix == "" {
         // TODO: consider removing this check
         return Err("statsd prefix must be specified in config".into());
@@ -201,6 +203,36 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )),
     }?;
 
+    // Deploy scripts run `snapchain --check-config` between rewriting config.toml
+    // (fc config pull) and restarting the node, so a bad config fails here — before
+    // the running node is stopped — rather than as a crash loop after. Placed after
+    // the log_format and statsd checks so everything main() itself validates
+    // pure-config (no side effects) is covered; --clear-db stays behind the gate,
+    // since a validation run must never touch the database. Note the gate is
+    // otherwise loader-deep only — values that panic later in startup (e.g. a
+    // malformed consensus.private_key) are not exercised here.
+    if app_config.check_config {
+        println!("config OK");
+        return Ok(());
+    }
+
+    if app_config.clear_db {
+        let db_dir = format!("{}", app_config.rocksdb_dir);
+        if std::path::Path::new(&db_dir).exists() {
+            let remove_result = std::fs::remove_dir_all(db_dir.clone());
+            if let Err(e) = remove_result {
+                error!("Failed to clear db at {:?}: {}", db_dir, e);
+            }
+            let create_result = std::fs::create_dir_all(db_dir.clone());
+            if let Err(e) = create_result {
+                error!("Failed to create db dir at {:?}: {}", db_dir, e);
+            }
+            warn!("Cleared db at {:?}", db_dir);
+        } else {
+            warn!("No db to clear at {:?}", db_dir);
+        }
+    }
+
     // Resolving the statsd host can fail transiently at boot, e.g. when the metrics
     // container hasn't registered with the DNS resolver yet. Retry for a bounded
     // window, then carry on without metrics: a metrics sink must never keep the node
@@ -212,7 +244,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut statsd_sink = None;
     loop {
         let socket = net::UdpSocket::bind("0.0.0.0:0").unwrap();
-        match cadence::UdpMetricSink::from((statsd_host.as_str(), statsd_port), socket) {
+        match cadence::BufferedUdpMetricSink::from((statsd_host.as_str(), statsd_port), socket) {
             Ok(sink) => {
                 statsd_sink = Some(sink);
                 break;
@@ -237,9 +269,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let statsd_client = match statsd_sink {
-        Some(sink) => {
-            cadence::StatsdClient::builder(app_config.statsd.prefix.as_str(), sink).build()
-        }
+        // A queue thread sends the metrics, many to a packet: a UDP send for
+        // each metric cost a syscall for each message of a block.
+        Some(sink) => cadence::StatsdClient::builder(
+            app_config.statsd.prefix.as_str(),
+            cadence::QueuingMetricSink::from(sink),
+        )
+        .build(),
         None => cadence::StatsdClient::builder(
             app_config.statsd.prefix.as_str(),
             cadence::NopMetricSink,
@@ -247,6 +283,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .build(),
     };
     let statsd_client = StatsdClientWrapper::new(statsd_client, app_config.statsd.use_tags);
+    // The rest of a packet goes out each second.
+    {
+        let statsd_client = statsd_client.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                tick.tick().await;
+                statsd_client.flush();
+            }
+        });
+    }
 
     // After the epoch-1 pivot: run as a Hypersnap validator (FIP §17). A
     // pivot marker of another PIVOT_HEIGHT is removed, and the snapchain
@@ -262,7 +309,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if app_config.hypersnap.enabled
         || matches!(marker, hypersnap::node::pivot_boot::MarkerState::Pivot(_))
     {
-        return hypersnap::node::hypersnap_main::run(&app_config, statsd_client).await;
+        let result = hypersnap::node::hypersnap_main::run(&app_config, statsd_client).await;
+        // A normal exit runs the C++ static destructors, and RocksDB aborts in
+        // them while its threads still run ("pthread lock: Invalid
+        // argument"). The node stopped its actors, and each write is in the
+        // RocksDB log, so the process ends without the destructors.
+        let code = match result {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("Error: {:?}", e);
+                1
+            }
+        };
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+        unsafe { libc::_exit(code) }
     }
 
     // We only use snapshots if the db directory doesn't exist or is empty.
@@ -530,6 +592,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         );
         let (api_handler, api_search_indexer) = api_handlers(api_system.as_ref(), &statsd_client);
 
+        let l1_validator = Arc::new(L1Validator::new(
+            chains_clients,
+            node.shard_stores.clone(),
+            Box::new(routing::ShardRouter {}),
+            app_config.consensus.num_shards,
+            app_config.fc_network,
+            app_config.l1_gate.cache_config(),
+        ));
+
         start_servers(
             &app_config,
             gossip_tx.clone(),
@@ -546,7 +617,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             node.shard_stores.clone(),
             node.shard_senders.clone(),
             node.block_stores.clone(),
-            chains_clients,
+            l1_validator,
             replicator,
             api_handler,
             api_search_indexer,
@@ -558,20 +629,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .await;
 
         let mut shards_finished_syncing = HashSet::new();
+        let shutdown = shutdown_signal();
+        tokio::pin!(shutdown);
         loop {
             select! {
-                _ = ctrl_c() => {
-                    info!("Received Ctrl-C, shutting down");
+                signal = &mut shutdown => {
+                    info!(signal, "Received shutdown signal, shutting down");
+                    close_gossip_connections(&gossip_tx).await;
                     if let Some(api) = api_system {
-                        api.shutdown().await;
+                        shut_down_api(api).await;
                     }
                     node.stop();
                     return Ok(());
                 }
                 _ = shutdown_rx.recv() => {
                     error!("Received shutdown signal, shutting down");
+                    close_gossip_connections(&gossip_tx).await;
                     if let Some(api) = api_system {
-                        api.shutdown().await;
+                        shut_down_api(api).await;
                     }
                     node.stop();
                     return Ok(());
@@ -693,6 +768,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 hypersnap::connectors::onchain_events::Subscriber::new(
                     &app_config.onchain_events,
                     node_local_state::Chain::Optimism,
+                    app_config.fc_network,
                     mempool_tx.clone(),
                     statsd_client.clone(),
                     local_state_store.clone(),
@@ -714,6 +790,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 hypersnap::connectors::onchain_events::Subscriber::new(
                     &app_config.base_onchain_events,
                     node_local_state::Chain::Base,
+                    app_config.fc_network,
                     mempool_tx.clone(),
                     statsd_client.clone(),
                     local_state_store.clone(),
@@ -777,6 +854,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         }
 
+        let l1_validator = Arc::new(L1Validator::new(
+            chains_clients,
+            node.shard_stores.clone(),
+            Box::new(routing::ShardRouter {}),
+            app_config.consensus.num_shards,
+            app_config.fc_network,
+            app_config.l1_gate.cache_config(),
+        ));
+        let (gossip_l1_gate, gossip_l1_gate_worker) = GossipL1Gate::new(
+            app_config.l1_gate.clone(),
+            l1_validator.clone(),
+            app_config.fc_network,
+            mempool_tx.clone(),
+            statsd_client.clone(),
+        );
+        tokio::spawn(gossip_l1_gate_worker.run());
+
         // Initialize API indexing system if enabled
         let api_system = init_api(
             &app_config,
@@ -804,7 +898,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             node.shard_stores.clone(),
             node.shard_senders.clone(),
             node.block_stores.clone(),
-            chains_clients,
+            l1_validator,
             replicator,
             api_handler,
             api_search_indexer,
@@ -843,21 +937,41 @@ async fn main() -> Result<(), Box<dyn Error>> {
             });
         }
 
+        // Wait for the readiness signal before entering the consensus loop.
+        // Today the signal fires synchronously at the end of
+        // SnapchainNode::create(), so this returns immediately. The gate is in
+        // place so a future change that introduces real concurrency in node
+        // init (e.g., parallel shard DB open via spawn_blocking) can hold
+        // consensus message dispatch until the actors are ready, without
+        // changing the call site here.
+        {
+            let mut wal_replay_complete = node.wal_replay_complete.clone();
+            if !*wal_replay_complete.borrow() {
+                info!("Waiting for WAL replay to complete before consensus participation");
+                let _ = wal_replay_complete.changed().await;
+            }
+            info!("Validator initialization complete; entering consensus loop");
+        }
+
         // Kick it off
+        let shutdown = shutdown_signal();
+        tokio::pin!(shutdown);
         loop {
             select! {
-                _ = ctrl_c() => {
-                    info!("Received Ctrl-C, shutting down");
+                signal = &mut shutdown => {
+                    info!(signal, "Received shutdown signal, shutting down");
+                    close_gossip_connections(&gossip_tx).await;
                     if let Some(api) = api_system {
-                        api.shutdown().await;
+                        shut_down_api(api).await;
                     }
                     node.stop();
                     return Ok(());
                 }
                 _ = shutdown_rx.recv() => {
                     error!("Received shutdown signal, shutting down");
+                    close_gossip_connections(&gossip_tx).await;
                     if let Some(api) = api_system {
-                        api.shutdown().await;
+                        shut_down_api(api).await;
                     }
                     node.stop();
                     return Ok(());
@@ -868,12 +982,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             // Forward to appropriate consensus actors
                             node.dispatch(shard, event);
                         },
-                        SystemMessage::Mempool(msg) => {
-                            let res = mempool_tx.try_send(msg);
-                            if let Err(e) = res {
-                                warn!("Failed to add to local mempool: {:?}", e);
-                            }
-                        },
+                        SystemMessage::Mempool(msg) => gossip_l1_gate.admit(msg),
                         SystemMessage::BlockRequest {block_event_seqnum, block_tx } => {
                             let block= node.block_stores.get_block_by_event_seqnum(block_event_seqnum);
                             block_tx.send(block).unwrap();

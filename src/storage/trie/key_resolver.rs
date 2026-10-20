@@ -17,8 +17,8 @@ use crate::core::error::HubError;
 use crate::proto::{self, MessageType, OnChainEventType};
 use crate::storage::db::{PageOptions, RocksDbTransactionBatch};
 use crate::storage::store::account::{
-    get_key_remove_message, list_gasless_keys_by_fid, LinkStore, StorageLendStore, UserDataStore,
-    UsernameProofStore, VerificationStore, FID_BYTES,
+    get_key_remove_message, list_gasless_keys_by_fid, CastStore, LinkStore, StorageLendStore,
+    UserDataStore, UsernameProofStore, VerificationStore, FID_BYTES,
 };
 use crate::storage::store::stores::Stores;
 use prost::Message as _;
@@ -35,7 +35,49 @@ pub fn messages_for_fid_and_type(
 ) -> Result<Option<Vec<proto::Message>>, HubError> {
     let mut page_options = PageOptions::default();
     page_options.page_size = Some(usize::MAX);
-    let filter = Option::<fn(&proto::Message) -> bool>::None;
+    messages_of(
+        stores,
+        fid,
+        message_type,
+        &page_options,
+        Option::<fn(&proto::Message) -> bool>::None,
+    )
+}
+
+/// The message of `fid` and `message_type` with `hash`: from the hash index
+/// for a cast, else from a scan of the FID's messages of the type that stops
+/// at it.
+pub fn message_by_hash(
+    stores: &Stores,
+    fid: u64,
+    message_type: MessageType,
+    hash: &[u8],
+) -> Result<Option<proto::Message>, HubError> {
+    if message_type == MessageType::CastAdd {
+        return CastStore::get_cast_add(&stores.cast_store, fid, hash.to_vec());
+    }
+    let mut page_options = PageOptions::default();
+    page_options.page_size = Some(1);
+    Ok(messages_of(
+        stores,
+        fid,
+        message_type,
+        &page_options,
+        Some(|m: &proto::Message| m.hash == hash),
+    )?
+    .and_then(|messages| messages.into_iter().find(|m| m.hash == hash)))
+}
+
+/// The messages of `fid` and `message_type` that pass `filter`, up to the
+/// page size (some stores ignore both).
+fn messages_of<F: Fn(&proto::Message) -> bool>(
+    stores: &Stores,
+    fid: u64,
+    message_type: MessageType,
+    page_options: &PageOptions,
+    filter: Option<F>,
+) -> Result<Option<Vec<proto::Message>>, HubError> {
+    let page_options = page_options.clone();
     let messages = match message_type {
         MessageType::FrameAction
         | MessageType::None
@@ -126,6 +168,30 @@ pub fn messages_for_fid_and_type(
             )?);
             messages
         }
+        MessageType::ChannelUpdate => {
+            stores
+                .channel_update_store
+                .get_adds_by_fid(fid, &page_options, filter)?
+                .messages
+        }
+        MessageType::ChannelMember => {
+            stores
+                .channel_member_store
+                .get_adds_by_fid(fid, &page_options, filter)?
+                .messages
+        }
+        MessageType::ChannelPin => {
+            stores
+                .channel_pin_store
+                .get_adds_by_fid(fid, &page_options, filter)?
+                .messages
+        }
+        MessageType::ChannelModerate => {
+            stores
+                .channel_moderate_store
+                .get_adds_by_fid(fid, &page_options, filter)?
+                .messages
+        }
         // Hypersnap types (100–999) are shard-0 state, not in the shard-1/2
         // sync trie.
         _ => return Ok(None),
@@ -158,6 +224,9 @@ pub struct TrieKeyResolver<'a> {
     messages: HashMap<(u64, u8), HashMap<Vec<u8>, proto::Message>>,
     onchain: HashMap<(u64, u8), HashMap<Vec<u8>, proto::OnChainEvent>>,
     key_removes: Option<HashMap<Vec<u8>, proto::Message>>,
+    /// Resolve each message key alone (`message_by_hash`), not through all
+    /// the messages of its FID and type.
+    one_leaf: bool,
 }
 
 impl<'a> TrieKeyResolver<'a> {
@@ -167,6 +236,17 @@ impl<'a> TrieKeyResolver<'a> {
             messages: HashMap::new(),
             onchain: HashMap::new(),
             key_removes: None,
+            one_leaf: false,
+        }
+    }
+
+    /// A resolver for one key (a DA answer, FIP §5.1): a full scan caches
+    /// all the messages of each FID and type, a single key does not need
+    /// them.
+    pub fn for_one_leaf(stores: &'a Stores) -> Self {
+        TrieKeyResolver {
+            one_leaf: true,
+            ..Self::new(stores)
         }
     }
 
@@ -282,6 +362,10 @@ impl<'a> TrieKeyResolver<'a> {
                         .key_removes()?
                         .get(&hash)
                         .cloned()
+                        .map(TrieObject::Message));
+                }
+                if self.one_leaf && msg_type != MessageType::KeyAdd {
+                    return Ok(message_by_hash(self.stores, fid, msg_type, &hash)?
                         .map(TrieObject::Message));
                 }
                 let cache_key = (fid, message_type);

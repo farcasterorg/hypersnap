@@ -40,6 +40,27 @@ message DaChallengeResponseBody {
   bytes proof = 5;             // Inclusion proof of the leaf (§16.13 encoding)
 }
 
+// §13.7. BRIDGE_ACTION_VOTE (157): a vote of a validator for a bridge
+// action, signed by its node key.
+message BridgeActionVoteBody {
+  uint32 kind = 1;              // 1 upgrade, 2 cancel an upgrade, 3 pause
+  uint32 chain_id = 2;          // EIP-155 chain ID; 0 = all chains
+  bytes target = 3;             // 20 bytes: the implementation; zero for a pause
+  uint64 epoch = 4;             // The epoch of the block that includes the vote
+}
+
+// §4.9. SEED_COMMIT (158) and SEED_REVEAL (159), signed by the node key of a
+// validator.
+message SeedCommitBody {
+  uint64 target_epoch = 1;      // The epoch whose seed the secret is for
+  bytes commitment = 2;         // keccak256("hypersnap-seed-reveal-v1" || target_epoch || secret)
+}
+
+message SeedRevealBody {
+  uint64 target_epoch = 1;
+  bytes secret = 2;             // 32 bytes
+}
+
 // §7.3. APP_USAGE_RECEIPT (151).
 message AppUsageReceiptBody {
   bytes miniapp_id = 1;       // 16-byte miniapp ID

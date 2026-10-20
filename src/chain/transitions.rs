@@ -1,6 +1,7 @@
-//! Validator transitions (FIP §4.6). In the rebalance window before an epoch
-//! boundary, a validator that leaves at the boundary is `DEPARTING` and one
-//! that joins at it is `JOINING`. Each node derives these from its shard-0
+//! Validator transitions (FIP §4.6, §4.8). In the rebalance window before an
+//! epoch boundary, a validator that leaves at the boundary is `DEPARTING`,
+//! one that joins at it is `JOINING`, and a member that is `INACTIVE` asks
+//! new validators to register. Each node derives these from its shard-0
 //! state; the `ValidatorTransitionAlert`s on the `membership` topic announce
 //! them to peers.
 
@@ -27,6 +28,8 @@ pub fn transition(v: &ValidatorRecord, epoch: u64) -> TransitionType {
         TransitionType::TransitionDeparting
     } else if v.join_epoch == epoch {
         TransitionType::TransitionJoining
+    } else if v.inactive && validators::is_member(v, epoch) {
+        TransitionType::TransitionInactive
     } else {
         TransitionType::TransitionNone
     }
@@ -103,6 +106,11 @@ mod tests {
             transition(&record(3, 1, 0), 3),
             TransitionType::TransitionNone
         );
+        let inactive = ValidatorRecord {
+            inactive: true,
+            ..record(4, 1, 0)
+        };
+        assert_eq!(transition(&inactive, 3), TransitionType::TransitionInactive);
         assert!(!is_departing(&p, &leaving, boundary3 - 6));
         assert!(is_departing(&p, &leaving, boundary3 - 5));
         assert!(is_departing(&p, &leaving, boundary3 - 1));

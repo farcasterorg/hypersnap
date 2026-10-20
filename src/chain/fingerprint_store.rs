@@ -23,8 +23,7 @@
 use std::sync::Arc;
 
 use proof_of_quality::uniqueness::{
-    fingerprint, hamming_distance_128, uniqueness_enc_from_neighbor_count,
-    NEAR_DUP_HAMMING_THRESHOLD,
+    hamming_distance_128, uniqueness_enc_from_neighbor_count, NEAR_DUP_HAMMING_THRESHOLD,
 };
 
 use crate::core::error::HubError;
@@ -40,6 +39,28 @@ pub enum FingerprintError {
     MalformedKey(usize),
     #[error("malformed fingerprint value (len {0})")]
     MalformedValue(usize),
+}
+
+thread_local! {
+    static LAST_FINGERPRINT: std::cell::RefCell<(String, u128)> =
+        const { std::cell::RefCell::new((String::new(), 0)) };
+}
+
+/// `uniqueness::fingerprint(text)`. A cast's fee and its record after the
+/// merge fingerprint the same text in turn, so the last result of the
+/// thread is kept.
+fn fingerprint(text: &str) -> u128 {
+    LAST_FINGERPRINT.with(|last| {
+        let mut last = last.borrow_mut();
+        if !text.is_empty() && last.0 == text {
+            return last.1;
+        }
+        let fp = proof_of_quality::uniqueness::fingerprint(text);
+        last.0.clear();
+        last.0.push_str(text);
+        last.1 = fp;
+        fp
+    })
 }
 
 /// 30-day rolling window in seconds.

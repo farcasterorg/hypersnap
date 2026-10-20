@@ -1,5 +1,4 @@
 mod tests {
-    use rand::Rng;
     use serde::Deserialize;
 
     use crate::{
@@ -63,86 +62,86 @@ mod tests {
         messages: Vec<Message>,
     }
 
-    #[tokio::test]
-    async fn test_cast_validation() {
-        let n: u32 = rand::thread_rng().gen::<u32>() % 10000;
-        let resp = reqwest::get(format!(
-            "https://snap.farcaster.xyz:3381/v1/castsByFid?fid={}",
-            n
-        ))
-        .await;
-        assert!(!resp.is_err());
+    // Committed sample of a `/v1/castsByFid` response. Previously this test fetched a random fid from
+    // live production every run, which made it non-deterministic and flaky: it depended on prod
+    // uptime, CI egress, and whatever cast data that random fid happened to have. The fixture pins a
+    // representative mix of real casts — reply (parentCastId), channel cast (parentUrl), URL embed,
+    // CastId embed, a plain root cast, mentions, and all three cast types (CAST, LONG_CAST,
+    // TEN_K_CAST) — so the test exercises the validator itself rather than the network. See
+    // NEYN-12730.
+    const CASTS_FIXTURE: &str = include_str!("testdata/casts_by_fid.json");
 
-        let response = resp.unwrap();
-        let resp_json = response.text().await.unwrap();
-
-        let json = serde_json::from_str::<PagedResponse>(&resp_json);
-        let page = json.unwrap();
+    #[test]
+    fn test_cast_validation() {
+        let page = serde_json::from_str::<PagedResponse>(CASTS_FIXTURE).unwrap();
+        assert!(
+            !page.messages.is_empty(),
+            "fixture should contain casts to validate"
+        );
         for msg in page.messages {
-            match msg.data.cast_add_body {
-                Some(body) => {
-                    let cast = crate::proto::CastAddBody {
-                        embeds_deprecated: body.embeds_deprecated,
-                        mentions: body.mentions,
-                        embeds: body
-                            .embeds
-                            .into_iter()
-                            .map(|e| match e {
-                                EmbedUrlOrCastId::Url(url) => Embed {
-                                    embed: Some(embed::Embed::Url(url.url)),
-                                },
-                                EmbedUrlOrCastId::CastId(cast_id) => Embed {
-                                    embed: Some(embed::Embed::CastId(crate::proto::CastId {
-                                        fid: cast_id.cast_id.fid,
-                                        hash: hex::decode(&cast_id.cast_id.hash[2..]).unwrap(),
-                                    })),
-                                },
-                            })
-                            .collect(),
-                        text: body.text,
-                        mentions_positions: body
-                            .mentions_positions
-                            .iter()
-                            .map(|p| *p as u32)
-                            .collect(),
-                        r#type: match body.cast_type.as_str() {
-                            "CAST" => 0,
-                            "LONG_CAST" => 1,
-                            "TEN_K_CAST" => 2,
-                            _ => 1,
+            let Some(body) = msg.data.cast_add_body else {
+                continue;
+            };
+            let cast = crate::proto::CastAddBody {
+                embeds_deprecated: body.embeds_deprecated,
+                mentions: body.mentions,
+                embeds: body
+                    .embeds
+                    .into_iter()
+                    .map(|e| match e {
+                        EmbedUrlOrCastId::Url(url) => Embed {
+                            embed: Some(embed::Embed::Url(url.url)),
                         },
-                        parent: body.parent_cast_id.map(|p| {
-                            cast_add_body::Parent::ParentCastId(crate::proto::CastId {
-                                fid: p.fid,
-                                hash: hex::decode(p.hash.replace("0x", "")).unwrap(),
-                            })
-                        }),
-                    };
-                    assert!(
-                        // Assume pro user is true to avoid failures on casts with 10k characters or 4 embeds.
-                        validations::cast::validate_cast_add_body(
-                            &cast,
-                            true,
-                            true,
-                            EngineVersion::latest()
-                        )
-                        .is_ok(),
-                        "Failed to validate cast {:?}",
-                        serde_json::to_string(&cast)
-                    );
-                }
-                None => {}
+                        EmbedUrlOrCastId::CastId(cast_id) => Embed {
+                            embed: Some(embed::Embed::CastId(crate::proto::CastId {
+                                fid: cast_id.cast_id.fid,
+                                hash: hex::decode(&cast_id.cast_id.hash[2..]).unwrap(),
+                            })),
+                        },
+                    })
+                    .collect(),
+                text: body.text,
+                mentions_positions: body.mentions_positions.iter().map(|p| *p as u32).collect(),
+                r#type: match body.cast_type.as_str() {
+                    "CAST" => 0,
+                    "LONG_CAST" => 1,
+                    "TEN_K_CAST" => 2,
+                    _ => 1,
+                },
+                parent: body.parent_cast_id.map(|p| {
+                    cast_add_body::Parent::ParentCastId(crate::proto::CastId {
+                        fid: p.fid,
+                        hash: hex::decode(p.hash.replace("0x", "")).unwrap(),
+                    })
+                }),
+            };
+            // Assume pro user is true to avoid failures on casts with 10k characters or 4 embeds.
+            // The fixtures predate the embed-limit change, so validate them at V19 — the version
+            // that was live when they were signed.
+            if let Err(err) =
+                validations::cast::validate_cast_add_body(&cast, true, true, EngineVersion::V19)
+            {
+                panic!(
+                    "Failed to validate cast: {:?} \
+                     (text_len={}, embeds={}, embeds_deprecated={}, mentions={}, type={}, has_parent={})",
+                    err,
+                    cast.text.len(),
+                    cast.embeds.len(),
+                    cast.embeds_deprecated.len(),
+                    cast.mentions.len(),
+                    cast.r#type,
+                    cast.parent.is_some(),
+                );
             }
         }
     }
 
     fn cast_with_embeds(count: usize) -> crate::proto::CastAddBody {
-        // Fully qualified: this module already defines its own `CastAddBody`
-        // deserialization fixture, so importing the proto type would shadow it.
         crate::proto::CastAddBody {
+            text: "hello".to_string(),
             embeds: (0..count)
                 .map(|i| Embed {
-                    embed: Some(embed::Embed::Url(format!("https://example.com/{}", i))),
+                    embed: Some(embed::Embed::Url(format!("https://example.com/{i}"))),
                 })
                 .collect(),
             ..Default::default()
@@ -164,9 +163,7 @@ mod tests {
 
     /// Pins both sides of the `IncreaseEmbedLimitForAllUsers` boundary. The pre-V20 row is what
     /// makes replay of existing history safe: a non-Pro cast with 3 embeds was invalid when it
-    /// would have been signed, and must stay invalid forever at that version. The post-V20 row
-    /// is what keeps this node in consensus with mainnet, which has merged 4-embed non-Pro casts
-    /// since 2026-08-13.
+    /// would have been signed, and must stay invalid forever at that version.
     #[test]
     fn embed_limit_is_four_for_everyone_from_v20() {
         use validations::error::ValidationError;

@@ -11,6 +11,7 @@
 pub mod account_association;
 pub mod auth;
 pub mod boundary;
+pub mod bridge_actions;
 pub mod emission;
 pub mod engine;
 #[cfg(test)]
@@ -24,10 +25,13 @@ pub mod precheck;
 pub mod proposer;
 pub mod reader;
 pub mod registry;
+pub mod seed;
 pub mod state;
-#[cfg(test)]
-pub(crate) mod test_support;
+/// The shard-0 test harness, also for the fuzz targets (`fuzz/`).
+#[cfg(any(test, feature = "fuzzing"))]
+pub mod test_support;
 pub mod validators;
+pub mod verifications;
 pub mod views;
 #[cfg(test)]
 mod wallet_test;
@@ -99,6 +103,16 @@ pub struct Shard0Params {
     pub onboarding_stake_gate: bool,
     pub min_onboarding_stake: u64,
     pub min_onboarding_stake_duration: u64,
+    /// `RETRO_MINTED` (FIP §9, §10.1), micro-units: a release constant, the
+    /// sum of the retroactive `Claimed` amounts. Devnets set it with
+    /// `[hypersnap] retro_minted`.
+    pub retro_minted: u64,
+    /// `PAUSE_DURATION` (FIP §13.8), seconds.
+    pub pause_duration_secs: u64,
+    /// `SEED_REVEAL_MARGIN` (FIP §4.9), shard-0 blocks: the reveals of the
+    /// seed of epoch `t` end this many blocks before `boundary_height(t)`.
+    /// Devnets set it with `[hypersnap] seed_reveal_margin`.
+    pub seed_reveal_margin: u64,
     /// `EXEMPT_RECOVERIES` of the release (FIP §2).
     pub exempt_recoveries: Vec<crate::chain::exempt_recoveries::ExemptRecovery>,
 }
@@ -142,6 +156,9 @@ impl Shard0Params {
             onboarding_stake_gate: false,
             min_onboarding_stake: 1_000_000_000,
             min_onboarding_stake_duration: 100_000,
+            retro_minted: 0,
+            pause_duration_secs: 72 * 3600,
+            seed_reveal_margin: 300,
             exempt_recoveries: crate::chain::exempt_recoveries::release_list(network),
         }
     }

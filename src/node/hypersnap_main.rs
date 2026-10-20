@@ -60,13 +60,25 @@ pub struct HypersnapConfig {
     pub epoch_length: u64,
     /// 0 = the FIP value.
     pub scoring_delay: u64,
-    /// `RETRO_MINTED` (FIP §9), micro-units.
+    /// Devnet override of `RETRO_MINTED` (FIP §9), micro-units (0 = the
+    /// release value). It is in `params_hash`.
     pub retro_minted: u64,
     /// `host:port` of the submit endpoint (`POST /v1/submitMessage`, a
     /// protobuf `Message`). Empty: no endpoint.
     pub submit_address: String,
-    /// Devnet override of `MIN_DIFFICULTY_BITS` (0 = the release value).
+    /// Devnet override of `MIN_DIFFICULTY_BITS` (0 = the release value). It
+    /// is in `params_hash`.
     pub min_difficulty_bits: u32,
+    /// Devnet override of `AUTO_DEREGISTER_THRESHOLD` (FIP §4.7; 0 = the
+    /// release value). It is in `params_hash`.
+    pub auto_deregister_threshold: u64,
+    /// Devnet override of `REBALANCE_WINDOW` (FIP §4.6; 0 = the release
+    /// value). It is in `params_hash`.
+    pub rebalance_window: u64,
+    /// Devnet override of `SEED_REVEAL_MARGIN` (FIP §4.9; 0 = the release
+    /// value), for epochs shorter than the release margin. It is in
+    /// `params_hash`.
+    pub seed_reveal_margin: u64,
     /// The bridge contracts that this validator watches for burns (FIP
     /// §13.6).
     pub bridge_watchers: Vec<BridgeWatcherConfig>,
@@ -79,6 +91,12 @@ pub struct HypersnapConfig {
     /// Remove the snapchain history after the shard-0 pivot block is
     /// certified (FIP §17.7). Off by default.
     pub prune_pre_pivot_history: bool,
+    /// Keep the blocks of about the last N epochs on each shard and remove
+    /// older ones (FIP §17.6: a node can prune block history, not messages):
+    /// the last `N · EPOCH_LENGTH` heights. 0 (the default) keeps all; the
+    /// smallest other value is 2. A peer that syncs from an older height gets
+    /// those blocks from another node or a snapshot.
+    pub prune_block_history_epochs: u64,
     /// A node without the snapchain chunks from the first one (FIP §17.4):
     /// the base URL of the genesis state snapshot
     /// (`<network>/genesis-<P>/<s>/latest.json`).
@@ -120,10 +138,14 @@ impl Default for HypersnapConfig {
             retro_minted: 0,
             submit_address: String::new(),
             min_difficulty_bits: 0,
+            auto_deregister_threshold: 0,
+            rebalance_window: 0,
+            seed_reveal_margin: 0,
             bridge_watchers: vec![],
             rpc_exempt_ips: vec![],
             bootstrap_peers: String::new(),
             prune_pre_pivot_history: false,
+            prune_block_history_epochs: 0,
             genesis_snapshot_url: String::new(),
             genesis_snapshot_rpc: vec![],
             recovery_watcher_rpc_url: String::new(),
@@ -163,6 +185,11 @@ pub struct DevnetValidator {
     /// so the node does not answer DA challenges.
     #[serde(default)]
     pub node_key: String,
+    /// Hex Falcon-512 custody (account) public key (897 bytes): the FID is
+    /// migrated from the genesis. A node key needs it, because a node key
+    /// signs only for a migrated FID (FIP §3).
+    #[serde(default)]
+    pub custody_key: String,
 }
 
 fn hex32(s: &str) -> Result<[u8; 32], String> {
@@ -281,7 +308,41 @@ pub fn shard0_params(
     if cfg.min_difficulty_bits > 0 {
         params.min_difficulty_bits = cfg.min_difficulty_bits;
     }
+    if cfg.retro_minted > 0 {
+        params.retro_minted = cfg.retro_minted;
+    }
+    if cfg.auto_deregister_threshold > 0 {
+        params.auto_deregister_threshold = cfg.auto_deregister_threshold;
+    }
+    if cfg.rebalance_window > 0 {
+        params.rebalance_window = cfg.rebalance_window;
+    }
+    if cfg.seed_reveal_margin > 0 {
+        params.seed_reveal_margin = cfg.seed_reveal_margin;
+    }
     Ok(params)
+}
+
+/// The consensus configuration of a Hypersnap node: the timing of FIP §4.2 on
+/// mainnet and testnet (a devnet keeps its `[consensus]` values), and sync
+/// requests for blocks of up to `MAX_BLOCK_BYTES`.
+pub fn consensus_config(
+    cfg: &crate::consensus::consensus::Config,
+    network: proto::FarcasterNetwork,
+) -> crate::consensus::consensus::Config {
+    use crate::chain::block;
+    let mut c = cfg.clone();
+    if network != proto::FarcasterNetwork::Devnet {
+        c.block_time = block::BLOCK_TIME;
+        c.propose_time = block::PROPOSE_TIME;
+        c.prevote_time = block::PREVOTE_TIME;
+        c.precommit_time = block::PRECOMMIT_TIME;
+        c.step_delta = block::STEP_DELTA;
+    }
+    c.sync_request_timeout = c
+        .sync_request_timeout
+        .max(crate::network::gossip::HYPERSNAP_SYNC_REQUEST_TIMEOUT);
+    c
 }
 
 /// The Optimism subscriber, its confirmation relay and the fname fetcher
@@ -367,12 +428,15 @@ fn start_watchers(
         },
         stop_block_number: base.stop_block_number,
         override_tier_registry_address: None,
+        override_channel_registrar_address: None,
+        override_ens_registry_address: None,
     };
     let (subscriber_tx, subscriber_rx) = mpsc::channel(1_000);
     let (_retry_tx, retry_rx) = broadcast::channel(16);
     let mut subscriber = crate::connectors::onchain_events::Subscriber::new(
         &cfg,
         Chain::Optimism,
+        app_config.fc_network,
         subscriber_tx,
         statsd.clone(),
         local,
@@ -398,6 +462,8 @@ fn start_watchers(
 /// start.
 fn devnet_boot(
     cfg: &HypersnapConfig,
+    network: proto::FarcasterNetwork,
+    params: &Shard0Params,
     data_dir: &std::path::Path,
 ) -> Result<PivotBoot, Box<dyn std::error::Error>> {
     let genesis: DevnetGenesis = serde_json::from_slice(&std::fs::read(&cfg.genesis_file)?)?;
@@ -417,10 +483,12 @@ fn devnet_boot(
                     node_key_hash: hex32(&v.node_key_hash)?,
                     node_public_key: hex::decode(v.node_key.trim_start_matches("0x"))
                         .map_err(|e| e.to_string())?,
+                    custody_key: hex::decode(v.custody_key.trim_start_matches("0x"))
+                        .map_err(|e| e.to_string())?,
                 })
             })
             .collect::<Result<_, String>>()?;
-        write_bootstrap_set(&db, &validators, &fork_hash).map_err(|e| e.to_string())?;
+        write_bootstrap_set(&db, &validators, &fork_hash, params).map_err(|e| e.to_string())?;
         info!(validators = validators.len(), "Wrote the devnet genesis");
     }
     db.close();
@@ -428,6 +496,10 @@ fn devnet_boot(
         record: PivotRecord {
             pivot_height: cfg.pivot_height,
             fork_block_hash: fork_hash.to_vec(),
+            snapchain_engine_version: crate::chain::pivot::snapchain_engine_version(
+                network,
+                genesis.fork_timestamp,
+            ) as u32,
             ..Default::default()
         },
         shard0_parent: ParentInfo {
@@ -556,8 +628,37 @@ async fn serve_submit(
     }
 }
 
+/// The smallest `prune_block_history_epochs` other than 0: the scoring of an
+/// epoch reads its boundary block, and the fee settlements and onboarding
+/// anchors read recent blocks.
+const MIN_BLOCK_HISTORY_EPOCHS: u64 = 2;
+
+/// Every 10 minutes, remove the blocks of each shard below its tip less
+/// `keep` heights.
+async fn prune_block_history(dbs: Vec<(u32, Arc<RocksDB>)>, keep: u64) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(600));
+    loop {
+        tick.tick().await;
+        for (shard, db) in &dbs {
+            let db = db.clone();
+            let pruned = tokio::task::spawn_blocking(move || {
+                let store = crate::chain::shard_blocks::HypersnapBlockStore::new(db);
+                let tip = store.last().and_then(|b| b.header).map(|h| h.height)?;
+                Some(store.prune_below(tip.saturating_sub(keep)))
+            })
+            .await;
+            match pruned {
+                Ok(Some(Ok(n))) if n > 0 => info!(shard, heights = n, "Pruned block history"),
+                Ok(Some(Err(e))) => error!(shard, "Pruning the block history failed: {}", e),
+                _ => {}
+            }
+        }
+    }
+}
+
 /// Publish the `ValidatorTransitionAlert`s of each rebalance window that a
-/// committed shard-0 block opens (FIP §4.6).
+/// committed shard-0 block opens (FIP §4.6), and log the size of the next
+/// validator set at each epoch boundary.
 async fn announce_transitions(
     mut decided: broadcast::Receiver<HypersnapBlock>,
     shard0: Arc<RocksDB>,
@@ -575,6 +676,18 @@ async fn announce_transitions(
         let Some(header) = block.header.filter(|h| h.shard_id == 0) else {
             continue;
         };
+        if params.epochs.is_boundary(header.height) {
+            let state = crate::chain::shard0::state::BlockState::new(shard0.clone());
+            if let Ok(Some(set)) =
+                crate::chain::shard0::validators::set_record(&state.txn(), header.epoch + 1)
+            {
+                info!(
+                    epoch = header.epoch + 1,
+                    members = set.members.len(),
+                    "Validator set of the next epoch"
+                );
+            }
+        }
         match crate::chain::transitions::alerts_at(&shard0, &params, header.height) {
             Ok(alerts) => {
                 for alert in alerts {
@@ -594,15 +707,16 @@ async fn announce_transitions(
     }
 }
 
-/// Answer the DA challenges of this validator (FIP §5.1) after each
-/// committed shard-0 block. The checkpoint reads block, so the responder has
-/// its own thread.
+/// Answer the DA challenges of this validator (FIP §5.1) and send its seed
+/// commits and reveals (FIP §4.9) after each committed shard-0 block. The
+/// checkpoint reads block, so the responders have their own thread.
 fn answer_da_challenges(
     mut decided: broadcast::Receiver<HypersnapBlock>,
     shard0: Arc<RocksDB>,
     params: Shard0Params,
     checkpoints: Arc<crate::chain::checkpoints::Checkpoints>,
     mut responder: crate::chain::da_responder::DaResponder,
+    mut seeds: crate::chain::seed_responder::SeedResponder,
     mempool_tx: mpsc::Sender<MempoolRequest>,
 ) {
     use crate::mempool::mempool::MempoolSource;
@@ -616,7 +730,7 @@ fn answer_da_challenges(
         let Some(header) = block.header.filter(|h| h.shard_id == 0) else {
             continue;
         };
-        let answers = match responder.after_block(
+        let mut answers = match responder.after_block(
             &shard0,
             &params,
             &checkpoints,
@@ -627,9 +741,28 @@ fn answer_da_challenges(
             Ok(answers) => answers,
             Err(e) => {
                 error!(height = header.height, "DA responses: {}", e);
-                continue;
+                vec![]
             }
         };
+        match seeds.after_block(
+            &shard0,
+            &params,
+            header.height,
+            header.timestamp,
+            &mut rand::rngs::OsRng,
+        ) {
+            Ok(messages) => {
+                for m in &messages {
+                    info!(
+                        height = header.height,
+                        r#type = ?m.data.as_ref().map(|d| d.r#type()),
+                        "Sending a seed message"
+                    );
+                }
+                answers.extend(messages);
+            }
+            Err(e) => error!(height = header.height, "Seed messages: {}", e),
+        }
         if !answers.is_empty() {
             info!(
                 height = header.height,
@@ -738,14 +871,18 @@ pub async fn run(
                 marker,
             )?
         }
-        None => devnet_boot(cfg, &data_dir)?,
+        None => devnet_boot(cfg, network, &params, &data_dir)?,
     };
+    // Shards 1 and 2 keep the snapchain rules of the fork block (FIP §17.7).
+    let engine_version = crate::chain::pivot::record_engine_version(&boot.record)?;
+    info!(?engine_version, "Snapchain rules of shards 1 and 2");
 
     let (system_tx, mut system_rx) = mpsc::channel::<SystemMessage>(16_384);
     let mut gossip_config = app_config
         .gossip
         .clone()
-        .with_namespace(crate::network::gossip::Config::hypersnap_namespace(network));
+        .with_namespace(crate::network::gossip::Config::hypersnap_namespace(network))
+        .with_engine_version(engine_version);
     // A Hypersnap node never dials snapchain peers (FIP §4.10).
     if marker.is_some() {
         gossip_config.bootstrap_peers = cfg.bootstrap_peers.clone();
@@ -781,6 +918,7 @@ pub async fn run(
     let transitions_rx = decided_tx.subscribe();
     let da_rx = decided_tx.subscribe();
     let transition_params = params.clone();
+    let epoch_length = params.epochs.epoch_length;
     let (block_tx, block_rx) = broadcast::channel::<proto::Block>(1_000);
     let (chunk_tx, chunk_rx) = broadcast::channel::<proto::ShardChunk>(1_000);
     let pivot_record = boot.record.clone();
@@ -791,7 +929,7 @@ pub async fn run(
         .chain(boot.shards.iter().map(|(s, g)| (*s, g.parent.height + 1)))
         .collect();
 
-    let node = HypersnapNode::create(
+    let mut node = HypersnapNode::create(
         HypersnapNodeConfig {
             data_dir: data_dir.clone(),
             network,
@@ -800,8 +938,8 @@ pub async fn run(
             shards: boot.shards,
             pivot_record: Some(boot.record),
             consensus_key,
-            consensus: app_config.consensus.clone(),
-            retro_minted: cfg.retro_minted,
+            consensus: consensus_config(&app_config.consensus, network),
+            engine_version,
             link_lag: 1,
             watchers: watchers.clone(),
             decided_tx: Some(decided_tx.clone()),
@@ -820,6 +958,8 @@ pub async fn run(
             warn!("No node key file: this validator does not answer DA challenges");
         }
     } else {
+        let seeds =
+            crate::chain::seed_responder::SeedResponder::new(load_node_key(&cfg.node_key_file)?);
         let responder =
             crate::chain::da_responder::DaResponder::new(load_node_key(&cfg.node_key_file)?);
         info!(
@@ -832,6 +972,7 @@ pub async fn run(
             params.clone(),
             node.checkpoints.clone(),
             responder,
+            seeds,
             mempool_tx.clone(),
         );
     }
@@ -849,7 +990,7 @@ pub async fn run(
         block_rx,
         statsd.clone(),
     );
-    mempool.set_hypersnap(params.clone());
+    mempool.set_hypersnap(params.clone(), engine_version);
     let rpc = NodeRpc {
         pivot: pivot_record,
         shards: std::iter::once((0u32, node.shard0.clone()))
@@ -873,6 +1014,7 @@ pub async fn run(
             )
             .map_err(|e| e.to_string())?;
             engine.set_checkpoints(node.checkpoints.clone());
+            engine.snapchain_version = engine_version;
             engine
         })),
     };
@@ -888,6 +1030,24 @@ pub async fn run(
     );
     let (api_handler, api_search_indexer) =
         crate::node::servers::api_handlers(api_system.as_ref(), &statsd);
+    // ENS names and contract verifications are checked at submit and on
+    // gossip, as on a snapchain node.
+    let l1_validator = Arc::new(crate::mempool::l1_validator::L1Validator::new(
+        crate::connectors::onchain_events::ChainClients::new(app_config),
+        node.shard_stores.clone(),
+        Box::new(crate::mempool::routing::ShardRouter {}),
+        node.shard_stores.len() as u32,
+        app_config.fc_network,
+        app_config.l1_gate.cache_config(),
+    ));
+    let (gossip_l1_gate, gossip_l1_gate_worker) = crate::mempool::l1_gate::GossipL1Gate::new(
+        app_config.l1_gate.clone(),
+        l1_validator.clone(),
+        app_config.fc_network,
+        mempool_tx.clone(),
+        statsd.clone(),
+    );
+    tokio::spawn(gossip_l1_gate_worker.run());
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
     let service = crate::node::servers::start_servers(
         app_config,
@@ -902,9 +1062,7 @@ pub async fn run(
         node.shard_stores.clone(),
         node.shard_senders.clone(),
         node.block_stores.clone(),
-        // ENS names and contract verifications are checked at submit, as
-        // on a snapchain node.
-        crate::connectors::onchain_events::ChainClients::new(app_config),
+        l1_validator,
         None,
         api_handler,
         api_search_indexer,
@@ -989,17 +1147,27 @@ pub async fn run(
             }
         });
     }
+    if cfg.prune_block_history_epochs > 0 {
+        let epochs = cfg.prune_block_history_epochs.max(MIN_BLOCK_HISTORY_EPOCHS);
+        let keep = epochs * epoch_length;
+        let dbs: Vec<(u32, Arc<RocksDB>)> = std::iter::once((0, node.shard0.clone()))
+            .chain(node.shards.iter().map(|(s, db)| (*s, db.clone())))
+            .collect();
+        info!(epochs, keep, "Pruning the block history");
+        tokio::spawn(prune_block_history(dbs, keep));
+    }
     tokio::spawn(async move { gossip.start().await });
 
     info!(data_dir = %data_dir.display(), "Hypersnap validator running");
+    let shutdown = crate::node::shutdown::shutdown_signal();
+    tokio::pin!(shutdown);
     loop {
         tokio::select! {
             message = system_rx.recv() => match message {
-                Some(SystemMessage::Mempool(request)) => {
-                    let _ = mempool_tx.send(request).await;
-                }
+                Some(SystemMessage::Mempool(request)) => gossip_l1_gate.admit(request),
                 Some(SystemMessage::ExitWithError(e)) => {
                     error!("Exiting: {}", e);
+                    node.stop();
                     return Err(e.into());
                 }
                 Some(other) => node.dispatch(other),
@@ -1009,11 +1177,43 @@ pub async fn run(
                 error!("An API server stopped; exiting");
                 return Err("API server stopped".into());
             }
-            _ = tokio::signal::ctrl_c() => {
-                info!("Shutting down");
-                drop(api_system);
+            signal = &mut shutdown => {
+                info!(signal, "Received shutdown signal, shutting down");
+                crate::node::shutdown::close_gossip_connections(&gossip_tx).await;
+                if let Some(api) = api_system {
+                    crate::node::shutdown::shut_down_api(api).await;
+                }
+                node.stop();
                 return Ok(());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mainnet_and_testnet_use_the_fip_timing_and_a_devnet_its_own() {
+        let mut cfg = crate::consensus::consensus::Config::default();
+        cfg.block_time = std::time::Duration::from_millis(500);
+        for network in [
+            proto::FarcasterNetwork::Mainnet,
+            proto::FarcasterNetwork::Testnet,
+        ] {
+            let c = consensus_config(&cfg, network);
+            assert_eq!(c.block_time, crate::chain::block::BLOCK_TIME);
+            assert_eq!(c.propose_time, crate::chain::block::PROPOSE_TIME);
+            assert_eq!(c.prevote_time, crate::chain::block::PREVOTE_TIME);
+            assert_eq!(c.precommit_time, crate::chain::block::PRECOMMIT_TIME);
+            assert_eq!(c.step_delta, crate::chain::block::STEP_DELTA);
+        }
+        let devnet = consensus_config(&cfg, proto::FarcasterNetwork::Devnet);
+        assert_eq!(devnet.block_time, std::time::Duration::from_millis(500));
+        assert_eq!(
+            devnet.sync_request_timeout,
+            crate::network::gossip::HYPERSNAP_SYNC_REQUEST_TIMEOUT
+        );
     }
 }

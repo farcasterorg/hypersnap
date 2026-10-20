@@ -11,5 +11,6 @@ pub mod pivot_boot;
 #[cfg(test)]
 mod pivot_boot_test;
 pub mod servers;
+pub mod shutdown;
 pub mod snapchain_node;
 pub mod snapchain_read_node;

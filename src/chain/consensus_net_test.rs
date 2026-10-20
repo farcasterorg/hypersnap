@@ -129,7 +129,9 @@ mod tests {
             )
             .await
             .unwrap();
-            engine.enter_hypersnap_mode(Some(0)).unwrap();
+            engine
+                .enter_hypersnap_mode(Some(0), crate::version::version::EngineVersion::latest())
+                .unwrap();
 
             let key = validators.keys[i].clone();
             let address = key.public_key().address();
@@ -349,7 +351,7 @@ mod three_shards {
             crate::storage::db::RocksDB::new(dir.path().join("node/shard0").to_str().unwrap());
         std::fs::create_dir_all(dir.path().join("node")).unwrap();
         shard0.open().unwrap();
-        genesis.write(&Arc::new(shard0));
+        genesis.write(&Arc::new(shard0), &s0::params());
 
         let mut consensus = Config::default();
         consensus.block_time = Duration::from_millis(400);
@@ -367,7 +369,7 @@ mod three_shards {
                 pivot_record: Some(s0::pivot_record()),
                 consensus_key: key,
                 consensus,
-                retro_minted: 0,
+                engine_version: crate::version::version::EngineVersion::latest(),
                 link_lag: 1,
                 watchers: Arc::new(AllFinal),
                 decided_tx: None,

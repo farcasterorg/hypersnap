@@ -38,6 +38,7 @@ use crate::storage::store::node_local_state::LocalStateStore;
 use crate::storage::store::stores::StoreLimits;
 use crate::storage::trie::merkle_trie::MerkleTrie;
 use crate::utils::statsd_wrapper::StatsdClientWrapper;
+use crate::version::version::EngineVersion;
 use informalsystems_malachitebft_metrics::SharedRegistry;
 use informalsystems_malachitebft_network::PeerId as MalachitePeerId;
 use libp2p::PeerId;
@@ -65,7 +66,9 @@ pub struct HypersnapNodeConfig {
     pub pivot_record: Option<PivotRecord>,
     pub consensus_key: ConsensusPrivateKey,
     pub consensus: ConsensusConfig,
-    pub retro_minted: u64,
+    /// The snapchain engine version of shards 1 and 2: the version of the
+    /// fork block (FIP §17.7).
+    pub engine_version: EngineVersion,
     /// How many blocks below a shard tip the shard-0 proposer links.
     pub link_lag: u64,
     pub watchers: Arc<dyn Watchers>,
@@ -158,8 +161,36 @@ pub struct HypersnapNode {
     stopped: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// The block cache of the DBs of a Hypersnap node: one LRU cache for all of
+/// them, as on a snapchain node, with the index and filter blocks in it, so
+/// that their memory is bounded. Without it, each read of a full-block
+/// workload went to the file.
+fn block_cache() -> rocksdb::Cache {
+    static CACHE: std::sync::OnceLock<rocksdb::Cache> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| rocksdb::Cache::new_lru_cache(512 * 1024 * 1024))
+        .clone()
+}
+
+/// The node-local DB of a shard (`LocalStateStore`, the undecided values):
+/// no blob files, so a proposal that the commit deletes is gone at the next
+/// compaction, often before it leaves the memtable.
+fn open_local_db(path: &Path) -> Arc<RocksDB> {
+    let db = Arc::new(RocksDB::new_with_cache(
+        path.to_str().expect("utf-8 path"),
+        crate::storage::db::SnapchainDbOptimizationType::Default,
+        Some(block_cache()),
+    ));
+    db.open().expect("open RocksDB");
+    db
+}
+
 fn open_db(path: &Path) -> Arc<RocksDB> {
-    let db = Arc::new(RocksDB::new(path.to_str().expect("utf-8 path")));
+    let db = Arc::new(RocksDB::new_with_cache(
+        path.to_str().expect("utf-8 path"),
+        crate::storage::db::SnapchainDbOptimizationType::Hypersnap,
+        Some(block_cache()),
+    ));
     db.open().expect("open RocksDB");
     db
 }
@@ -176,7 +207,10 @@ impl HypersnapNode {
     ) -> Result<Self, String> {
         let dir = &config.data_dir;
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        let checkpoints = Arc::new(Checkpoints::new(dir.join("checkpoints"), config.network));
+        let checkpoints = Arc::new(
+            Checkpoints::new(dir.join("checkpoints"), config.network)
+                .with_block_cache(block_cache()),
+        );
         let address = config.consensus_key.public_key().address();
 
         let shard0 = open_db(&dir.join("shard0"));
@@ -187,6 +221,7 @@ impl HypersnapNode {
         )
         .map_err(|e| e.to_string())?;
         engine0.set_checkpoints(checkpoints.clone());
+        engine0.snapchain_version = config.engine_version;
         let reader = engine0.reader();
 
         let mut validators: Vec<(u32, ShardValidator)> = Vec::new();
@@ -212,7 +247,7 @@ impl HypersnapNode {
             .await
             .map_err(|e| e.to_string())?;
             engine
-                .enter_hypersnap_mode(Some(genesis.parent.height))
+                .enter_hypersnap_mode(Some(genesis.parent.height), config.engine_version)
                 .map_err(|e| e.to_string())?;
             shard_stores.insert(shard, engine.get_stores());
             shard_senders.insert(shard, engine.get_senders());
@@ -223,12 +258,14 @@ impl HypersnapNode {
             if let Some(record) = &config.pivot_record {
                 producer = producer.with_pivot_record(record);
             }
+            let local = open_local_db(&dir.join(format!("local{}", shard)));
             let mut proposer = HypersnapShardProposer::new(
                 address.clone(),
                 producer,
                 Arc::new(reader.clone()),
                 Arc::new(reader.clone()),
-            );
+            )
+            .with_undecided_db(local.clone());
             if let Some(tx) = &config.decided_tx {
                 proposer = proposer.with_decided(tx.clone());
             }
@@ -239,7 +276,7 @@ impl HypersnapNode {
                     address.clone(),
                     SnapchainShard::new(shard),
                     proposer,
-                    LocalStateStore::new(open_db(&dir.join(format!("local{}", shard)))),
+                    LocalStateStore::new(local),
                     statsd.clone(),
                 ),
             ));
@@ -251,7 +288,7 @@ impl HypersnapNode {
             checkpoints.clone(),
             config.params.clone(),
             config.shards.keys().copied().collect(),
-            config.retro_minted,
+            config.params.retro_minted,
             Some(dir.join("scoring")),
         ));
         let views: Arc<dyn Shard0Inputs> = Arc::new(NodeViews {
@@ -266,10 +303,12 @@ impl HypersnapNode {
         let mempool = MempoolPoller {
             messages_request_tx: mempool_tx,
             max_messages_per_block: config.params.max_messages_per_block() as u32,
+            max_bytes: Some(crate::chain::block::PULL_BYTES),
             network: config.network,
             shard_id: 0,
             statsd_client: statsd.clone(),
         };
+        let local0 = open_local_db(&dir.join("local0"));
         validators.insert(
             0,
             (
@@ -279,13 +318,14 @@ impl HypersnapNode {
                     SnapchainShard::new(0),
                     {
                         let p = Shard0Proposer::new(address.clone(), engine0, views, mempool)
+                            .with_undecided_db(local0.clone())
                             .with_statsd(statsd.clone());
                         match &config.decided_tx {
                             Some(tx) => p.with_decided(tx.clone()),
                             None => p,
                         }
                     },
-                    LocalStateStore::new(open_db(&dir.join("local0"))),
+                    LocalStateStore::new(local0),
                     statsd.clone(),
                 ),
             ),

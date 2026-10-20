@@ -189,8 +189,8 @@ pub fn verify(set: &EpochSet, cert: &CommitCertificate) -> Result<(), Certificat
     Ok(())
 }
 
-#[cfg(test)]
-pub(crate) mod test_support {
+#[cfg(any(test, feature = "fuzzing"))]
+pub mod test_support {
     //! A Falcon-512 validator set for tests.
     use super::*;
     use crate::chain::validator_sets::build_record;

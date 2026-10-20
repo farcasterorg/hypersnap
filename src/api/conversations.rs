@@ -189,11 +189,12 @@ where
         Ok(response.into_inner())
     }
 
-    /// Fetch replies to a cast.
+    /// Fetch up to `limit` direct replies to a cast, oldest first.
     async fn fetch_replies(
         &self,
         fid: u64,
         hash: &[u8],
+        limit: usize,
     ) -> Result<Vec<Message>, ConversationError> {
         let request = proto::CastsByParentRequest {
             parent: Some(proto::casts_by_parent_request::Parent::ParentCastId(
@@ -202,7 +203,7 @@ where
                     hash: hash.to_vec(),
                 },
             )),
-            page_size: Some(self.config.max_replies as u32),
+            page_size: Some(limit as u32),
             page_token: None,
             reverse: Some(false),
         };
@@ -213,7 +214,11 @@ where
             .await
             .map_err(|e| ConversationError::ServiceError(e.message().to_string()))?;
 
-        Ok(response.into_inner().messages)
+        // Each shard returns its own page, so order and trim the combined set.
+        let mut replies = response.into_inner().messages;
+        replies.sort_by_key(|m| m.data.as_ref().map(|d| d.timestamp).unwrap_or(0));
+        replies.truncate(limit);
+        Ok(replies)
     }
 
     /// Recursively build the conversation tree.
@@ -260,18 +265,15 @@ where
             }
         };
 
-        // Fetch direct replies
-        let reply_messages = self.fetch_replies(fid, &hash).await?;
+        // Fetch direct replies, within what remains of the reply budget
+        let budget = self.config.max_replies - *total_replies;
+        let reply_messages = self.fetch_replies(fid, &hash, budget).await?;
         *total_replies += reply_messages.len();
 
-        // Recursively build reply trees
+        // Recursively build reply trees. Direct replies are already counted, so
+        // deeper levels only get what they leave of the budget.
         let mut replies = Vec::with_capacity(reply_messages.len());
         for reply in reply_messages {
-            // Check reply limit before processing each reply
-            if *total_replies >= self.config.max_replies {
-                break;
-            }
-
             let reply_tree = Box::pin(self.build_conversation_tree(
                 reply,
                 current_depth + 1,

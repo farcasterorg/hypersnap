@@ -1,5 +1,7 @@
 use super::{
-    get_from_db_or_txn, get_message, make_fid_key, make_user_key_with_prefix, read_fid_key,
+    get_from_db_or_txn, get_message,
+    index_read::{get_union_index_value, index_roots},
+    make_fid_key, make_user_key_with_prefix, read_fid_key,
     store::{Store, StoreDef},
     IntoU8, MessagesPage, StoreEventHandler, TS_HASH_LENGTH,
 };
@@ -322,7 +324,7 @@ impl StoreDef for UsernameProofStoreDef {
             _ => None,
         };
 
-        let (deleted_proof_body, deleted_message) = if merge_conflicts.len() > 0 {
+        let (deleted_proof_body, deleted_message) = if !merge_conflicts.is_empty() {
             match &merge_conflicts[0].data {
                 Some(message_data) => match &message_data.body {
                     Some(Body::UsernameProofBody(username_proof_body)) => (
@@ -429,7 +431,16 @@ impl UsernameProofStore {
         txn: &RocksDbTransactionBatch,
     ) -> Result<Option<Message>, HubError> {
         let by_name_key = UsernameProofStoreDef::make_username_proof_by_name_key(name);
-        let fid_result = get_from_db_or_txn(&store.db(), txn, by_name_key.as_slice())?;
+        let ctx = store.state_context();
+        let fid_result = get_union_index_value(
+            &store.db(),
+            Some(txn),
+            &index_roots(
+                ctx.root_prefix(RootPrefix::UserNameProofByName),
+                RootPrefix::UserNameProofByName as u8,
+            ),
+            &by_name_key[1..],
+        )?;
 
         if fid_result.is_none() {
             return Err(HubError::not_found(

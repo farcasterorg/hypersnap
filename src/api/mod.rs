@@ -29,6 +29,7 @@ pub mod cast_quotes_index;
 pub mod channels;
 pub mod config;
 pub mod conversations;
+pub mod custody_index;
 pub mod daily_stats;
 pub mod events;
 pub mod feeds;
@@ -42,6 +43,7 @@ pub mod ssrf;
 pub mod types;
 pub mod user_data_index;
 pub mod user_hydrator;
+pub mod user_search_index;
 pub mod webhooks;
 pub mod worker;
 
@@ -286,6 +288,79 @@ pub fn initialize(
     };
     let user_data_indexer = Arc::new(UserDataIndexer::new(user_data_config, db.clone()));
 
+    // Custody index is always enabled when API is enabled — it backs custody
+    // address lookups (/user/bulk-by-address, /user/custody-address) that would
+    // otherwise scan every IdRegister event. Live events keep it current; the
+    // on-chain event store fills it once, since the event log is pruned.
+    let custody_indexer = Arc::new(crate::api::custody_index::CustodyIndexer::new(
+        FeatureConfig {
+            enabled: true,
+            ..Default::default()
+        },
+        db.clone(),
+    ));
+    // User search index is always enabled when API is enabled — it backs
+    // prefix search on /v2/farcaster/user/search. Live user data merges keep
+    // it current; the stores fill it once (hyper stores when available, so
+    // users whose profile messages were pruned from legacy stay findable).
+    let user_search_indexer = Arc::new(crate::api::user_search_index::UserSearchIndexer::new(
+        FeatureConfig {
+            enabled: true,
+            ..Default::default()
+        },
+        db.clone(),
+    ));
+    if !user_search_indexer.is_complete() {
+        let indexer = user_search_indexer.clone();
+        let stores = hyper_shard_stores
+            .clone()
+            .unwrap_or_else(|| shard_stores.clone());
+        tokio::task::spawn_blocking(move || {
+            let started = std::time::Instant::now();
+            match indexer.backfill(&stores) {
+                Ok(()) => tracing::info!(
+                    elapsed_secs = started.elapsed().as_secs(),
+                    "User search index backfill complete"
+                ),
+                Err(e) => tracing::warn!(error = %e, "User search index backfill failed"),
+            }
+        });
+    }
+
+    if !custody_indexer.is_complete() {
+        let indexer = custody_indexer.clone();
+        let onchain_stores: Vec<_> = shard_stores
+            .values()
+            .map(|s| s.onchain_event_store.clone())
+            .collect();
+        tokio::task::spawn_blocking(move || {
+            let started = std::time::Instant::now();
+            match indexer.backfill(&onchain_stores) {
+                Ok(()) => tracing::info!(
+                    elapsed_secs = started.elapsed().as_secs(),
+                    "Custody index backfill complete"
+                ),
+                Err(e) => tracing::warn!(error = %e, "Custody index backfill failed"),
+            }
+        });
+    }
+
+    // Trending windows read hourly engagement buckets that live events only
+    // fill from the first start of this version; fill the buckets for the
+    // engagement before it once, from the hyper stores.
+    if let (Some(metrics), Some(hyper)) = (metrics_indexer.clone(), hyper_shard_stores.clone()) {
+        tokio::task::spawn_blocking(move || {
+            let started = std::time::Instant::now();
+            match metrics.backfill_window(&hyper) {
+                Ok(()) => tracing::info!(
+                    elapsed_secs = started.elapsed().as_secs(),
+                    "Trending window backfill complete"
+                ),
+                Err(e) => tracing::warn!(error = %e, "Trending window backfill failed"),
+            }
+        });
+    }
+
     // Collect indexers that need backfill
     let mut backfill_indexers: Vec<Arc<dyn Indexer>> = Vec::new();
     backfill_indexers.push(cast_hash_indexer.clone());
@@ -324,6 +399,8 @@ pub fn initialize(
     worker_pool.register_arc(cast_hash_indexer.clone());
     worker_pool.register_arc(cast_quotes_indexer.clone());
     worker_pool.register_arc(user_data_indexer.clone());
+    worker_pool.register_arc(custody_indexer.clone());
+    worker_pool.register_arc(user_search_indexer.clone());
 
     if let Some(ref indexer) = social_graph_indexer {
         worker_pool.register_arc(indexer.clone());
@@ -545,6 +622,8 @@ pub fn initialize(
     }
 
     http_handler.set_shard_dbs(shard_dbs);
+    http_handler.set_custody_index(custody_indexer);
+    http_handler.set_user_search(user_search_indexer);
 
     // Mini app notifications — two stateful HTTP handlers wired here,
     // one more (the registration management handler) wired from

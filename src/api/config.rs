@@ -321,6 +321,10 @@ pub struct FeedConfig {
     /// Default page size for feed responses.
     #[serde(default = "default_feed_page_size")]
     pub default_page_size: usize,
+
+    /// Seconds a trending ranking is served before a background refresh.
+    #[serde(default = "default_trending_cache_ttl_secs")]
+    pub trending_cache_ttl_secs: u64,
 }
 
 impl Default for FeedConfig {
@@ -329,8 +333,13 @@ impl Default for FeedConfig {
             enabled: false,
             max_following_fetch: default_max_following_fetch(),
             default_page_size: default_feed_page_size(),
+            trending_cache_ttl_secs: default_trending_cache_ttl_secs(),
         }
     }
+}
+
+fn default_trending_cache_ttl_secs() -> u64 {
+    60
 }
 
 fn default_max_following_fetch() -> usize {

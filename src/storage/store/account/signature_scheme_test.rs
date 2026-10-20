@@ -96,7 +96,7 @@ mod tests {
             assert!(!links.is_compact_state_type(&with_scheme(&compact, scheme)));
         }
 
-        let reactions = ReactionStore::new(db.clone(), handler.clone(), 10).store_def();
+        let reactions = ReactionStore::new(db.clone(), handler.clone(), 10, None).store_def();
         let target = Target::TargetUrl("https://example.com".to_string());
         assert_add(
             &reactions,

@@ -3,15 +3,15 @@ use super::rpc_extensions::{
     FidTimestampRequestExt, LinksByFidRequestExt, ReactionsByFidRequestExt,
 };
 use crate::connectors::fname::FnameTransferLookup;
-use crate::connectors::onchain_events::{Chain, ChainClients};
 use crate::core::error::HubError;
 use crate::core::types::SnapchainValidatorContext;
 use crate::core::util::{get_farcaster_time, FarcasterTime};
 use crate::core::validations;
-use crate::core::validations::verification::VerificationAddressClaim;
+use crate::mempool::l1_validator::L1Validator;
 use crate::mempool::mempool::{MempoolRequest, MempoolSource};
 use crate::mempool::routing;
 use crate::network::gossip::GossipEvent;
+use crate::network::mesh::cache::MeshCache;
 use crate::network::mesh::crawl::crawl_mesh;
 use crate::network::mesh::view::{build_validator_peer_ids, classify_mesh_view, ValidatorPeerIds};
 use crate::proto::hub_service_server::HubService;
@@ -19,30 +19,43 @@ use crate::proto::{
     self, cast_add_body, casts_by_parent_request, link_body, links_by_target_request, message_data,
     on_chain_event::Body, reaction_body, reactions_by_target_request, AddressLookupRequest,
     AddressMatch, AddressToFidResponse, Block, BlocksRequest, CastId, CastsByParentRequest,
-    DbStats, EventRequest, EventsRequest, EventsResponse, FidAddressTypeRequest,
-    FidAddressTypeResponse, FidRequest, FidResponse, FidTimestampRequest, FidsRequest,
-    FidsResponse, GetConnectedPeersRequest, GetConnectedPeersResponse, GetInfoRequest,
+    ChannelFollow, ChannelFollower, ChannelFollowerCountRequest, ChannelFollowerCountResponse,
+    ChannelFollowersRequest, ChannelFollowersResponse, ChannelFollowsRequest,
+    ChannelFollowsResponse, ChannelInfo, ChannelMember, ChannelMemberRequest,
+    ChannelMemberResponse, ChannelMembersRequest, ChannelMembersResponse, ChannelMembership,
+    ChannelMembershipsByFidRequest, ChannelMembershipsResponse, ChannelMetadataResponse,
+    ChannelModeration, ChannelModerationsRequest, ChannelModerationsResponse, ChannelOwnerRequest,
+    ChannelOwnerResponse, ChannelPin, ChannelPinResponse, ChannelRequest, ChannelsByAddressRequest,
+    ChannelsByFidRequest, ChannelsResponse, DbStats, EventRequest, EventsRequest, EventsResponse,
+    FidAddressTypeRequest, FidAddressTypeResponse, FidRequest, FidResponse, FidTimestampRequest,
+    FidsRequest, FidsResponse, GetConnectedPeersRequest, GetConnectedPeersResponse, GetInfoRequest,
     GetInfoResponse, GetMeshViewRequest, Height, HubEvent, IdRegistryEventByAddressRequest,
-    LinkRequest, LinksByFidRequest, LinksByTargetRequest, MeshTopology, MeshView, Message,
-    MessageType, MessagesResponse, NameLookupRequest, NameToAddressResponse, OnChainEvent,
-    OnChainEventRequest, OnChainEventResponse, ReactionRequest, ReactionType,
-    ReactionsByFidRequest, ReactionsByTargetRequest, ShardChunk, ShardChunksRequest,
-    ShardChunksResponse, Signer, SignerEventType, SignerRequest, SignerResponse, SignerSource,
-    SignersByFidRequest, SignersByFidResponse, StorageLimitsResponse, SubscribeRequest,
-    TrieNodeMetadataRequest, TrieNodeMetadataResponse, UserDataRequest, UserNameProof,
-    UserNameType, UsernameProofRequest, UsernameProofsResponse, ValidationResponse,
-    VerificationAddAddressBody, VerificationRequest,
+    IsFollowingChannelRequest, IsFollowingChannelResponse, LinkRequest, LinksByFidRequest,
+    LinksByTargetRequest, MeshTopology, MeshView, Message, MessageType, MessagesResponse,
+    NameLookupRequest, NameToAddressResponse, OnChainEvent, OnChainEventRequest,
+    OnChainEventResponse, ReactionRequest, ReactionType, ReactionsByFidRequest,
+    ReactionsByTargetRequest, ShardChunk, ShardChunksRequest, ShardChunksResponse, Signer,
+    SignerEventType, SignerRequest, SignerResponse, SignerSource, SignersByFidRequest,
+    SignersByFidResponse, StorageLimitsResponse, SubscribeRequest, TrieNodeMetadataRequest,
+    TrieNodeMetadataResponse, UserDataRequest, UserNameProof, UserNameType, UsernameProofRequest,
+    UsernameProofsResponse, ValidationResponse, VerificationAddAddressBody, VerificationRequest,
 };
 use crate::storage::constants::OnChainEventPostfix;
 use crate::storage::constants::RootPrefix;
+use crate::storage::constants::PAGE_SIZE_MAX;
 use crate::storage::db::PageOptions;
 use crate::storage::db::RocksDbTransactionBatch;
 use crate::storage::store::account::MessagesPage;
 use crate::storage::store::account::UsernameProofStore;
 use crate::storage::store::account::{
     get_app_nonce, get_gasless_key_count, get_gasless_key_record, get_last_used_at, get_user_nonce,
-    list_gasless_keys_by_fid, CastStore, GaslessKeyRecord, LinkStore, ReactionStore, UserDataStore,
-    VerificationStore,
+    list_gasless_keys_by_fid, CastStore, CastStoreDef,
+    ChannelMemberState as StoredChannelMemberState, ChannelMemberStore, ChannelModerateStore,
+    ChannelPinStore, ChannelUpdateStore, GaslessKeyRecord, LinkStore, OnchainEventStorageError,
+    ReactionStore, UserDataStore, VerificationStore, CHANNEL_ID_LENGTH, HASH_LENGTH,
+};
+use crate::storage::store::account::{
+    get_channel_keys_by_owner_address, get_channel_keys_for_owner_addresses,
 };
 use crate::storage::store::account::{message_bytes_decode, IntoI32};
 use crate::storage::store::account::{EventsPage, HubEventIdGenerator};
@@ -60,6 +73,7 @@ use moka::sync::{Cache, CacheBuilder};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -67,10 +81,27 @@ use tokio::time::{sleep, timeout};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::AsciiMetadataValue;
 use tonic::{Request, Response, Status};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 pub const MEMPOOL_ADD_REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Threads used to probe FIDs in parallel when resolving a cast by hash alone.
+const CAST_SCAN_THREADS: u64 = 8;
+/// Cast-adds keys per multi-get while probing FIDs for a cast hash.
+const CAST_SCAN_BATCH: usize = 1024;
+
+/// Run a synchronous, long-running closure from async code without starving
+/// the other tasks on this runtime worker. Falls back to a direct call on a
+/// current-thread runtime, where `block_in_place` is unavailable.
+fn run_blocking<R>(f: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
 
 // Time budget for recovering from a `MissingFname` validation failure on UserDataAdd
 // Username messages.
@@ -118,6 +149,263 @@ fn signer_store_error_to_status(err: HubError) -> Status {
     }
 }
 
+fn onchain_event_storage_error_to_status(err: OnchainEventStorageError) -> Status {
+    match err {
+        OnchainEventStorageError::HubError(hub_error)
+            if hub_error.code.starts_with("bad_request") =>
+        {
+            Status::invalid_argument(hub_error.to_string())
+        }
+        other => Status::internal(format!("Store error: {:?}", other)),
+    }
+}
+
+fn channel_member_state_to_proto(state: StoredChannelMemberState) -> proto::ChannelMemberState {
+    match state {
+        StoredChannelMemberState::Member => proto::ChannelMemberState::Member,
+        StoredChannelMemberState::Moderator => proto::ChannelMemberState::Moderator,
+        StoredChannelMemberState::Removed => proto::ChannelMemberState::Removed,
+        StoredChannelMemberState::Banned => proto::ChannelMemberState::Banned,
+    }
+}
+
+fn channel_member_state_from_proto(
+    state: proto::ChannelMemberState,
+) -> Option<StoredChannelMemberState> {
+    match state {
+        proto::ChannelMemberState::None => None,
+        proto::ChannelMemberState::Member => Some(StoredChannelMemberState::Member),
+        proto::ChannelMemberState::Moderator => Some(StoredChannelMemberState::Moderator),
+        proto::ChannelMemberState::Removed => Some(StoredChannelMemberState::Removed),
+        proto::ChannelMemberState::Banned => Some(StoredChannelMemberState::Banned),
+    }
+}
+
+fn channel_page_options(
+    page_size: Option<u32>,
+    page_token: Option<Vec<u8>>,
+    reverse: Option<bool>,
+) -> PageOptions {
+    PageOptions {
+        page_size: Some(
+            page_size
+                .map(|size| size as usize)
+                .unwrap_or(PAGE_SIZE_MAX)
+                .min(PAGE_SIZE_MAX),
+        ),
+        // `optional bytes` lets a client send an explicitly empty token, which
+        // generated clients do when they echo back an absent `next_page_token`.
+        // Treat it as "first page" the way `page_options` in rpc_extensions does,
+        // rather than letting it reach the store as an out-of-prefix cursor.
+        page_token: page_token.filter(|token| !token.is_empty()),
+        reverse: reverse.unwrap_or(false),
+    }
+}
+
+/// Rejects `page_size: 0` on the paginated channel reads.
+///
+/// Zero is the natural default an unset integer takes in generated clients, and
+/// serving it as an empty page with no `next_page_token` would assert "this
+/// channel has no members, enumeration complete" — indistinguishable from the
+/// truth. Callers wanting the server default must omit the field.
+fn require_nonzero_page_size(page_size: Option<u32>) -> Result<(), Status> {
+    if page_size == Some(0) {
+        return Err(Status::invalid_argument(
+            "page_size must be greater than zero; omit it for the server default",
+        ));
+    }
+    Ok(())
+}
+
+/// Validates the width of a caller-supplied channel id and returns it as a
+/// fixed-width array.
+///
+/// Split out of `require_registered_channel` so the follow reads can share the
+/// width check without the registration check. Follows are answered from data
+/// shards and deliberately do not require a registered channel — see the contract
+/// on `GetChannelFollowers` in rpc.proto.
+fn require_channel_id_width(channel_id: &[u8]) -> Result<[u8; CHANNEL_ID_LENGTH], Status> {
+    channel_id
+        .try_into()
+        .map_err(|_| Status::invalid_argument("channel_id must be 32 bytes"))
+}
+
+/// Where one shard's scan should pick up.
+///
+/// Three states rather than an `Option`, because `Exhausted` and `Fresh` are not
+/// the same instruction: handing an exhausted shard "start from the beginning"
+/// restarts it, re-emitting its rows on every subsequent page and never
+/// terminating.
+///
+/// This distinction is spelled out ON THE WIRE — the enum is what gets
+/// serialized — rather than reconstructed by a decoder from `Option::None`. With
+/// `Option<Vec<u8>>` on the wire, serde's missing-field-means-`None` rule made a
+/// truncated token like `{"shard_id":1}` decode as `Exhausted`, so a proxy that
+/// strips null fields would turn every shard "complete" and the read would answer
+/// `followers: []` with no next token — "this channel has no followers", as a
+/// success.
+#[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Eq)]
+enum ShardScan {
+    Fresh,
+    Resume(Vec<u8>),
+    Exhausted,
+}
+
+/// One shard's position in a fan-out enumeration.
+///
+/// Carries the shard id rather than relying on position, so a cursor cannot be
+/// silently applied to the wrong shard if the hosted set changes between pages —
+/// the failure `get_casts_by_parent` has, zipping tokens against `HashMap` order.
+///
+/// `deny_unknown_fields` because this is pagination state, not a forward-
+/// compatible API: silently ignoring a field a newer node meant something by is
+/// how a cursor quietly pages the wrong range.
+#[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ShardCursor {
+    shard_id: u32,
+    scan: ShardScan,
+}
+
+/// Decodes a fan-out `page_token` into one scan position per hosted shard.
+///
+/// A present token must name exactly the node's shard set, each shard once: a
+/// mismatch means it was minted against a different topology, and applying it
+/// would page the wrong shards.
+fn decode_shard_cursors(
+    page_token: Option<Vec<u8>>,
+    shards: &[(u32, &Stores)],
+) -> Result<HashMap<u32, ShardScan>, Status> {
+    let Some(bytes) = page_token.filter(|token| !token.is_empty()) else {
+        return Ok(shards
+            .iter()
+            .map(|(id, _)| (*id, ShardScan::Fresh))
+            .collect());
+    };
+    let cursors: Vec<ShardCursor> = serde_json::from_slice(&bytes)
+        .map_err(|err| Status::invalid_argument(format!("invalid page token: {err}")))?;
+
+    // Built with an explicit loop rather than `collect()`: a `HashMap` silently
+    // keeps the last of a duplicated key, and a length check afterwards only
+    // notices when the collapse drops below the shard count. A token listing one
+    // shard twice plus every other shard once would otherwise pass, with one
+    // cursor discarded.
+    let mut scans: HashMap<u32, ShardScan> = HashMap::with_capacity(cursors.len());
+    for cursor in cursors {
+        let shard_id = cursor.shard_id;
+        if scans.insert(shard_id, cursor.scan).is_some() {
+            return Err(Status::invalid_argument(format!(
+                "page token names shard {shard_id} more than once"
+            )));
+        }
+    }
+    if scans.len() != shards.len() || shards.iter().any(|(id, _)| !scans.contains_key(id)) {
+        return Err(Status::invalid_argument(
+            "page token does not match this node's shards",
+        ));
+    }
+    Ok(scans)
+}
+
+/// Re-encodes the per-shard cursors, or `None` once every shard is exhausted.
+///
+/// Returning `None` at the end is what lets a client terminate; a token that is
+/// always `Some` makes the loop unbounded.
+fn encode_shard_cursors(cursors: Vec<ShardCursor>) -> Result<Option<Vec<u8>>, Status> {
+    if cursors
+        .iter()
+        .all(|cursor| cursor.scan == ShardScan::Exhausted)
+    {
+        return Ok(None);
+    }
+    serde_json::to_vec(&cursors)
+        .map(Some)
+        .map_err(|err| Status::internal(format!("failed to serialize next_page_token: {err}")))
+}
+
+/// Translate a HubError raised by the channel stores into a gRPC `Status`.
+///
+/// Only `bad_request.invalid_param` is caller-supplied on these read paths — a
+/// page token that does not belong to the requested index, an out-of-range fid.
+/// Everything else is state this node stored and can no longer interpret, so it
+/// stays `internal`.
+///
+/// Deliberately narrower than a `bad_request` prefix match. `validation_failure`
+/// is reachable from a read (`member_state_for_message` and
+/// `moderation_state_for_message` raise it when a STORED body carries an action
+/// this binary cannot parse), and those are replica corruption, not bad input.
+/// Matching the prefix would report them as 4xx and hide them from anyone
+/// watching error rates — the same failure mode as the dangling slot pointer
+/// two lines below them, which is already treated as corruption.
+pub(crate) fn channel_store_error_to_status(err: HubError) -> Status {
+    if err.code == "bad_request.invalid_param" {
+        Status::invalid_argument(err.to_string())
+    } else {
+        Status::internal(format!("Store error: {err:?}"))
+    }
+}
+
+/// Resolves `(owner_address, channel_key)` index entries into [`ChannelInfo`]s,
+/// stamping `fid` onto each. Lapsed records (expiry in the past) are included:
+/// release state is not computable from chain events, so callers interpret
+/// `expiry` themselves (see GetChannelOwner in rpc.proto). An index entry whose
+/// primary `ChannelOwner` disagrees on the owner address is dropped with a
+/// `warn!`, since the fold writes both sides in one transaction so a mismatch
+/// signals index corruption.
+fn channel_infos_for_index_keys(
+    block_stores: &BlockStores,
+    index_keys: impl IntoIterator<Item = (Vec<u8>, String)>,
+    fid: u64,
+) -> Result<Vec<ChannelInfo>, Status> {
+    let mut channels = Vec::new();
+
+    for (owner_address, channel_key) in index_keys {
+        let Some(channel_owner) = block_stores
+            .onchain_event_store
+            .get_channel_owner(&channel_key, None)
+            .map_err(|err| Status::internal(format!("Store error: {:?}", err)))?
+        else {
+            continue;
+        };
+
+        if channel_owner.owner_address != owner_address {
+            warn!(
+                channel_key,
+                indexed_owner_address = hex::encode(&owner_address),
+                primary_owner_address = hex::encode(&channel_owner.owner_address),
+                "channel list skipped an owner-address index entry that disagrees with its primary record",
+            );
+            continue;
+        }
+
+        channels.push(ChannelInfo {
+            channel_key,
+            fid,
+            owner_address: channel_owner.owner_address,
+            expiry: channel_owner.expiry,
+        });
+    }
+
+    Ok(channels)
+}
+
+fn channel_infos_by_owner_address(
+    block_stores: &BlockStores,
+    owner_address: &[u8],
+    fid: u64,
+    page_options: &PageOptions,
+) -> Result<(Vec<ChannelInfo>, Option<Vec<u8>>), Status> {
+    let (channel_keys, next_page_token) =
+        get_channel_keys_by_owner_address(&block_stores.db, owner_address, page_options)
+            .map_err(onchain_event_storage_error_to_status)?;
+    let index_keys = channel_keys
+        .into_iter()
+        .map(|channel_key| (owner_address.to_vec(), channel_key));
+    let channels = channel_infos_for_index_keys(block_stores, index_keys, fid)?;
+
+    Ok((channels, next_page_token))
+}
+
 /// Build a unified `Signer` record from an on-chain `OnChainEvent` whose body is a
 /// `SignerEventBody`. Off-chain–only fields (scopes, ttl, last_used_at, expires_at,
 /// nonce, request_fid) are intentionally left at their proto defaults; the
@@ -162,6 +450,9 @@ fn signer_from_gasless_record(
         _ => return None,
     };
     let ttl = key_add.ttl;
+    // Both `data.timestamp` and the gasless last-used store are Farcaster-time
+    // seconds; the unified API normalizes everything to Unix seconds so a single
+    // time base flows out across on-chain and off-chain sources.
     let added_at_unix = FarcasterTime::new(data.timestamp as u64).to_unix_seconds();
     let last_used_at_unix = last_used_at.map(|t| FarcasterTime::new(t).to_unix_seconds());
     let expires_at = match (last_used_at_unix, ttl) {
@@ -250,6 +541,7 @@ fn list_signers_for_fid(
             .map_err(|e| Status::invalid_argument(format!("invalid signers page token: {}", e)))?,
     };
 
+    // None means "no client cap" — defer to the underlying store defaults.
     let global_limit = page_options.page_size;
 
     let mut signers: Vec<Signer> = Vec::new();
@@ -349,13 +641,16 @@ pub struct MyHubService {
     num_shards: u32,
     message_router: Box<dyn routing::MessageRouter>,
     statsd_client: StatsdClientWrapper,
-    chain_clients: ChainClients,
+    l1_validator: Arc<L1Validator>,
     mempool_tx: mpsc::Sender<MempoolRequest>,
     gossip_tx: mpsc::Sender<GossipEvent<SnapchainValidatorContext>>,
     network: proto::FarcasterNetwork,
     version: String,
     peer_id: String,
     id_registry_cache: Cache<Vec<u8>, OnChainEvent>,
+    /// Short-TTL cache for the admin mesh view / topology responses. Consulted
+    /// only *after* the admin auth check in each handler.
+    mesh_cache: MeshCache,
     // Synchronous lookup against the fname registry. Used to recover from the
     // race condition where a client submits a UserDataAdd for a username before
     // the background fname connector has polled the corresponding transfer. None
@@ -364,6 +659,8 @@ pub struct MyHubService {
     /// Set on a Hypersnap node after the pivot: the certified-block calls and
     /// the certified tips in `GetInfo` (FIP Appendix A).
     hypersnap: Option<Arc<dyn crate::network::hypersnap_rpc::HypersnapRpc>>,
+    /// A Hypersnap node: the snapchain engine version of its pivot record.
+    hypersnap_version: Option<EngineVersion>,
     /// A read node with the content replay (FIP §17.4).
     content_replay: Option<crate::node::content_replay::ReplayDbs>,
 }
@@ -410,10 +707,11 @@ impl MyHubService {
         message_router: Box<dyn routing::MessageRouter>,
         mempool_tx: mpsc::Sender<MempoolRequest>,
         gossip_tx: mpsc::Sender<GossipEvent<SnapchainValidatorContext>>,
-        chain_clients: ChainClients,
+        l1_validator: Arc<L1Validator>,
         version: String,
         peer_id: String,
         fname_lookup: Option<Arc<dyn FnameTransferLookup>>,
+        mesh_config: crate::network::mesh::config::Config,
     ) -> Self {
         let parse_auth = |auth_str: &str| {
             let mut users = HashMap::new();
@@ -453,6 +751,16 @@ impl MyHubService {
             .eviction_policy(EvictionPolicy::lru())
             .build();
 
+        let mesh_cache = MeshCache::new(Duration::from_secs(mesh_config.cache_ttl_secs));
+        if mesh_config.cache_ttl_secs == 0 {
+            info!("Mesh view/topology cache disabled (cache_ttl_secs = 0)");
+        } else {
+            info!(
+                "Mesh view/topology cache enabled with {}s TTL",
+                mesh_config.cache_ttl_secs
+            );
+        }
+
         let service = Self {
             allowed_users,
             admin_allowed_users,
@@ -465,17 +773,26 @@ impl MyHubService {
             statsd_client,
             message_router,
             num_shards,
-            chain_clients,
+            l1_validator,
             mempool_tx,
             gossip_tx,
             version,
             peer_id,
             id_registry_cache,
+            mesh_cache,
             fname_lookup,
             hypersnap: None,
+            hypersnap_version: None,
             content_replay: None,
         };
         service
+    }
+
+    /// The snapchain rules version for routing and checks: on a Hypersnap
+    /// node the version of the fork block (FIP §17.7), else the current one.
+    pub fn engine_version(&self) -> EngineVersion {
+        self.hypersnap_version
+            .unwrap_or_else(|| EngineVersion::current(self.network))
     }
 
     /// A Hypersnap node after the pivot.
@@ -483,6 +800,9 @@ impl MyHubService {
         mut self,
         rpc: Arc<dyn crate::network::hypersnap_rpc::HypersnapRpc>,
     ) -> Self {
+        self.hypersnap_version = rpc
+            .pivot_record()
+            .and_then(|r| crate::chain::pivot::record_engine_version(&r).ok());
         self.hypersnap = Some(rpc);
         self
     }
@@ -493,12 +813,24 @@ impl MyHubService {
         self
     }
 
+    #[cfg(test)]
+    pub fn l1_validator(&self) -> &L1Validator {
+        &self.l1_validator
+    }
+
+    #[cfg(test)]
+    pub fn set_fname_lookup_for_test(&mut self, lookup: Arc<dyn FnameTransferLookup>) {
+        self.fname_lookup = Some(lookup);
+    }
+
     async fn submit_message_internal(
         &self,
         message: proto::Message,
     ) -> Result<proto::Message, HubError> {
         let fid = message.fid();
-        let dst_shard = routing::route_message(&self.message_router, &message, self.num_shards);
+        let version = self.engine_version();
+        let dst_shard =
+            routing::route_message(&self.message_router, &message, self.num_shards, version);
         // On a Hypersnap node, shard 0 decides: escrow messages have FID 0
         // (FIP §16.8).
         if fid == 0 && !(self.hypersnap.is_some() && dst_shard == 0) {
@@ -660,52 +992,9 @@ impl MyHubService {
         &self,
         message: proto::Message,
     ) -> Result<proto::Message, HubError> {
-        let fid = message.fid();
-
         // We're doing the ens and address validations here for now because we don't want L1 interactions to be on the consensus critical path.
         // Eventually this will move to the fname server.
-        if let Some(message_data) = &message.data {
-            match &message_data.body {
-                Some(proto::message_data::Body::UserDataBody(user_data)) => {
-                    if user_data.r#type() == proto::UserDataType::Username {
-                        if user_data.value.ends_with(".eth") {
-                            self.validate_ens_username(fid, user_data.value.to_string())
-                                .await?;
-                        }
-                    };
-                }
-                Some(proto::message_data::Body::UsernameProofBody(proof)) => {
-                    self.validate_ens_username_proof(fid, &proof).await?;
-                }
-                Some(proto::message_data::Body::VerificationAddAddressBody(body)) => {
-                    if body.verification_type == 1 {
-                        let claim_result =
-                            validations::verification::make_verification_address_claim(
-                                message_data.fid,
-                                &body.address,
-                                self.network,
-                                &body.block_hash,
-                                proto::Protocol::Ethereum,
-                            );
-                        match claim_result {
-                            Ok(claim) => {
-                                self.validate_contract_signature(claim, body).await?;
-                            }
-                            Err(err) => {
-                                return Err(HubError::validation_failure(
-                                    format!(
-                                        "could not create verification address claim: {}",
-                                        err.to_string()
-                                    )
-                                    .as_str(),
-                                ))
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
+        self.l1_validator.validate_message(&message).await?;
 
         let (tx, rx) = oneshot::channel();
 
@@ -758,6 +1047,35 @@ impl MyHubService {
         };
     }
 
+    /// Every data shard, ascending by shard id, or an error if this node does not
+    /// host all of them.
+    ///
+    /// Fan-out reads must not answer from a subset. An empty follower list from a
+    /// node hosting one shard of four is indistinguishable from a channel nobody
+    /// follows, so an incomplete node has to refuse rather than under-report.
+    ///
+    /// Sorted, and carrying the shard id, because `shard_stores` is a `HashMap`:
+    /// `get_casts_by_parent` zips per-shard page tokens against its unspecified
+    /// iteration order, which means a token slot is not stably bound to any shard.
+    /// Do not reproduce that here.
+    fn all_shard_stores(&self) -> Result<Vec<(u32, &Stores)>, Status> {
+        // Data shards are 1..=num_shards; `route_fid` returns `(hash % n) + 1`.
+        (1..=self.num_shards)
+            .map(|shard_id| {
+                self.shard_stores
+                    .get(&shard_id)
+                    .map(|stores| (shard_id, stores))
+                    .ok_or_else(|| {
+                        Status::failed_precondition(format!(
+                            "node hosts {} of {} shards; cross-shard channel follow reads are unavailable here",
+                            self.shard_stores.len(),
+                            self.num_shards
+                        ))
+                    })
+            })
+            .collect()
+    }
+
     fn get_stores_for_shard(&self, shard_id: u32) -> Result<&Stores, Status> {
         match self.shard_stores.get(&shard_id) {
             Some(store) => Ok(store),
@@ -770,6 +1088,33 @@ impl MyHubService {
     fn get_stores_for(&self, fid: u64) -> Result<&Stores, Status> {
         let shard_id = self.message_router.route_fid(fid, self.num_shards);
         self.get_stores_for_shard(shard_id)
+    }
+
+    /// Validates the width and registration of a caller-supplied channel id, and
+    /// returns the id as a fixed-width array.
+    ///
+    /// Returning the validated value rather than `()` is deliberate: the store keys
+    /// are built by concatenation and do not re-check width (see CHANNEL_ID_LENGTH),
+    /// so passing the raw request slice onward would leave width safety resting on
+    /// every handler remembering to call this first. Threading the array makes
+    /// "validated" and "used" the same value.
+    fn require_registered_channel(
+        &self,
+        channel_id: &[u8],
+    ) -> Result<[u8; CHANNEL_ID_LENGTH], Status> {
+        let channel_id = require_channel_id_width(channel_id)?;
+        let channel_key = self
+            .block_stores
+            .onchain_event_store
+            .get_channel_key_by_label(&channel_id, None)
+            .map_err(|err| Status::internal(format!("Store error: {err:?}")))?
+            .ok_or_else(|| Status::not_found("channel not registered"))?;
+        self.block_stores
+            .onchain_event_store
+            .get_channel_owner(&channel_key, None)
+            .map_err(|err| Status::internal(format!("Store error: {err:?}")))?
+            .ok_or_else(|| Status::not_found("channel not registered"))?;
+        Ok(channel_id)
     }
 
     async fn simulate_message_for_shard(
@@ -830,20 +1175,14 @@ impl MyHubService {
             };
 
             // TODO: This is a hack to get around the fact that self cannot be made mutable
-            let mut readonly_engine = ShardEngine::new(
+            let mut readonly_engine = ShardEngine::new_readonly(
                 stores.db.clone(),
                 self.network,
                 stores.trie.clone(),
                 1,
                 stores.store_limits.clone(),
                 self.statsd_client.clone(),
-                100,
-                None,
-                None,
-                None,
-            )
-            .await
-            .map_err(engine::MessageValidationError::StoreError)?;
+            );
 
             readonly_engine.simulate_message(message)
         }
@@ -881,26 +1220,14 @@ impl MyHubService {
             };
 
             // Create shard engine for bulk simulation
-            let mut readonly_engine = match ShardEngine::new(
+            let mut readonly_engine = ShardEngine::new_readonly(
                 stores.db.clone(),
                 self.network,
                 stores.trie.clone(),
                 shard_id,
                 stores.store_limits.clone(),
                 self.statsd_client.clone(),
-                100,
-                None,
-                None,
-                None,
-            )
-            .await
-            {
-                Ok(engine) => engine,
-                Err(err) => {
-                    let hub_error = HubError::invalid_internal_state(&err.to_string());
-                    return messages.iter().map(|_| Err(hub_error.clone())).collect();
-                }
-            };
+            );
 
             readonly_engine
                 .simulate_bulk_messages(messages)
@@ -945,170 +1272,21 @@ impl MyHubService {
         let Some(stores) = self.shard_stores.get(&shard_id) else {
             return all(HubError::invalid_parameter("shard not found for fid"));
         };
-        let mut readonly_engine = match ShardEngine::new(
+        let mut readonly_engine = ShardEngine::new_readonly(
             stores.db.clone(),
             self.network,
             stores.trie.clone(),
             shard_id,
             stores.store_limits.clone(),
             self.statsd_client.clone(),
-            100,
-            None,
-            None,
-            None,
-        )
-        .await
-        {
-            Ok(engine) => engine,
-            Err(e) => return all(e),
-        };
-        if let Err(e) = readonly_engine.enter_hypersnap_mode(None) {
+        );
+        if let Err(e) = readonly_engine.enter_hypersnap_mode(None, self.engine_version()) {
             return all(e);
         }
         if messages.len() == 1 {
             vec![readonly_engine.simulate_message(&messages[0])]
         } else {
             readonly_engine.simulate_bulk_messages(messages)
-        }
-    }
-
-    pub async fn validate_contract_signature(
-        &self,
-        claim: VerificationAddressClaim,
-        body: &VerificationAddAddressBody,
-    ) -> Result<(), HubError> {
-        let chain = Chain::from_chain_id(body.chain_id)
-            .ok_or(HubError::validation_failure("invalid chain id"))?;
-        let client = &self.chain_clients.for_chain(chain)?;
-        client
-            .verify_contract_signature(claim, body)
-            .await
-            .or_else(|e| {
-                Err(HubError::validation_failure(
-                    format!("could not verify contract signature: {}", e.to_string()).as_str(),
-                ))
-            })
-    }
-
-    pub async fn validate_ens_username_proof(
-        &self,
-        fid: u64,
-        proof: &UserNameProof,
-    ) -> Result<(), HubError> {
-        let resolved_ens_address = self.resolve_ens_address(proof).await?;
-        if resolved_ens_address != proof.owner {
-            return Err(HubError::validation_failure(
-                "invalid ens name, resolved address doesn't match proof owner address",
-            ));
-        }
-
-        let stores = self
-            .get_stores_for(fid)
-            .map_err(|_| HubError::internal_db_error("stores not found for fid"))?;
-
-        let id_register = stores
-            .onchain_event_store
-            .get_id_register_event_by_fid(fid, None)
-            .map_err(|_| HubError::internal_db_error("Could not fetch id registration"))?;
-
-        match id_register {
-            None => return Err(HubError::validation_failure("missing fid registration")),
-            Some(id_register) => {
-                match id_register.body {
-                    Some(Body::IdRegisterEventBody(id_register)) => {
-                        // Check verified addresses if the resolved address doesn't match the custody address
-                        if id_register.to != resolved_ens_address {
-                            let verification = VerificationStore::get_verification_add(
-                                &stores.verification_store,
-                                fid,
-                                &resolved_ens_address,
-                                None,
-                            )?;
-
-                            match verification {
-                                None => Err(HubError::validation_failure("invalid ens proof, no matching custody address or verified addresses")),
-                                Some(_) => Ok(()),
-                            }
-                        } else {
-                            Ok(())
-                        }
-                    }
-                    _ => return Err(HubError::validation_failure("missing fid registration")),
-                }
-            }
-        }
-    }
-
-    async fn resolve_ens_address(&self, proof: &UserNameProof) -> Result<Vec<u8>, HubError> {
-        let name = std::str::from_utf8(&proof.name)
-            .map_err(|_| HubError::validation_failure("ENS name is not utf8"))?;
-
-        let chain_api = match UserNameType::try_from(proof.r#type) {
-            Ok(UserNameType::UsernameTypeEnsL1) => {
-                if !name.ends_with(".eth") {
-                    return Err(HubError::validation_failure(
-                        "ENS name does not end with .eth",
-                    ));
-                }
-                self.chain_clients.for_chain(Chain::EthMainnet)?
-            }
-            Ok(UserNameType::UsernameTypeBasename) => {
-                if !name.ends_with(".base.eth") {
-                    return Err(HubError::validation_failure(
-                        "Basename does not end with base.eth",
-                    ));
-                }
-                self.chain_clients.for_chain(Chain::BaseMainnet)?
-            }
-            _ => {
-                return Err(HubError::validation_failure(
-                    format!(
-                        "unsupported username type: {} for name: {}",
-                        proof.r#type, name,
-                    )
-                    .as_str(),
-                ))
-            }
-        };
-
-        let resolved_ens_address = chain_api
-            .resolve_ens_name(name.to_string())
-            .await
-            .map_err(|err| {
-                HubError::validation_failure(
-                    format!("ENS resolution error: {}", err.to_string()).as_str(),
-                )
-            })?
-            .to_vec();
-
-        Ok(resolved_ens_address)
-    }
-
-    async fn validate_ens_username(&self, fid: u64, name: String) -> Result<(), HubError> {
-        let stores = self
-            .get_stores_for(fid)
-            .map_err(|_| HubError::invalid_parameter("stores not found for fid"))?;
-        let proof_message = UsernameProofStore::get_username_proof(
-            &stores.username_proof_store,
-            &name.as_bytes().to_vec(),
-            &mut RocksDbTransactionBatch::new(),
-        )?;
-        match proof_message {
-            Some(message) => match message.data {
-                None => Err(HubError::validation_failure("username proof missing data")),
-                Some(message_data) => match message_data.body {
-                    Some(body) => match body {
-                        proto::message_data::Body::UsernameProofBody(proof) => {
-                            self.validate_ens_username_proof(fid, &proof).await
-                        }
-                        _ => Err(HubError::validation_failure(
-                            "username proof has wrong type",
-                        )),
-                    },
-                    None => Err(HubError::validation_failure("username proof missing body")),
-                },
-            },
-            None => Err(HubError::validation_failure("username proof missing proof")),
         }
     }
 
@@ -1254,6 +1432,102 @@ impl MyHubService {
         }
     }
 
+    /// Find the author FID of a cast from its hash alone. The shard stores
+    /// have no hash-keyed index, so this probes the cast-adds key of every
+    /// FID up to the highest registered one, in batched multi-gets across
+    /// scoped threads, stopping as soon as any thread finds the cast.
+    fn find_cast_fid_by_hash(&self, hash: &[u8]) -> Option<u64> {
+        if hash.len() != HASH_LENGTH {
+            return None;
+        }
+        // IdRegister events are keyed by FID, so the last page in reverse
+        // order holds the highest registered FIDs.
+        let max_fid = self
+            .shard_stores
+            .values()
+            .filter_map(|stores| {
+                stores
+                    .onchain_event_store
+                    .get_fids(&PageOptions {
+                        page_size: Some(64),
+                        page_token: None,
+                        reverse: true,
+                    })
+                    .ok()
+            })
+            .flat_map(|(fids, _)| fids)
+            .max()?;
+
+        let hash = hash.to_vec();
+        let found = AtomicU64::new(0);
+        let span = max_fid.div_ceil(CAST_SCAN_THREADS);
+        std::thread::scope(|scope| {
+            for i in 0..CAST_SCAN_THREADS {
+                let (hash, found) = (&hash, &found);
+                let start = 1 + i * span;
+                let end = ((i + 1) * span).min(max_fid);
+                scope.spawn(move || self.scan_cast_adds_range(hash, start, end, found));
+            }
+        });
+        match found.load(Ordering::Relaxed) {
+            0 => None,
+            fid => Some(fid),
+        }
+    }
+
+    /// Probe the cast-adds key for `hash` under each FID in `start..=end`,
+    /// recording the owning FID in `found`. Returns early once any scanner
+    /// has set `found`.
+    fn scan_cast_adds_range(&self, hash: &Vec<u8>, start: u64, end: u64, found: &AtomicU64) {
+        let probe = |shard_id: u32, fids: &[u64], keys: &Vec<Vec<u8>>| -> Option<u64> {
+            let stores = self.shard_stores.get(&shard_id)?;
+            let values = stores.cast_store.db().get_many(keys).ok()?;
+            values
+                .iter()
+                .position(|v| !v.is_empty())
+                .map(|idx| fids[idx])
+        };
+
+        let mut batches: HashMap<u32, (Vec<u64>, Vec<Vec<u8>>)> = HashMap::new();
+        for fid in start..=end {
+            if found.load(Ordering::Relaxed) != 0 {
+                return;
+            }
+            let shard_id = self.message_router.route_fid(fid, self.num_shards);
+            let Some(stores) = self.shard_stores.get(&shard_id) else {
+                continue;
+            };
+            let root_prefix = stores
+                .cast_store
+                .state_context()
+                .root_prefix(RootPrefix::User);
+            let (fids, keys) = batches.entry(shard_id).or_default();
+            fids.push(fid);
+            keys.push(CastStoreDef::make_cast_adds_key_with_prefix(
+                root_prefix,
+                fid,
+                hash,
+            ));
+            if keys.len() >= CAST_SCAN_BATCH {
+                if let Some(owner) = probe(shard_id, fids, keys) {
+                    found.store(owner, Ordering::Relaxed);
+                    return;
+                }
+                fids.clear();
+                keys.clear();
+            }
+        }
+        for (shard_id, (fids, keys)) in &batches {
+            if keys.is_empty() || found.load(Ordering::Relaxed) != 0 {
+                continue;
+            }
+            if let Some(owner) = probe(*shard_id, fids, keys) {
+                found.store(owner, Ordering::Relaxed);
+                return;
+            }
+        }
+    }
+
     fn find_id_registry_event_by_address(
         &self,
         address: &[u8],
@@ -1379,7 +1653,7 @@ impl HubService for MyHubService {
         &self,
         request: Request<proto::SubmitBulkMessagesRequest>,
     ) -> Result<Response<proto::SubmitBulkMessagesResponse>, Status> {
-        let version = EngineVersion::current(self.network);
+        let version = self.engine_version();
         if !version.is_enabled(ProtocolFeature::DependentMessagesInBulkSubmit) {
             return Err(Status::invalid_argument(
                 "Dependent messages are not supported in this version",
@@ -1416,7 +1690,8 @@ impl HubService for MyHubService {
         // 1. Group messages by their destination shard
         let mut messages_by_shard: HashMap<u32, Vec<proto::Message>> = HashMap::new();
         for msg in messages {
-            let shard_id = routing::route_message(&self.message_router, &msg, self.num_shards);
+            let shard_id =
+                routing::route_message(&self.message_router, &msg, self.num_shards, version);
             messages_by_shard.entry(shard_id).or_default().push(msg);
         }
 
@@ -2217,7 +2492,7 @@ impl HubService for MyHubService {
             self.network,
             is_pro_user,
             &FarcasterTime::current(),
-            EngineVersion::current(self.network),
+            self.engine_version(),
         )
         .map_or_else(|_| false, |_| true);
 
@@ -2912,10 +3187,16 @@ impl HubService for MyHubService {
         let page_options = req.page_options();
         let page = list_signers_for_fid(stores, fid, &page_options)?;
 
+        // Read nonces from the gasless-key counter store. A missing entry means
+        // no gasless activity has occurred yet for that namespace, which we
+        // surface as 0 — matching the merge-time validation that treats stored
+        // = 0 when the key is absent (key_nonce_store::check_and_set_nonce).
         let nonce_txn = RocksDbTransactionBatch::new();
         let current_user_nonce = get_user_nonce(&stores.db, &nonce_txn, fid)
             .map_err(signer_store_error_to_status)?
             .unwrap_or(0);
+        // One map entry per requested FID. Missing counters surface as 0,
+        // mirroring the merge-time validation rule (stored = 0 when absent).
         let mut requester_fid_nonces: HashMap<u64, u32> =
             HashMap::with_capacity(req.requester_fids.len());
         for requester_fid in &req.requester_fids {
@@ -2959,6 +3240,495 @@ impl HubService for MyHubService {
             next_page_token: None,
         };
         Ok(Response::new(response))
+    }
+
+    async fn get_channel_owner(
+        &self,
+        request: Request<ChannelOwnerRequest>,
+    ) -> Result<Response<ChannelOwnerResponse>, Status> {
+        let req = request.into_inner();
+        let channel_owner = self
+            .block_stores
+            .onchain_event_store
+            .get_channel_owner(&req.channel_key, None)
+            .map_err(|err| Status::internal(format!("Store error: {:?}", err)))?
+            .ok_or_else(|| Status::not_found("channel not registered"))?;
+
+        // 0 is a real answer, not a swallowed error: the owner's verification has
+        // not landed on shard 0 yet. See ChannelOwnerResponse.fid.
+        let fid = self
+            .block_stores
+            .resolve_channel_owner_fid(&channel_owner.owner_address, None)
+            .map_err(|err| Status::internal(format!("Store error: {:?}", err)))?
+            .unwrap_or(0);
+
+        Ok(Response::new(ChannelOwnerResponse {
+            fid,
+            owner_address: channel_owner.owner_address,
+            expiry: channel_owner.expiry,
+        }))
+    }
+
+    async fn get_channels_by_address(
+        &self,
+        request: Request<ChannelsByAddressRequest>,
+    ) -> Result<Response<ChannelsResponse>, Status> {
+        let req = request.into_inner();
+        // Match GetChannelsByFid's page-size contract on this public read: 0
+        // returns an empty page, and an omitted or oversized value is clamped
+        // to the server-side maximum so it can't trigger an unbounded scan.
+        let mut page_options = req.page_options();
+        page_options.page_size = match page_options.page_size {
+            Some(0) => {
+                return Ok(Response::new(ChannelsResponse {
+                    channels: vec![],
+                    next_page_token: None,
+                }));
+            }
+            Some(size) => Some(size.min(PAGE_SIZE_MAX)),
+            None => Some(PAGE_SIZE_MAX),
+        };
+        let (mut channels, next_page_token) = channel_infos_by_owner_address(
+            &self.block_stores,
+            &req.owner_address,
+            0,
+            &page_options,
+        )?;
+
+        if !channels.is_empty() {
+            // Same contract as GetChannelOwner: 0 means the owner's verification
+            // has not landed on shard 0 yet, and is stamped onto every channel in
+            // this page. See ChannelOwnerResponse.fid.
+            let fid = self
+                .block_stores
+                .resolve_channel_owner_fid(&req.owner_address, None)
+                .map_err(|err| Status::internal(format!("Store error: {:?}", err)))?
+                .unwrap_or(0);
+            for channel in &mut channels {
+                channel.fid = fid;
+            }
+        }
+
+        Ok(Response::new(ChannelsResponse {
+            channels,
+            next_page_token,
+        }))
+    }
+
+    async fn get_channels_by_fid(
+        &self,
+        request: Request<ChannelsByFidRequest>,
+    ) -> Result<Response<ChannelsResponse>, Status> {
+        let req = request.into_inner();
+        let stores = self.get_stores_for(req.fid)?;
+
+        // Clamp the page size to a server-side maximum so an omitted or oversized
+        // request can't trigger an unbounded scan on this public read.
+        let page_size = match req.page_size {
+            Some(0) => {
+                return Ok(Response::new(ChannelsResponse {
+                    channels: vec![],
+                    next_page_token: None,
+                }));
+            }
+            Some(size) => (size as usize).min(PAGE_SIZE_MAX),
+            None => PAGE_SIZE_MAX,
+        };
+
+        // Collect the fid's verified Ethereum addresses (deduped), then sort them
+        // ascending so the by-owner-address index key is a globally ordered
+        // composite cursor across the whole join.
+        let mut verification_page_token = None;
+        let mut owner_addresses = Vec::new();
+        let mut seen_owner_addresses = HashSet::new();
+
+        loop {
+            let verification_page_options = PageOptions {
+                page_size: None,
+                page_token: verification_page_token.clone(),
+                reverse: false,
+            };
+            let page = VerificationStore::get_verification_adds_by_fid(
+                &stores.verification_store,
+                req.fid,
+                &verification_page_options,
+            )
+            .map_err(|err| Status::internal(format!("Store error: {:?}", err)))?;
+
+            for message in page.messages {
+                let message_hash = message.hash.clone();
+                let Some(data) = message.data else {
+                    // A merged message always carries `data`; a missing one is a
+                    // storage anomaly, not a benign state. Skip it (one bad record
+                    // must not fail the read) but log so it stays observable.
+                    warn!(
+                        fid = req.fid,
+                        message_hash = hex::encode(&message_hash),
+                        "channels-by-fid skipped a VerificationAdd with no data",
+                    );
+                    continue;
+                };
+                let Some(proto::message_data::Body::VerificationAddAddressBody(body)) = data.body
+                else {
+                    continue;
+                };
+                if body.protocol != proto::Protocol::Ethereum as i32 || body.address.len() != 20 {
+                    continue;
+                }
+                if seen_owner_addresses.insert(body.address.clone()) {
+                    owner_addresses.push(body.address);
+                }
+            }
+
+            let Some(next_page_token) = page.next_page_token else {
+                break;
+            };
+            verification_page_token = Some(next_page_token);
+        }
+        owner_addresses.sort();
+
+        // Keep only the addresses this fid currently wins under the shard-0
+        // winner rule, so a channel appears here only if GetChannelOwner
+        // resolves it to `req.fid`. The converse does not quite hold: shard-0
+        // replica rows are permanent, but the home-shard rows enumerated above
+        // prune to the fid's local storage cap, so a winning verification the
+        // home shard has pruned keeps the owner resolvable without the channel
+        // being listed here.
+        let mut winning_addresses = Vec::new();
+        for owner_address in owner_addresses {
+            if self
+                .block_stores
+                .resolve_channel_owner_fid(&owner_address, None)
+                .map_err(|err| Status::internal(format!("Store error: {:?}", err)))?
+                == Some(req.fid)
+            {
+                winning_addresses.push(owner_address);
+            }
+        }
+
+        // Page across the winning addresses using the composite cursor.
+        let (index_keys, next_page_token) = get_channel_keys_for_owner_addresses(
+            &self.block_stores.db,
+            &winning_addresses,
+            req.page_token.as_deref(),
+            page_size,
+        )
+        .map_err(onchain_event_storage_error_to_status)?;
+        let channels = channel_infos_for_index_keys(&self.block_stores, index_keys, req.fid)?;
+
+        Ok(Response::new(ChannelsResponse {
+            channels,
+            next_page_token,
+        }))
+    }
+
+    async fn get_channel_member(
+        &self,
+        request: Request<ChannelMemberRequest>,
+    ) -> Result<Response<ChannelMemberResponse>, Status> {
+        let req = request.into_inner();
+        let channel_id = self.require_registered_channel(&req.channel_id)?;
+        if req.fid == 0 || u32::try_from(req.fid).is_err() {
+            return Err(Status::invalid_argument("fid must fit in a non-zero u32"));
+        }
+        let member = ChannelMemberStore::member(
+            &self.block_stores.channel_member_store,
+            &channel_id,
+            req.fid,
+            None,
+        )
+        .map_err(|err| Status::internal(format!("Store error: {err:?}")))?;
+        Ok(Response::new(match member {
+            Some(member) => ChannelMemberResponse {
+                state: channel_member_state_to_proto(member.state) as i32,
+                last_action_ts: Some(member.last_action_ts),
+            },
+            None => ChannelMemberResponse {
+                state: proto::ChannelMemberState::None as i32,
+                last_action_ts: None,
+            },
+        }))
+    }
+
+    async fn get_channel_members(
+        &self,
+        request: Request<ChannelMembersRequest>,
+    ) -> Result<Response<ChannelMembersResponse>, Status> {
+        let req = request.into_inner();
+        let channel_id = self.require_registered_channel(&req.channel_id)?;
+        require_nonzero_page_size(req.page_size)?;
+        let state_filter = req
+            .state_filter
+            .map(|value| {
+                proto::ChannelMemberState::try_from(value)
+                    .map_err(|_| Status::invalid_argument("invalid channel member state"))
+            })
+            .transpose()?
+            .and_then(channel_member_state_from_proto);
+        let page = ChannelMemberStore::members_by_channel(
+            &self.block_stores.channel_member_store,
+            &channel_id,
+            state_filter,
+            &channel_page_options(req.page_size, req.page_token, req.reverse),
+        )
+        .map_err(channel_store_error_to_status)?;
+        Ok(Response::new(ChannelMembersResponse {
+            members: page
+                .entries
+                .into_iter()
+                .map(|member| ChannelMember {
+                    fid: member.fid,
+                    state: channel_member_state_to_proto(member.state) as i32,
+                })
+                .collect(),
+            next_page_token: page.next_page_token,
+        }))
+    }
+
+    async fn get_channel_pin(
+        &self,
+        request: Request<ChannelRequest>,
+    ) -> Result<Response<ChannelPinResponse>, Status> {
+        let req = request.into_inner();
+        let channel_id = self.require_registered_channel(&req.channel_id)?;
+        let pin = ChannelPinStore::get_channel_pin_state(
+            &self.block_stores.channel_pin_store,
+            &channel_id,
+            None,
+        )
+        .map_err(|err| Status::internal(format!("Store error: {err:?}")))?;
+        // An unpin (empty cast_hash, permitted by validate_channel_pin_body) and a
+        // channel that was never pinned intentionally read identically as "no pin".
+        Ok(Response::new(ChannelPinResponse {
+            pin: pin
+                .filter(|pin| !pin.body.cast_hash.is_empty())
+                .map(|pin| ChannelPin {
+                    cast_hash: pin.body.cast_hash,
+                    author_fid: pin.author_fid,
+                }),
+        }))
+    }
+
+    async fn get_channel_moderations(
+        &self,
+        request: Request<ChannelModerationsRequest>,
+    ) -> Result<Response<ChannelModerationsResponse>, Status> {
+        let req = request.into_inner();
+        let channel_id = self.require_registered_channel(&req.channel_id)?;
+        require_nonzero_page_size(req.page_size)?;
+        let page = ChannelModerateStore::moderations_by_channel(
+            &self.block_stores.channel_moderate_store,
+            &channel_id,
+            &channel_page_options(req.page_size, req.page_token, req.reverse),
+        )
+        .map_err(channel_store_error_to_status)?;
+        Ok(Response::new(ChannelModerationsResponse {
+            moderations: page
+                .entries
+                .into_iter()
+                .map(|moderation| ChannelModeration {
+                    cast_hash: moderation.cast_hash,
+                    action: moderation.action as i32,
+                    author_fid: moderation.author_fid,
+                })
+                .collect(),
+            next_page_token: page.next_page_token,
+        }))
+    }
+
+    async fn get_channel_metadata(
+        &self,
+        request: Request<ChannelRequest>,
+    ) -> Result<Response<ChannelMetadataResponse>, Status> {
+        let req = request.into_inner();
+        let channel_id = self.require_registered_channel(&req.channel_id)?;
+        let update = ChannelUpdateStore::get_channel_update(
+            &self.block_stores.channel_update_store,
+            &channel_id,
+            None,
+        )
+        .map_err(|err| Status::internal(format!("Store error: {err:?}")))?;
+        Ok(Response::new(match update {
+            Some(update) => ChannelMetadataResponse {
+                name: update.body.name,
+                description: update.body.description,
+                image_url: update.body.image_url,
+                header: update.body.header,
+                rules: update.body.rules,
+                casting_mode: update.casting_mode as i32,
+                membership_mode: update.membership_mode as i32,
+            },
+            None => {
+                // Taken from the fold rather than restated, so this branch cannot
+                // drift from the policy admission applies to an unconfigured channel.
+                let (casting_mode, membership_mode) = ChannelUpdateStore::default_channel_modes();
+                ChannelMetadataResponse {
+                    name: None,
+                    description: None,
+                    image_url: None,
+                    header: None,
+                    rules: None,
+                    casting_mode: casting_mode as i32,
+                    membership_mode: membership_mode as i32,
+                }
+            }
+        }))
+    }
+
+    async fn get_channel_memberships_by_fid(
+        &self,
+        request: Request<ChannelMembershipsByFidRequest>,
+    ) -> Result<Response<ChannelMembershipsResponse>, Status> {
+        let req = request.into_inner();
+        if req.fid == 0 || u32::try_from(req.fid).is_err() {
+            return Err(Status::invalid_argument("fid must fit in a non-zero u32"));
+        }
+        require_nonzero_page_size(req.page_size)?;
+        let page = ChannelMemberStore::memberships_by_fid(
+            &self.block_stores.channel_member_store,
+            req.fid,
+            &channel_page_options(req.page_size, req.page_token, req.reverse),
+        )
+        .map_err(channel_store_error_to_status)?;
+        Ok(Response::new(ChannelMembershipsResponse {
+            memberships: page
+                .entries
+                .into_iter()
+                .map(|membership| ChannelMembership {
+                    channel_id: membership.channel_id,
+                    state: channel_member_state_to_proto(membership.state) as i32,
+                })
+                .collect(),
+            next_page_token: page.next_page_token,
+        }))
+    }
+
+    async fn get_channel_followers(
+        &self,
+        request: Request<ChannelFollowersRequest>,
+    ) -> Result<Response<ChannelFollowersResponse>, Status> {
+        let req = request.into_inner();
+        // Width only: follows live on data shards and carry no registration check.
+        let channel_id = require_channel_id_width(&req.channel_id)?;
+        require_nonzero_page_size(req.page_size)?;
+
+        let shards = self.all_shard_stores()?;
+        let mut cursors = decode_shard_cursors(req.page_token, &shards)?;
+
+        let mut followers = Vec::new();
+        let mut next_cursors = Vec::with_capacity(shards.len());
+        for (shard_id, stores) in &shards {
+            let token = match cursors.remove(shard_id) {
+                Some(ShardScan::Fresh) => None,
+                Some(ShardScan::Resume(token)) => Some(token),
+                // Already read to the end on an earlier page. Skipping it is the
+                // whole point of the three-state cursor: re-scanning with `None`
+                // would re-emit its rows forever.
+                Some(ShardScan::Exhausted) => {
+                    next_cursors.push(ShardCursor {
+                        shard_id: *shard_id,
+                        scan: ShardScan::Exhausted,
+                    });
+                    continue;
+                }
+                // `decode_shard_cursors` guarantees every hosted shard is present,
+                // so this is unreachable. Refuse rather than defaulting to a fresh
+                // scan: if that guarantee is ever loosened, defaulting would
+                // silently restart a shard and page forever.
+                None => {
+                    return Err(Status::internal(format!(
+                        "no cursor for shard {shard_id} after validation"
+                    )))
+                }
+            };
+            let page = ReactionStore::followers_by_channel(
+                &stores.reaction_store,
+                &channel_id,
+                &channel_page_options(req.page_size, token, req.reverse),
+            )
+            .map_err(channel_store_error_to_status)?;
+            followers.extend(page.entries.into_iter().map(|entry| ChannelFollower {
+                fid: entry.fid,
+                followed_at: entry.followed_at,
+            }));
+            next_cursors.push(ShardCursor {
+                shard_id: *shard_id,
+                scan: match page.next_page_token {
+                    Some(token) => ShardScan::Resume(token),
+                    None => ShardScan::Exhausted,
+                },
+            });
+        }
+
+        Ok(Response::new(ChannelFollowersResponse {
+            followers,
+            next_page_token: encode_shard_cursors(next_cursors)?,
+        }))
+    }
+
+    async fn get_channel_follower_count(
+        &self,
+        request: Request<ChannelFollowerCountRequest>,
+    ) -> Result<Response<ChannelFollowerCountResponse>, Status> {
+        let req = request.into_inner();
+        let channel_id = require_channel_id_width(&req.channel_id)?;
+
+        // Summed as u64: each shard's counter is a u32, and their total need not be.
+        let mut count: u64 = 0;
+        for (_shard_id, stores) in self.all_shard_stores()? {
+            count += ReactionStore::follower_count(&stores.reaction_store, &channel_id)
+                .map_err(channel_store_error_to_status)?;
+        }
+        Ok(Response::new(ChannelFollowerCountResponse { count }))
+    }
+
+    async fn get_channel_follows(
+        &self,
+        request: Request<ChannelFollowsRequest>,
+    ) -> Result<Response<ChannelFollowsResponse>, Status> {
+        let req = request.into_inner();
+        if req.fid == 0 || u32::try_from(req.fid).is_err() {
+            return Err(Status::invalid_argument("fid must fit in a non-zero u32"));
+        }
+        require_nonzero_page_size(req.page_size)?;
+        // Keyed by fid, so this is a single-shard read with none of the fan-out
+        // caveats.
+        let stores = self.get_stores_for(req.fid)?;
+        let page = ReactionStore::follows_by_fid(
+            &stores.reaction_store,
+            req.fid,
+            &channel_page_options(req.page_size, req.page_token, req.reverse),
+        )
+        .map_err(channel_store_error_to_status)?;
+        Ok(Response::new(ChannelFollowsResponse {
+            follows: page
+                .entries
+                .into_iter()
+                .map(|entry| ChannelFollow {
+                    channel_id: entry.channel_id.to_vec(),
+                    followed_at: entry.followed_at,
+                })
+                .collect(),
+            next_page_token: page.next_page_token,
+        }))
+    }
+
+    async fn is_following_channel(
+        &self,
+        request: Request<IsFollowingChannelRequest>,
+    ) -> Result<Response<IsFollowingChannelResponse>, Status> {
+        let req = request.into_inner();
+        if req.fid == 0 || u32::try_from(req.fid).is_err() {
+            return Err(Status::invalid_argument("fid must fit in a non-zero u32"));
+        }
+        let channel_id = require_channel_id_width(&req.channel_id)?;
+        let stores = self.get_stores_for(req.fid)?;
+        let followed_at = ReactionStore::is_following(&stores.reaction_store, req.fid, &channel_id)
+            .map_err(channel_store_error_to_status)?;
+        Ok(Response::new(IsFollowingChannelResponse {
+            following: followed_at.is_some(),
+            followed_at,
+        }))
     }
 
     async fn get_id_registry_on_chain_event(
@@ -3246,87 +4016,99 @@ impl HubService for MyHubService {
         &self,
         request: Request<GetMeshViewRequest>,
     ) -> Result<Response<MeshView>, Status> {
-        // Admin-gated diagnostic endpoint.
+        // Admin-gated diagnostic endpoint. Authenticate BEFORE touching the
+        // cache — a cached view must never be served to an unauthenticated
+        // caller.
         authenticate_request(&request, &self.admin_allowed_users)?;
         let validators_only = request.into_inner().validators_only;
 
-        let (tx, rx) = oneshot::channel();
-        let _ = self
-            .gossip_tx
-            .send(GossipEvent::GetMeshView(tx))
-            .await
-            .map_err(|err| {
-                error!(
-                    { err = err.to_string() },
-                    "[get_mesh_view] error sending mesh view request"
-                );
-            });
+        self.mesh_cache
+            .view(validators_only, || async {
+                let (tx, rx) = oneshot::channel();
+                let _ = self
+                    .gossip_tx
+                    .send(GossipEvent::GetMeshView(tx))
+                    .await
+                    .map_err(|err| {
+                        error!(
+                            { err = err.to_string() },
+                            "[get_mesh_view] error sending mesh view request"
+                        );
+                    });
 
-        match timeout(DEFAULT_REQUEST_TIMEOUT, rx).await {
-            Ok(Ok(view)) => {
-                // Classify peers against the validator set effective at the current
-                // block height (this is the only place public-key -> validator-set
-                // mapping happens).
-                let current_height = self
-                    .block_stores
-                    .block_store
-                    .max_block_number()
-                    .unwrap_or(0);
-                let view = classify_mesh_view(
-                    view,
-                    &self.validator_peer_ids,
-                    current_height,
-                    validators_only,
-                );
-                Ok(Response::new(view))
-            }
-            Ok(Err(err)) => {
-                error!(
-                    { err = err.to_string() },
-                    "[get_mesh_view] error receiving mesh view response"
-                );
-                Err(Status::internal("Unable to retrieve mesh view."))
-            }
-            Err(_) => {
-                error!("[get_mesh_view] timeout receiving mesh view response");
-                Err(Status::internal("Unable to retrieve mesh view."))
-            }
-        }
+                match timeout(DEFAULT_REQUEST_TIMEOUT, rx).await {
+                    Ok(Ok(view)) => {
+                        // Classify peers against the validator set effective at the
+                        // current block height (this is the only place public-key ->
+                        // validator-set mapping happens).
+                        let current_height = self
+                            .block_stores
+                            .block_store
+                            .max_block_number()
+                            .unwrap_or(0);
+                        let view = classify_mesh_view(
+                            view,
+                            &self.validator_peer_ids,
+                            current_height,
+                            validators_only,
+                        );
+                        Ok(view)
+                    }
+                    Ok(Err(err)) => {
+                        error!(
+                            { err = err.to_string() },
+                            "[get_mesh_view] error receiving mesh view response"
+                        );
+                        Err(Status::internal("Unable to retrieve mesh view."))
+                    }
+                    Err(_) => {
+                        error!("[get_mesh_view] timeout receiving mesh view response");
+                        Err(Status::internal("Unable to retrieve mesh view."))
+                    }
+                }
+            })
+            .await
+            .map(Response::new)
     }
 
     async fn get_mesh_topology(
         &self,
         request: Request<GetMeshViewRequest>,
     ) -> Result<Response<MeshTopology>, Status> {
-        // Admin-gated diagnostic endpoint.
+        // Admin-gated diagnostic endpoint. Authenticate BEFORE touching the
+        // cache — a cached topology must never be served to an unauthenticated
+        // caller. The cache also single-flights concurrent misses, so a burst of
+        // requests triggers only one (expensive) crawl.
         authenticate_request(&request, &self.admin_allowed_users)?;
         let validators_only = request.into_inner().validators_only;
 
-        let current_height = self
-            .block_stores
-            .block_store
-            .max_block_number()
-            .unwrap_or(0);
-        let generated_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        self.mesh_cache
+            .topology(validators_only, || async {
+                let current_height = self
+                    .block_stores
+                    .block_store
+                    .max_block_number()
+                    .unwrap_or(0);
+                let generated_at = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
 
-        match crawl_mesh(
-            &self.gossip_tx,
-            &self.validator_peer_ids,
-            current_height,
-            validators_only,
-            generated_at,
-        )
-        .await
-        {
-            Ok(topology) => Ok(Response::new(topology)),
-            Err(err) => {
-                error!({ err = err }, "[get_mesh_topology] crawl failed");
-                Err(Status::internal("Unable to crawl mesh topology."))
-            }
-        }
+                crawl_mesh(
+                    &self.gossip_tx,
+                    &self.validator_peer_ids,
+                    current_height,
+                    validators_only,
+                    generated_at,
+                )
+                .await
+                .map_err(|err| {
+                    error!({ err = err }, "[get_mesh_topology] crawl failed");
+                    Status::internal("Unable to crawl mesh topology.")
+                })
+            })
+            .await
+            .map(Response::new)
     }
 }
 
@@ -3334,50 +4116,32 @@ impl HubService for MyHubService {
 
 #[tonic::async_trait]
 impl crate::api::HubQueryHandler for MyHubService {
-    async fn get_cast_by_hash(&self, hash: &[u8], fid_hint: Option<u64>) -> Option<Message> {
-        // Fast path: if caller provides the FID (from cast_hash_index), do
-        // a single O(1) RocksDB get on the correct shard.
-        if let Some(fid) = fid_hint {
-            if let Ok(stores) = self.get_stores_for(fid) {
-                if let Ok(Some(msg)) =
-                    CastStore::get_cast_add(&stores.cast_store, fid, hash.to_vec())
-                {
-                    return Some(msg);
-                }
-            }
-        }
-
-        // Slow fallback: scan all shards. Only reached when no FID hint
-        // is available (e.g. cast_hash_index hasn't backfilled yet).
+    async fn count_direct_replies(&self, fid: u64, hash: &[u8]) -> Result<u64, String> {
+        let parent = cast_add_body::Parent::ParentCastId(CastId {
+            fid,
+            hash: hash.to_vec(),
+        });
+        let mut count = 0u64;
         for stores in self.shard_stores.values() {
-            let mut page_token: Option<Vec<u8>> = None;
-            loop {
-                let page_options = PageOptions {
-                    page_size: Some(1000),
-                    page_token: page_token.clone(),
-                    reverse: false,
-                };
-                let (fids, next_token) = match stores.onchain_event_store.get_fids(&page_options) {
-                    Ok(result) => result,
-                    Err(_) => break,
-                };
-                if fids.is_empty() {
-                    break;
-                }
-                for fid in &fids {
-                    if let Ok(Some(msg)) =
-                        CastStore::get_cast_add(&stores.cast_store, *fid, hash.to_vec())
-                    {
-                        return Some(msg);
-                    }
-                }
-                match next_token {
-                    Some(token) if !token.is_empty() => page_token = Some(token),
-                    _ => break,
-                }
-            }
+            let shard_count = CastStore::count_casts_by_parent(&stores.cast_store, &parent)
+                .map_err(|e| e.to_string())?;
+            count = count.saturating_add(shard_count);
         }
-        None
+        Ok(count)
+    }
+
+    async fn get_cast_by_hash(&self, hash: &[u8], fid_hint: Option<u64>) -> Option<Message> {
+        // A message hash commits to its author FID, so with a known FID the
+        // cast can only live at one key. A miss there means it was removed,
+        // pruned or never existed; probing other FIDs cannot find it.
+        let fid = match fid_hint {
+            Some(fid) => fid,
+            None => run_blocking(|| self.find_cast_fid_by_hash(hash))?,
+        };
+        let stores = self.get_stores_for(fid).ok()?;
+        CastStore::get_cast_add(&stores.cast_store, fid, hash.to_vec())
+            .ok()
+            .flatten()
     }
 
     async fn get_casts_by_fid(
@@ -3494,7 +4258,7 @@ impl crate::api::HubQueryHandler for MyHubService {
         None
     }
 
-    async fn get_fids_by_address(&self, address: &[u8]) -> Vec<u64> {
+    async fn get_fids_by_address(&self, address: &[u8], include_custody: bool) -> Vec<u64> {
         let mut fids = Vec::new();
 
         // Check verifications first (direct RocksDB lookup, O(1) per shard)
@@ -3511,7 +4275,7 @@ impl crate::api::HubQueryHandler for MyHubService {
         // Check ID registry for custody address (uses a cache, but the
         // initial population scans all id register events and can be slow).
         // Skip if we already found matches via verifications.
-        if fids.is_empty() {
+        if include_custody && fids.is_empty() {
             if let Ok(Some(event)) = self.find_id_registry_event_by_address(address) {
                 if let Some(Body::IdRegisterEventBody(body)) = &event.body {
                     if body.to == address && !fids.contains(&event.fid) {

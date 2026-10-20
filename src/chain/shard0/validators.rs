@@ -210,7 +210,11 @@ pub fn register(
     if let Some(mut existing) = txn.get_proto::<ValidatorRecord>(&key)? {
         // A registration during the buffer cancels an auto-deregistration
         // (§4.7). Otherwise the key must not be active or announced.
-        if existing.auto_deregistered && existing.leave_epoch > ctx.epoch && existing.fid == fid {
+        // A registration of an `INACTIVE` key makes it active again (§4.8).
+        if existing.fid == fid
+            && ((existing.auto_deregistered && existing.leave_epoch > ctx.epoch)
+                || (existing.inactive && existing.leave_epoch == 0))
+        {
             existing.leave_epoch = 0;
             existing.auto_deregistered = false;
             existing.inactive = false;
@@ -344,21 +348,41 @@ pub fn record_participation(
     set: &EpochSet,
     certificate: &crate::proto::CommitCertificate,
 ) -> Result<(), Shard0Error> {
-    let shard = certificate.shard_id;
-    let height = certificate.height;
-    for round in 0..=certificate.round {
+    record_proposals(
+        ctx,
+        txn,
+        set,
+        certificate.shard_id,
+        certificate.height,
+        certificate.round,
+    )
+}
+
+/// The proposers of rounds 0 to `decided − 1` at (`shard`, `height`) missed
+/// their proposals; the proposer of `decided` did not (§4.7).
+pub fn record_proposals(
+    ctx: &BlockCtx,
+    txn: &mut MsgTxn,
+    set: &EpochSet,
+    shard: u32,
+    height: u64,
+    decided: u32,
+) -> Result<(), Shard0Error> {
+    for round in 0..=decided {
         let proposer = set.proposer(shard, height, round);
         let key = keys::validator(&proposer.consensus_key_hash);
         let Some(mut record) = txn.get_proto::<ValidatorRecord>(&key)? else {
             continue;
         };
-        if round == certificate.round {
+        if round == decided {
+            // `INACTIVE` stays until a new registration (§4.8).
             record.consecutive_missed = 0;
         } else {
             record.consecutive_missed += 1;
+            // An `INACTIVE` validator tries again at each miss, so that it
+            // leaves when the set has enough validators (§4.8).
             if record.consecutive_missed >= ctx.params.auto_deregister_threshold
                 && record.leave_epoch == 0
-                && !record.inactive
             {
                 auto_deregister(ctx, txn, &mut record)?;
             }
@@ -385,6 +409,7 @@ fn auto_deregister(
     } else {
         record.leave_epoch = leave;
         record.auto_deregistered = true;
+        record.inactive = false;
     }
     Ok(())
 }

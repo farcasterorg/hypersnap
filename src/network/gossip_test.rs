@@ -1,11 +1,12 @@
 use crate::consensus::consensus::SystemMessage;
+use crate::core::types::SnapchainValidatorContext;
 use crate::mempool::mempool::{MempoolRequest, MempoolSource};
 use crate::network::gossip::{Config, GossipEvent, SnapchainGossip};
-use crate::proto::{self, FarcasterNetwork, Message, MessageData};
+use crate::proto::{FarcasterNetwork, Message, MessageData};
 use crate::storage::store::mempool_poller::MempoolMessage;
 use crate::storage::store::test_helper::statsd_client;
 use crate::utils::factory::messages_factory;
-use libp2p::{identity::ed25519::Keypair, PeerId};
+use libp2p::identity::ed25519::Keypair;
 use prost::Message as _;
 use serial_test::serial;
 use std::time::Duration;
@@ -14,6 +15,60 @@ use tokio::{select, time};
 
 const HOST_FOR_TEST: &str = "127.0.0.1";
 const BASE_PORT_FOR_TEST: u32 = 9382;
+
+/// Re-publishes `message` on `publisher_tx` every 200ms, polling `receiver` for
+/// a matching `SystemMessage::Mempool(...)` delivery, and returns `true` as
+/// soon as one arrives (or `false` once `deadline` elapses). Breaks the
+/// publisher loop early if the gossip event channel closes — without that, a
+/// dead gossip task would burn the full deadline before failing.
+///
+/// Repeat sends are safe: gossipsub message-id dedup ensures the receiver sees
+/// each unique payload at most once. This is the right shape for tests where
+/// the publisher hasn't yet formed a mesh with subscribed peers — the first
+/// few `publish` calls can return `InsufficientPeers` and are only warn-logged
+/// and dropped by `SnapchainGossip::publish`.
+async fn publish_until_received(
+    publisher_tx: mpsc::Sender<GossipEvent<SnapchainValidatorContext>>,
+    receiver: &mut mpsc::Receiver<SystemMessage>,
+    message: Message,
+    deadline: Duration,
+) -> bool {
+    let expected_hash = message.hash.clone();
+
+    let cast_for_publisher = message;
+    let publisher = tokio::spawn(async move {
+        loop {
+            if publisher_tx
+                .send(GossipEvent::BroadcastMempoolMessage(
+                    MempoolMessage::UserMessage(cast_for_publisher.clone()),
+                ))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    });
+
+    let end = tokio::time::Instant::now() + deadline;
+    let received = loop {
+        if tokio::time::Instant::now() >= end {
+            break false;
+        }
+        match tokio::time::timeout(Duration::from_millis(200), receiver.recv()).await {
+            Ok(Some(SystemMessage::Mempool(MempoolRequest::AddMessage(
+                MempoolMessage::UserMessage(msg),
+                MempoolSource::Gossip,
+                _,
+            )))) if msg.hash == expected_hash => break true,
+            _ => {}
+        }
+    };
+
+    publisher.abort();
+    received
+}
 
 async fn wait_for_message(
     system_rx: &mut mpsc::Receiver<SystemMessage>,
@@ -210,6 +265,77 @@ async fn test_hypersnap_namespace_is_isolated() {
     let mut hypersnap_rx = receivers.pop().unwrap();
     assert_eq!(wait_for_message(&mut hypersnap_rx, cast.clone()).await, 1);
     assert_eq!(wait_for_message(&mut snapchain_rx, cast).await, 0);
+}
+
+/// A Hypersnap node gossips its mempool messages in batches (by size and each
+/// `MEMPOOL_BATCH_INTERVAL`): the peer gets each message once.
+#[tokio::test]
+#[serial]
+async fn a_hypersnap_node_gossips_its_mempool_messages_in_batches() {
+    let base = BASE_PORT_FOR_TEST + 44;
+    let addr = |i: u32| format!("/ip4/{HOST_FOR_TEST}/udp/{}/quic-v1", base + i);
+    let ns = Config::hypersnap_namespace(FarcasterNetwork::Devnet);
+    let configs = [
+        Config::new(addr(0), addr(1)).with_namespace(ns.clone()),
+        Config::new(addr(1), addr(0)).with_namespace(ns.clone()),
+    ];
+    let mut receivers = Vec::new();
+    let mut senders = Vec::new();
+    for config in &configs {
+        let (system_tx, system_rx) = mpsc::channel::<SystemMessage>(10_000);
+        let mut gossip = SnapchainGossip::create(
+            Keypair::generate(),
+            config,
+            Some(system_tx),
+            false,
+            FarcasterNetwork::Devnet,
+            statsd_client(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        senders.push(gossip.tx.clone());
+        receivers.push(system_rx);
+        tokio::spawn(async move { gossip.start().await });
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // 500 casts of about 1 KB: one batch by size, then the rest by time.
+    let mut sent = std::collections::BTreeSet::new();
+    for i in 0..500 {
+        let cast = messages_factory::casts::create_cast_add(
+            123,
+            &format!("{} {}", i, "x".repeat(300)),
+            None,
+            None,
+        );
+        sent.insert(cast.hash.clone());
+        senders[0]
+            .send(GossipEvent::BroadcastMempoolMessage(
+                MempoolMessage::UserMessage(cast),
+            ))
+            .await
+            .unwrap();
+    }
+    let rx = &mut receivers[1];
+    let mut received = std::collections::BTreeSet::new();
+    let deadline = time::Instant::now() + Duration::from_secs(10);
+    while received.len() < sent.len() {
+        select! {
+            m = rx.recv() => {
+                if let Some(SystemMessage::Mempool(MempoolRequest::AddMessage(
+                    MempoolMessage::UserMessage(m),
+                    MempoolSource::Gossip,
+                    _,
+                ))) = m
+                {
+                    assert!(received.insert(m.hash), "a message came twice");
+                }
+            }
+            _ = time::sleep_until(deadline) => break,
+        }
+    }
+    assert_eq!(received, sent);
 }
 
 /// The mesh-diagnostics responder serves only validator peers: a request from a
@@ -642,4 +768,361 @@ async fn test_bootstrap_peer_reconnection() {
 
     let receive_counts = wait_for_message(&mut system_rx2, cast_add).await;
     assert_eq!(receive_counts, 1);
+}
+
+/// Regression test for #865: read nodes must subscribe to MEMPOOL_TOPIC so that
+/// they receive mempool gossip from validator peers. Before the fix, a read
+/// node never joined the mempool mesh and never delivered inbound mempool
+/// messages to its system channel, regardless of how many validator peers
+/// were publishing.
+#[tokio::test]
+#[serial]
+async fn test_read_node_receives_mempool_gossip() {
+    let validator_keypair = Keypair::generate();
+    let read_node_keypair = Keypair::generate();
+
+    let validator_port = BASE_PORT_FOR_TEST + 50;
+    let validator_addr = format!("/ip4/{HOST_FOR_TEST}/udp/{validator_port}/quic-v1");
+
+    let read_node_port = BASE_PORT_FOR_TEST + 51;
+    let read_node_addr = format!("/ip4/{HOST_FOR_TEST}/udp/{read_node_port}/quic-v1");
+
+    let validator_config = Config::new(validator_addr.clone(), read_node_addr.clone())
+        .with_contact_info_interval(Duration::from_millis(100));
+    let read_node_config = Config::new(read_node_addr.clone(), validator_addr.clone())
+        .with_contact_info_interval(Duration::from_millis(100));
+
+    let (validator_system_tx, _) = mpsc::channel::<SystemMessage>(100);
+    let (read_node_system_tx, mut read_node_system_rx) = mpsc::channel::<SystemMessage>(100);
+
+    let mut validator_gossip = SnapchainGossip::create(
+        validator_keypair,
+        &validator_config,
+        Some(validator_system_tx),
+        false,
+        FarcasterNetwork::Devnet,
+        statsd_client(),
+        Vec::new(),
+    )
+    .await
+    .unwrap();
+
+    let mut read_node_gossip = SnapchainGossip::create(
+        read_node_keypair,
+        &read_node_config,
+        Some(read_node_system_tx),
+        true,
+        FarcasterNetwork::Devnet,
+        statsd_client(),
+        Vec::new(),
+    )
+    .await
+    .unwrap();
+
+    let validator_tx = validator_gossip.tx.clone();
+
+    tokio::spawn(async move { validator_gossip.start().await });
+    tokio::spawn(async move { read_node_gossip.start().await });
+
+    let cast_add = messages_factory::casts::create_cast_add(456, "regression", None, None);
+    let received = publish_until_received(
+        validator_tx,
+        &mut read_node_system_rx,
+        cast_add,
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(
+        received,
+        "read node did not receive mempool gossip from validator within deadline"
+    );
+}
+
+/// Multi-hop variant of the regression test. Topology:
+///
+/// ```text
+///   read_node_1  <-->  read_node_2  <-->  validator
+/// ```
+///
+/// `read_node_1` and `validator` only bootstrap to `read_node_2`, never to
+/// each other, and autodiscovery is left off (default). For a mempool message
+/// published on `read_node_1` to reach `validator`, gossipsub must forward
+/// it through `read_node_2`'s mempool-topic mesh. Crucially, this is
+/// distinguishable from the fanout-fallback path that makes the simpler 2-node
+/// regression pass even when read nodes don't subscribe: in the bug scenario
+/// `read_node_2` isn't subscribed to MEMPOOL_TOPIC, `read_node_1`'s only
+/// direct peer that knows the topic is no one, fanout has nothing to fall back
+/// to, and the publish never leaves `read_node_1`.
+#[tokio::test]
+#[serial]
+async fn test_read_node_relays_mempool_gossip() {
+    let read_node_1_keypair = Keypair::generate();
+    let read_node_2_keypair = Keypair::generate();
+    let validator_keypair = Keypair::generate();
+
+    let read_node_1_port = BASE_PORT_FOR_TEST + 60;
+    let read_node_1_addr = format!("/ip4/{HOST_FOR_TEST}/udp/{read_node_1_port}/quic-v1");
+
+    let read_node_2_port = BASE_PORT_FOR_TEST + 61;
+    let read_node_2_addr = format!("/ip4/{HOST_FOR_TEST}/udp/{read_node_2_port}/quic-v1");
+
+    let validator_port = BASE_PORT_FOR_TEST + 62;
+    let validator_addr = format!("/ip4/{HOST_FOR_TEST}/udp/{validator_port}/quic-v1");
+
+    // read_node_1 and validator only bootstrap to read_node_2, never to each
+    // other. read_node_2 has no bootstrap (it'll be dialled by the others).
+    let read_node_1_config = Config::new(read_node_1_addr.clone(), read_node_2_addr.clone())
+        .with_contact_info_interval(Duration::from_millis(100));
+    let read_node_2_config = Config::new(read_node_2_addr.clone(), "".to_string())
+        .with_contact_info_interval(Duration::from_millis(100));
+    let validator_config = Config::new(validator_addr.clone(), read_node_2_addr.clone())
+        .with_contact_info_interval(Duration::from_millis(100));
+
+    let (read_node_1_system_tx, _) = mpsc::channel::<SystemMessage>(100);
+    let (read_node_2_system_tx, _) = mpsc::channel::<SystemMessage>(100);
+    let (validator_system_tx, mut validator_system_rx) = mpsc::channel::<SystemMessage>(100);
+
+    let mut read_node_1_gossip = SnapchainGossip::create(
+        read_node_1_keypair,
+        &read_node_1_config,
+        Some(read_node_1_system_tx),
+        true,
+        FarcasterNetwork::Devnet,
+        statsd_client(),
+        Vec::new(),
+    )
+    .await
+    .unwrap();
+
+    let mut read_node_2_gossip = SnapchainGossip::create(
+        read_node_2_keypair,
+        &read_node_2_config,
+        Some(read_node_2_system_tx),
+        true,
+        FarcasterNetwork::Devnet,
+        statsd_client(),
+        Vec::new(),
+    )
+    .await
+    .unwrap();
+
+    let mut validator_gossip = SnapchainGossip::create(
+        validator_keypair,
+        &validator_config,
+        Some(validator_system_tx),
+        false,
+        FarcasterNetwork::Devnet,
+        statsd_client(),
+        Vec::new(),
+    )
+    .await
+    .unwrap();
+
+    let read_node_1_tx = read_node_1_gossip.tx.clone();
+
+    tokio::spawn(async move { read_node_1_gossip.start().await });
+    tokio::spawn(async move { read_node_2_gossip.start().await });
+    tokio::spawn(async move { validator_gossip.start().await });
+
+    let cast_add = messages_factory::casts::create_cast_add(789, "multi-hop", None, None);
+    let received = publish_until_received(
+        read_node_1_tx,
+        &mut validator_system_rx,
+        cast_add,
+        Duration::from_secs(15),
+    )
+    .await;
+    assert!(
+        received,
+        "validator did not receive mempool gossip relayed through read_node_2 within deadline"
+    );
+}
+
+mod self_heal_bounce {
+    use crate::network::gossip::{peers_to_bounce, BounceTimers};
+    use libp2p::gossipsub::{IdentTopic, TopicHash};
+    use libp2p::PeerId;
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    const SETTLE: Duration = Duration::from_secs(30);
+    const COOLDOWN: Duration = Duration::from_secs(60);
+
+    fn contact_info() -> TopicHash {
+        IdentTopic::new("contact-info").hash()
+    }
+
+    fn bounce(
+        peer: PeerId,
+        topics: Vec<TopicHash>,
+        connected_for: Duration,
+        last_bounce_ago: Option<Duration>,
+        streak: u32,
+    ) -> bool {
+        let now = Instant::now() + Duration::from_secs(10_000);
+        let peer_topics = HashMap::from([(peer, topics)]);
+        let connected_at = HashMap::from([(peer, now - connected_for)]);
+        let last_bounce: HashMap<_, _> = last_bounce_ago
+            .map(|ago| (peer, now - ago))
+            .into_iter()
+            .collect();
+        let streaks = HashMap::from([(peer, streak)]);
+        let timers = BounceTimers {
+            connected_at: &connected_at,
+            last_bounce: &last_bounce,
+            streak: &streaks,
+            settle: SETTLE,
+            cooldown: COOLDOWN,
+        };
+        peers_to_bounce([peer], &peer_topics, &contact_info(), &timers, now) == vec![peer]
+    }
+
+    #[test]
+    fn bounces_a_settled_peer_missing_its_subscriptions() {
+        // The prod failure: a validator connected long ago that never sent SUBSCRIBE.
+        assert!(bounce(PeerId::random(), vec![], SETTLE * 2, None, 0));
+    }
+
+    #[test]
+    fn leaves_healthy_and_mid_handshake_peers_alone() {
+        assert!(!bounce(
+            PeerId::random(),
+            vec![contact_info()],
+            SETTLE * 2,
+            None,
+            0
+        ));
+        assert!(!bounce(PeerId::random(), vec![], SETTLE / 2, None, 0));
+    }
+
+    #[test]
+    fn skips_peers_that_are_not_connected() {
+        let peer = PeerId::random();
+        let now = Instant::now();
+        let none = HashMap::new();
+        let streaks = HashMap::new();
+        let timers = BounceTimers {
+            connected_at: &none,
+            last_bounce: &none,
+            streak: &streaks,
+            settle: SETTLE,
+            cooldown: COOLDOWN,
+        };
+        assert!(peers_to_bounce([peer], &HashMap::new(), &contact_info(), &timers, now).is_empty());
+    }
+
+    #[test]
+    fn cooldown_doubles_with_each_consecutive_bounce() {
+        let peer = PeerId::random();
+        // First bounce done (streak 1): eligible again after 60s.
+        assert!(!bounce(peer, vec![], SETTLE * 2, Some(COOLDOWN), 1));
+        assert!(bounce(
+            peer,
+            vec![],
+            SETTLE * 2,
+            Some(COOLDOWN + Duration::from_secs(1)),
+            1
+        ));
+        // Third consecutive bounce (streak 3): 4 x 60s.
+        assert!(!bounce(peer, vec![], SETTLE * 2, Some(COOLDOWN * 3), 3));
+        assert!(bounce(
+            peer,
+            vec![],
+            SETTLE * 2,
+            Some(COOLDOWN * 4 + Duration::from_secs(1)),
+            3
+        ));
+        // Capped at 32 x 60s however long the streak runs.
+        assert!(bounce(
+            peer,
+            vec![],
+            SETTLE * 2,
+            Some(COOLDOWN * 32 + Duration::from_secs(1)),
+            40
+        ));
+    }
+}
+
+async fn connected_peer_count(tx: &mpsc::Sender<GossipEvent<SnapchainValidatorContext>>) -> usize {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    tx.send(GossipEvent::GetConnectedPeers(reply_tx))
+        .await
+        .unwrap();
+    reply_rx.await.unwrap().len()
+}
+
+/// A node that shuts down must close its connections, not just stop. Otherwise each
+/// peer keeps the dead connection until its 10s QUIC idle timeout, and a restart inside
+/// that window leaves the peer treating us as already connected, so it never sends us
+/// its gossipsub subscriptions.
+#[tokio::test]
+#[serial]
+async fn test_shutdown_closes_peer_connections_promptly() {
+    let validator_addr = format!(
+        "/ip4/{HOST_FOR_TEST}/udp/{}/quic-v1",
+        BASE_PORT_FOR_TEST + 80
+    );
+    let read_node_addr = format!(
+        "/ip4/{HOST_FOR_TEST}/udp/{}/quic-v1",
+        BASE_PORT_FOR_TEST + 81
+    );
+
+    let (validator_system_tx, _) = mpsc::channel::<SystemMessage>(100);
+    let (read_node_system_tx, _) = mpsc::channel::<SystemMessage>(100);
+    let mut validator = SnapchainGossip::create(
+        Keypair::generate(),
+        &Config::new(validator_addr.clone(), "".to_string()),
+        Some(validator_system_tx),
+        false,
+        FarcasterNetwork::Devnet,
+        statsd_client(),
+        Vec::new(),
+    )
+    .await
+    .unwrap();
+    let mut read_node = SnapchainGossip::create(
+        Keypair::generate(),
+        &Config::new(read_node_addr, validator_addr),
+        Some(read_node_system_tx),
+        true,
+        FarcasterNetwork::Devnet,
+        statsd_client(),
+        Vec::new(),
+    )
+    .await
+    .unwrap();
+    let validator_tx = validator.tx.clone();
+    let read_node_tx = read_node.tx.clone();
+    tokio::spawn(async move { validator.start().await });
+    let read_node_task = tokio::spawn(async move { read_node.start().await });
+
+    let deadline = time::Instant::now() + Duration::from_secs(10);
+    while connected_peer_count(&validator_tx).await == 0 {
+        assert!(time::Instant::now() < deadline, "read node never connected");
+        time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    read_node_tx
+        .send(GossipEvent::Shutdown(done_tx))
+        .await
+        .unwrap();
+    time::timeout(Duration::from_secs(5), done_rx)
+        .await
+        .expect("shutdown did not finish")
+        .unwrap();
+    time::timeout(Duration::from_secs(1), read_node_task)
+        .await
+        .expect("gossip loop kept running after shutdown")
+        .unwrap();
+
+    // Well under the 10s QUIC idle timeout an abrupt exit would leave behind.
+    let closed_by = time::Instant::now() + Duration::from_secs(3);
+    while connected_peer_count(&validator_tx).await > 0 {
+        assert!(
+            time::Instant::now() < closed_by,
+            "validator still holds the read node's connection after a clean shutdown"
+        );
+        time::sleep(Duration::from_millis(50)).await;
+    }
 }

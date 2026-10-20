@@ -23,6 +23,11 @@ impl StatsdClientWrapper {
         }
     }
 
+    /// Send the metrics that a buffered sink holds.
+    pub fn flush(&self) {
+        _ = self.client.flush();
+    }
+
     pub fn incr(&self, key: &str) {
         _ = self.client.incr(key);
     }

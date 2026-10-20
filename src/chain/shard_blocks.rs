@@ -8,7 +8,7 @@
 
 use super::block::{
     block_hash, certificate_hash, seal, validate_body, validate_header, HeaderContext, ParentInfo,
-    BLOCK_VERSION,
+    BLOCK_VERSION, MAX_BLOCK_BYTES,
 };
 use super::certificate;
 use super::epoch::EpochParams;
@@ -47,7 +47,11 @@ impl HypersnapBlockStore {
         HypersnapBlockStore { db }
     }
 
-    fn key(height: u64) -> Vec<u8> {
+    pub fn db(&self) -> &Arc<RocksDB> {
+        &self.db
+    }
+
+    pub(crate) fn key(height: u64) -> Vec<u8> {
         let mut k = vec![RootPrefix::HypersnapBlock as u8];
         k.extend_from_slice(&height.to_be_bytes());
         k
@@ -67,6 +71,53 @@ impl HypersnapBlockStore {
     pub fn get(&self, height: u64) -> Option<HypersnapBlock> {
         let bytes = self.db.get(&Self::key(height)).ok()??;
         HypersnapBlock::decode(bytes.as_slice()).ok()
+    }
+
+    /// The lowest stored height.
+    pub fn first_height(&self) -> Option<u64> {
+        let start = vec![RootPrefix::HypersnapBlock as u8];
+        let stop = vec![RootPrefix::HypersnapBlock as u8 + 1];
+        let mut found = None;
+        let options = PageOptions {
+            page_size: Some(1),
+            ..PageOptions::default()
+        };
+        let _ = self.db.for_each_iterator_by_prefix_paged(
+            Some(start),
+            Some(stop),
+            &options,
+            |key, _| {
+                found = key
+                    .get(1..9)
+                    .and_then(|h| <[u8; 8]>::try_from(h).ok())
+                    .map(u64::from_be_bytes);
+                Ok(true)
+            },
+        );
+        found
+    }
+
+    /// Remove the stored blocks below `height`, with the chunk headers of
+    /// their heights: a node can prune block history (FIP §17.6). The
+    /// blocks are node-local, in no state trie. Returns the number of
+    /// heights removed.
+    pub fn prune_below(&self, height: u64) -> Result<u64, String> {
+        let Some(mut h) = self.first_height() else {
+            return Ok(0);
+        };
+        let first = h;
+        while h < height {
+            let end = (h + 1_000).min(height);
+            let mut txn = RocksDbTransactionBatch::new();
+            for x in h..end {
+                txn.delete(Self::key(x));
+                crate::storage::store::shard::stage_delete_shard_chunk(&self.db, &mut txn, x)
+                    .map_err(|e| e.to_string())?;
+            }
+            self.db.commit(txn).map_err(|e| e.to_string())?;
+            h = end;
+        }
+        Ok(h.saturating_sub(first))
     }
 
     pub fn last(&self) -> Option<HypersnapBlock> {
@@ -107,6 +158,13 @@ pub struct ValidationInputs<'a> {
     pub parent_set: Option<&'a EpochSet>,
 }
 
+/// The part of `max_block_bytes` that a proposal keeps for the header.
+const BLOCK_RESERVE_BYTES: usize = 4096;
+
+/// The bytes of a message in a block beyond its encoding, at most: its field
+/// in a transaction, and a transaction of its own.
+const MESSAGE_FRAME_BYTES: usize = 64;
+
 /// The shard-0 outbox (FIP §17.7), for the replica of a shard.
 pub trait OutboxSource: Send + Sync {
     /// The outbox entries of the shard-0 block at `height`, in order.
@@ -130,6 +188,12 @@ pub struct ShardBlockProducer {
     /// keccak256 of this node's `PivotRecord`, for the shard's pivot block
     /// (FIP §17.5).
     pivot_record_hash: Vec<u8>,
+    /// The size limit of a proposal: `MAX_BLOCK_BYTES` (tests set less).
+    pub max_block_bytes: usize,
+    /// The header and the certificate of the tip, kept at each commit: a
+    /// read of the tip block decodes up to `MAX_BLOCK_BYTES`, and a height
+    /// needs the parent several times.
+    tip_head: std::sync::Mutex<Option<(HypersnapBlockHeader, Option<CommitCertificate>)>>,
 }
 
 impl ShardBlockProducer {
@@ -144,6 +208,8 @@ impl ShardBlockProducer {
             outbox: None,
             checkpoints: None,
             pivot_record_hash: vec![],
+            max_block_bytes: MAX_BLOCK_BYTES,
+            tip_head: std::sync::Mutex::new(None),
         }
     }
 
@@ -178,11 +244,21 @@ impl ShardBlockProducer {
         self
     }
 
-    fn replica_key(height: u64, parent_ref: Option<u64>, block_ref: u64) -> Vec<u8> {
-        let mut k = Vec::with_capacity(24);
+    /// What the execution of a block depends on besides its transactions:
+    /// its height, its shard-0 references (the replica entries) and its
+    /// timestamp. The commit reuses an execution of the engine only with the
+    /// same key.
+    fn replica_key(
+        height: u64,
+        parent_ref: Option<u64>,
+        block_ref: u64,
+        timestamp: u64,
+    ) -> Vec<u8> {
+        let mut k = Vec::with_capacity(32);
         k.extend_from_slice(&height.to_be_bytes());
         k.extend_from_slice(&parent_ref.unwrap_or(u64::MAX).to_be_bytes());
         k.extend_from_slice(&block_ref.to_be_bytes());
+        k.extend_from_slice(&timestamp.to_be_bytes());
         k
     }
 
@@ -221,21 +297,30 @@ impl ShardBlockProducer {
         self.store.last()
     }
 
+    /// The header and the certificate of the tip.
+    pub fn tip_header(&self) -> Option<(HypersnapBlockHeader, Option<CommitCertificate>)> {
+        let mut head = self.tip_head.lock().unwrap();
+        if head.is_none() {
+            *head = self
+                .store
+                .last()
+                .and_then(|b| Some((b.header?, b.certificate)));
+        }
+        head.clone()
+    }
+
     fn parent(&self) -> (ParentInfo, Option<CommitCertificate>) {
-        match self.tip() {
-            Some(block) => {
-                let h = block.header.clone().unwrap_or_default();
-                (
-                    ParentInfo {
-                        height: h.height,
-                        hash: block_hash(&h),
-                        timestamp: h.timestamp,
-                        epoch_ref_height: Some(h.epoch_ref_height),
-                        shard_links: vec![],
-                    },
-                    block.certificate,
-                )
-            }
+        match self.tip_header() {
+            Some((h, certificate)) => (
+                ParentInfo {
+                    height: h.height,
+                    hash: block_hash(&h),
+                    timestamp: h.timestamp,
+                    epoch_ref_height: Some(h.epoch_ref_height),
+                    shard_links: vec![],
+                },
+                certificate,
+            ),
             None => (self.genesis_parent.clone(), None),
         }
     }
@@ -261,29 +346,74 @@ impl ShardBlockProducer {
             .shard_block_epoch(self.parent().0.epoch_ref_height)
     }
 
+    /// A proposal fills the block by bytes (FIP §4.2): the messages that do
+    /// not fit in `max_block_bytes` wait for a later block. The input is cut
+    /// to the room of the block first; if the block is still too large, the
+    /// last messages go and the proposal runs again.
     pub fn propose(&mut self, inputs: ProposalInputs) -> Result<HypersnapBlock, ShardBlockError> {
+        let ProposalInputs {
+            timestamp,
+            epoch_ref_height,
+            mut messages,
+        } = inputs;
+        let mut room = self.max_block_bytes.saturating_sub(
+            BLOCK_RESERVE_BYTES + self.parent().1.as_ref().map_or(0, |c| c.encoded_len()),
+        );
+        let fit = messages
+            .iter()
+            .take_while(|m| {
+                let size = m.encoded_len() + MESSAGE_FRAME_BYTES;
+                let fits = size <= room;
+                room = room.saturating_sub(size);
+                fits
+            })
+            .count();
+        messages.truncate(fit);
+        loop {
+            let block = self.propose_messages(timestamp, epoch_ref_height, messages.clone())?;
+            let size = block.encoded_len();
+            if size <= self.max_block_bytes || messages.is_empty() {
+                return Ok(block);
+            }
+            let mut excess = size - self.max_block_bytes;
+            while excess > 0 {
+                match messages.pop() {
+                    Some(m) => excess = excess.saturating_sub(m.encoded_len()),
+                    None => break,
+                }
+            }
+        }
+    }
+
+    fn propose_messages(
+        &mut self,
+        timestamp: u64,
+        epoch_ref_height: u64,
+        messages: Vec<MempoolMessage>,
+    ) -> Result<HypersnapBlock, ShardBlockError> {
         let (parent, parent_certificate) = self.parent();
-        let replica = self.replica_entries(parent.epoch_ref_height, inputs.epoch_ref_height);
+        let replica = self.replica_entries(parent.epoch_ref_height, epoch_ref_height);
         let key = Self::replica_key(
             parent.height + 1,
             parent.epoch_ref_height,
-            inputs.epoch_ref_height,
+            epoch_ref_height,
+            timestamp,
         );
         self.engine
             .set_hypersnap_block(parent.height + 1, replica, key);
         let (change, state_root) = self
             .engine
-            .hypersnap_propose(inputs.messages, FarcasterTime::new(inputs.timestamp))
+            .hypersnap_propose(messages, FarcasterTime::new(timestamp))
             .map_err(|e| ShardBlockError::Execution(e.to_string()))?;
         let header = HypersnapBlockHeader {
             shard_id: self.shard_id(),
             height: parent.height + 1,
-            timestamp: inputs.timestamp,
+            timestamp,
             parent_hash: parent.hash.to_vec(),
             epoch: self.epochs.shard_block_epoch(parent.epoch_ref_height),
             state_root: state_root.to_vec(),
             version: BLOCK_VERSION,
-            epoch_ref_height: inputs.epoch_ref_height,
+            epoch_ref_height,
             last_commit_hash: parent_certificate
                 .as_ref()
                 .map(|c| certificate_hash(c).to_vec())
@@ -316,6 +446,7 @@ impl ShardBlockProducer {
             header.height,
             parent.epoch_ref_height,
             header.epoch_ref_height,
+            header.timestamp,
         );
         self.engine.set_hypersnap_block(header.height, replica, key);
         let replay = self
@@ -401,6 +532,7 @@ impl ShardBlockProducer {
             header.height,
             parent.epoch_ref_height,
             header.epoch_ref_height,
+            header.timestamp,
         );
         self.engine.set_hypersnap_block(header.height, replica, key);
         let root = self
@@ -414,7 +546,8 @@ impl ShardBlockProducer {
                 computed: hex::encode(root),
             });
         }
-        self.store.put(&block).map_err(ShardBlockError::Other)?;
+        // The engine stored the block in the batch of its state.
+        *self.tip_head.lock().unwrap() = Some((header.clone(), block.certificate.clone()));
         // The first block that references the boundary of epoch e is the
         // last block of epoch e − 1 on this shard (FIP §4.3).
         // The shard's pivot block has no parent reference: it starts from

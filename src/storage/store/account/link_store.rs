@@ -1,6 +1,7 @@
 use super::{
-    get_many_messages, make_fid_key, make_message_primary_key, make_user_key_with_prefix,
-    read_fid_key, read_ts_hash,
+    get_many_messages,
+    index_read::{get_union_index_page, index_roots},
+    make_fid_key, make_message_primary_key, make_user_key_with_prefix, read_fid_key, read_ts_hash,
     store::{CompactStateDetails, MergeContext, Store, StoreDef},
     MessagesPage, StoreEventHandler, PAGE_SIZE_MAX, TS_HASH_LENGTH,
 };
@@ -149,6 +150,22 @@ impl LinkStore {
         page_options: &PageOptions,
     ) -> Result<MessagesPage, HubError> {
         let start_prefix: Vec<u8> = LinkStore::links_by_target_key(target, 0, None)?;
+        let ctx = store.state_context();
+        if ctx.is_hyper() {
+            return get_union_index_page(
+                &store.db(),
+                &index_roots(
+                    ctx.root_prefix(RootPrefix::LinksByTarget),
+                    RootPrefix::LinksByTarget as u8,
+                ),
+                &index_roots(ctx.root_prefix(RootPrefix::User), RootPrefix::User as u8),
+                &start_prefix[1..],
+                store.postfix(),
+                page_options,
+                page_options.page_size.unwrap_or(PAGE_SIZE_MAX),
+                |value| r#type.is_empty() || value.eq(r#type.as_bytes()),
+            );
+        }
 
         let mut message_keys = vec![];
         let mut last_key = vec![];
@@ -219,7 +236,7 @@ impl LinkStore {
             ..Default::default()
         };
 
-        store.get_remove(&partial_message)
+        store.get_remove(&partial_message, None)
     }
 
     // Generates a unique key used to store a LinkCompactState message key in the store
@@ -321,7 +338,7 @@ impl LinkStore {
             && (link_body.r#type.is_empty() || link_body.r#type.len() == 0)
         {
             return Err(HubError::validation_failure(
-                "targetID provided without type",
+                "targetId provided without type",
             ));
         }
 

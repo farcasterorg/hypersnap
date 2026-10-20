@@ -239,7 +239,12 @@ async fn shard_engine(db: Arc<RocksDB>, shard: u32, fork_height: u64) -> ShardEn
     )
     .await
     .unwrap();
-    engine.enter_hypersnap_mode(Some(fork_height)).unwrap();
+    engine
+        .enter_hypersnap_mode(
+            Some(fork_height),
+            crate::version::version::EngineVersion::latest(),
+        )
+        .unwrap();
     engine
 }
 

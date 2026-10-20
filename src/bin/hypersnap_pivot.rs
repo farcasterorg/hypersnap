@@ -130,6 +130,35 @@ enum Command {
         #[arg(long)]
         upload: bool,
     },
+    /// Vote with the node key of a validator for a bridge action (FIP §13.7):
+    /// a pause of the inbound bridge, or an upgrade or a cancel for the bridge
+    /// contract. The action is decided when the votes pass 2/3 of the set.
+    BridgeVote {
+        /// `node.falcon` of the validator.
+        #[arg(long)]
+        node_key: PathBuf,
+        /// The FID of the validator.
+        #[arg(long)]
+        fid: u64,
+        /// `pause`, `upgrade` or `cancel`.
+        #[arg(long, default_value = "pause")]
+        kind: String,
+        /// EIP-155 chain ID of the bridge (0 = all chains).
+        #[arg(long, default_value_t = 0)]
+        chain_id: u32,
+        /// The implementation address of an upgrade or a cancel (hex).
+        #[arg(long)]
+        target: Option<String>,
+        /// The current epoch (`GET /hyper/v1/epoch` of a node).
+        #[arg(long)]
+        epoch: u64,
+        #[arg(long, default_value = "mainnet")]
+        network: String,
+        /// `http://host:port` of a submit endpoint (`[hypersnap]
+        /// submit_address`). Without it, the vote is printed as hex.
+        #[arg(long)]
+        submit: Option<String>,
+    },
 }
 
 fn network(name: &str) -> Result<FarcasterNetwork, String> {
@@ -139,6 +168,69 @@ fn network(name: &str) -> Result<FarcasterNetwork, String> {
         "devnet" => Ok(FarcasterNetwork::Devnet),
         other => Err(format!("unknown network {}", other)),
     }
+}
+
+fn bridge_vote(
+    node_key: &Path,
+    fid: u64,
+    kind: &str,
+    chain_id: u32,
+    target: Option<&str>,
+    epoch: u64,
+    network: FarcasterNetwork,
+) -> Result<hypersnap::proto::Message, String> {
+    use hypersnap::chain::shard0::bridge_actions::{KIND_CANCEL, KIND_PAUSE, KIND_UPGRADE};
+    use hypersnap::proto::{message_data::Body, BridgeActionVoteBody, MessageData, MessageType};
+    let kind = match kind {
+        "pause" => KIND_PAUSE,
+        "upgrade" => KIND_UPGRADE,
+        "cancel" => KIND_CANCEL,
+        other => return Err(format!("unknown bridge action {}", other)),
+    };
+    let target = match (kind, target) {
+        (KIND_PAUSE, None) => vec![0u8; 20],
+        (KIND_PAUSE, Some(_)) => return Err("a pause has no target".into()),
+        (_, Some(t)) => hex::decode(t.trim_start_matches("0x")).map_err(|e| e.to_string())?,
+        (_, None) => return Err("an upgrade or a cancel needs --target".into()),
+    };
+    if target.len() != 20 {
+        return Err("the target is not a 20-byte address".into());
+    }
+    let key =
+        hypersnap::node::hypersnap_main::load_node_key(node_key.to_str().ok_or("node key path")?)?;
+    let data = MessageData {
+        r#type: MessageType::BridgeActionVote as i32,
+        fid,
+        timestamp: hypersnap::core::util::FarcasterTime::current().to_u64() as u32,
+        network: network as i32,
+        body: Some(Body::BridgeActionVoteBody(BridgeActionVoteBody {
+            kind,
+            chain_id,
+            target,
+            epoch,
+        })),
+    };
+    hypersnap_messages::falcon_message(&key, data, &mut rand::rngs::OsRng)
+        .map_err(|e| e.to_string())
+}
+
+fn submit(url: &str, message: &hypersnap::proto::Message) -> Result<String, String> {
+    let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    runtime.block_on(async {
+        let response = reqwest::Client::new()
+            .post(format!("{}/v1/submitMessage", url.trim_end_matches('/')))
+            .body(message.encode_to_vec())
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = response.status();
+        let text = response.text().await.map_err(|e| e.to_string())?;
+        if status.is_success() {
+            Ok(text)
+        } else {
+            Err(format!("{}: {}", status, text))
+        }
+    })
 }
 
 fn read_hex(path: &Path) -> Result<Vec<u8>, String> {
@@ -410,6 +502,30 @@ fn run(cli: Cli) -> Result<(), String> {
                 &marker,
             )?;
             print_record(&boot.record);
+        }
+        Command::BridgeVote {
+            node_key,
+            fid,
+            kind,
+            chain_id,
+            target,
+            epoch,
+            network: n,
+            submit: url,
+        } => {
+            let vote = bridge_vote(
+                &node_key,
+                fid,
+                &kind,
+                chain_id,
+                target.as_deref(),
+                epoch,
+                network(&n)?,
+            )?;
+            match url {
+                Some(url) => println!("{}", submit(&url, &vote)?),
+                None => println!("{}", hex::encode(vote.encode_to_vec())),
+            }
         }
         Command::RecoveryList { config_path, out } => {
             use hypersnap::chain::exempt_recoveries::{format, from_watcher, list_hash};

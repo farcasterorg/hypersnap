@@ -199,27 +199,41 @@ impl WebhookStore {
 
     /// List every registered webhook across every owner, up to `max`.
     /// Used by the admin override (`X-Admin-Api-Key`) for moderation
-    /// and bulk inspection. Iterates the primary prefix.
+    /// and bulk inspection.
+    ///
+    /// Walks the owner index, which holds every webhook, rather than the
+    /// primary prefix: the cast hash index shares `[PREFIX][SUB_PRIMARY]`
+    /// for its 20-byte hash keys, so that range holds a key per cast.
     pub fn list_all(&self, max: usize) -> Result<Vec<Webhook>, WebhookStoreError> {
-        let prefix = vec![PREFIX, SUB_PRIMARY];
+        let prefix = vec![PREFIX, SUB_OWNER_INDEX];
         let stop = increment_prefix(&prefix);
-        let mut out = Vec::new();
+        let id_offset = prefix.len() + 8;
+        let mut webhook_ids = Vec::new();
         self.db
             .for_each_iterator_by_prefix(
                 Some(prefix),
                 Some(stop),
                 &crate::storage::db::PageOptions::default(),
-                |_key, value| {
-                    if out.len() >= max {
+                |key, _value| {
+                    if webhook_ids.len() >= max {
                         return Ok(true);
                     }
-                    if let Ok(webhook) = serde_json::from_slice::<Webhook>(value) {
-                        out.push(webhook);
+                    if let Some(Ok(arr)) =
+                        key.get(id_offset..id_offset + 16).map(<[u8; 16]>::try_from)
+                    {
+                        webhook_ids.push(Uuid::from_bytes(arr));
                     }
                     Ok(false)
                 },
             )
             .map_err(|e| WebhookStoreError::Storage(e.to_string()))?;
+
+        let mut out = Vec::with_capacity(webhook_ids.len());
+        for id in webhook_ids {
+            if let Some(webhook) = self.get(&id)? {
+                out.push(webhook);
+            }
+        }
         Ok(out)
     }
 
@@ -390,6 +404,34 @@ mod tests {
 
         assert_eq!(store.count_by_owner(1).unwrap(), 2);
         assert_eq!(store.count_by_owner(2).unwrap(), 1);
+    }
+
+    #[test]
+    fn list_all_ignores_cast_hash_keys_in_shared_prefix() {
+        let dir = TempDir::new().unwrap();
+        let db = Arc::new(RocksDB::new(dir.path().to_str().unwrap()));
+        db.open().unwrap();
+        let store = WebhookStore::new(db.clone());
+        let a = sample_webhook(1);
+        let b = sample_webhook(2);
+        store.create(&a).unwrap();
+        store.create(&b).unwrap();
+        // A cast hash index entry: [PREFIX][SUB_PRIMARY][hash:20] -> fid.
+        let mut cast_key = vec![PREFIX, SUB_PRIMARY];
+        cast_key.extend_from_slice(&[0xab; 20]);
+        db.put(&cast_key, &42u64.to_be_bytes()).unwrap();
+
+        let mut got: Vec<Uuid> = store
+            .list_all(100)
+            .unwrap()
+            .iter()
+            .map(|w| w.webhook_id)
+            .collect();
+        got.sort();
+        let mut expected = vec![a.webhook_id, b.webhook_id];
+        expected.sort();
+        assert_eq!(got, expected);
+        assert_eq!(store.list_all(1).unwrap().len(), 1);
     }
 
     #[test]

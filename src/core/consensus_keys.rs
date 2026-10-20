@@ -211,7 +211,7 @@ impl fmt::Debug for ConsensusPrivateKey {
 
 /// A Falcon-512 consensus key for tests. The seed differs from the
 /// `[n; 32]` seeds of the user keys in tests.
-#[cfg(test)]
+#[cfg(any(test, feature = "fuzzing"))]
 pub fn test_key(n: u8) -> ConsensusPrivateKey {
     let mut seed = [n; 32];
     seed[0] = 0xc0;

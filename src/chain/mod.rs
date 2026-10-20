@@ -24,6 +24,8 @@ pub mod exempt_recoveries;
 pub mod fingerprint_store;
 pub mod genesis;
 pub mod genesis_file;
+#[cfg(test)]
+mod load_test;
 pub mod merkle;
 pub mod metrics;
 pub mod pivot;
@@ -37,10 +39,12 @@ pub mod replica;
 #[cfg(test)]
 pub(crate) mod replica_test;
 pub mod scoring;
+pub mod seed_responder;
 pub mod shard0;
 pub mod shard_blocks;
 #[cfg(test)]
 mod shard_blocks_test;
 pub mod transitions;
+pub mod undecided;
 pub mod validator_sets;
 pub mod watchers;

@@ -107,7 +107,9 @@ impl Shard1 {
         )
         .await
         .unwrap();
-        engine.enter_hypersnap_mode(Some(0)).unwrap();
+        engine
+            .enter_hypersnap_mode(Some(0), crate::version::version::EngineVersion::latest())
+            .unwrap();
         let reader = net.nodes[0].engine.reader();
         let producer = ShardBlockProducer::new(
             engine,
@@ -149,27 +151,7 @@ impl Shard1 {
                 messages,
             })
             .unwrap();
-        let header = block.header.clone().unwrap();
-        let set = net.nodes[0]
-            .engine
-            .epoch_set(header.epoch)
-            .unwrap()
-            .unwrap();
-        let sigs: BTreeMap<_, _> = net
-            .genesis
-            .validators
-            .keys
-            .iter()
-            .take(3)
-            .map(|k| {
-                let address = k.public_key().address();
-                let bytes =
-                    certificate::precommit_sign_bytes(1, header.height, 0, &block.hash, &address);
-                (address, k.sign(ConsensusDomain::Vote, &bytes))
-            })
-            .collect();
-        block.certificate =
-            Some(certificate::build(&set, 1, header.height, 0, &block.hash, &sigs).unwrap());
+        certify(net, &mut block);
         self.producer.commit(block.clone()).await.unwrap();
         block
     }
@@ -183,6 +165,31 @@ impl Shard1 {
             state_root: h.state_root,
         }
     }
+}
+
+/// A round-0 certificate of three genesis validators for a shard-1 block.
+pub(crate) fn certify(net: &Net, block: &mut proto::HypersnapBlock) {
+    let header = block.header.clone().unwrap();
+    let set = net.nodes[0]
+        .engine
+        .epoch_set(header.epoch)
+        .unwrap()
+        .unwrap();
+    let sigs: BTreeMap<_, _> = net
+        .genesis
+        .validators
+        .keys
+        .iter()
+        .take(3)
+        .map(|k| {
+            let address = k.public_key().address();
+            let bytes =
+                certificate::precommit_sign_bytes(1, header.height, 0, &block.hash, &address);
+            (address, k.sign(ConsensusDomain::Vote, &bytes))
+        })
+        .collect();
+    block.certificate =
+        Some(certificate::build(&set, 1, header.height, 0, &block.hash, &sigs).unwrap());
 }
 
 pub(crate) fn genesis_link(shard: u32) -> ShardLink {
@@ -356,7 +363,9 @@ async fn migrated_fid_casts_on_shard_1_and_fees_settle_on_shard_0() {
     let fee = charges[0].amount;
     assert_eq!(fee, 125_000, "1 token × (1 − 0.875)");
 
-    // Shard 0 links the shard-1 block and settles the charge.
+    // Shard 0 links the next shard-1 block, which has the certificate round
+    // of the charged block, and settles every block below it (§12).
+    shard1.run(&net, vec![]).await;
     let views = NodeViews {
         shards: [(1u32, LocalShard::new(shard1.db.clone(), genesis_link(1)))]
             .into_iter()
@@ -378,6 +387,16 @@ async fn migrated_fid_casts_on_shard_1_and_fees_settle_on_shard_0() {
             Some(proto::hypersnap_system_message::Message::FeeSettlement(s)) => Some(s.clone()),
             _ => None,
         })
+        .collect();
+    let first = settlements[0].height;
+    assert_eq!(
+        settlements.iter().map(|s| s.height).collect::<Vec<_>>(),
+        (first..=h1).collect::<Vec<_>>(),
+        "one settlement for each block"
+    );
+    let settlements: Vec<_> = settlements
+        .into_iter()
+        .filter(|s| !s.charges.is_empty())
         .collect();
     assert_eq!(settlements.len(), 1);
     assert_eq!(settlements[0].height, h1);
@@ -410,6 +429,18 @@ async fn migrated_fid_casts_on_shard_1_and_fees_settle_on_shard_0() {
             .unwrap(),
         0
     );
+
+    // A node that has a certificate of another round for the block computes
+    // the same settlements: the round comes from the next block (§12).
+    use crate::chain::shard0::engine::Shard0Inputs as _;
+    let ours = views.fee_settlements(1, 0, h1).unwrap();
+    let store = crate::chain::shard_blocks::HypersnapBlockStore::new(shard1.db.clone());
+    let mut other = store.get(h1).unwrap();
+    other.certificate.as_mut().unwrap().round += 1;
+    let mut txn = crate::storage::db::RocksDbTransactionBatch::new();
+    store.stage(&other, &mut txn);
+    shard1.db.commit(txn).unwrap();
+    assert_eq!(views.fee_settlements(1, 0, h1).unwrap(), ours);
 }
 
 #[tokio::test]
@@ -638,6 +669,109 @@ fn stored_casts(shard1: &Shard1, fid: u64) -> usize {
 }
 
 #[tokio::test]
+async fn a_commit_does_not_reuse_the_execution_of_another_proposal() {
+    // Two proposals of one height with no messages and other shard-0
+    // references: node `b` runs the first, and another round decides the
+    // second, which applies the outbox of the migration.
+    let mut net = Net::new(1);
+    let mut a = Shard1::new(&net).await;
+    let mut b = Shard1::new(&net).await;
+    net.run(p0(&net, vec![]));
+    let pivot = a.run(&net, vec![]).await;
+    b.producer.commit(pivot).await.unwrap();
+    let before = net.nodes[0].engine.tip().unwrap().header.unwrap().height;
+    migrated_fid(&mut net, 3_600);
+    let after = net.nodes[0].engine.tip().unwrap().header.unwrap().height;
+
+    let first = b
+        .producer
+        .propose(ProposalInputs {
+            timestamp: Shard1::time(&net),
+            epoch_ref_height: before,
+            messages: vec![],
+        })
+        .unwrap();
+    let mut decided = a
+        .producer
+        .propose(ProposalInputs {
+            timestamp: Shard1::time(&net),
+            epoch_ref_height: after,
+            messages: vec![],
+        })
+        .unwrap();
+    assert_eq!(first.transactions, decided.transactions);
+    assert_ne!(first.header, decided.header);
+    certify(&net, &mut decided);
+    let root_a = a.producer.commit(decided.clone()).await.unwrap();
+    let root_b = b.producer.commit(decided.clone()).await.unwrap();
+    assert_eq!(root_a, root_b);
+    assert_eq!(
+        root_b.as_slice(),
+        decided.header.unwrap().state_root.as_slice()
+    );
+    assert!(
+        BlockState::new(b.db.clone())
+            .txn()
+            .exists(&keys::custody(1000))
+            .unwrap(),
+        "the replica of the decided block"
+    );
+}
+
+#[tokio::test]
+async fn a_commit_does_not_reuse_the_execution_of_a_proposal_with_other_messages() {
+    // Two proposals of one height with the same shard-0 reference and time
+    // and other casts (the events hash covers no user message): node `b`
+    // runs its own, and the other one is decided.
+    let mut net = Net::new(1);
+    let mut a = Shard1::new(&net).await;
+    let mut b = Shard1::new(&net).await;
+    let signer = migrated_fid(&mut net, 3_600);
+    let pivot = a.run(&net, vec![]).await;
+    b.producer.commit(pivot).await.unwrap();
+    let now = Shard1::time(&net);
+    let tip0 = net.nodes[0].engine.tip().unwrap().header.unwrap().height;
+    let inputs = |text: &str| ProposalInputs {
+        timestamp: now,
+        epoch_ref_height: tip0,
+        messages: vec![MempoolMessage::UserMessage(falcon_message(
+            &signer,
+            cast(1000, text, now),
+        ))],
+    };
+    let first = b.producer.propose(inputs("not decided")).unwrap();
+    let mut decided = a.producer.propose(inputs("decided")).unwrap();
+    assert_ne!(first.transactions, decided.transactions);
+    certify(&net, &mut decided);
+    let root_a = a.producer.commit(decided.clone()).await.unwrap();
+    let root_b = b.producer.commit(decided.clone()).await.unwrap();
+    assert_eq!(root_a, root_b);
+    let casts = b.producer.engine.get_casts_by_fid(1000).unwrap().messages;
+    assert_eq!(casts.len(), 1);
+    assert_eq!(casts[0].hash, decided.transactions[0].user_messages[0].hash);
+}
+
+#[tokio::test]
+async fn a_migrated_fid_sends_a_10k_cast() {
+    // Every FID is Pro after the pivot (§17.6): a Falcon-signed 10K cast
+    // has the snapchain limit of a Pro FID, not 2,048 bytes.
+    let mut net = Net::new(1);
+    let mut shard1 = Shard1::new(&net).await;
+    let signer = migrated_fid(&mut net, 3_600);
+    let now = Shard1::time(&net);
+    let mut data = cast(1000, &"ten thousand ".repeat(700), now);
+    if let Some(Body::CastAddBody(body)) = data.body.as_mut() {
+        body.r#type = proto::CastType::TenKCast as i32;
+    }
+    let long = falcon_message(&signer, data);
+    assert!(long.data.as_ref().unwrap().encoded_len() > 2_048);
+    shard1
+        .run(&net, vec![MempoolMessage::UserMessage(long)])
+        .await;
+    assert_eq!(stored_casts(&shard1, 1000), 1);
+}
+
+#[tokio::test]
 async fn a_falcon_signer_expires_ttl_seconds_after_its_last_use() {
     let mut net = Net::new(1);
     let mut shard1 = Shard1::new(&net).await;
@@ -711,4 +845,94 @@ async fn a_falcon_signer_expires_ttl_seconds_after_its_last_use() {
         .run(&net, vec![MempoolMessage::UserMessage(late)])
         .await;
     assert_eq!(stored_casts(&shard1, 1000), 2);
+}
+
+/// FIP §17.7: a verification that shard 0 merges reaches the FID's shard
+/// through the replica, with no fee, and that shard rejects a verification
+/// that a user sends to it directly.
+#[tokio::test]
+async fn a_shard0_verification_reaches_the_fid_shard() {
+    use crate::storage::store::account::VerificationStore;
+    let mut net = Net::new(1);
+    let mut shard1 = Shard1::new(&net).await;
+    net.run(p0(&net, vec![]));
+    // FID 1000 (shard 1, not migrated) with an on-chain Ed25519 signer.
+    let owner = PrivateKeySigner::from_bytes(&[5u8; 32].into()).unwrap();
+    let signer = ed25519_dalek::SigningKey::from_bytes(&[23u8; 32]);
+    let mut p = p0(&net, vec![]);
+    let mut key_event = events_factory::create_signer_event(
+        1000,
+        signer.clone(),
+        proto::SignerEventType::Add,
+        Some(1_700_000_100),
+        None,
+    );
+    key_event.transaction_hash = vec![78u8; 32];
+    p.onchain_events = vec![
+        events_factory::create_id_register_event(
+            1000,
+            proto::IdRegisterEventType::Register,
+            owner.address().to_vec(),
+            Some(1_700_000_000),
+        ),
+        key_event,
+    ];
+    net.run(p);
+
+    let address = vec![0xA7u8; 20];
+    let add = ed25519_message(
+        &signer,
+        data(
+            1000,
+            MessageType::VerificationAddEthAddress,
+            Body::VerificationAddAddressBody(proto::VerificationAddAddressBody {
+                address: address.clone(),
+                verification_type: 1,
+                block_hash: vec![0xB6; 32],
+                ..Default::default()
+            }),
+            net.proposal(vec![]).timestamp,
+        ),
+    );
+    assert_eq!(net.run(p0(&net, vec![add.clone()])).messages.len(), 1);
+    shard1.run(&net, vec![]).await;
+    // Shard 1 has FID 1000 now, and still rejects a verification as a user
+    // message: its rules put verifications on shard 0.
+    let t = FarcasterTime::new(Shard1::time(&net));
+    let v = shard1.producer.engine.version_for(&t);
+    let err = shard1
+        .producer
+        .engine
+        .validate_user_message(
+            &add,
+            &t,
+            v,
+            &mut crate::storage::db::RocksDbTransactionBatch::new(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::storage::store::engine::MessageValidationError::InvalidMessageType(_)
+        ),
+        "{:?}",
+        err
+    );
+    let stored = VerificationStore::get_verification_add(
+        &shard1.producer.engine.get_stores().verification_store,
+        1000,
+        &address,
+        None,
+    )
+    .unwrap();
+    assert_eq!(stored.map(|m| m.hash), Some(add.hash.clone()));
+    // No fee charge for the replay.
+    assert_eq!(
+        shard1
+            .db
+            .get(&keys::fee_balance(1000))
+            .unwrap()
+            .map(|v| keys::decode_u64(&v)),
+        None
+    );
 }

@@ -85,6 +85,9 @@ pub trait HubQueryHandler: Send + Sync {
         fid_hint: Option<u64>,
     ) -> Option<crate::proto::Message>;
 
+    /// Count live direct replies from the casts-by-parent index.
+    async fn count_direct_replies(&self, fid: u64, hash: &[u8]) -> Result<u64, String>;
+
     /// Get casts by FID with pagination.
     async fn get_casts_by_fid(
         &self,
@@ -114,8 +117,9 @@ pub trait HubQueryHandler: Send + Sync {
     /// Resolve a username to an FID.
     async fn get_fid_by_username(&self, username: &str) -> Option<u64>;
 
-    /// Resolve an address to FIDs.
-    async fn get_fids_by_address(&self, address: &[u8]) -> Vec<u64>;
+    /// Resolve an address to the FIDs that verified it, or, when none did and
+    /// `include_custody` is set, to the FID it is the custody address of.
+    async fn get_fids_by_address(&self, address: &[u8], include_custody: bool) -> Vec<u64>;
 
     /// Get username proof.
     async fn get_username_proof(&self, name: &[u8]) -> Option<(u64, String, u64, Vec<u8>)>;
@@ -219,7 +223,70 @@ pub struct ApiHttpHandler {
     /// takes six same-typed `Option<Arc<…>>` indexers and another one is a
     /// transposition waiting to happen.
     daily_stats: Arc<std::sync::RwLock<Option<Arc<crate::api::daily_stats::DailyStatsIndexer>>>>,
+    /// Hashes that a full FID probe recently failed to find, so repeated
+    /// lookups of a missing cast (client retries, bulk refetches) answer
+    /// without probing again.
+    missing_casts: moka::sync::Cache<Vec<u8>, ()>,
+    /// Serializes full FID probes so concurrent misses cannot pile up on disk.
+    cast_probe_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Custody address → FID index. Late-bound like `daily_stats`.
+    custody_index: Arc<std::sync::RwLock<Option<Arc<crate::api::custody_index::CustodyIndexer>>>>,
+    /// Username / display-name prefix index. Late-bound like `daily_stats`.
+    user_search:
+        Arc<std::sync::RwLock<Option<Arc<crate::api::user_search_index::UserSearchIndexer>>>>,
 }
+
+/// Emit the count, latency, total and error metrics for one request.
+fn emit_request_metric(
+    statsd: &crate::utils::statsd_wrapper::StatsdClientWrapper,
+    metric_key: &str,
+    start: std::time::Instant,
+    status: u16,
+) {
+    statsd.count(&format!("api.request.{}", metric_key), 1, vec![]);
+    statsd.time(
+        &format!("api.latency.{}", metric_key),
+        start.elapsed().as_millis() as u64,
+    );
+    statsd.count("api.request.total", 1, vec![]);
+    if status >= 400 {
+        statsd.count("api.errors", 1, vec![]);
+    }
+}
+
+/// Records a request whose future was dropped before it produced a response,
+/// typically because the client timed out or disconnected. Disarmed once the
+/// request completes, since the completion path records it.
+struct AbandonedRequest {
+    statsd: crate::utils::statsd_wrapper::StatsdClientWrapper,
+    metric_key: String,
+    start: std::time::Instant,
+    armed: bool,
+}
+
+impl Drop for AbandonedRequest {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // 499: client closed the request (nginx convention).
+        emit_request_metric(&self.statsd, &self.metric_key, self.start, 499);
+        self.statsd
+            .count(&format!("api.abandoned.{}", self.metric_key), 1, vec![]);
+    }
+}
+
+/// Most users one /user/search request returns.
+const USER_SEARCH_MAX_RESULTS: usize = 100;
+/// Prefix matches read per field before ranking by followers.
+const USER_SEARCH_SCAN_LIMIT: usize = 5_000;
+
+/// How long a hash stays in `missing_casts` after a probe misses it.
+const MISSING_CAST_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+/// Upper bound on hashes held in `missing_casts`.
+const MISSING_CAST_CAPACITY: u64 = 100_000;
+/// Hashes per bulk cast request that may fall back to a full FID probe.
+const BULK_CAST_PROBE_LIMIT: usize = 3;
 
 impl ApiHttpHandler {
     /// Create a new handler with optional indexers.
@@ -253,7 +320,44 @@ impl ApiHttpHandler {
             notification_token_store: Arc::new(std::sync::RwLock::new(None)),
             daily_stats: Arc::new(std::sync::RwLock::new(None)),
             shard_dbs: Arc::new(std::sync::RwLock::new(None)),
+            missing_casts: moka::sync::Cache::builder()
+                .max_capacity(MISSING_CAST_CAPACITY)
+                .time_to_live(MISSING_CAST_TTL)
+                .build(),
+            cast_probe_lock: Arc::new(tokio::sync::Mutex::new(())),
+            custody_index: Arc::new(std::sync::RwLock::new(None)),
+            user_search: Arc::new(std::sync::RwLock::new(None)),
         }
+    }
+
+    /// Install the user search index (callable after construction).
+    pub fn set_user_search(&self, index: Arc<crate::api::user_search_index::UserSearchIndexer>) {
+        *self.user_search.write().unwrap() = Some(index);
+    }
+
+    /// Install the custody address index (callable after construction).
+    pub fn set_custody_index(&self, index: Arc<crate::api::custody_index::CustodyIndexer>) {
+        *self.custody_index.write().unwrap() = Some(index);
+    }
+
+    /// FIDs that verified `address`, or else the FID it is custody for. The
+    /// custody part reads the custody index once it is complete, and falls
+    /// back to the hub's IdRegister scan until then.
+    async fn fids_for_address(&self, hub: &Arc<dyn HubQueryHandler>, address: &[u8]) -> Vec<u64> {
+        let custody = self
+            .custody_index
+            .read()
+            .unwrap()
+            .clone()
+            .filter(|idx| idx.is_complete());
+        let Some(custody) = custody else {
+            return hub.get_fids_by_address(address, true).await;
+        };
+        let mut fids = hub.get_fids_by_address(address, false).await;
+        if fids.is_empty() {
+            fids.extend(custody.get_fid_by_custody_address(address));
+        }
+        fids
     }
 
     /// Install per-shard DB handles so `/v2/farcaster/_status/halt` can read the
@@ -363,17 +467,16 @@ impl ApiHttpHandler {
     /// the same instrumentation contract.
     fn record_request_metric(&self, metric_key: &str, start: std::time::Instant, status: u16) {
         if let Some(ref statsd) = self.statsd {
-            let elapsed = start.elapsed();
-            statsd.count(&format!("api.request.{}", metric_key), 1, vec![]);
-            statsd.time(
-                &format!("api.latency.{}", metric_key),
-                elapsed.as_millis() as u64,
-            );
-            statsd.count("api.request.total", 1, vec![]);
-            if status >= 400 {
-                statsd.count("api.errors", 1, vec![]);
-            }
+            emit_request_metric(statsd, metric_key, start, status);
         }
+    }
+
+    /// Short metric key for a request path: /v2/farcaster/user/bulk → user.bulk
+    fn metric_key_for(path: &str) -> String {
+        let path = path.trim_end_matches('/');
+        path.strip_prefix("/v2/farcaster/")
+            .unwrap_or(path)
+            .replace('/', ".")
     }
 
     /// Check if this handler can handle the given request.
@@ -641,15 +744,30 @@ impl ApiHttpHandler {
         req: Request<hyper::body::Incoming>,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
         let start = std::time::Instant::now();
+        // If the client goes away first, hyper drops this future before any
+        // return path records the request; the guard records it instead.
+        let mut abandoned = self.statsd.clone().map(|statsd| AbandonedRequest {
+            statsd,
+            metric_key: Self::metric_key_for(req.uri().path()),
+            start,
+            armed: true,
+        });
+        let response = self.dispatch(req, start).await;
+        if let Some(guard) = abandoned.as_mut() {
+            guard.armed = false;
+        }
+        response
+    }
+
+    async fn dispatch(
+        &self,
+        req: Request<hyper::body::Incoming>,
+        start: std::time::Instant,
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
         let method = req.method().clone();
         let path = req.uri().path().trim_end_matches('/').to_string();
         let query = req.uri().query().unwrap_or("").to_string();
-
-        // Derive a short metric key from the path: /v2/farcaster/user/bulk → user.bulk
-        let metric_key = path
-            .strip_prefix("/v2/farcaster/")
-            .unwrap_or(&path)
-            .replace('/', ".");
+        let metric_key = Self::metric_key_for(&path);
 
         // Webhook management endpoints (POST/PUT/DELETE/GET) consume the
         // request body inside their own handler, so route them before the
@@ -834,6 +952,23 @@ impl ApiHttpHandler {
                             &format!("Missing required parameter: {}", $name),
                         ))
                     }
+                }
+            };
+        }
+        // `time_window` for trending feeds; defaults to 24h, rejects unknown values.
+        macro_rules! trending_window {
+            ($params:expr) => {
+                match $params.get("time_window").map(|v| v.as_str()) {
+                    None | Some("") => crate::api::feeds::TrendingWindow::default(),
+                    Some(v) => match crate::api::feeds::TrendingWindow::parse(v) {
+                        Some(window) => window,
+                        None => {
+                            return Ok(Self::error_response(
+                                StatusCode::BAD_REQUEST,
+                                "time_window must be one of 1h, 6h, 12h, 24h, 7d",
+                            ))
+                        }
+                    },
                 }
             };
         }
@@ -1044,7 +1179,8 @@ impl ApiHttpHandler {
                     }
                     _ => {
                         let fid: Option<u64> = params.get("fid").and_then(|s| s.parse().ok());
-                        self.handle_feed(feed_type, fid, cursor.as_deref(), limit)
+                        let window = trending_window!(params);
+                        self.handle_feed(feed_type, fid, cursor.as_deref(), limit, window)
                             .await
                     }
                 }
@@ -1055,12 +1191,16 @@ impl ApiHttpHandler {
                     .await
             }
             "/v2/farcaster/feed/trending" => {
-                self.handle_trending_feed(cursor.as_deref(), limit).await
+                let window = trending_window!(params);
+                self.handle_trending_feed(cursor.as_deref(), limit, window)
+                    .await
             }
             "/v2/farcaster/feed/for_you" => {
                 // "For you" feed — alias to trending as personalization
                 // requires model inference not available on-node
-                self.handle_trending_feed(cursor.as_deref(), limit).await
+                let window = trending_window!(params);
+                self.handle_trending_feed(cursor.as_deref(), limit, window)
+                    .await
             }
             "/v2/farcaster/feed/channels" => {
                 let channel_ids = require_param!(params, "channel_ids");
@@ -1084,7 +1224,9 @@ impl ApiHttpHandler {
             }
             "/v2/farcaster/feed/topic" => {
                 // Topics alias to trending feed
-                self.handle_trending_feed(cursor.as_deref(), limit).await
+                let window = trending_window!(params);
+                self.handle_trending_feed(cursor.as_deref(), limit, window)
+                    .await
             }
             "/v2/farcaster/feed/user/replies_and_recasts" => {
                 let fid: u64 = require_fid!(params);
@@ -1615,25 +1757,11 @@ impl ApiHttpHandler {
                     ))
                 }
             };
-            // Resolve FID from hash. Try the O(1) index first; if the
-            // index hasn't indexed this cast yet (or doesn't have it for
-            // any other reason), fall back to the hub's cast-by-hash
-            // lookup, which scans shards but works.
-            let mut resolved_fid = self
-                .cast_hash_index
-                .as_ref()
-                .and_then(|idx| idx.get_fid_by_hash(&hash))
+            let resolved_fid = self
+                .resolve_cast(&hash, None, true)
+                .await
+                .and_then(|msg| msg.data.map(|d| d.fid))
                 .unwrap_or(0);
-            if resolved_fid == 0 {
-                let hub = self.hub_query.read().unwrap().clone();
-                if let Some(hub) = hub {
-                    if let Some(msg) = hub.get_cast_by_hash(&hash, None).await {
-                        if let Some(data) = &msg.data {
-                            resolved_fid = data.fid;
-                        }
-                    }
-                }
-            }
             if resolved_fid == 0 {
                 return Ok(Self::error_response(
                     StatusCode::NOT_FOUND,
@@ -1653,9 +1781,15 @@ impl ApiHttpHandler {
             .await
         {
             Ok(conversation) => {
-                let cast_with_replies = self
+                let cast_with_replies = match self
                     .conversation_cast_to_cast_with_replies(&conversation.root)
-                    .await;
+                    .await
+                {
+                    Ok(cast) => cast,
+                    Err(e) => {
+                        return Ok(Self::error_response(StatusCode::INTERNAL_SERVER_ERROR, &e))
+                    }
+                };
 
                 let response = ConversationResponse {
                     conversation: Conversation {
@@ -1678,31 +1812,25 @@ impl ApiHttpHandler {
         }
     }
 
-    /// Convert internal conversation cast to Farcaster Cast format.
-    async fn conversation_cast_to_cast(
-        &self,
-        conv_cast: &crate::api::conversations::ConversationCast,
-    ) -> Cast {
-        let mut cast = self.message_to_cast(&conv_cast.cast).await;
-        cast.replies.count = conv_cast.replies.len() as u64;
-        cast
-    }
-
     /// Recursively convert a ConversationCast into CastWithReplies.
     fn conversation_cast_to_cast_with_replies<'a>(
         &'a self,
         conv_cast: &'a crate::api::conversations::ConversationCast,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CastWithReplies> + Send + 'a>> {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<CastWithReplies, String>> + Send + 'a>,
+    > {
         Box::pin(async move {
-            let cast = self.conversation_cast_to_cast(conv_cast).await;
+            let mut cast = self.message_to_cast(&conv_cast.cast).await;
+            self.attach_cast_metrics(&mut cast, &conv_cast.cast.hash)
+                .await?;
             let mut direct_replies = Vec::with_capacity(conv_cast.replies.len());
             for reply in &conv_cast.replies {
-                direct_replies.push(self.conversation_cast_to_cast_with_replies(reply).await);
+                direct_replies.push(self.conversation_cast_to_cast_with_replies(reply).await?);
             }
-            CastWithReplies {
+            Ok(CastWithReplies {
                 cast,
                 direct_replies,
-            }
+            })
         })
     }
 
@@ -1755,11 +1883,12 @@ impl ApiHttpHandler {
         }
     }
 
-    /// Handle GET /v2/farcaster/feed/trending/
+    /// Handle GET /v2/farcaster/feed/trending/?time_window=1h|6h|12h|24h|7d
     async fn handle_trending_feed(
         &self,
         cursor: Option<&str>,
         limit: usize,
+        window: crate::api::feeds::TrendingWindow,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
         let handler = self.feeds.read().unwrap().clone();
         let Some(handler) = handler else {
@@ -1776,7 +1905,7 @@ impl ApiHttpHandler {
             ));
         }
 
-        match handler.get_trending_feed(cursor, limit).await {
+        match handler.get_trending_feed(cursor, limit, window).await {
             Ok(feed_response) => {
                 let casts = self.convert_feed_items(&feed_response.items).await;
                 let response = FeedResponse {
@@ -1997,13 +2126,12 @@ impl ApiHttpHandler {
         id_type: &str,
         fid: Option<u64>,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
-        let hub = self.hub_query.read().unwrap().clone();
-        let Some(hub) = hub else {
+        if self.hub_query.read().unwrap().is_none() {
             return Ok(Self::error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Hub query service not available",
             ));
-        };
+        }
 
         if id_type != "hash" {
             return Ok(Self::error_response(
@@ -2023,16 +2151,11 @@ impl ApiHttpHandler {
             }
         };
 
-        // Resolve FID via index for O(1) lookup
-        let fid_hint = fid.or_else(|| {
-            self.cast_hash_index
-                .as_ref()
-                .and_then(|idx| idx.get_fid_by_hash(&hash))
-        });
-
-        if let Some(msg) = hub.get_cast_by_hash(&hash, fid_hint).await {
+        if let Some(msg) = self.resolve_cast(&hash, fid, true).await {
             let mut cast = self.message_to_cast(&msg).await;
-            self.attach_cast_metrics(&mut cast, &msg.hash);
+            if let Err(e) = self.attach_cast_metrics(&mut cast, &msg.hash).await {
+                return Ok(Self::error_response(StatusCode::INTERNAL_SERVER_ERROR, &e));
+            }
             return Ok(Self::json_response(StatusCode::OK, &CastResponse { cast }));
         }
 
@@ -2047,25 +2170,27 @@ impl ApiHttpHandler {
         &self,
         hashes_str: &str,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
-        let hub = self.hub_query.read().unwrap().clone();
-        let Some(hub) = hub else {
+        if self.hub_query.read().unwrap().is_none() {
             return Ok(Self::error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Hub query service not available",
             ));
-        };
+        }
 
         let mut casts = Vec::new();
+        let mut probes_left = BULK_CAST_PROBE_LIMIT;
         for hash_str in hashes_str.split(',') {
             let hash_str = hash_str.trim().trim_start_matches("0x");
             if let Ok(hash) = hex::decode(hash_str) {
-                let fid_hint = self
-                    .cast_hash_index
-                    .as_ref()
-                    .and_then(|idx| idx.get_fid_by_hash(&hash));
-                if let Some(msg) = hub.get_cast_by_hash(&hash, fid_hint).await {
+                let allow_probe = probes_left > 0 && self.cast_needs_probe(&hash);
+                if allow_probe {
+                    probes_left -= 1;
+                }
+                if let Some(msg) = self.resolve_cast(&hash, None, allow_probe).await {
                     let mut cast = self.message_to_cast(&msg).await;
-                    self.attach_cast_metrics(&mut cast, &msg.hash);
+                    if let Err(e) = self.attach_cast_metrics(&mut cast, &msg.hash).await {
+                        return Ok(Self::error_response(StatusCode::INTERNAL_SERVER_ERROR, &e));
+                    }
                     casts.push(cast);
                 }
             }
@@ -2077,21 +2202,91 @@ impl ApiHttpHandler {
         ))
     }
 
-    /// Attach aggregate engagement data maintained by the metrics indexer.
-    ///
-    /// `message_to_cast` only converts the cast message itself, so endpoints
-    /// that return casts directly must explicitly hydrate these derived fields.
-    fn attach_cast_metrics(&self, cast: &mut Cast, hash: &[u8]) {
-        let Some(metrics) = &self.metrics else {
-            return;
-        };
-        let Ok(metrics) = metrics.get_cast_metrics(cast.author.fid, hash) else {
-            return;
-        };
+    /// True when no FID is known for `hash`, so resolving it would need a
+    /// full FID probe.
+    fn cast_needs_probe(&self, hash: &[u8]) -> bool {
+        self.cast_hash_index
+            .as_ref()
+            .map_or(true, |idx| idx.get_fid_by_hash(hash).is_none())
+            && !self.missing_casts.contains_key(hash)
+    }
 
-        cast.reactions.likes_count = metrics.likes;
-        cast.reactions.recasts_count = metrics.recasts;
-        cast.replies.count = metrics.replies;
+    /// Resolve a cast by hash, given an optional caller-supplied author FID.
+    ///
+    /// Each known FID (the caller's, then the cast hash index's) gets a direct
+    /// lookup. An indexed FID is authoritative, since a hash commits to its
+    /// author: a miss there means the cast was removed or pruned. Only when no
+    /// FID is indexed, and `allow_probe` is set, does this fall back to probing
+    /// every FID. Probes run one at a time; a hit is written back to the index
+    /// and a miss is remembered in `missing_casts`.
+    async fn resolve_cast(
+        &self,
+        hash: &[u8],
+        fid_param: Option<u64>,
+        allow_probe: bool,
+    ) -> Option<crate::proto::Message> {
+        let hub = self.hub_query.read().unwrap().clone()?;
+        let indexed_fid = self
+            .cast_hash_index
+            .as_ref()
+            .and_then(|idx| idx.get_fid_by_hash(hash));
+
+        if let Some(fid) = fid_param.filter(|&f| Some(f) != indexed_fid) {
+            if let Some(msg) = hub.get_cast_by_hash(hash, Some(fid)).await {
+                return Some(msg);
+            }
+        }
+        if let Some(fid) = indexed_fid {
+            return hub.get_cast_by_hash(hash, Some(fid)).await;
+        }
+        if !allow_probe || self.missing_casts.contains_key(hash) {
+            return None;
+        }
+
+        let _probe = self.cast_probe_lock.lock().await;
+        // A probe that finished while this one waited may have settled the hash.
+        if let Some(fid) = self
+            .cast_hash_index
+            .as_ref()
+            .and_then(|idx| idx.get_fid_by_hash(hash))
+        {
+            return hub.get_cast_by_hash(hash, Some(fid)).await;
+        }
+        if self.missing_casts.contains_key(hash) {
+            return None;
+        }
+        match hub.get_cast_by_hash(hash, None).await {
+            Some(msg) => {
+                if let (Some(idx), Some(data)) = (&self.cast_hash_index, &msg.data) {
+                    idx.record(hash, data.fid);
+                }
+                Some(msg)
+            }
+            None => {
+                self.missing_casts.insert(hash.to_vec(), ());
+                None
+            }
+        }
+    }
+
+    /// Attach indexed reactions and the live direct-reply count. Reply counts
+    /// must not depend on conversation expansion or the metrics indexer's checkpoint.
+    async fn attach_cast_metrics(&self, cast: &mut Cast, hash: &[u8]) -> Result<(), String> {
+        let hub = self
+            .hub_query
+            .read()
+            .unwrap()
+            .clone()
+            .ok_or("Hub query service not available")?;
+        cast.replies.count = hub.count_direct_replies(cast.author.fid, hash).await?;
+
+        if let Some(metrics) = &self.metrics {
+            if let Ok(metrics) = metrics.get_cast_metrics(cast.author.fid, hash) {
+                cast.reactions.likes_count = metrics.likes;
+                cast.reactions.recasts_count = metrics.recasts;
+            }
+        }
+        Ok(())
     }
 
     /// Handle GET /v2/farcaster/user/bulk-by-address?addresses=0x...,0x...
@@ -2111,7 +2306,7 @@ impl ApiHttpHandler {
         for addr_str in addresses_str.split(',') {
             let addr_str = addr_str.trim().trim_start_matches("0x");
             if let Ok(addr) = hex::decode(addr_str) {
-                let found = hub.get_fids_by_address(&addr).await;
+                let found = self.fids_for_address(&hub, &addr).await;
                 fids.extend(found);
             }
         }
@@ -2154,8 +2349,10 @@ impl ApiHttpHandler {
     async fn handle_user_search(
         &self,
         query: &str,
-        _limit: usize,
+        limit: usize,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        use crate::api::user_search_index::{SearchField, UserSearchIndexer};
+
         let hub = self.hub_query.read().unwrap().clone();
         let Some(hub) = hub else {
             return Ok(Self::error_response(
@@ -2163,12 +2360,49 @@ impl ApiHttpHandler {
                 "Hub query service not available",
             ));
         };
-
-        // Try exact username match
-        let mut users = Vec::new();
-        if let Some(fid) = hub.get_fid_by_username(query).await {
-            users.push(self.get_user(fid).await);
+        let query = UserSearchIndexer::normalize(query);
+        if query.is_empty() {
+            return Ok(Self::error_response(
+                StatusCode::BAD_REQUEST,
+                "Missing required parameter: q",
+            ));
         }
+        let limit = limit.clamp(1, USER_SEARCH_MAX_RESULTS);
+
+        // Ranked by (match rank, followers): an exact username or fname match,
+        // then usernames starting with the query, then display-name words.
+        let mut ranked: HashMap<u64, (u8, u64)> = HashMap::new();
+        let mut consider = |fid: u64, rank: u8| {
+            let entry = ranked.entry(fid).or_insert((rank, 0));
+            entry.0 = entry.0.max(rank);
+        };
+        if let Some(fid) = hub.get_fid_by_username(&query).await {
+            consider(fid, 3);
+        }
+        let index = self.user_search.read().unwrap().clone();
+        if let Some(index) = index {
+            for hit in index.search_prefix(SearchField::Username, &query, USER_SEARCH_SCAN_LIMIT) {
+                consider(hit.fid, if hit.term == query { 3 } else { 2 });
+            }
+            for hit in index.search_prefix(SearchField::DisplayName, &query, USER_SEARCH_SCAN_LIMIT)
+            {
+                consider(hit.fid, 1);
+            }
+        }
+        if let Some(ref social_graph) = self.social_graph {
+            for (fid, (_, followers)) in ranked.iter_mut() {
+                *followers = social_graph.get_follower_count(*fid).unwrap_or(0);
+            }
+        }
+
+        let mut fids: Vec<(u64, (u8, u64))> = ranked.into_iter().collect();
+        fids.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let fids: Vec<u64> = fids.into_iter().take(limit).map(|(fid, _)| fid).collect();
+        let users = if fids.is_empty() {
+            vec![]
+        } else {
+            self.get_users(&fids).await
+        };
 
         Ok(Self::json_response(
             StatusCode::OK,
@@ -2320,6 +2554,7 @@ impl ApiHttpHandler {
         fid: Option<u64>,
         cursor: Option<&str>,
         limit: usize,
+        window: crate::api::feeds::TrendingWindow,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
         match feed_type {
             "following" => {
@@ -2332,7 +2567,7 @@ impl ApiHttpHandler {
                     ))
                 }
             }
-            _ => self.handle_trending_feed(cursor, limit).await,
+            _ => self.handle_trending_feed(cursor, limit, window).await,
         }
     }
 
@@ -2697,18 +2932,27 @@ impl ApiHttpHandler {
             _ => 1, // default to likes
         };
 
-        // Resolve cast FID via hash index, fall back to provided fid
-        let target_fid = fid
-            .or_else(|| {
-                self.cast_hash_index
-                    .as_ref()
-                    .and_then(|idx| idx.get_fid_by_hash(&hash))
-            })
-            .unwrap_or(0);
-        match hub
-            .get_reactions_by_cast(target_fid, &hash, reaction_type, limit)
-            .await
-        {
+        // Resolve cast FID via the provided fid or hash index, else find the cast.
+        let target_fid = match fid.or_else(|| {
+            self.cast_hash_index
+                .as_ref()
+                .and_then(|idx| idx.get_fid_by_hash(&hash))
+        }) {
+            Some(fid) => fid,
+            None => self
+                .resolve_cast(&hash, None, true)
+                .await
+                .and_then(|msg| msg.data.map(|d| d.fid))
+                .unwrap_or(0),
+        };
+        // An unresolved cast has no reactions; skip the hub's own FID probe.
+        let messages = if target_fid == 0 {
+            Ok(vec![])
+        } else {
+            hub.get_reactions_by_cast(target_fid, &hash, reaction_type, limit)
+                .await
+        };
+        match messages {
             Ok(messages) => {
                 let mut reactions = Vec::new();
                 let object_str = match types {
@@ -3819,7 +4063,7 @@ impl ApiHttpHandler {
             }
         };
 
-        let fids = hub.get_fids_by_address(&addr).await;
+        let fids = self.fids_for_address(&hub, &addr).await;
         if fids.is_empty() {
             return Ok(Self::error_response(
                 StatusCode::NOT_FOUND,
@@ -4944,15 +5188,26 @@ mod tests {
     struct MockHubQuery {
         notifications: Vec<crate::proto::Message>,
         cast_lookup: Option<crate::proto::Message>,
+        direct_reply_count: u64,
+        /// Calls to `get_cast_by_hash` without an FID, i.e. full FID probes.
+        probes: std::sync::atomic::AtomicUsize,
     }
 
     #[async_trait]
     impl HubQueryHandler for MockHubQuery {
+        async fn count_direct_replies(&self, _fid: u64, _hash: &[u8]) -> Result<u64, String> {
+            Ok(self.direct_reply_count)
+        }
+
         async fn get_cast_by_hash(
             &self,
             _hash: &[u8],
-            _fid_hint: Option<u64>,
+            fid_hint: Option<u64>,
         ) -> Option<crate::proto::Message> {
+            if fid_hint.is_none() {
+                self.probes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             self.cast_lookup.clone()
         }
 
@@ -4989,7 +5244,7 @@ mod tests {
             None
         }
 
-        async fn get_fids_by_address(&self, _address: &[u8]) -> Vec<u64> {
+        async fn get_fids_by_address(&self, _address: &[u8], _include_custody: bool) -> Vec<u64> {
             vec![]
         }
 
@@ -5062,8 +5317,158 @@ mod tests {
         }
     }
 
+    fn mock_cast(fid: u64, hash: Vec<u8>) -> crate::proto::Message {
+        crate::proto::Message {
+            data: Some(crate::proto::MessageData {
+                fid,
+                r#type: crate::proto::MessageType::CastAdd as i32,
+                body: Some(crate::proto::message_data::Body::CastAddBody(
+                    crate::proto::CastAddBody::default(),
+                )),
+                ..Default::default()
+            }),
+            hash,
+            ..Default::default()
+        }
+    }
+
     #[tokio::test]
-    async fn test_cast_lookup_includes_indexed_reaction_counts() {
+    async fn test_user_search_matches_partial_usernames() {
+        use crate::api::user_search_index::UserSearchIndexer;
+        use crate::proto::{message_data::Body, MessageData, UserDataBody, UserDataType};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(crate::storage::db::RocksDB::new(
+            temp_dir.path().to_str().unwrap(),
+        ));
+        db.open().unwrap();
+        let index = Arc::new(UserSearchIndexer::new(
+            crate::api::config::FeatureConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            db,
+        ));
+        let user_data = |fid: u64, kind: UserDataType, value: &str| crate::proto::Message {
+            data: Some(MessageData {
+                fid,
+                r#type: crate::proto::MessageType::UserDataAdd as i32,
+                body: Some(Body::UserDataBody(UserDataBody {
+                    r#type: kind as i32,
+                    value: value.into(),
+                })),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        index
+            .process_batch(&[crate::api::events::IndexEvent::messages(
+                vec![
+                    user_data(40, UserDataType::Username, "dwrx.eth"),
+                    user_data(3, UserDataType::Username, "dwr"),
+                    user_data(3, UserDataType::Display, "Dan Romero"),
+                    user_data(9, UserDataType::Display, "dw fan"),
+                ],
+                1,
+                1,
+            )])
+            .await
+            .unwrap();
+
+        let handler = ApiHttpHandler::new(None, None, None, None, None, None);
+        handler.set_hub_query(Arc::new(MockHubQuery {
+            notifications: vec![],
+            cast_lookup: None,
+            direct_reply_count: 0,
+            probes: Default::default(),
+        }));
+        handler.set_user_search(index);
+
+        let search = |q: &'static str| {
+            let handler = handler.clone();
+            async move {
+                let response = handler.handle_user_search(q, 10).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = response.collect().await.unwrap().to_bytes();
+                let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                json["users"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|u| u["fid"].as_u64().unwrap())
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        // Usernames starting with the query, then display-name words.
+        assert_eq!(search("dw").await, vec![3, 40, 9]);
+        // An exact username outranks longer ones.
+        assert_eq!(search("@DWRX.eth").await, vec![40]);
+        assert_eq!(search("dwr").await, vec![3, 40]);
+        assert_eq!(search("romero").await, vec![3]);
+        assert!(search("zz").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_cast_remembers_probe_misses() {
+        let handler = ApiHttpHandler::new(None, None, None, None, None, None);
+        let mock = Arc::new(MockHubQuery {
+            notifications: vec![],
+            cast_lookup: None,
+            direct_reply_count: 0,
+            probes: Default::default(),
+        });
+        handler.set_hub_query(mock.clone());
+        let probes = || mock.probes.load(std::sync::atomic::Ordering::Relaxed);
+
+        let missing = [7u8; 20];
+        assert!(handler.resolve_cast(&missing, None, true).await.is_none());
+        assert!(handler.resolve_cast(&missing, None, true).await.is_none());
+        assert_eq!(probes(), 1, "a missed hash is not probed again");
+
+        assert!(handler
+            .resolve_cast(&[8u8; 20], None, false)
+            .await
+            .is_none());
+        assert_eq!(probes(), 1, "no probe when probing is not allowed");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_cast_indexes_probe_hits() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(crate::storage::db::RocksDB::new(
+            temp_dir.path().to_str().unwrap(),
+        ));
+        db.open().unwrap();
+        let index = Arc::new(crate::api::cast_hash_index::CastHashIndexer::new(
+            crate::api::config::FeatureConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            db,
+        ));
+        let handler = ApiHttpHandler::new(None, None, None, Some(index.clone()), None, None);
+        let hash = vec![9u8; 20];
+        let mock = Arc::new(MockHubQuery {
+            notifications: vec![],
+            cast_lookup: Some(mock_cast(42, hash.clone())),
+            direct_reply_count: 0,
+            probes: Default::default(),
+        });
+        handler.set_hub_query(mock.clone());
+        let probes = || mock.probes.load(std::sync::atomic::Ordering::Relaxed);
+
+        assert!(handler.resolve_cast(&hash, None, true).await.is_some());
+        assert_eq!(probes(), 1);
+        assert_eq!(index.get_fid_by_hash(&hash), Some(42));
+
+        // Later lookups use the indexed FID directly.
+        assert!(handler.resolve_cast(&hash, None, true).await.is_some());
+        assert_eq!(probes(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_cast_counts_do_not_depend_on_reply_expansion() {
         let temp_dir = tempfile::tempdir().unwrap();
         let db = Arc::new(crate::storage::db::RocksDB::new(
             temp_dir.path().to_str().unwrap(),
@@ -5125,9 +5530,16 @@ mod tests {
             .unwrap();
 
         let handler = ApiHttpHandler::new(None, None, Some(metrics), None, None, None);
+        let conversation_cast = crate::api::conversations::ConversationCast {
+            cast: cast.clone(),
+            replies: vec![],
+            depth: 0,
+        };
         handler.set_hub_query(Arc::new(MockHubQuery {
             notifications: vec![],
             cast_lookup: Some(cast),
+            direct_reply_count: 1,
+            probes: Default::default(),
         }));
 
         let response = handler
@@ -5141,6 +5553,14 @@ mod tests {
         assert_eq!(json["cast"]["reactions"]["likes_count"], 2);
         assert_eq!(json["cast"]["reactions"]["recasts_count"], 0);
         assert_eq!(json["cast"]["reactions"]["likes"], serde_json::json!([]));
+        assert_eq!(json["cast"]["replies"]["count"], 1);
+
+        let shallow = handler
+            .conversation_cast_to_cast_with_replies(&conversation_cast)
+            .await
+            .unwrap();
+        assert!(shallow.direct_replies.is_empty());
+        assert_eq!(shallow.cast.replies.count, 1);
     }
 
     #[tokio::test]
@@ -5263,6 +5683,8 @@ mod tests {
         let mock = Arc::new(MockHubQuery {
             notifications: vec![reply_msg.clone(), reaction_msg.clone(), follow_msg.clone()],
             cast_lookup: Some(target_cast_msg),
+            direct_reply_count: 0,
+            probes: Default::default(),
         });
 
         let handler = ApiHttpHandler::new(None, None, None, None, None, None);

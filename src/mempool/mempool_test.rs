@@ -14,7 +14,7 @@ mod tests {
             StorageUnitType, Transaction,
         },
         storage::store::{
-            account::make_ts_hash,
+            account::{make_ts_hash, ChannelModerateStore, DerivedIndexGate},
             block_engine::BlockEngine,
             block_engine_test_helpers,
             engine::ShardEngine,
@@ -60,6 +60,31 @@ mod tests {
         broadcast::Sender<Block>,
         mpsc::Receiver<SystemMessage>,
     ) {
+        setup_for_network(
+            config,
+            enable_rate_limits,
+            num_shards,
+            FarcasterNetwork::Devnet,
+        )
+        .await
+    }
+
+    async fn setup_for_network(
+        config: Option<Config>,
+        enable_rate_limits: bool,
+        num_shards: u32,
+        network: FarcasterNetwork,
+    ) -> (
+        HashMap<u32, ShardEngine>,
+        BlockEngine,
+        Option<SnapchainGossip>,
+        Mempool,
+        mpsc::Sender<MempoolRequest>,
+        mpsc::Sender<MempoolMessagesRequest>,
+        broadcast::Sender<ShardChunk>,
+        broadcast::Sender<Block>,
+        mpsc::Receiver<SystemMessage>,
+    ) {
         let keypair = Keypair::generate();
         let statsd_client = StatsdClientWrapper::new(
             cadence::StatsdClient::builder("", cadence::NopMetricSink {}).build(),
@@ -90,7 +115,7 @@ mod tests {
                     &config,
                     Some(system_tx),
                     false,
-                    proto::FarcasterNetwork::Devnet,
+                    network,
                     statsd_client.clone(),
                     Vec::new(),
                 )
@@ -108,7 +133,7 @@ mod tests {
         mempool_config.enable_rate_limits = enable_rate_limits;
         let mempool = Mempool::new(
             mempool_config,
-            FarcasterNetwork::Devnet,
+            network,
             mempool_rx,
             messages_request_rx,
             num_shards,
@@ -133,6 +158,68 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn s4_mempool_wall_clock_rejects_channels_before_v21_and_admits_them_at_v21() {
+        let (_, _, _, mut pre_v21_mempool, _, _, _, _, _) =
+            setup_for_network(None, false, 1, FarcasterNetwork::Mainnet).await;
+        let (_, _, _, mut v21_mempool, _, _, _, _, _) =
+            setup_for_network(None, false, 1, FarcasterNetwork::Devnet).await;
+
+        for (message_type, body) in messages_factory::channels::all_message_bodies() {
+            // Timestamp zero is deliberately from the pre-cutover regime. Channel embedded
+            // timestamps are inert, so wall-clock admission changes only with the node version.
+            let message =
+                messages_factory::create_message_with_data(1234, message_type, body, Some(0), None);
+            let error = pre_v21_mempool
+                .message_is_valid(0, &MempoolMessage::UserMessage(message.clone()), true)
+                .unwrap_err();
+            assert_eq!(error.message, "channel messages not yet active");
+            assert!(v21_mempool
+                .message_is_valid(0, &MempoolMessage::UserMessage(message), true)
+                .is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_channel_moderate_dedup_uses_the_full_message_key() {
+        let (_, block_engine, _, mut mempool, _, _, _, _, _) = setup(None, false, 1).await;
+        let fid = 1234;
+        let timestamp = messages_factory::farcaster_time();
+        let channel_id = vec![0x11; 32];
+        let moderate = |cast_byte| {
+            messages_factory::create_message_with_data(
+                fid,
+                proto::MessageType::ChannelModerate,
+                proto::message_data::Body::ChannelModerateBody(proto::ChannelModerateBody {
+                    channel_id: channel_id.clone(),
+                    cast_hash: vec![cast_byte; 20],
+                    action: proto::ChannelModerateAction::Hide as i32,
+                }),
+                Some(timestamp),
+                None,
+            )
+        };
+        let merged = moderate(0x22);
+        let distinct_slot = moderate(0x33);
+        let stores = block_engine.stores();
+        let mut txn = crate::storage::db::RocksDbTransactionBatch::new();
+        ChannelModerateStore::merge(
+            &stores.channel_moderate_store,
+            &merged,
+            &mut txn,
+            DerivedIndexGate::Write,
+        )
+        .unwrap();
+        stores.db.commit(txn).unwrap();
+
+        assert!(mempool
+            .message_is_valid(0, &MempoolMessage::UserMessage(merged.clone()), true,)
+            .is_err());
+        assert!(mempool
+            .message_is_valid(0, &MempoolMessage::UserMessage(distinct_slot), true)
+            .is_ok());
+    }
+
     async fn pull_message(
         messages_request_tx: &mpsc::Sender<MempoolMessagesRequest>,
         shard_id: u32,
@@ -147,6 +234,7 @@ mod tests {
                 shard_id,
                 max_messages_per_block: 1,
                 message_tx: mempool_retrieval_tx,
+                max_bytes: None,
             })
             .await
             .unwrap();
@@ -570,6 +658,7 @@ mod tests {
                 shard_id: 1,
                 max_messages_per_block: 2,
                 message_tx: mempool_retrieval_tx,
+                max_bytes: None,
             })
             .await
             .unwrap();
@@ -579,6 +668,128 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].fid(), fid);
     }
+    #[tokio::test]
+    async fn a_pull_stops_at_its_byte_budget() {
+        let (
+            mut engines,
+            _,
+            _,
+            mut mempool,
+            mempool_tx,
+            messages_request_tx,
+            _shard_decision_tx,
+            _block_decision_tx,
+            _,
+        ) = setup(None, false, 1).await;
+        let mut engine = engines.get_mut(&1).unwrap();
+        test_helper::register_user(
+            1234,
+            default_signer(),
+            default_custody_address(),
+            &mut engine,
+        )
+        .await;
+        tokio::spawn(async move {
+            mempool.run().await;
+        });
+
+        // Three casts of one size.
+        let casts: Vec<_> = ["one", "two", "six"]
+            .iter()
+            .map(|t| create_cast_add(1234, t, None, None))
+            .collect();
+        for cast in &casts {
+            let _ = mempool_tx
+                .send(MempoolRequest::AddMessage(
+                    MempoolMessage::UserMessage(cast.clone()),
+                    MempoolSource::Local,
+                    None,
+                ))
+                .await;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let pull = |max_bytes: Option<usize>| {
+            let messages_request_tx = messages_request_tx.clone();
+            async move {
+                let (tx, rx) = oneshot::channel();
+                messages_request_tx
+                    .send(MempoolMessagesRequest {
+                        shard_id: 1,
+                        max_messages_per_block: 10,
+                        message_tx: tx,
+                        max_bytes,
+                    })
+                    .await
+                    .unwrap();
+                rx.await.unwrap()
+            }
+        };
+        // Two fit in the budget; the third stays for the next pull.
+        let size = MempoolMessage::UserMessage(casts[0].clone()).encoded_len();
+        assert_eq!(pull(Some(2 * size + size / 2)).await.len(), 2);
+        assert_eq!(pull(None).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_messages_stay_when_the_proposer_stops_waiting() {
+        let (
+            mut engines,
+            _,
+            _,
+            mut mempool,
+            mempool_tx,
+            messages_request_tx,
+            _shard_decision_tx,
+            _block_decision_tx,
+            _,
+        ) = setup(None, false, 1).await;
+        let mut engine = engines.get_mut(&1).unwrap();
+        test_helper::register_user(
+            1234,
+            default_signer(),
+            default_custody_address(),
+            &mut engine,
+        )
+        .await;
+        tokio::spawn(async move {
+            mempool.run().await;
+        });
+        for text in ["one", "two", "six"] {
+            let _ = mempool_tx
+                .send(MempoolRequest::AddMessage(
+                    MempoolMessage::UserMessage(create_cast_add(1234, text, None, None)),
+                    MempoolSource::Local,
+                    None,
+                ))
+                .await;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // A pull whose proposer is gone, then a pull that waits.
+        let (gone, _) = oneshot::channel();
+        messages_request_tx
+            .send(MempoolMessagesRequest {
+                shard_id: 1,
+                max_messages_per_block: 10,
+                message_tx: gone,
+                max_bytes: None,
+            })
+            .await
+            .unwrap();
+        let (tx, rx) = oneshot::channel();
+        messages_request_tx
+            .send(MempoolMessagesRequest {
+                shard_id: 1,
+                max_messages_per_block: 10,
+                message_tx: tx,
+                max_bytes: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(rx.await.unwrap().len(), 3);
+    }
+
     #[tokio::test]
     async fn test_mempool_eviction_shard0() {
         let (
@@ -680,6 +891,7 @@ mod tests {
                 shard_id: 0,
                 max_messages_per_block: 2,
                 message_tx: mempool_retrieval_tx,
+                max_bytes: None,
             })
             .await
             .unwrap();
@@ -800,6 +1012,7 @@ mod tests {
                 shard_id: 1,
                 max_messages_per_block: 1,
                 message_tx: mempool_retrieval_tx,
+                max_bytes: None,
             })
             .await
             .unwrap();
@@ -1375,7 +1588,10 @@ mod tests {
             _blocks,
             _system,
         ) = setup(None, false, 2).await;
-        mempool.set_hypersnap(crate::chain::shard0::test_support::params());
+        mempool.set_hypersnap(
+            crate::chain::shard0::test_support::params(),
+            crate::version::version::EngineVersion::latest(),
+        );
         tokio::spawn(async move { mempool.run().await });
 
         let key = falcon(5);
@@ -1442,7 +1658,10 @@ mod tests {
             _blocks,
             _system,
         ) = setup(None, false, 2).await;
-        mempool.set_hypersnap(crate::chain::shard0::test_support::params());
+        mempool.set_hypersnap(
+            crate::chain::shard0::test_support::params(),
+            crate::version::version::EngineVersion::latest(),
+        );
         tokio::spawn(async move { mempool.run().await });
 
         let fid = 1234;
@@ -1481,5 +1700,53 @@ mod tests {
         for shard in [1, 2] {
             pull_message(&messages_request_tx, shard, None).await;
         }
+    }
+
+    /// Pull-time `message_is_valid` (`at_admission = false`) must not invoke the
+    /// rate limiter — the token was already consumed at admission, and re-running
+    /// the check would double-charge the bucket and silently drop accepted messages
+    /// before they ever reach the engine. Same fixture as `test_rate_limits_applied`
+    /// (FID registered with no storage rent → admission rejects on rate-limit), but
+    /// flipping the flag to `false` must turn the rate-limit branch into a no-op
+    /// and leave the message admissible by all other criteria.
+    #[tokio::test]
+    async fn test_rate_limits_skipped_at_pull_time() {
+        let (mut engines, _, _, mut mempool, _, _, _, _, _) = setup(None, true, 1).await;
+        let mut engine = engines.get_mut(&1).unwrap();
+
+        let id_register_event = events_factory::create_id_register_event(
+            FID_FOR_TEST,
+            proto::IdRegisterEventType::Register,
+            default_custody_address(),
+            None,
+        );
+        commit_event(&mut engine, &id_register_event).await;
+        let signer_event = events_factory::create_signer_event(
+            FID_FOR_TEST,
+            default_signer(),
+            proto::SignerEventType::Add,
+            None,
+            None,
+        );
+        commit_event(&mut engine, &signer_event).await;
+
+        // Sanity: at admission, an FID with no storage rent fails the rate limit.
+        let cast = create_cast_add(FID_FOR_TEST, "hello", None, None);
+        let admission_result =
+            mempool.message_is_valid(1, &MempoolMessage::UserMessage(cast.clone()), true);
+        assert!(
+            admission_result.is_err(),
+            "without storage rent the admission-time rate limit must reject"
+        );
+
+        // At pull time the same fixture must be admissible — the rate limiter is
+        // gated off and only the cheap idempotent checks (feature gate, BlockEvent
+        // shard, post-merge dedup) run.
+        let pull_result = mempool.message_is_valid(1, &MempoolMessage::UserMessage(cast), false);
+        assert!(
+            pull_result.is_ok(),
+            "at_admission=false must skip the rate limiter so already-admitted \
+             messages survive being re-validated on the way out of the buffer"
+        );
     }
 }

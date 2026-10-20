@@ -137,6 +137,10 @@ message FeeSettlement {
   uint64 height = 2;                     // The shard-s block whose charges settle
   repeated FeeCharge charges = 3;        // Sorted by fid
   uint64 proposer_fid = 4;
+  // The epoch and the round of the certificate of the block, from the parent
+  // certificate of block height + 1 (§4.7, §12).
+  uint64 epoch = 5;
+  uint32 round = 6;
 }
 
 message FeeCharge {

@@ -164,7 +164,7 @@ pub async fn run_hyper_backfill(
 }
 
 /// Merge a single message into the hyper stores. Returns true if merged.
-fn merge_message_to_hyper(
+pub(crate) fn merge_message_to_hyper(
     hyper: &Stores,
     msg: &Message,
     txn_batch: &mut RocksDbTransactionBatch,

@@ -47,6 +47,64 @@ pub fn fee_balance(fid: u64) -> Vec<u8> {
     key(RootPrefix::HyperFeeBalance, &[&fid.to_be_bytes()])
 }
 
+/// The verification records of an FID on shard 0 (FIP §17.7).
+pub fn verification_counts(fid: u64) -> Vec<u8> {
+    key(RootPrefix::HyperVerificationCount, &[&fid.to_be_bytes()])
+}
+
+// ---- Bridge actions (§13.7) ----
+
+pub const BRIDGE_VOTE_COUNT: u8 = 0x01;
+pub const BRIDGE_VOTE: u8 = 0x02;
+pub const BRIDGE_ACTION: u8 = 0x03;
+pub const BRIDGE_DECIDED: u8 = 0x04;
+pub const BRIDGE_PAUSE: u8 = 0x05;
+
+pub fn bridge_votes_of_epoch(sub: u8, epoch: u64) -> Vec<u8> {
+    key(
+        RootPrefix::HyperBridgeAction,
+        &[&[sub], &epoch.to_be_bytes()],
+    )
+}
+
+pub fn bridge_action_key(sub: u8, epoch: u64, action: &[u8; 32]) -> Vec<u8> {
+    key(
+        RootPrefix::HyperBridgeAction,
+        &[&[sub], &epoch.to_be_bytes(), action],
+    )
+}
+
+pub fn bridge_vote(epoch: u64, action: &[u8; 32], node_key_hash: &[u8]) -> Vec<u8> {
+    key(
+        RootPrefix::HyperBridgeAction,
+        &[&[BRIDGE_VOTE], &epoch.to_be_bytes(), action, node_key_hash],
+    )
+}
+
+pub fn bridge_pause(chain_id: u32) -> Vec<u8> {
+    key(
+        RootPrefix::HyperBridgeAction,
+        &[&[BRIDGE_PAUSE], &chain_id.to_be_bytes()],
+    )
+}
+
+// ---- Seed beacon (§4.9) ----
+
+pub const SEED_COMMIT: u8 = 0x01;
+pub const SEED_REVEAL: u8 = 0x02;
+pub const SEED_FORFEIT: u8 = 0x03;
+
+pub fn seed_records(sub: u8, epoch: u64) -> Vec<u8> {
+    key(RootPrefix::HyperSeedBeacon, &[&[sub], &epoch.to_be_bytes()])
+}
+
+pub fn seed_record(sub: u8, epoch: u64, node_key_hash: &[u8]) -> Vec<u8> {
+    key(
+        RootPrefix::HyperSeedBeacon,
+        &[&[sub], &epoch.to_be_bytes(), node_key_hash],
+    )
+}
+
 // ---- Escrow (§13.9) ----
 
 pub const ESCROW_OPTIMISM: u8 = 0x01;
@@ -394,6 +452,14 @@ pub fn is_shard0_consensus_prefix(prefix: u8) -> bool {
         P::OnChainEvent as u8,
         P::LendStorageByRecipient as u8,
         P::GaslessKey as u8,
+        // The verifications that shard 0 takes when the snapchain rules put
+        // them on the block shard (FIP §17.7): the address index and the
+        // record counters.
+        P::VerificationByAddress as u8,
+        P::HyperVerificationCount as u8,
+        // Bridge actions (FIP §13.7) and the seed beacon (FIP §4.9).
+        P::HyperBridgeAction as u8,
+        P::HyperSeedBeacon as u8,
         // Hypersnap shard-0 state (FIP §14.6).
         P::HyperRewardBalance as u8,
         P::HyperTrustScore as u8,

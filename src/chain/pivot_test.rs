@@ -338,3 +338,66 @@ fn two_nodes_build_the_same_genesis_and_accept_the_pivot_block() {
     assert_eq!(r0, r1);
     assert_eq!(block_hash(&header).to_vec(), block.hash);
 }
+
+/// Each consensus parameter is in `params_hash` (FIP §17.4), also the ones
+/// that a devnet sets in its config.
+#[test]
+fn params_hash_covers_every_consensus_parameter() {
+    let base = params();
+    let changes: Vec<(&str, Box<dyn Fn(&mut crate::chain::shard0::Shard0Params)>)> = vec![
+        (
+            "network",
+            Box::new(|p| p.network = FarcasterNetwork::Testnet),
+        ),
+        ("retro_minted", Box::new(|p| p.retro_minted += 1)),
+        (
+            "min_difficulty_bits",
+            Box::new(|p| p.min_difficulty_bits += 1),
+        ),
+        ("max_memo_bytes", Box::new(|p| p.max_memo_bytes += 1)),
+        ("protocol_chain_id", Box::new(|p| p.protocol_chain_id += 1)),
+        (
+            "onboard_anchor_window",
+            Box::new(|p| p.onboard_anchor_window += 1),
+        ),
+        (
+            "onboarding_stake_gate",
+            Box::new(|p| p.onboarding_stake_gate ^= true),
+        ),
+        (
+            "min_onboarding_stake",
+            Box::new(|p| p.min_onboarding_stake += 1),
+        ),
+        (
+            "min_onboarding_stake_duration",
+            Box::new(|p| p.min_onboarding_stake_duration += 1),
+        ),
+        ("scoring_delay", Box::new(|p| p.scoring_delay += 1)),
+        (
+            "pause_duration_secs",
+            Box::new(|p| p.pause_duration_secs += 1),
+        ),
+        (
+            "seed_reveal_margin",
+            Box::new(|p| p.seed_reveal_margin += 1),
+        ),
+    ];
+    for (name, change) in changes {
+        let mut p = base.clone();
+        change(&mut p);
+        assert_ne!(p.params_hash(), base.params_hash(), "{name}");
+    }
+}
+
+/// The consensus constants that the release compiles in are in `params_hash`
+/// through `release_constants_hash`. The pinned value fails when one of them
+/// changes: a new value is a new release, so update the pin on purpose.
+#[test]
+fn release_constants_hash_is_pinned() {
+    let hash = crate::chain::pivot::release_constants_hash();
+    assert_eq!(hash, crate::chain::pivot::release_constants_hash());
+    assert_eq!(hex::encode(hash), PINNED_RELEASE_CONSTANTS_HASH);
+}
+
+const PINNED_RELEASE_CONSTANTS_HASH: &str =
+    "260c1a7c6172ac086d5da3fd197fb8642ff3b56eb0bcd13ffd9be991f11f60b3";

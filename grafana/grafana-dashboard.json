@@ -838,7 +838,15 @@
       "targets": [
         {
           "refId": "A",
-          "target": "stats.timers.snapchain.api.latency.*.upper_90"
+          "target": "aliasSub(stats.timers.snapchain.api.latency.*.upper_90, '^stats\\.timers\\.snapchain\\.api\\.latency\\.(.*)\\.upper_90$', '\\1')"
+        },
+        {
+          "refId": "B",
+          "target": "aliasSub(stats.timers.snapchain.api.latency.*.*.upper_90, '^stats\\.timers\\.snapchain\\.api\\.latency\\.(.*)\\.upper_90$', '\\1')"
+        },
+        {
+          "refId": "C",
+          "target": "aliasSub(stats.timers.snapchain.api.latency.*.*.*.upper_90, '^stats\\.timers\\.snapchain\\.api\\.latency\\.(.*)\\.upper_90$', '\\1')"
         }
       ],
       "title": "API Latency p90 (ms)",
@@ -886,12 +894,61 @@
       "type": "timeseries"
     },
     {
+      "datasource": "Graphite",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 20,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal"
+            }
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 35
+      },
+      "id": 29,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "target": "aliasSub(perSecond(stats.snapchain.api.abandoned.*), '^.*api\\.abandoned\\.([^)]*).*$', '\\1')"
+        },
+        {
+          "refId": "B",
+          "target": "aliasSub(perSecond(stats.snapchain.api.abandoned.*.*), '^.*api\\.abandoned\\.([^)]*).*$', '\\1')"
+        },
+        {
+          "refId": "C",
+          "target": "aliasSub(perSecond(stats.snapchain.api.abandoned.*.*.*), '^.*api\\.abandoned\\.([^)]*).*$', '\\1')"
+        }
+      ],
+      "title": "Abandoned Requests by Endpoint (client timeout/disconnect)",
+      "type": "timeseries"
+    },
+    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 35
+        "y": 43
       },
       "id": 18,
       "title": "Indexers",
@@ -917,7 +974,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 36
+        "y": 44
       },
       "id": 19,
       "options": {
@@ -955,7 +1012,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 36
+        "y": 44
       },
       "id": 20,
       "options": {
@@ -993,7 +1050,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 44
+        "y": 52
       },
       "id": 21,
       "options": {
@@ -1030,7 +1087,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 52
+        "y": 60
       },
       "id": 22,
       "title": "Webhooks",
@@ -1095,7 +1152,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 53
+        "y": 61
       },
       "id": 23,
       "options": {
@@ -1178,7 +1235,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 53
+        "y": 61
       },
       "id": 24,
       "options": {
@@ -1235,7 +1292,7 @@
         "h": 6,
         "w": 6,
         "x": 0,
-        "y": 61
+        "y": 69
       },
       "id": 25,
       "options": {
@@ -1291,7 +1348,7 @@
         "h": 6,
         "w": 6,
         "x": 6,
-        "y": 61
+        "y": 69
       },
       "id": 26,
       "options": {
@@ -1351,7 +1408,7 @@
         "h": 6,
         "w": 6,
         "x": 12,
-        "y": 61
+        "y": 69
       },
       "id": 27,
       "options": {
@@ -1407,7 +1464,7 @@
         "h": 6,
         "w": 6,
         "x": 18,
-        "y": 61
+        "y": 69
       },
       "id": 28,
       "options": {

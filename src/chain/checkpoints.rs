@@ -9,7 +9,7 @@
 
 use crate::chain::shard0::work::DaCheckpoints;
 use crate::proto::FarcasterNetwork;
-use crate::storage::db::RocksDB;
+use crate::storage::db::{RocksDB, SnapchainDbOptimizationType};
 use crate::storage::store::stores::{StoreLimits, Stores};
 use crate::storage::trie::key_resolver::TrieKeyResolver;
 use crate::storage::trie::merkle_trie::MerkleTrie;
@@ -26,6 +26,10 @@ pub struct Checkpoints {
     /// The checkpoints opened so far, by (shard, epoch). A DA answer and its
     /// check read one checkpoint many times.
     opened: Mutex<HashMap<(u32, u64), Arc<RocksDB>>>,
+    /// The block cache of the node. An open checkpoint keeps the index and
+    /// filter blocks of its SST files in it: without it they stay in memory
+    /// for as long as the checkpoint is open (about 0.3% of its size).
+    block_cache: Option<rocksdb::Cache>,
 }
 
 impl Checkpoints {
@@ -34,7 +38,13 @@ impl Checkpoints {
             root: root.into(),
             network,
             opened: Mutex::new(HashMap::new()),
+            block_cache: None,
         }
+    }
+
+    pub fn with_block_cache(mut self, cache: rocksdb::Cache) -> Self {
+        self.block_cache = Some(cache);
+        self
     }
 
     /// The checkpoint of `shard` for the boundary of `epoch`.
@@ -79,7 +89,13 @@ impl Checkpoints {
         if !self.exists(shard, epoch) {
             return None;
         }
-        match RocksDB::new(self.path(shard, epoch).to_str().unwrap()).open_read_only() {
+        match RocksDB::new_with_cache(
+            self.path(shard, epoch).to_str().unwrap(),
+            SnapchainDbOptimizationType::Default,
+            self.block_cache.clone(),
+        )
+        .open_read_only()
+        {
             Ok(db) => {
                 let db = Arc::new(db);
                 opened.insert((shard, epoch), db.clone());
@@ -116,6 +132,18 @@ impl Checkpoints {
         }
     }
 
+    /// The leaf at or after `target_path` (FIP §5.1; the first leaf if there
+    /// is none after it).
+    fn first_leaf<S: hypersnap_ktrie::NodeStore>(
+        trie: &KTrie<S>,
+        target_path: &[u8; 32],
+    ) -> Option<hypersnap_ktrie::LeafEntry> {
+        match trie.first_at_or_after(target_path).ok()? {
+            Some(l) => Some(l),
+            None => trie.first_at_or_after(&[0u8; 32]).ok()?,
+        }
+    }
+
     /// The leaf at or after `target_path` in the state trie of the
     /// checkpoint (FIP §5.1; the first leaf if there is none after it), with
     /// its value, the encoded inclusion proof and the root.
@@ -127,10 +155,7 @@ impl Checkpoints {
     ) -> Option<ChallengedLeaf> {
         let db = self.open(shard, epoch)?;
         let trie = KTrie::open(RocksNodeStore::new(db.clone())).ok()?;
-        let leaf = match trie.first_at_or_after(target_path).ok()? {
-            Some(l) => l,
-            None => trie.first_at_or_after(&[0u8; 32]).ok()??,
-        };
+        let leaf = Self::first_leaf(&trie, target_path)?;
         // A `RootPrefix` record is in the trie as its storage key and stored
         // bytes. A snapchain trie key names an object in the stores. Its
         // first byte is a virtual shard, so it can look like a prefix, and
@@ -155,7 +180,7 @@ impl Checkpoints {
                     false,
                 ),
             );
-            let mut resolver = TrieKeyResolver::new(&stores);
+            let mut resolver = TrieKeyResolver::for_one_leaf(&stores);
             let v = resolver.resolve(&leaf.key).ok()??.state_value();
             (hypersnap_ktrie::value_hash(&v) == leaf.value_hash).then_some(v)?
         };
@@ -177,13 +202,17 @@ pub struct ChallengedLeaf {
 }
 
 impl DaCheckpoints for Checkpoints {
+    /// From the trie only: resolving the value of a snapchain leaf reads all
+    /// the messages of its FID and type.
     fn expected_leaf(
         &self,
         epoch: u64,
         shard_id: u32,
         target_path: &[u8; 32],
-    ) -> Option<(Vec<u8>, Vec<u8>, [u8; 32])> {
-        self.challenged_leaf(epoch, shard_id, target_path)
-            .map(|l| (l.key, l.value, l.root))
+    ) -> Option<(Vec<u8>, [u8; 32], [u8; 32])> {
+        let db = self.open(shard_id, epoch)?;
+        let trie = KTrie::open(RocksNodeStore::new(db)).ok()?;
+        let leaf = Self::first_leaf(&trie, target_path)?;
+        Some((leaf.key, leaf.value_hash, trie.committed_root()))
     }
 }

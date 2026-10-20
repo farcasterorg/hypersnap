@@ -21,12 +21,11 @@ works without a relay.
 
 ## Build and run
 
-Until the crate joins the root workspace it has its own `[workspace]` table
-and `Cargo.lock`:
+The crate is a member of the root workspace:
 
 ```sh
-cargo build --release --manifest-path crates/hypersnap-relay/Cargo.toml
-crates/hypersnap-relay/target/release/hypersnap-relay --config relay.toml
+cargo build --release -p hypersnap-relay
+target/release/hypersnap-relay --config relay.toml
 ```
 
 `RUST_LOG` sets the log filter; `--log-format json` gives JSON logs. SIGINT or
@@ -157,63 +156,15 @@ summary every `metrics_log_interval_secs`.
 
 ## Deployment
 
-### Dockerfile stage
+The node image contains the relay binary (`/app/hypersnap-relay`, from the
+repo `Dockerfile`), so the relay runs from the same image as the node.
 
-Insert these stages into the repo `Dockerfile` **between** the `builder` stage
-and the final node stage, so that the default target stays the node image.
-Build with `docker build --target relay -t hypersnap-relay .`.
+`docker-compose.mainnet.yml` and `docker-compose.nightly.yml` have a `relay`
+service in the `relay` profile, with the settings as environment variables.
+Start it after the pivot:
 
-```dockerfile
-#################################################################################
-# Relay worker (FIP-proof-of-work-tokenization Appendix A).
-
-FROM builder AS relay-builder
-# The crate has its own [workspace] and Cargo.lock until it joins the root
-# workspace; then this becomes `cargo build --release --locked --bin hypersnap-relay`.
-# The shared target dir reuses the dependencies that the node build compiled.
-RUN CARGO_TARGET_DIR=/usr/src/app/target \
-  cargo build --release --locked --manifest-path crates/hypersnap-relay/Cargo.toml
-
-FROM ubuntu:24.04 AS relay
-RUN apt-get update && apt-get install -y ca-certificates && apt-get clean -y
-WORKDIR /app
-COPY --from=relay-builder /usr/src/app/target/release/hypersnap-relay /app/
-COPY --from=relay-builder \
-  /usr/src/app/crates/hypersnap-relay/relay.example.toml /app/relay.example.toml
-VOLUME ["/var/lib/hypersnap-relay"]
-ENTRYPOINT ["./hypersnap-relay"]
-CMD ["--config", "/app/relay.toml"]
-```
-
-### docker-compose service
-
-```yaml
-services:
-  relay:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      target: relay
-    init: true                  # forward SIGTERM; the relay stops at a safe point
-    restart: unless-stopped
-    stop_grace_period: 30s
-    depends_on:
-      - node1
-    environment:
-      RUST_LOG: "info"
-      HYPERSNAP_RELAY_NETWORK: "mainnet"
-      HYPERSNAP_RELAY_SNAPCHAIN_ENDPOINTS: '["https://snapchain-a.example:3383","https://snapchain-b.example:3383"]'
-      HYPERSNAP_RELAY_HYPERSNAP_ENDPOINTS: '["http://node1:3383"]'
-      HYPERSNAP_RELAY_STATE_DIR: "/var/lib/hypersnap-relay"
-      HYPERSNAP_RELAY_RATE_LIMITS__SNAPCHAIN_RPCS_PER_MINUTE: "100"
-    volumes:
-      - ./relay.toml:/app/relay.toml:ro
-      - relay-data:/var/lib/hypersnap-relay
-    networks:
-      - snapchain-subnet
-
-volumes:
-  relay-data:
+```sh
+docker compose --profile relay up -d relay
 ```
 
 The relay's own volume must not be shared with another relay or a node.
@@ -221,7 +172,7 @@ The relay's own volume must not be shared with another relay or a node.
 ## Tests
 
 ```sh
-cargo test --manifest-path crates/hypersnap-relay/Cargo.toml
+cargo test -p hypersnap-relay
 ```
 
 Unit tests cover the filter and the Ed25519-form rewrite (byte-identical
