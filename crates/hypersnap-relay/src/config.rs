@@ -204,7 +204,7 @@ pub struct RelayConfig {
     pub inbound_enabled: bool,
     pub outbound_enabled: bool,
     /// Snapchain shards that the inbound path reads. Shard 0 carries `KEY_ADD`,
-    /// `KEY_REMOVE` and `LEND_STORAGE` on snapchain, and from V21 the verifications.
+    /// `KEY_REMOVE` and `LEND_STORAGE` on snapchain, and from V23 the verifications.
     pub inbound_shards: Vec<u32>,
     /// Hypersnap shards that the outbound path reads.
     pub outbound_shards: Vec<u32>,

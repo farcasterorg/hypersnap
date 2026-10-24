@@ -104,8 +104,8 @@ pub struct Shard0Params {
     pub min_onboarding_stake: u64,
     pub min_onboarding_stake_duration: u64,
     /// `RETRO_MINTED` (FIP §9, §10.1), micro-units: a release constant, the
-    /// sum of the retroactive `Claimed` amounts. Devnets set it with
-    /// `[hypersnap] retro_minted`.
+    /// sum of the retroactive `Claimed` amounts on mainnet, 0 on other
+    /// networks. Devnets set it with `[hypersnap] retro_minted`.
     pub retro_minted: u64,
     /// `PAUSE_DURATION` (FIP §13.8), seconds.
     pub pause_duration_secs: u64,
@@ -156,7 +156,11 @@ impl Shard0Params {
             onboarding_stake_gate: false,
             min_onboarding_stake: 1_000_000_000,
             min_onboarding_stake_duration: 100_000,
-            retro_minted: 0,
+            retro_minted: if network == FarcasterNetwork::Mainnet {
+                emission::MAINNET_RETRO_MINTED
+            } else {
+                0
+            },
             pause_duration_secs: 72 * 3600,
             seed_reveal_margin: 300,
             exempt_recoveries: crate::chain::exempt_recoveries::release_list(network),

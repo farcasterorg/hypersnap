@@ -49,7 +49,7 @@ pub fn route_message(
     // owner address to a fid — are shard-0-only, so admission can only be decided there. Per-shard
     // state (casts, reactions, links, etc.) routes by FID hash.
     //
-    // The channel arms are unconditional because these types are new at V21 and no pre-V21
+    // The channel arms are unconditional because these types are new at V23 and no pre-V23
     // traffic exists; the feature gate lives at admission (mempool, wall-clock; engines,
     // block-ts), not here.
     match message.msg_type() {
@@ -63,7 +63,7 @@ pub fn route_message(
         // All Hypersnap types are shard-0 state (FIP §14.2).
         t if t.is_hypersnap() => 0,
         // Routing is a wall-clock convention on each node; consensus does not re-check it.
-        // During the mixed V21 window, an in-flight verification routed to a data shard before
+        // During the mixed V23 window, an in-flight verification routed to a data shard before
         // cutover can land in a post-cutover block, where the data shard's block-ts-gated arm
         // rejects it deterministically.
         //
@@ -118,7 +118,7 @@ mod tests {
                     &router,
                     &msg(MessageType::KeyAdd, fid),
                     2,
-                    EngineVersion::V21
+                    EngineVersion::V23
                 ),
                 0
             );
@@ -127,7 +127,7 @@ mod tests {
                     &router,
                     &msg(MessageType::KeyRemove, fid),
                     2,
-                    EngineVersion::V21,
+                    EngineVersion::V23,
                 ),
                 0
             );
@@ -159,7 +159,7 @@ mod tests {
                 &router,
                 &msg(MessageType::LendStorage, 99),
                 2,
-                EngineVersion::V21,
+                EngineVersion::V23,
             ),
             0
         );
@@ -173,7 +173,7 @@ mod tests {
             &router,
             &msg(MessageType::CastAdd, 12345),
             2,
-            EngineVersion::V21,
+            EngineVersion::V23,
         );
         assert!(
             shard == 1 || shard == 2,
@@ -209,11 +209,11 @@ mod tests {
             MessageType::VerificationRemove,
         ] {
             assert_eq!(
-                route_message(&router, &msg(message_type, 1), 2, EngineVersion::V21),
+                route_message(&router, &msg(message_type, 1), 2, EngineVersion::V23),
                 0
             );
             assert_eq!(
-                route_message(&router, &msg(message_type, 2), 2, EngineVersion::V21),
+                route_message(&router, &msg(message_type, 2), 2, EngineVersion::V23),
                 0
             );
         }
@@ -223,13 +223,13 @@ mod tests {
     fn s4_channel_messages_route_to_shard_zero_before_and_after_activation() {
         let router: Box<dyn MessageRouter> = Box::new(EvenOddRouterForTest {});
 
-        // Channel types are new at V21, so their routing is unconditional. The mempool's
+        // Channel types are new at V23, so their routing is unconditional. The mempool's
         // wall-clock feature gate rejects them before activation; keeping both versions here
         // pins that routing itself cannot strand an admitted channel message on a data shard.
         // Straddle the gate: one version with ChannelMessages closed, one with it open. Asserted
         // rather than assumed because a version renumber can silently collapse this pair into a
         // single case, leaving the test green while covering only one side.
-        let versions = [EngineVersion::V20, EngineVersion::V21];
+        let versions = [EngineVersion::V22, EngineVersion::V23];
         assert!(!versions[0].is_enabled(ProtocolFeature::ChannelMessages));
         assert!(versions[1].is_enabled(ProtocolFeature::ChannelMessages));
 

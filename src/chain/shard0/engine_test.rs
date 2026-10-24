@@ -1949,7 +1949,7 @@ fn hyper_v1_reads_the_shard0_state() {
 }
 
 /// FIP §17.7: when the snapchain rules put verifications on the block shard
-/// (V21), shard 0 merges them with no fee, keeps the records of each FID
+/// (V23), shard 0 merges them with no fee, keeps the records of each FID
 /// under `MAX_VERIFICATIONS_PER_FID`, and sends each one to the FID's shard.
 #[test]
 fn shard0_takes_verifications_when_the_rules_put_them_there() {
@@ -2121,7 +2121,7 @@ fn signer_of_2000(net: &mut Net) -> ed25519_dalek::SigningKey {
 
 /// FIP §17.7: shard 0 does not take the snapchain channel messages and
 /// registrar events, also when the snapchain rules put them on the block
-/// shard (V21). Hypersnap channels are the ones of FIP-native-channels.
+/// shard (V23). Hypersnap channels are the ones of FIP-native-channels.
 #[test]
 fn shard0_rejects_snapchain_channels() {
     let (mut net, _custody, _owner) = funded_net();

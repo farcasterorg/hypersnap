@@ -1,5 +1,5 @@
 //! Verifications on shard 0 (FIP §17.7). When the snapchain rules of the
-//! network put verifications on the block shard (snapchain V21), shard 0
+//! network put verifications on the block shard (snapchain V23), shard 0
 //! checks and merges them, and sends each one to the shard of its FID.
 //!
 //! The transition rules are the ones of the snapchain block shard, with

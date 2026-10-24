@@ -15,6 +15,12 @@
 pub const TOTAL_SUPPLY: u64 = 2_000_000_000 * 1_000_000;
 pub const EPOCHS_PER_HALVING: u64 = 146;
 pub const E0: u64 = TOTAL_SUPPLY / (2 * EPOCHS_PER_HALVING);
+/// `RETROACTIVE_POOL` (FIP §10.4): 200,000,000 tokens in micro-units.
+pub const RETROACTIVE_POOL: u64 = TOTAL_SUPPLY / 10;
+/// `RETRO_MINTED` of mainnet (FIP §10.1), in micro-units. Provisional:
+/// 50,000,000 tokens until the claim close fixes the sum of the `Claimed`
+/// amounts.
+pub const MAINNET_RETRO_MINTED: u64 = 50_000_000 * 1_000_000;
 
 /// Shares of the epoch emission (FIP §9), in percent.
 pub const DA_SHARE_PERCENT: u64 = 50;
@@ -136,6 +142,18 @@ mod tests {
         // Retro plus forward emission is the schedule total.
         let forward: u128 = (1..=400).map(|e| s.emission(e) as u128).sum();
         assert_eq!(forward + (TOTAL_SUPPLY / 10) as u128, cumulative(29 + 400));
+    }
+
+    #[test]
+    fn the_mainnet_retro_minted_starts_seven_epochs_in() {
+        // 50,000,000 tokens cover 7.3 schedule epochs: q = 7, r = 0.3 · E0,
+        // first halving at epoch 146 − 7 + 1 = 140.
+        assert!(MAINNET_RETRO_MINTED <= RETROACTIVE_POOL);
+        let s = Schedule::new(MAINNET_RETRO_MINTED);
+        assert_eq!(s.q, 7);
+        assert!((s.r as f64 / E0 as f64 - 0.3).abs() < 1e-9);
+        assert_eq!(s.emission(139), E0);
+        assert_eq!(s.emission(140), E0 / 2);
     }
 
     #[test]

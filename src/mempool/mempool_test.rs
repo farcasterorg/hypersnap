@@ -159,10 +159,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn s4_mempool_wall_clock_rejects_channels_before_v21_and_admits_them_at_v21() {
-        let (_, _, _, mut pre_v21_mempool, _, _, _, _, _) =
+    async fn s4_mempool_wall_clock_rejects_channels_before_v23_and_admits_them_at_v23() {
+        let (_, _, _, mut pre_v23_mempool, _, _, _, _, _) =
             setup_for_network(None, false, 1, FarcasterNetwork::Mainnet).await;
-        let (_, _, _, mut v21_mempool, _, _, _, _, _) =
+        let (_, _, _, mut v23_mempool, _, _, _, _, _) =
             setup_for_network(None, false, 1, FarcasterNetwork::Devnet).await;
 
         for (message_type, body) in messages_factory::channels::all_message_bodies() {
@@ -170,11 +170,11 @@ mod tests {
             // timestamps are inert, so wall-clock admission changes only with the node version.
             let message =
                 messages_factory::create_message_with_data(1234, message_type, body, Some(0), None);
-            let error = pre_v21_mempool
+            let error = pre_v23_mempool
                 .message_is_valid(0, &MempoolMessage::UserMessage(message.clone()), true)
                 .unwrap_err();
             assert_eq!(error.message, "channel messages not yet active");
-            assert!(v21_mempool
+            assert!(v23_mempool
                 .message_is_valid(0, &MempoolMessage::UserMessage(message), true)
                 .is_ok());
         }
@@ -1567,7 +1567,8 @@ mod tests {
     }
 
     /// Hypersnap: an FID-0 escrow claim needs a valid authorization when it
-    /// arrives, and one claim for each escrow and nonce can be pending.
+    /// arrives, and one claim for each escrow and nonce can be pending. A claim
+    /// from gossip is not refused by the snapchain message checks.
     #[tokio::test]
     async fn test_hypersnap_fid0_messages_are_checked_and_deduplicated() {
         use crate::chain::shard0::auth::test_keys::{
@@ -1620,13 +1621,13 @@ mod tests {
             }
             unsigned_message(data(body))
         };
-        let add = |m: proto::Message| {
+        let add_from = |m: proto::Message, source: MempoolSource| {
             let tx = mempool_tx.clone();
             async move {
                 let (reply, rx) = oneshot::channel();
                 tx.send(MempoolRequest::AddMessage(
                     MempoolMessage::UserMessage(m),
-                    MempoolSource::Local,
+                    source,
                     Some(reply),
                 ))
                 .await
@@ -1634,6 +1635,7 @@ mod tests {
                 rx.await.unwrap()
             }
         };
+        let add = |m: proto::Message| add_from(m, MempoolSource::Local);
 
         assert!(add(claim(1, 2000, false)).await.is_ok());
         let dup = add(claim(1, 3000, false)).await.unwrap_err();
@@ -1641,6 +1643,13 @@ mod tests {
         assert!(add(claim(2, 2000, false)).await.is_ok());
         let bad = add(claim(3, 2000, true)).await.unwrap_err();
         assert_eq!(bad.code, "bad_request.validation_failure", "{}", bad);
+        let gossiped = claim(4, 2000, false);
+        assert!(crate::mempool::mempool::validate_gossiped_message(
+            &gossiped,
+            FarcasterNetwork::Devnet
+        )
+        .is_err());
+        assert!(add_from(gossiped, MempoolSource::Gossip).await.is_ok());
     }
 
     /// Hypersnap: IdRegistry events go to shard 0; StorageRegistry events
@@ -1748,5 +1757,80 @@ mod tests {
             "at_admission=false must skip the rate limiter so already-admitted \
              messages survive being re-validated on the way out of the buffer"
         );
+    }
+
+    async fn add_gossiped_message(
+        mempool_tx: &mpsc::Sender<MempoolRequest>,
+        message: proto::Message,
+    ) -> Result<(), crate::core::error::HubError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        mempool_tx
+            .send(MempoolRequest::AddMessage(
+                MempoolMessage::UserMessage(message),
+                MempoolSource::Gossip,
+                Some(reply_tx),
+            ))
+            .await
+            .unwrap();
+        reply_rx
+            .await
+            .expect("mempool dropped the reply; the mempool task has likely panicked")
+    }
+
+    #[tokio::test]
+    async fn test_malformed_gossiped_messages_are_rejected_without_stopping_the_mempool() {
+        let (
+            _,
+            _,
+            _,
+            mut mempool,
+            mempool_tx,
+            messages_request_tx,
+            _shard_decision_tx,
+            _block_decision_tx,
+            _,
+        ) = setup(None, false, 1).await;
+        tokio::spawn(async move {
+            mempool.run().await;
+        });
+
+        let mut no_data = create_cast_add(1234, "no data", None, None);
+        no_data.data = None;
+        no_data.data_bytes = None;
+
+        let mut short_hash = create_cast_add(1234, "short hash", None, None);
+        short_hash.hash.truncate(19);
+
+        let mut bad_signature = create_cast_add(1234, "bad signature", None, None);
+        bad_signature.signature[0] ^= 0xff;
+
+        for message in [no_data, short_hash, bad_signature] {
+            let error = add_gossiped_message(&mempool_tx, message)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "bad_request.validation_failure");
+        }
+        pull_message(&messages_request_tx, 1, None).await;
+
+        let valid = create_cast_add(1234, "valid", None, None);
+        add_gossiped_message(&mempool_tx, valid.clone())
+            .await
+            .unwrap();
+        pull_message(
+            &messages_request_tx,
+            1,
+            Some(MempoolMessage::UserMessage(valid)),
+        )
+        .await;
+    }
+
+    #[test]
+    fn test_mempool_key_does_not_panic_without_data() {
+        use crate::mempool::mempool::MessageMempoolExt;
+
+        let mut message = create_cast_add(1234, "no data", None, None);
+        message.data = None;
+        let key = message.mempool_key();
+        assert_eq!(key.identity(), message.hex_hash());
     }
 }
