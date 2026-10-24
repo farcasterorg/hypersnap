@@ -1,0 +1,29 @@
+[package]
+name = "hypersnap-wallet"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+description = "Hypersnap wallet: Falcon-512, Ed25519 and custody keys, signed message builders, and a node client"
+
+[[bin]]
+name = "hypersnap-wallet"
+path = "src/main.rs"
+
+[dependencies]
+hypersnap-messages = { path = "../hypersnap-messages" }
+hypersnap-proto = { path = "../../proto" }
+hypersnap-falcon = { path = "../hypersnap-falcon" }
+ed25519-dalek = "2.1.1"
+alloy-signer-local = "2.0"
+prost = "0.13.3"
+reqwest = "0.12.9"
+serde_json = "1.0"
+hex = "0.4.3"
+thiserror = "1.0"
+tokio = { version = "1.40.0", features = ["rt", "macros"] }
+rand = "0.8.5"
+clap = { version = "4.3.0", features = ["derive"] }
+
+[dev-dependencies]
+# rand_chacha 0.3 implements the rand_core 0.6 traits that fn-dsa 0.4 uses.
+rand_chacha = "0.3"

@@ -5,7 +5,6 @@ use super::account::{
 use crate::core::channel_uri::channel_registrar_for_network;
 use crate::core::error::HubError;
 use crate::core::util::FarcasterTime;
-use crate::hyper::StateContext;
 use crate::network::http_server::TierType;
 use crate::proto::{
     self, HubEvent, OnChainEvent, StorageLimit, StorageLimitsResponse, StorageUnitDetails,
@@ -22,6 +21,7 @@ use crate::storage::store::account::{
     StoreOptions, UsernameProofStore, UsernameProofStoreDef,
 };
 use crate::storage::store::shard::ShardStore;
+use crate::storage::store::state_context::StateContext;
 use crate::storage::trie::merkle_trie;
 use crate::storage::trie::merkle_trie::TrieKey;
 use crate::utils::statsd_wrapper::StatsdClientWrapper;
@@ -81,6 +81,9 @@ pub struct Stores {
     pub statsd: StatsdClientWrapper,
     prune_lock: Arc<RwLock<bool>>,
     pub network: proto::FarcasterNetwork,
+    /// After the pivot: no FID has a storage limit, and storage units are
+    /// not used (FIP-proof-of-work-tokenization §17.6 "Storage").
+    pub hypersnap_unbounded: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -171,6 +174,9 @@ impl Limits {
             | MessageType::ChannelPin
             | MessageType::ChannelModerate => StoreType::None,
             MessageType::None => StoreType::None,
+            // Hypersnap types live in shard-0 state, outside the snapchain
+            // per-store quotas.
+            _ => StoreType::None,
         }
     }
 
@@ -302,6 +308,7 @@ impl Stores {
             statsd: self.statsd.clone(),
             prune_lock: self.prune_lock.clone(),
             network: self.network,
+            hypersnap_unbounded: self.hypersnap_unbounded,
         }
     }
 }
@@ -438,6 +445,7 @@ impl Stores {
             network,
             statsd,
             prune_lock: Arc::new(RwLock::new(false)),
+            hypersnap_unbounded: false,
             block_event_store: BlockEventStore { db: db.clone() },
         }
     }
@@ -465,6 +473,12 @@ impl Stores {
         count_borrowed_storage: bool,
         pending_events: &[OnChainEvent],
     ) -> Result<StorageSlot, StoresError> {
+        if self.hypersnap_unbounded {
+            // Active for every FID. The engine does not prune in Hypersnap
+            // mode; the units only fill the usage report and fit a u32
+            // when multiplied by a store limit.
+            return Ok(StorageSlot::new(0, 0, 100_000, u32::MAX));
+        }
         let lent_storage = StorageLendStore::get_lent_storage(&self.storage_lend_store, fid)
             .map_err(|err| StoresError::StoreError {
                 inner: err,
@@ -555,6 +569,13 @@ impl Stores {
     }
 
     pub fn get_storage_limits(&self, fid: u64) -> Result<StorageLimitsResponse, StoresError> {
+        // Note: hyper-native FIDs (fid >= 2^63) have no per-FID storage
+        // units — the hyper trie retains messages unbounded and
+        // per-message fees are enforced through `HyperFeeBalance`, not
+        // through StorageRegistry-style provisioning. They fall through
+        // to the snapchain lookup below, which returns zero units.
+        // Snapchain mempool already rejects hyper-FID UserMessages, so
+        // this RPC result is informational only for that range.
         let txn_batch = &mut RocksDbTransactionBatch::new();
         let mut limits = vec![];
         let purchased_slot = self
@@ -775,6 +796,15 @@ impl Stores {
             *prune_lock = true;
         }
         let stop_height = self.get_next_height_by_timestamp(timestamp);
+        // A shadow-trie backfill replays events above its recorded height;
+        // keep them until the trie is live.
+        let stop_height = match (
+            stop_height,
+            crate::storage::trie::shadow_backfill::event_prune_floor(&self.db),
+        ) {
+            (Some(h), Some(floor)) => Some(h.min(floor)),
+            (h, _) => h,
+        };
 
         let page_options = page_options.unwrap_or(PageOptions {
             page_size: Some(PAGE_SIZE_MAX),

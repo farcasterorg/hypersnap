@@ -255,6 +255,9 @@ pub fn merge_key_add(
     let is_first_time_add = prior_record.is_none();
     if is_first_time_add {
         increment_gasless_key_count(db, txn_batch, fid)?;
+        // FIP §8.3 F0 reverse-index bump. Only on first-time-add
+        // (upserts don't grow the signer set for this user).
+        super::signer_auth_index::inc(db, txn_batch, verified.request_fid, fid)?;
     }
 
     let deleted_messages: Vec<proto::Message> =
@@ -381,6 +384,12 @@ pub fn merge_key_remove(
     // function guarantees this decrement corresponds to a real prior KEY_ADD; the counter stays
     // in sync with the number of distinct records on disk.
     decrement_gasless_key_count(db, txn_batch, fid)?;
+    // FIP §8.3 F0 reverse-index decrement, in lockstep with the
+    // per-FID count. The prior record carries the `request_fid`
+    // that was originally bumped on KEY_ADD, so we decrement the
+    // same `(request_fid, fid)` pair. When the count drops to
+    // zero, the entry is removed by the index helper.
+    super::signer_auth_index::dec(db, txn_batch, record.request_fid, fid)?;
 
     Ok(HubEvent::new_event(
         HubEventType::MergeMessage,

@@ -1,7 +1,7 @@
 use clap::Parser;
 use hex;
-use snapchain::proto::{message_data, Message, MessageType};
-use snapchain::utils::cli::follow_blocks;
+use hypersnap::proto::{message_data, Message, MessageType};
+use hypersnap::utils::cli::follow_blocks;
 use tokio::sync::mpsc;
 
 #[derive(Parser)]

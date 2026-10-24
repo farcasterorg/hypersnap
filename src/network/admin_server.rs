@@ -206,7 +206,13 @@ impl AdminService for MyAdminService {
         &self,
         request: Request<RetryOnchainEventsRequest>,
     ) -> std::result::Result<Response<Empty>, Status> {
-        info!("Received call to [retry_fname_events] RPC");
+        // F039 fix: this is an admin RPC; its sibling endpoints
+        // (`upload_snapshot`) already gate via `authenticate_request`.
+        // The gate was missing here and on `retry_fname_events` —
+        // any unauthenticated caller could trigger reindexing
+        // workloads (CPU/IO amplification DoS).
+        authenticate_request(&request, &self.allowed_users)?;
+        info!("Received call to [retry_onchain_events] RPC");
         match request.into_inner().kind {
             None => {}
             Some(kind) => match kind {
@@ -238,6 +244,9 @@ impl AdminService for MyAdminService {
         &self,
         request: Request<RetryFnameRequest>,
     ) -> std::result::Result<Response<Empty>, Status> {
+        // F039 fix: gate behind the same admin auth as sibling
+        // endpoints. See `retry_onchain_events` above.
+        authenticate_request(&request, &self.allowed_users)?;
         info!("Received call to [retry_fname_events] RPC");
 
         match request.into_inner().kind {

@@ -60,6 +60,8 @@ pub fn route_message(
         | MessageType::ChannelMember
         | MessageType::ChannelPin
         | MessageType::ChannelModerate => 0,
+        // All Hypersnap types are shard-0 state (FIP §14.2).
+        t if t.is_hypersnap() => 0,
         // Routing is a wall-clock convention on each node; consensus does not re-check it.
         // During the mixed V23 window, an in-flight verification routed to a data shard before
         // cutover can land in a post-cutover block, where the data shard's block-ts-gated arm
@@ -127,6 +129,21 @@ mod tests {
                     2,
                     EngineVersion::V23,
                 ),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn hypersnap_types_route_to_shard_zero() {
+        let router: Box<dyn MessageRouter> = Box::new(ShardRouter {});
+        for t in [
+            MessageType::TokenTransfer,
+            MessageType::CustodyMigration,
+            MessageType::NativeOnboard,
+        ] {
+            assert_eq!(
+                route_message(&router, &msg(t, 12345), 2, EngineVersion::latest()),
                 0
             );
         }

@@ -5,7 +5,7 @@ use super::{
     store::{CompactStateDetails, MergeContext, Store, StoreDef},
     MessagesPage, StoreEventHandler, PAGE_SIZE_MAX, TS_HASH_LENGTH,
 };
-use crate::hyper::StateContext;
+use crate::storage::store::state_context::StateContext;
 use crate::version::version::ProtocolFeature;
 use crate::{
     core::error::HubError,
@@ -550,7 +550,7 @@ impl StoreDef for LinkStore {
             return false;
         }
         let data = message.data.as_ref().unwrap();
-        message.signature_scheme == SignatureScheme::Ed25519 as i32
+        SignatureScheme::is_message_scheme(message.signature_scheme)
             && data.r#type == MessageType::LinkAdd as i32
             && data.body.is_some()
     }
@@ -561,7 +561,7 @@ impl StoreDef for LinkStore {
             return false;
         }
         let data = message.data.as_ref().unwrap();
-        message.signature_scheme == SignatureScheme::Ed25519 as i32
+        SignatureScheme::is_message_scheme(message.signature_scheme)
             && data.r#type == MessageType::LinkRemove as i32
             && data.body.is_some()
     }
@@ -572,7 +572,7 @@ impl StoreDef for LinkStore {
             return false;
         }
         let data = message.data.as_ref().unwrap();
-        message.signature_scheme == SignatureScheme::Ed25519 as i32
+        SignatureScheme::is_message_scheme(message.signature_scheme)
             && message.data.is_some()
             && data.r#type == MessageType::LinkCompactState as i32
             && data.body.is_some()

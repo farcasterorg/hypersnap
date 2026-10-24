@@ -34,9 +34,29 @@ services:
         [consensus]
         shard_ids = [1,2]
         num_shards = 2
+        # The content replay for the genesis state (FIP §17.4), in the
+        # background. Needs the shard chunks from the first one.
+        # content_replay = true
 
-        [hyper]
-        enabled = true
+        # After the epoch-1 pivot (FIP §17.5): the node stops at the fork
+        # block, and `restart: always` starts it again as a Hypersnap node.
+        [hypersnap]
+        genesis_validators_file = "/app/hypersnap/genesis_validators.pb"
+        # Hypersnap peers (the release sets them); never snapchain peers.
+        # bootstrap_peers = ""
+        # A validator: its Falcon-512 consensus key. Without one, the node follows.
+        # consensus_key_file = "/app/hypersnap/keys/consensus.falcon"
+        # A validator: its Falcon-512 node key, which answers DA challenges.
+        # node_key_file = "/app/hypersnap/keys/node.falcon"
+        # The relay worker's address, without the per-IP gRPC limit.
+        # rpc_exempt_ips = []
+        prune_pre_pivot_history = false
+        # Keep about the last N epochs of blocks (0 keeps all; at least 2).
+        prune_block_history_epochs = 0
+        # An Optimism RPC URL: record the IdRegistry Recover logs before the
+        # pivot (EXEMPT_RECOVERIES, FIP §2).
+        # recovery_watcher_rpc_url = ""
+
 
         [api]
         enabled = true
@@ -87,12 +107,38 @@ services:
       - .rocks:/app/.rocks
       - .rocks.snapshot:/app/.rocks.snapshot
       - ./validators.toml:/app/validators.toml:ro
+      # The genesis validator file and the consensus key (FIP §17.3).
+      - ./hypersnap:/app/hypersnap:ro
     networks:
       - hypersnap
     ulimits:
       nofile:
         soft: 65535
         hard: 65535
+
+  # The relay worker between snapchain and Hypersnap (FIP Appendix A), after
+  # the pivot. Start it with `docker compose --profile relay up -d relay`.
+  relay:
+    image: farcasterorg/hypersnap:latest
+    profiles: ["relay"]
+    init: true
+    entrypoint: ["./hypersnap-relay"]
+    environment:
+      HYPERSNAP_RELAY_NETWORK: "mainnet"
+      HYPERSNAP_RELAY_SNAPCHAIN_ENDPOINTS: '${RELAY_SNAPCHAIN_ENDPOINTS:-["https://snap.farcaster.xyz:3383"]}'
+      HYPERSNAP_RELAY_HYPERSNAP_ENDPOINTS: '["http://hypersnap:3383"]'
+      HYPERSNAP_RELAY_STATE_DIR: "/data"
+      # Under the 120/min per-IP limit of a node that does not exempt the relay.
+      HYPERSNAP_RELAY_RATE_LIMITS__SNAPCHAIN_RPCS_PER_MINUTE: "100"
+      HYPERSNAP_RELAY_RATE_LIMITS__HYPERSNAP_RPCS_PER_MINUTE: "100"
+    restart: unless-stopped
+    depends_on:
+      hypersnap:
+        condition: service_started
+    volumes:
+      - .relay:/data
+    networks:
+      - hypersnap
 
   # Start this if you want perf metrics for your hubble node. Remember to start `grafana` as well.
   statsd:

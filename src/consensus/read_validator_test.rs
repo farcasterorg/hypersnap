@@ -66,6 +66,7 @@ mod tests {
             statsd_client: test_helper::statsd_client(),
             validator_sets: StoredValidatorSets::new(read_node_engine.shard_id(), validator_sets),
             system_tx,
+            pivot_guard: None,
         };
 
         (
@@ -162,6 +163,90 @@ mod tests {
             Ok(SystemMessage::ExitWithError { .. }) => (),
             _ => panic!("Expected ExitWithError system message"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_pivot_guard_holds_unwitnessed_chunks() {
+        use crate::consensus::pivot_guard::PivotGuard;
+        use crate::storage::db::RocksDB;
+        use crate::storage::store::block::BlockStore;
+        use std::sync::Arc;
+
+        let (
+            mut proposer_engine,
+            read_node_engine,
+            mut read_validator,
+            proposer_keypair,
+            mut system_rx,
+        ) = setup(0).await;
+        read_validator.max_num_buffered_blocks = 10;
+        let shard_id = read_node_engine.shard_id();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = RocksDB::new(dir.path().join("blocks").to_str().unwrap());
+        db.open().unwrap();
+        let blocks = BlockStore::new(Arc::new(db));
+
+        read_validator.pivot_guard = Some(PivotGuard::new(1_000, blocks.clone(), vec![shard_id]));
+
+        let witness_block = |block_number: u64, chunk_height: u64| proto::Block {
+            header: Some(proto::BlockHeader {
+                height: Some(Height::new(0, block_number)),
+                ..Default::default()
+            }),
+            hash: vec![block_number as u8; 32],
+            shard_witness: Some(proto::ShardWitness {
+                shard_chunk_witnesses: vec![proto::ShardChunkWitness {
+                    height: Some(Height::new(shard_id, chunk_height)),
+                    shard_root: vec![],
+                    shard_hash: vec![chunk_height as u8; 32],
+                }],
+            }),
+            ..Default::default()
+        };
+
+        let chunk1 = commit_shard_chunk(&mut proposer_engine, &proposer_keypair).await;
+        let chunk2 = commit_shard_chunk(&mut proposer_engine, &proposer_keypair).await;
+
+        // Nothing witnessed: the chunk is held, not committed or dropped.
+        assert_eq!(process_decided_value(&mut read_validator, &chunk1).await, 0);
+        assert_eq!(read_validator.buffered_blocks.len(), 1);
+        assert_eq!(read_node_engine.get_confirmed_height().block_number, 0);
+
+        // Shard 0 witnesses chunk 1. The next decided value retries the buffer:
+        // chunk 1 commits, chunk 2 stays held.
+        blocks.put_block(&witness_block(5, 1)).unwrap();
+        assert_eq!(process_decided_value(&mut read_validator, &chunk2).await, 1);
+        assert_eq!(read_validator.last_height.block_number, 1);
+        assert_eq!(read_validator.buffered_blocks.len(), 1);
+
+        // Shard 0 witnesses chunk 2. A duplicate of an old value retries too.
+        blocks.put_block(&witness_block(6, 2)).unwrap();
+        assert_eq!(process_decided_value(&mut read_validator, &chunk1).await, 1);
+        assert_eq!(read_validator.last_height.block_number, 2);
+        assert!(read_validator.buffered_blocks.is_empty());
+        assert_eq!(read_node_engine.get_confirmed_height().block_number, 2);
+        assert!(system_rx.try_recv().is_err(), "no fork block yet");
+
+        // The fork block (PIVOT_HEIGHT − 1) witnesses chunk 3. Chunk 4 is
+        // held for good; chunk 3 is the last one, and its commit writes the
+        // marker and stops the process.
+        let chunk3 = commit_shard_chunk(&mut proposer_engine, &proposer_keypair).await;
+        let chunk4 = commit_shard_chunk(&mut proposer_engine, &proposer_keypair).await;
+        blocks.put_block(&witness_block(999, 3)).unwrap();
+        assert_eq!(process_decided_value(&mut read_validator, &chunk4).await, 0);
+        assert_eq!(process_decided_value(&mut read_validator, &chunk3).await, 1);
+        assert_eq!(read_node_engine.get_confirmed_height().block_number, 3);
+        match system_rx.try_recv() {
+            Ok(SystemMessage::ExitWithError(_)) => {}
+            _ => panic!("expected the pivot exit"),
+        }
+        let marker = crate::consensus::pivot_guard::read_marker(&blocks.db).expect("marker");
+        assert_eq!(marker.pivot_height, 1_000);
+        assert_eq!(marker.fork_block_hash, vec![231u8; 32]);
+        assert_eq!(marker.shard_forks.len(), 1);
+        assert_eq!(marker.shard_forks[0].fork_height, 3);
+        assert_eq!(marker.shard_forks[0].chunk_hash, vec![3u8; 32]);
     }
 
     #[tokio::test]

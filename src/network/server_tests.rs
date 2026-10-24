@@ -6635,6 +6635,189 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_hypersnap_certified_block_rpcs() {
+        use crate::chain::shard_blocks::HypersnapBlockStore;
+        use crate::network::hypersnap_rpc::NodeRpc;
+        let (stores, _senders, _engines, _block_engine, service, _s, _b) =
+            make_server(None, None).await;
+        // A snapchain node does not serve them.
+        let err = service
+            .get_pivot_record(Request::new(proto::GetPivotRecordRequest {}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+
+        let store = HypersnapBlockStore::new(stores[&1].db.clone());
+        for height in 5..8u64 {
+            store
+                .put(&proto::HypersnapBlock {
+                    header: Some(proto::HypersnapBlockHeader {
+                        shard_id: 1,
+                        height,
+                        ..Default::default()
+                    }),
+                    hash: vec![height as u8; 32],
+                    certificate: Some(proto::CommitCertificate {
+                        shard_id: 1,
+                        height,
+                        block_hash: vec![height as u8; 32],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let record = proto::PivotRecord {
+            pivot_height: 100,
+            snapchain_engine_version: crate::version::version::EngineVersion::latest() as u32,
+            ..Default::default()
+        };
+        let (decided, _) = broadcast::channel(8);
+        let service = service.with_hypersnap(Arc::new(NodeRpc {
+            pivot: record.clone(),
+            shards: [(1u32, (store, 5u64))].into_iter().collect(),
+            decided,
+            shard0: None,
+        }));
+
+        let got = service
+            .get_pivot_record(Request::new(proto::GetPivotRecordRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(got, record);
+
+        let stream = service
+            .get_certified_blocks(Request::new(proto::CertifiedBlocksRequest {
+                shard_id: 1,
+                start_height: 5,
+                stop_height: Some(7),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let heights: Vec<u64> = stream
+            .map(|b| b.unwrap().header.unwrap().height)
+            .collect()
+            .await;
+        assert_eq!(heights, vec![5, 6]);
+
+        let mut early = service
+            .get_certified_blocks(Request::new(proto::CertifiedBlocksRequest {
+                shard_id: 1,
+                start_height: 4,
+                stop_height: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            early.next().await.unwrap().unwrap_err().code(),
+            tonic::Code::OutOfRange
+        );
+
+        // GetInfo reports the certified tip.
+        let info = service
+            .get_info(Request::new(proto::GetInfoRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        let shard1 = info.shard_infos.iter().find(|i| i.shard_id == 1).unwrap();
+        assert_eq!(shard1.max_height, 7);
+    }
+
+    #[tokio::test]
+    async fn test_hypersnap_submit_checks_shard0_messages() {
+        use crate::chain::shard0::auth::test_keys::{falcon, falcon_message};
+        use crate::chain::shard0::engine::Shard0Engine;
+        use crate::chain::shard0::test_support::{genesis_parent, params, Genesis, T0};
+        use crate::network::hypersnap_rpc::NodeRpc;
+        let (_stores, _senders, _engines, _block_engine, service, _s, _b) =
+            make_server(None, None).await;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Arc::new(RocksDB::new(dir.path().join("shard0").to_str().unwrap()));
+        db.open().unwrap();
+        Genesis::new(1).write(&db, &params());
+        let engine = Shard0Engine::new(db, params(), genesis_parent()).unwrap();
+
+        let message = |fid: u64, t: proto::MessageType, body: proto::message_data::Body| {
+            falcon_message(
+                &falcon(3),
+                proto::MessageData {
+                    r#type: t as i32,
+                    fid,
+                    timestamp: (T0 + 10) as u32,
+                    network: proto::FarcasterNetwork::Devnet as i32,
+                    body: Some(body),
+                },
+            )
+        };
+        // A transfer from an FID with no account key on shard 0.
+        let transfer = message(
+            1000,
+            proto::MessageType::TokenTransfer,
+            proto::message_data::Body::TokenTransferBody(proto::TokenTransferBody {
+                recipient_fid: 2000,
+                amount: 1,
+                nonce: 1,
+                memo: vec![],
+            }),
+        );
+        // An escrow claim has FID 0.
+        let claim = message(
+            0,
+            proto::MessageType::TokenEscrowClaim,
+            proto::message_data::Body::TokenEscrowClaimBody(Default::default()),
+        );
+        let now = crate::core::util::FarcasterTime::current().to_u64();
+        let expected: Vec<String> = engine
+            .simulate_messages(&[transfer.clone()], now)
+            .into_iter()
+            .chain(engine.simulate_messages(&[claim.clone()], now))
+            .map(|r| crate::network::hypersnap_rpc::shard0_error(r.unwrap_err()).message)
+            .collect();
+
+        let (decided, _) = broadcast::channel(8);
+        let service = service.with_hypersnap(Arc::new(NodeRpc {
+            pivot: proto::PivotRecord {
+                snapchain_engine_version: crate::version::version::EngineVersion::latest() as u32,
+                ..Default::default()
+            },
+            shards: Default::default(),
+            decided,
+            shard0: Some(std::sync::Mutex::new(engine)),
+        }));
+
+        for (m, reason) in [(&transfer, &expected[0]), (&claim, &expected[1])] {
+            let err = submit_message(&service, m.clone()).await.unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+            assert_eq!(
+                err.message(),
+                format!("bad_request.validation_failure/{}", reason),
+                "the shard-0 engine's reason"
+            );
+            assert_eq!(
+                err.metadata().get("x-err-code").unwrap(),
+                "bad_request.validation_failure"
+            );
+        }
+
+        // Bulk submit checks shard-0 messages too.
+        let response = submit_bulk_messages(&service, vec![transfer.clone()])
+            .await
+            .unwrap()
+            .into_inner();
+        match &response.messages[0].response {
+            Some(proto::bulk_message_response::Response::MessageError(e)) => {
+                assert_eq!(e.err_code, "bad_request.validation_failure");
+                assert_eq!(&e.message, &expected[0]);
+            }
+            other => panic!("{:?}", other),
+        }
+    }
+
+    #[tokio::test]
     async fn test_get_info() {
         let (
             _stores,

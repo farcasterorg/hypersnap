@@ -8,11 +8,11 @@ use super::{
 };
 use crate::core::error::HubError;
 use crate::core::message::HubEventExt;
-use crate::hyper::StateContext;
 use crate::proto::{
     hub_event, HubEvent, HubEventType, MergeMessageBody, PruneMessageBody, RevokeMessageBody,
 };
 use crate::storage::db::PageOptions;
+use crate::storage::store::state_context::StateContext;
 use crate::storage::util::increment_vec_u8;
 use crate::version::version::{EngineVersion, ProtocolFeature};
 use crate::{
@@ -530,6 +530,16 @@ impl<T: StoreDef + Clone> Store<T> {
         }
     }
 
+    pub fn with_store_def(&self, store_def: T) -> Store<T> {
+        Store {
+            store_def,
+            store_event_handler: self.store_event_handler.clone(),
+            db: self.db.clone(),
+            store_opts: self.store_opts.clone(),
+            state_context: self.state_context,
+        }
+    }
+
     pub fn state_context(&self) -> StateContext {
         self.state_context
     }
@@ -860,6 +870,34 @@ impl<T: StoreDef + Clone> Store<T> {
         }
 
         Ok(())
+    }
+
+    /// The records that the store keeps for `message` when it is in the
+    /// store: the record of the message, its add or remove key, and the
+    /// secondary indexes (what a merge writes, without the conflict checks).
+    pub fn put_message_records(
+        &self,
+        txn: &mut RocksDbTransactionBatch,
+        message: &Message,
+    ) -> Result<(), HubError> {
+        if self.store_def.compact_state_type_supported()
+            && self.store_def.is_compact_state_type(message)
+        {
+            return self.put_add_compact_state_transaction(txn, message);
+        }
+        let ts_hash = make_ts_hash(message.data.as_ref().unwrap().timestamp, &message.hash)?;
+        if self.store_def.is_add_type(message) {
+            // The channel-follow rows are outside the state trie, so the
+            // store walk does not rebuild them.
+            self.put_add_transaction(txn, &ts_hash, message, FollowIndexGate::Skip)
+        } else if self.store_def.remove_type_supported() && self.store_def.is_remove_type(message) {
+            self.put_remove_transaction(txn, &ts_hash, message)
+        } else {
+            Err(HubError {
+                code: "bad_request.validation_failure".to_string(),
+                message: "invalid message type".to_string(),
+            })
+        }
     }
 
     /// Load the message a selector key points at. A selector whose message is missing is a

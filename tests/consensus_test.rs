@@ -1,46 +1,46 @@
 use ed25519_dalek::SigningKey;
 use hex;
+use hypersnap::connectors::onchain_events::{Chain, ChainAPI, ChainClients, EnsError};
+use hypersnap::consensus::consensus::{SystemMessage, ValidatorSetConfig};
+use hypersnap::consensus::proposer::GENESIS_MESSAGE;
+use hypersnap::core::types::SnapchainValidatorContext;
+use hypersnap::core::util::FarcasterTime;
+use hypersnap::core::validations::error::ValidationError;
+use hypersnap::core::validations::verification::VerificationAddressClaim;
+use hypersnap::mempool::block_receiver::{self, BlockReceiver};
+use hypersnap::mempool::l1_gate::{self, GossipL1Gate};
+use hypersnap::mempool::l1_validator::L1Validator;
+use hypersnap::mempool::mempool::{
+    self, Mempool, MempoolMessagesRequest, MempoolRequest, MempoolSource, ReadNodeMempool,
+};
+use hypersnap::mempool::routing::{self, MessageRouter, ShardRouter};
+use hypersnap::network::gossip::{GossipEvent, SnapchainGossip};
+use hypersnap::network::server::MyHubService;
+use hypersnap::node::snapchain_node::SnapchainNode;
+use hypersnap::node::snapchain_read_node::SnapchainReadNode;
+use hypersnap::proto::hub_service_client::HubServiceClient;
+use hypersnap::proto::hub_service_server::HubServiceServer;
+use hypersnap::proto::{self, CastId, Height, HubEventType, SubscribeRequest, UserDataRequest};
+use hypersnap::proto::{
+    Block, FarcasterNetwork, IdRegisterEventType, MessageType, SignerEventType,
+};
+use hypersnap::storage::db::{PageOptions, RocksDB, RocksDbTransactionBatch};
+use hypersnap::storage::store::account::{
+    get_gasless_key_record, CastStore, OnchainEventStore, UserDataStore, VerificationStore,
+};
+use hypersnap::storage::store::block_engine::BlockStores;
+use hypersnap::storage::store::mempool_poller::MempoolMessage;
+use hypersnap::storage::store::node_local_state::LocalStateStore;
+use hypersnap::storage::store::stores::Stores;
+use hypersnap::storage::trie::merkle_trie::{self, TrieKey};
+use hypersnap::utils::factory::{self, messages_factory};
+use hypersnap::utils::statsd_wrapper::StatsdClientWrapper;
+use hypersnap::version::version::{EngineVersion, VersionSchedule};
 use informalsystems_malachitebft_metrics::SharedRegistry;
 use libp2p::identity::ed25519::Keypair;
 use libp2p::PeerId;
 use parking_lot::Mutex;
 use serial_test::serial;
-use snapchain::connectors::onchain_events::{Chain, ChainAPI, ChainClients, EnsError};
-use snapchain::consensus::consensus::{SystemMessage, ValidatorSetConfig};
-use snapchain::consensus::proposer::GENESIS_MESSAGE;
-use snapchain::core::types::SnapchainValidatorContext;
-use snapchain::core::util::FarcasterTime;
-use snapchain::core::validations::error::ValidationError;
-use snapchain::core::validations::verification::VerificationAddressClaim;
-use snapchain::mempool::block_receiver::{self, BlockReceiver};
-use snapchain::mempool::l1_gate::{self, GossipL1Gate};
-use snapchain::mempool::l1_validator::L1Validator;
-use snapchain::mempool::mempool::{
-    self, Mempool, MempoolMessagesRequest, MempoolRequest, MempoolSource, ReadNodeMempool,
-};
-use snapchain::mempool::routing::{self, MessageRouter, ShardRouter};
-use snapchain::network::gossip::{GossipEvent, SnapchainGossip};
-use snapchain::network::server::MyHubService;
-use snapchain::node::snapchain_node::SnapchainNode;
-use snapchain::node::snapchain_read_node::SnapchainReadNode;
-use snapchain::proto::hub_service_client::HubServiceClient;
-use snapchain::proto::hub_service_server::HubServiceServer;
-use snapchain::proto::{self, CastId, Height, HubEventType, SubscribeRequest, UserDataRequest};
-use snapchain::proto::{
-    Block, FarcasterNetwork, IdRegisterEventType, MessageType, SignerEventType,
-};
-use snapchain::storage::db::{PageOptions, RocksDB, RocksDbTransactionBatch};
-use snapchain::storage::store::account::{
-    get_gasless_key_record, CastStore, OnchainEventStore, UserDataStore, VerificationStore,
-};
-use snapchain::storage::store::block_engine::BlockStores;
-use snapchain::storage::store::mempool_poller::MempoolMessage;
-use snapchain::storage::store::node_local_state::LocalStateStore;
-use snapchain::storage::store::stores::Stores;
-use snapchain::storage::trie::merkle_trie::{self, TrieKey};
-use snapchain::utils::factory::{self, messages_factory};
-use snapchain::utils::statsd_wrapper::StatsdClientWrapper;
-use snapchain::version::version::{EngineVersion, VersionSchedule};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, LazyLock};
@@ -367,9 +367,9 @@ impl ReadNodeForTest {
         );
 
         let config =
-            snapchain::network::gossip::Config::new(gossip_address.clone(), bootstrap_address);
+            hypersnap::network::gossip::Config::new(gossip_address.clone(), bootstrap_address);
 
-        let mut consensus_config = snapchain::consensus::consensus::Config::default();
+        let mut consensus_config = hypersnap::consensus::consensus::Config::default();
         consensus_config =
             consensus_config.with((1..=num_shards).collect(), validator_sets.clone());
 
@@ -466,7 +466,7 @@ impl ReadNodeForTest {
                                 Some(proto::decided_value::Value::Shard(chunk)) => {
                                     Some(chunk.hash.clone())
                                 }
-                                None => None,
+                                Some(proto::decided_value::Value::HypersnapBlock(_)) | None => None,
                             };
                             if let Some(hash) = hash {
                                 decided_value_hashes_for_dispatch.lock().insert(hash);
@@ -523,7 +523,7 @@ impl ReadNodeForTest {
     pub async fn submit_message_via_mempool(
         &self,
         message: proto::Message,
-    ) -> Result<(), snapchain::core::error::HubError> {
+    ) -> Result<(), hypersnap::core::error::HubError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.mempool_tx
             .send(MempoolRequest::AddMessage(
@@ -564,13 +564,13 @@ impl NodeForTest {
             true,
         );
         let mut config =
-            snapchain::network::gossip::Config::new(gossip_address.clone(), bootstrap_address)
+            hypersnap::network::gossip::Config::new(gossip_address.clone(), bootstrap_address)
                 .with_announce_address(gossip_address);
         if let Some(direct) = direct_peers {
             config = config.with_direct_peers(direct);
         }
 
-        let mut consensus_config = snapchain::consensus::consensus::Config::default();
+        let mut consensus_config = hypersnap::consensus::consensus::Config::default();
         consensus_config =
             consensus_config.with((1..=num_shards).collect(), validator_sets.clone());
         consensus_config.block_time = time::Duration::from_millis(250);
@@ -859,7 +859,7 @@ impl NodeForTest {
         &self,
         message: MempoolMessage,
         source: MempoolSource,
-        rx: Option<tokio::sync::oneshot::Sender<Result<(), snapchain::core::error::HubError>>>,
+        rx: Option<tokio::sync::oneshot::Sender<Result<(), hypersnap::core::error::HubError>>>,
     ) -> Result<(), mpsc::error::SendError<MempoolRequest>> {
         self.mempool_tx
             .send(MempoolRequest::AddMessage(message, source, rx))
@@ -2771,7 +2771,7 @@ async fn test_validator_set_rotation() {
 #[tokio::test]
 #[serial]
 async fn test_http_server_smoke() {
-    use snapchain::network::http_server::{
+    use hypersnap::network::http_server::{
         spawn_http_server, Config as HttpConfig, HubHttpServiceImpl,
     };
 
@@ -2799,7 +2799,7 @@ async fn test_http_server_smoke() {
         listener,
         http_service,
         HttpConfig::default(),
-        std::sync::Arc::new(snapchain::network::mesh::nodes::NodeRegistry::builtin()),
+        std::sync::Arc::new(hypersnap::network::mesh::nodes::NodeRegistry::builtin()),
     );
 
     // Tiny settle delay so the spawned accept loop is ready before the first request.
@@ -3588,7 +3588,7 @@ impl RoguePeer {
         );
         let mut gossip = SnapchainGossip::create(
             Keypair::generate(),
-            &snapchain::network::gossip::Config::new(address, bootstrap),
+            &hypersnap::network::gossip::Config::new(address, bootstrap),
             None,
             true,
             FarcasterNetwork::Devnet,
@@ -4162,7 +4162,7 @@ async fn test_malformed_decided_values_do_not_stall_the_read_node() {
         .filter_map(|v| match &v.value {
             Some(proto::decided_value::Value::Block(block)) => Some(block.hash.clone()),
             Some(proto::decided_value::Value::Shard(chunk)) => Some(chunk.hash.clone()),
-            None => None,
+            Some(proto::decided_value::Value::HypersnapBlock(_)) | None => None,
         })
         .collect();
     let read_node = &network.read_nodes[0];

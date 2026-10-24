@@ -209,7 +209,7 @@ impl MetricsIndexer {
         let router = ShardRouter {};
 
         for (&shard_id, stores) in hyper_stores {
-            let Some(max_fid) = crate::hyper::reconcile::max_registered_fid(stores) else {
+            let Some(max_fid) = crate::storage::store::reconcile::max_registered_fid(stores) else {
                 continue;
             };
             let mut txn = RocksDbTransactionBatch::new();

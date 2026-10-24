@@ -1,7 +1,9 @@
 pub mod admin_server;
 pub mod gossip;
 pub mod http_server;
+pub mod hypersnap_rpc;
 pub mod mesh;
+pub mod rate_limit;
 pub mod replication;
 pub mod rpc_extensions;
 pub mod server;

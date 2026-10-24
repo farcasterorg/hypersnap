@@ -212,6 +212,14 @@ impl NotificationSendHandler {
         let Some(sg) = self.social_graph.as_ref() else {
             return Err("following_fid filter requires social_graph indexing to be enabled".into());
         };
+        // F157: cap the per-request follower enumeration. Without
+        // this, a single `following_fid` referencing a megaphone
+        // account (millions of followers) materializes the whole
+        // set in a `HashSet<u64>` and pins the consensus-shared
+        // RocksDB for the duration. The cap bounds heap + CPU per
+        // call; oversize follower sets are truncated with the cap
+        // count and the caller can re-issue with `target_fids`.
+        const MAX_FOLLOWERS_PER_FILTER: usize = 50_000;
         let mut all = Vec::new();
         let mut cursor: Option<u64> = None;
         loop {
@@ -219,6 +227,10 @@ impl NotificationSendHandler {
                 .get_followers(fid, cursor, 1_000)
                 .map_err(|e| format!("social_graph error: {e:?}"))?;
             all.extend(page);
+            if all.len() >= MAX_FOLLOWERS_PER_FILTER {
+                all.truncate(MAX_FOLLOWERS_PER_FILTER);
+                break;
+            }
             match next {
                 Some(c) => cursor = Some(c),
                 None => break,
@@ -285,14 +297,15 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 async fn read_body(body: hyper::body::Incoming) -> Result<Bytes, String> {
-    let collected = body
+    // F030: cap the body at the transport layer with `Limited` so a
+    // huge POST errors out at the cap instead of being buffered into
+    // memory and only rejected after.
+    let limited = http_body_util::Limited::new(body, MAX_BODY_BYTES);
+    let collected = limited
         .collect()
         .await
-        .map_err(|e| format!("failed to read body: {e}"))?
+        .map_err(|e| format!("body too large or read error: {e}"))?
         .to_bytes();
-    if collected.len() > MAX_BODY_BYTES {
-        return Err(format!("body exceeds {} bytes", MAX_BODY_BYTES));
-    }
     Ok(collected)
 }
 

@@ -6,6 +6,7 @@ import "hub_event.proto";
 import "username_proof.proto";
 import "onchain_event.proto";
 import "request_response.proto";
+import "hypersnap.proto";
 
 service HubService {
   // Write API
@@ -20,6 +21,12 @@ service HubService {
   rpc GetShardChunks(ShardChunksRequest) returns (ShardChunksResponse);
 
   rpc GetInfo(GetInfoRequest) returns (GetInfoResponse);
+  // Shadow Keccak trie roots of the local shards (plan R0, diagnostic).
+  rpc GetShadowRoots(GetShadowRootsRequest) returns (GetShadowRootsResponse);
+  // Hypersnap nodes after the pivot (FIP Appendix A); other nodes return
+  // UNIMPLEMENTED.
+  rpc GetCertifiedBlocks(CertifiedBlocksRequest) returns (stream HypersnapBlock);
+  rpc GetPivotRecord(GetPivotRecordRequest) returns (PivotRecord);
   rpc GetFids(FidsRequest) returns (FidsResponse);
   rpc GetConnectedPeers(GetConnectedPeersRequest) returns (GetConnectedPeersResponse);
   // Mesh health & topology: this node's local view of the gossip mesh. Admin-gated.

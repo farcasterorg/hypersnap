@@ -20,10 +20,10 @@ use fancy_regex::Regex;
 use prost::Message;
 use std::sync::LazyLock;
 
-const MAX_DATA_BYTES: usize = 2048;
-const MAX_DATA_BYTES_FOR_10K_CAST: usize = 16_384;
-const MAX_DATA_BYTES_FOR_LINK_COMPACT: usize = 65536;
-const MAX_DATA_BYTES_FOR_USERNAME_PROOF: usize = 16_384;
+pub(crate) const MAX_DATA_BYTES: usize = 2048;
+pub(crate) const MAX_DATA_BYTES_FOR_10K_CAST: usize = 16_384;
+pub(crate) const MAX_DATA_BYTES_FOR_LINK_COMPACT: usize = 65536;
+pub(crate) const MAX_DATA_BYTES_FOR_USERNAME_PROOF: usize = 16_384;
 const EMBEDS_V1_CUTOFF: u32 = 73612800;
 const TWITTER_USERNAME_REGEX: &str = "^[a-z0-9_]{0,15}$";
 const FNAME_REGEX: &str = "^[a-z0-9][a-z0-9-]{0,15}$";
@@ -105,6 +105,27 @@ pub fn validate_message(
     block_timestamp: &FarcasterTime,
     version: EngineVersion,
 ) -> Result<(), ValidationError> {
+    validate_message_with(
+        message,
+        current_network,
+        is_pro_user,
+        block_timestamp,
+        version,
+        true,
+    )
+}
+
+/// `validate_message` with the Ed25519 signature check optional: after the
+/// pivot, a message of a migrated FID has a Falcon-512 or dual signature,
+/// which the caller verified against the shard-0 records (FIP §16.8).
+pub fn validate_message_with(
+    message: &proto::Message,
+    current_network: proto::FarcasterNetwork,
+    is_pro_user: bool,
+    block_timestamp: &FarcasterTime,
+    version: EngineVersion,
+    check_ed25519_signature: bool,
+) -> Result<(), ValidationError> {
     let data_bytes;
     let mut message_data;
     if message.data_bytes.is_some() {
@@ -167,12 +188,14 @@ pub fn validate_message(
     }
 
     validate_message_hash(message.hash_scheme, &data_bytes, &message.hash)?;
-    validate_signature(
-        message.signature_scheme,
-        &message.hash,
-        &message.signature,
-        &message.signer,
-    )?;
+    if check_ed25519_signature {
+        validate_signature(
+            message.signature_scheme,
+            &message.hash,
+            &message.signature,
+            &message.signer,
+        )?;
+    }
     validate_timestamp(message_data.timestamp, block_timestamp, version)?;
 
     match &message_data.body {
@@ -275,6 +298,9 @@ pub fn validate_message(
             }
             validate_channel_moderate_body(&body)?;
         }
+        // Hypersnap bodies are not snapchain messages. The shard-0 engine
+        // validates them after the pivot (FIP §14); here they are invalid.
+        Some(_) => return Err(ValidationError::InvalidMessageType),
         None => {}
     }
 

@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.env
+.env.local
+src/bytecode.ts
+src/abis.ts
+*.log

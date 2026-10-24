@@ -648,14 +648,15 @@ impl std::fmt::Display for AuthHeaderError {
 }
 
 async fn read_body(body: hyper::body::Incoming) -> Result<Bytes, String> {
-    let collected = body
+    // F030: stream the body through `Limited` so it errors out at the
+    // cap rather than buffering the full payload before checking the
+    // size post-hoc. An anonymous 10 GB POST no longer OOMs the node.
+    let limited = http_body_util::Limited::new(body, MAX_BODY_BYTES);
+    let collected = limited
         .collect()
         .await
-        .map_err(|e| format!("failed to read body: {e}"))?
+        .map_err(|e| format!("body too large or read error: {e}"))?
         .to_bytes();
-    if collected.len() > MAX_BODY_BYTES {
-        return Err(format!("body exceeds {} bytes", MAX_BODY_BYTES));
-    }
     Ok(collected)
 }
 

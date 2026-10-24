@@ -3,13 +3,14 @@ syntax = "proto3";
 import "message.proto";
 import "blocks.proto";
 import "request_response.proto";
-import "hyper.proto";
+import "hypersnap.proto";
 
 message ContactInfo {
   ContactInfoBody body = 1;
 }
 
 message GossipMessage {
+  reserved 7, 8;
   oneof gossip_message {
     ConsensusMessage consensus = 1;
     FullProposal full_proposal = 2;
@@ -17,6 +18,15 @@ message GossipMessage {
     StatusMessage status = 4;
     ReadNodeMessage read_node_message = 5;
     ContactInfo contact_info_message = 6;
-    HyperEnvelope hyper_envelope = 7;
+    // Hypersnap `membership` topic (FIP §4.6, §4.10).
+    ValidatorTransitionAlert transition_alert = 9;
+    // Hypersnap mempool topics (FIP §4.10): the mempool messages of a
+    // node, many in one gossip message.
+    MempoolBatch mempool_batch = 10;
   }
 }
+
+message MempoolBatch {
+  repeated MempoolMessage messages = 1;
+}
+

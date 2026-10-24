@@ -22,14 +22,14 @@
 //!     cargo test --test conformance_test generate_corpus -- --ignored --nocapture
 
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
+use hypersnap::core::util::{calculate_message_hash, FarcasterTime};
+use hypersnap::proto::{self, MessageType, ReactionType};
+use hypersnap::storage::store::engine::ShardEngine;
+use hypersnap::storage::store::test_helper;
+use hypersnap::utils::factory::messages_factory;
 use prost::Message as _;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use snapchain::core::util::{calculate_message_hash, FarcasterTime};
-use snapchain::proto::{self, MessageType, ReactionType};
-use snapchain::storage::store::engine::ShardEngine;
-use snapchain::storage::store::test_helper;
-use snapchain::utils::factory::messages_factory;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -471,7 +471,7 @@ async fn new_engine_on(network: proto::FarcasterNetwork) -> (ShardEngine, tempfi
 /// non-reproducible. We pin the tx hashes to fixed values; the random block number/timestamp/payer
 /// fields live only in the event *value* and do not affect the root.
 async fn register_user_deterministic(engine: &mut ShardEngine, fid: u64) {
-    use snapchain::utils::factory::events_factory;
+    use hypersnap::utils::factory::events_factory;
 
     let mut storage = test_helper::default_storage_event(fid);
     storage.transaction_hash = vec![0xa1; 32];
@@ -769,7 +769,7 @@ async fn generate_corpus() {
         corpus_version: CORPUS_VERSION,
         protocol: ProtocolPin {
             network: format!("{:?}", CORPUS_NETWORK),
-            engine_version: format!("{:?}", snapchain::version::version::EngineVersion::latest()),
+            engine_version: format!("{:?}", hypersnap::version::version::EngineVersion::latest()),
         },
         vectors: entries,
     };

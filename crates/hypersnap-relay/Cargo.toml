@@ -1,0 +1,42 @@
+[package]
+name = "hypersnap-relay"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+publish = false
+description = "Hypersnap <-> snapchain relay worker (FIP-proof-of-work-tokenization Appendix A)"
+
+[lib]
+name = "hypersnap_relay"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hypersnap-relay"
+path = "src/main.rs"
+
+
+[dependencies]
+hypersnap-proto = { path = "../../proto" }
+tonic = { version = "0.12.3", features = ["tls", "tls-native-roots"] }
+prost = "0.13.3"
+tokio = { version = "1.40.0", features = ["rt-multi-thread", "macros", "time", "sync", "signal", "net"] }
+futures = "0.3.28"
+async-trait = "0.1.68"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+figment = { version = "0.10.19", features = ["env", "toml"] }
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter", "fmt", "json"] }
+thiserror = "1.0.66"
+blake3 = "1.4.1"
+base64 = "0.22.1"
+hex = "0.4.3"
+clap = { version = "4.3.0", features = ["derive", "env"] }
+# Only the ring provider: tonic's rustls stack is built with ring, and leaving
+# rustls' default features on would also compile aws-lc-rs.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+
+[dev-dependencies]
+tempfile = "3.13.0"
+ed25519-dalek = "2.1.1"
+tokio-stream = { version = "0.1", features = ["net"] }

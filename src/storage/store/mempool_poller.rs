@@ -22,6 +22,8 @@ pub enum MempoolPollerError {
 pub struct MempoolPoller {
     pub messages_request_tx: Option<mpsc::Sender<MempoolMessagesRequest>>,
     pub max_messages_per_block: u32,
+    /// The encoded bytes of the messages of one pull (`None`: no limit).
+    pub max_bytes: Option<usize>,
     pub network: FarcasterNetwork,
     pub shard_id: u32,
     pub statsd_client: StatsdClientWrapper,
@@ -67,6 +69,18 @@ impl MempoolMessage {
         }
     }
 
+    /// The encoded size of the message.
+    pub fn encoded_len(&self) -> usize {
+        use prost::Message as _;
+        match self {
+            MempoolMessage::UserMessage(msg) => msg.encoded_len(),
+            MempoolMessage::OnchainEvent(event)
+            | MempoolMessage::OnchainEventForMigration(event) => event.encoded_len(),
+            MempoolMessage::FnameTransfer(transfer) => transfer.encoded_len(),
+            MempoolMessage::BlockEvent { message, .. } => message.encoded_len(),
+        }
+    }
+
     pub fn to_proto(&self) -> proto::MempoolMessage {
         let msg = match self {
             MempoolMessage::UserMessage(msg) => {
@@ -103,6 +117,7 @@ impl MempoolPoller {
                     shard_id: self.shard_id,
                     message_tx,
                     max_messages_per_block: self.max_messages_per_block,
+                    max_bytes: self.max_bytes,
                 })
                 .await
             {

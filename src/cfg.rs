@@ -1,7 +1,7 @@
 use crate::{
     api::{self},
     connectors::{self},
-    consensus, hyper,
+    consensus,
     mempool::{self, block_receiver},
     network::{self, http_server},
     proto::FarcasterNetwork,
@@ -105,7 +105,6 @@ pub struct Config {
     pub http_address: String,
     pub rocksdb_dir: String,
     pub clear_db: bool,
-    pub hyper: hyper::HyperConfig,
     pub check_config: bool,
     pub statsd: StatsdConfig,
     pub l1_rpc_url: String,
@@ -118,6 +117,9 @@ pub struct Config {
     pub block_receiver: block_receiver::Config,
     #[serde(default)]
     pub api: api::ApiConfig,
+    /// The Hypersnap validator after the pivot.
+    #[serde(default)]
+    pub hypersnap: crate::node::hypersnap_main::HypersnapConfig,
 }
 
 impl Default for Config {
@@ -133,11 +135,15 @@ impl Default for Config {
             l1_gate: mempool::l1_gate::Config::default(),
             rpc_auth: "".to_string(),
             admin_rpc_auth: "".to_string(),
-            rpc_address: format!("0.0.0.0:{}", DEFAULT_RPC_PORT),
-            http_address: format!("0.0.0.0:{}", DEFAULT_HTTP_PORT),
+            // Bind gRPC + HTTP RPC to localhost by default (audit
+            // residual #2): gRPC auth ships off-by-default, so the
+            // safest out-of-the-box posture is loopback-only. Operators
+            // exposing these ports publicly must opt in via config
+            // (typically behind a reverse proxy or mTLS).
+            rpc_address: format!("127.0.0.1:{}", DEFAULT_RPC_PORT),
+            http_address: format!("127.0.0.1:{}", DEFAULT_HTTP_PORT),
             rocksdb_dir: ".rocks".to_string(),
             clear_db: false,
-            hyper: hyper::HyperConfig::default(),
             check_config: false,
             statsd: StatsdConfig::default(),
             l1_rpc_url: "".to_string(),
@@ -150,6 +156,7 @@ impl Default for Config {
             replication: ReplicationConfig::default(),
             block_receiver: block_receiver::Config::default(),
             api: api::ApiConfig::default(),
+            hypersnap: crate::node::hypersnap_main::HypersnapConfig::default(),
         }
     }
 }

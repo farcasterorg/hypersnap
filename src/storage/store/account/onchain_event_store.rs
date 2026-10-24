@@ -2,7 +2,6 @@ use super::{get_from_db_or_txn, make_fid_key, StoreEventHandler, TRUE_VALUE};
 use crate::core::error::HubError;
 use crate::core::message::HubEventExt;
 use crate::core::util::FarcasterTime;
-use crate::hyper::StateContext;
 use crate::proto::{
     self, on_chain_event, on_chain_event::Body, ChannelOwnerChangeCause, ChannelRegisterBody,
     ChannelRegisterEventType, FarcasterNetwork, HubEvent, HubEventType, IdRegisterEventBody,
@@ -13,6 +12,7 @@ use crate::proto::{LendStorageBody, StorageUnitType};
 use crate::storage::constants::{OnChainEventPostfix, RootPrefix, PAGE_SIZE_MAX};
 use crate::storage::db::{PageOptions, RocksDB, RocksDbTransactionBatch, RocksdbError};
 use crate::storage::store::account::StoreOptions;
+use crate::storage::store::state_context::StateContext;
 use crate::storage::util::increment_vec_u8;
 use crate::version::version::{EngineVersion, ProtocolFeature};
 use alloy_primitives::keccak256;
@@ -106,7 +106,7 @@ fn make_onchain_event_type_prefix(onchain_event_type: OnChainEventType) -> Vec<u
     ]
 }
 
-fn make_onchain_event_primary_key(onchain_event: &OnChainEvent) -> Vec<u8> {
+pub fn make_onchain_event_primary_key(onchain_event: &OnChainEvent) -> Vec<u8> {
     let mut primary_key = make_onchain_event_type_prefix(onchain_event.r#type());
     primary_key.extend(make_fid_key(onchain_event.fid));
     primary_key.extend(make_block_number_key(onchain_event.block_number));
@@ -487,16 +487,44 @@ fn build_secondary_indices_for_id_register(
         return Ok(());
     }
     let id_register_by_fid_key = make_id_register_by_fid_key(onchain_event.fid);
-    match get_event_by_secondary_key(db, id_register_by_fid_key.clone(), Some(txn))? {
-        Some(existing_event) => {
-            if existing_event.block_number > onchain_event.block_number {
-                return Ok(());
-            }
+    // Look up the previous binding (if any) so a Transfer can
+    // clean up the OLD custody's cluster entry as well as add the
+    // new one. This must happen BEFORE we overwrite the secondary
+    // index with the new event.
+    let prior_event = get_event_by_secondary_key(db, id_register_by_fid_key.clone(), Some(txn))?;
+    if let Some(ref existing) = prior_event {
+        if existing.block_number > onchain_event.block_number {
+            return Ok(());
         }
-        None => {}
-    };
+    }
     let primary_key = make_onchain_event_primary_key(&onchain_event);
     txn.put(id_register_by_fid_key, primary_key);
+
+    // FIP threat-model #295 cluster index. Maintain
+    // `[HyperCustodyToFid][custody 20B][fid BE u64]` so prefix-scan
+    // by custody enumerates the FIDs under that custody.
+    let make_cluster_key = |custody: &[u8], fid: u64| -> Option<Vec<u8>> {
+        if custody.len() != 20 {
+            return None;
+        }
+        let mut k = Vec::with_capacity(1 + 20 + 8);
+        k.push(RootPrefix::HyperCustodyToFid as u8);
+        k.extend_from_slice(custody);
+        k.extend_from_slice(&fid.to_be_bytes());
+        Some(k)
+    };
+    // Remove the old-custody entry first (on Transfer).
+    if let Some(prior) = prior_event {
+        if let Some(on_chain_event::Body::IdRegisterEventBody(ref prior_body)) = prior.body {
+            if let Some(k) = make_cluster_key(&prior_body.to, prior.fid) {
+                txn.delete(k);
+            }
+        }
+    }
+    // Add the new-custody entry. REGISTER and TRANSFER both write here.
+    if let Some(k) = make_cluster_key(&id_register_event_body.to, onchain_event.fid) {
+        txn.put(k, vec![1u8]);
+    }
     Ok(())
 }
 
@@ -523,6 +551,25 @@ fn build_secondary_indices_for_signer(
         }
         None => {}
     };
+
+    // FIP §8.3 F0 reverse-index maintenance, mirroring the
+    // gasless KEY_ADD/REMOVE path. Add → inc, Remove → dec.
+    // AdminReset rewrites the secondary key but the F0 count
+    // intentionally does NOT change for it — the app's signer is
+    // simply being repointed to its earlier Add event.
+    if let Some(request_fid) =
+        crate::connectors::onchain_events::get_request_fid_from_signer_event(signer_event_body)
+    {
+        match signer_event_body.event_type() {
+            SignerEventType::Add => {
+                let _ = super::signer_auth_index::inc(db, txn, request_fid, onchain_event.fid);
+            }
+            SignerEventType::Remove => {
+                let _ = super::signer_auth_index::dec(db, txn, request_fid, onchain_event.fid);
+            }
+            _ => {}
+        }
+    }
 
     if signer_event_body.event_type() == SignerEventType::AdminReset {
         let mut next_page_token = None;

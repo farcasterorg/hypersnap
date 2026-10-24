@@ -1,14 +1,269 @@
 syntax = "proto3";
 
-message HyperBlockMetadata {
-  uint64 canonical_block_id = 1;
-  bytes parent_hash = 2;
-  bytes hyper_state_root = 3;
-  uint32 extra_rules_version = 4;
-  uint64 retained_message_count = 5;
+// FIP-proof-of-work-tokenization §16.8. Appended after the 64-byte Ed25519
+// signature in `Message.signature` when `signature_scheme` is
+// SIGNATURE_SCHEME_ED25519_FALCON512. The relay drops it (and resets the
+// scheme to ED25519) when it forwards the message to snapchain.
+message HyperSignatureExtension {
+  uint32 version = 1;
+  bytes falcon_signature = 2;          // By the paired Falcon-512 signer
+  bytes falcon_signer_key_hash = 3;    // keccak256 of the paired Falcon-512 public key
+  bytes falcon_signer_key = 4;         // KEY_ADD only: the paired Falcon-512 public key
+  bytes falcon_custody_signature = 5;  // Signer pair KEY_ADD only (§16.10)
 }
 
-message HyperEnvelope {
-  HyperBlockMetadata metadata = 1;
-  bytes payload = 2;
+enum HyperValidatorEventType {
+  HYPER_VALIDATOR_EVENT_TYPE_NONE = 0;
+  HYPER_VALIDATOR_EVENT_TYPE_REGISTER = 1;
+  HYPER_VALIDATOR_EVENT_TYPE_DEREGISTER = 2;
+}
+
+// FIP-proof-of-work-tokenization §12 stake categories. Same FID
+// can carry distinct amounts in each — e.g. validator-staked
+// for slot eligibility plus credibility-staked for stake_factor
+// in the identity weighting.
+enum StakeType {
+  STAKE_TYPE_NONE = 0;
+  // Required to register as a hyper validator (FIP §12).
+  // Minimum amount governed by `MIN_VALIDATOR_STAKE`.
+  STAKE_TYPE_VALIDATOR = 1;
+  // Vouching for new users in Growth PoW (FIP §12).
+  STAKE_TYPE_VOUCH = 2;
+  // Credibility contribution (`stake_factor` in §8.4).
+  STAKE_TYPE_CREDIBILITY = 3;
+}
+
+// =====================================================================
+// FIP-native-miniapp-index — protocol-level miniapp registry.
+//
+// Miniapps are identified by `miniapp_id = SHA256("farcaster-miniapp:"
+// || domain)[0..16]`. Registration binds a domain to an FID via a
+// JFS-style account-association proof (custody signature). Subsequent
+// updates / unregistration / user adds / removes use a per-FID
+// Ed25519 signer signature (the FIP's prose specifies "signer must be
+// the registering FID" without prescribing the bit shape — we use the
+// same Ed25519-app-key shape as TokenStake / TokenTransfer for
+// consistency with the rest of the hyper-message family).
+// =====================================================================
+
+enum MiniappCategory {
+  MINIAPP_CATEGORY_NONE = 0;
+  MINIAPP_CATEGORY_GAMES = 1;
+  MINIAPP_CATEGORY_SOCIAL = 2;
+  MINIAPP_CATEGORY_FINANCE = 3;
+  MINIAPP_CATEGORY_UTILITY = 4;
+  MINIAPP_CATEGORY_PRODUCTIVITY = 5;
+  MINIAPP_CATEGORY_NEWS_MEDIA = 6;
+  MINIAPP_CATEGORY_MUSIC = 7;
+  MINIAPP_CATEGORY_SHOPPING = 8;
+  MINIAPP_CATEGORY_EDUCATION = 9;
+  MINIAPP_CATEGORY_DEVELOPER_TOOLS = 10;
+  MINIAPP_CATEGORY_ENTERTAINMENT = 11;
+  MINIAPP_CATEGORY_ART_CREATIVITY = 12;
+  MINIAPP_CATEGORY_HEALTH_FITNESS = 13;
+}
+
+// User-visible metadata. Validation caps: name 1-32 chars, description
+// ≤256, tagline ≤64; up to 5 tags (≤24 chars each); up to 5 screenshots.
+message MiniappMetadata {
+  string name = 1;
+  string home_url = 2;
+  string icon_url = 3;
+  string description = 4;
+  string image_url = 5;
+  MiniappCategory category = 6;
+  repeated string tags = 7;
+  string webhook_url = 8;
+  repeated string screenshot_urls = 9;
+  string tagline = 10;
+}
+
+// JFS-style account-association proof. Standard Farcaster shape:
+// `header` = base64url-decoded JSON `{fid, type: "custody", key}`,
+// `payload` = base64url-decoded JSON `{domain}`, `signature` = EIP-191
+// `personal_sign` over the JWS signing input
+// `BASE64URL(header) || '.' || BASE64URL(payload)`.
+//
+// Verification: ecrecover the signature, require `header.key` ==
+// recovered address, require `header.key` == on-chain custody address
+// for `header.fid`, require `payload.domain` matches the message body's
+// `domain`, require `header.fid` matches the message body's signing FID.
+message AccountAssociationProof {
+  bytes header = 1;     // base64url-decoded JSON header
+  bytes payload = 2;    // base64url-decoded JSON payload
+  bytes signature = 3;  // 65-byte ECDSA personal_sign signature
+}
+
+// Stored miniapp record. Lives at
+// `[RootPrefix::HyperMiniappState][miniapp_id 16B]`.
+message MiniappState {
+  bytes miniapp_id = 1;
+  string domain = 2;
+  uint64 author_fid = 3;
+  MiniappMetadata metadata = 4;
+  uint64 registered_at_block = 5;
+  uint64 updated_at_timestamp = 6;
+  bool active = 7;
+  uint64 add_count = 8;
+}
+
+// Per-(user, miniapp) add record. Lives at
+// `[RootPrefix::HyperMiniappAdd][user_fid BE u64][miniapp_id 16B]`.
+message MiniappAddState {
+  uint64 fid = 1;
+  string domain = 2;
+  uint64 added_at_timestamp = 3;
+}
+
+// FIP-proof-of-work-tokenization §13.6 inbound bridge: a per-
+// validator local observation of a `HypersnapBridge.Burned` event
+// that has reached `BRIDGE_FINALITY_CONFIRMATIONS` on the source
+// chain. The watcher process persists these into the local
+// `BridgeBurnStore`; the threshold-signing flow consumes them and
+// emits `HyperInboundBurn` messages.
+//
+// Validators may observe burns at slightly different wall-clock
+// times depending on their RPC providers, but the canonical
+// replay key `(source_chain_id, burn_id)` is identical across
+// providers — so even if two validators sign the same burn at
+// different epochs, the importer accepts only the first.
+//
+// `observed_at_unix` is local diagnostic only; not part of any
+// signed payload.
+message HyperObservedBurn {
+  uint32 source_chain_id = 1;
+  // 32 bytes BE — the contract's uint256 burnId.
+  bytes burn_id = 2;
+  // FID decoded from the contract's `bytes32 hypersnapRecipient`
+  // (first 8 bytes BE; trailing 24 bytes must be zero or the
+  // watcher rejects the event).
+  uint64 recipient_fid = 3;
+  uint64 amount = 4;
+  uint64 source_block_number = 5;
+  bytes source_tx_hash = 6;
+  uint64 observed_at_unix = 7;
+}
+
+// FIP-proof-of-work-tokenization §13.6 inbound bridge: a wrapped-
+// token burn observed on the destination chain, threshold-signed
+// by the active validator set, and applied locally to credit the
+// recipient FID.
+//
+// Each validator independently observes the bridge contract's
+// `Burned(burnId, sender, hypersnapRecipient, amount,
+// sourceChainId)` event and waits `BRIDGE_FINALITY_CONFIRMATIONS`
+// blocks before committing the burn to a signing round. At each
+// epoch boundary the validators agree on the observed-burn set
+// and threshold-sign one of these messages per burn.
+//
+// Replay protection: `(source_chain_id, burn_id)` triple keyed
+// in `RootPrefix::HyperInboundBurnProcessed`. The bridge's
+// `burnNonce` is strictly-monotonic within a contract instance
+// per chain, so this triple is globally unique.
+//
+// `burn_id` is the contract's `uint256 burnId` — 32 bytes BE.
+// `source_tx_hash` is the L1 transaction hash that emitted the
+// `Burned` event; included for audit/cross-reference but not
+// part of the replay key (a single tx can emit multiple burns).
+message HyperInboundBurn {
+  uint64 epoch = 1;
+  uint32 source_chain_id = 2;
+  // 32 bytes BE — the contract's uint256 burnId.
+  bytes burn_id = 3;
+  // Decoded from the contract's `bytes32 hypersnapRecipient`. The
+  // hypersnap-side encoding writes the FID as 8 BE bytes into the
+  // first 8 of bytes32 with the rest zero; the watcher validates
+  // that before producing this message.
+  uint64 recipient_fid = 4;
+  // Atoms to credit to the recipient FID.
+  uint64 amount = 5;
+  // L1 block number the `Burned` event was emitted at.
+  uint64 source_block_number = 6;
+  // 32-byte L1 transaction hash.
+  bytes source_tx_hash = 7;
+  // 65-byte ECDSA `(r || s || v)` from the validator-set's DKLS23
+  // signing ceremony over the canonical signing payload. Recovers
+  // to the epoch's group address.
+  bytes ecdsa_signature = 8;
+}
+
+// Stored at `RootPrefix::HyperTokenLocked || sender_fid || lock_id`
+// for each unclaimed transparent token lock. The leaf hash is NOT
+// stored — it's recomputed deterministically via
+// `hypersnap_crypto::bridge_payload::lock_leaf_evm` whenever the
+// merkle tree is rebuilt. Storing the structured inputs gives us
+// queryable lock state for HTTP endpoints; storing the leaf hash
+// would lose information needed to reconstruct claims after a
+// missing proof.
+message TokenLockState {
+  uint64 sender_fid = 1;
+  uint64 amount = 2;
+  uint32 destination_chain_id = 3;
+  bytes destination_address = 4;
+  bytes lock_id = 5;
+}
+
+// =====================================================================
+// FIP-hyper-native-onboarding: validator-assigned FID issuance gated by
+// hashcash (PowSolution) or future native-token stake (StakeProof).
+// =====================================================================
+
+// Hashcash proof-of-work solution. Validator recomputes
+// `H("hyper.onboard.pow:" || custody_address || anchor_block_hash || nonce)`
+// and requires the output to be < 2^256 / 2^difficulty_bits, AND
+// `difficulty_bits >= MIN_DIFFICULTY_BITS`. Greater difficulty grants
+// more storage units per §7.2.
+message PowSolution {
+  bytes nonce = 1;
+  uint32 difficulty_bits = 2;
+}
+
+// Future stake-backed gate. Phase 2: references an existing stake-lock
+// committed by the staker; phase-1 builds reject this variant with
+// `StakeGateNotYetEnabled`. Design semantics (lock_id derivation,
+// who-can-stake-for-whom, slashing) are deferred to a follow-up FIP.
+message StakeProof {
+  bytes stake_lock_id = 1;
+  uint64 amount_atoms = 2;
+  uint64 lock_duration_blocks = 3;
+}
+
+// FIP §C-2 (proof-of-work-tokenization) work markets. Four independent
+// reward streams, each with its own per-epoch budget cap:
+//   - DataAvailability (§5): payment for serving DA challenges
+//   - Growth (§6): payment for sustained mutual engagement
+//   - AppUsage (§7): payment to miniapp developers for organic use
+//   - Retroactive (§10.5): per-epoch tranche of the genesis-distribution
+//     vesting schedule. Distinct from forward Growth so the
+//     `(epoch, fid, market)` replay key on `RewardStore` doesn't collide
+//     with same-epoch Growth credits.
+// `Unknown` is the proto3 default; old issuances without a market field
+// pre-date the split and are treated as Growth (the original
+// single-market interpretation) for backwards compatibility.
+enum WorkMarket {
+  WORK_MARKET_UNKNOWN = 0;
+  WORK_MARKET_DATA_AVAILABILITY = 1;
+  WORK_MARKET_GROWTH = 2;
+  WORK_MARKET_APP_USAGE = 3;
+  WORK_MARKET_RETROACTIVE = 4;
+}
+
+// Hyper-side mirror of an IdRegistry `Recover` event from the L1 chain
+// (Optimism for Farcaster mainnet). Persisted in the hyper store
+// independently of snapchain's on-chain events ingestion so the
+// upstream snapchain proto stays unchanged.
+//
+// Used by the deterministic retro distribution to distinguish
+// forced-recovery transfers from real ownership changes: a Transfer
+// event whose (fid, block_number) matches a HyperRecoveryEvent
+// preserves the original effective_ts.
+message HyperRecoveryEvent {
+  uint64 fid = 1;
+  bytes from_address = 2;
+  bytes to_address = 3;
+  uint64 block_number = 4;
+  uint64 block_timestamp = 5;
+  bytes transaction_hash = 6;
+  uint32 log_index = 7;
+  uint32 chain_id = 8;
 }

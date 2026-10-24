@@ -1,0 +1,8 @@
+# Consensus scoring must be bit-identical across platforms (FIP §8.5):
+# no floating point outside tests. `clippy::float_arithmetic` is denied in
+# lib.rs; this list also rejects f32/f64 in signatures, fields and casts.
+# Test-only modules opt out with `#[allow(clippy::disallowed_types)]`.
+disallowed-types = [
+    { path = "f64", reason = "consensus scoring is integer fixed point (FIP §8.5)" },
+    { path = "f32", reason = "consensus scoring is integer fixed point (FIP §8.5)" },
+]

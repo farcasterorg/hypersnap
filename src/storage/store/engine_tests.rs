@@ -5129,6 +5129,62 @@ mod tests {
         assert!(!root.is_empty());
     }
 
+    /// After the pivot no message is pruned: storage units do not limit an
+    /// FID (FIP-proof-of-work-tokenization §17.6 "Storage").
+    #[tokio::test]
+    async fn test_hypersnap_mode_prunes_nothing() {
+        let (mut engine, _tmpdir) = test_helper::new_engine().await;
+        register_user(
+            FID_FOR_TEST,
+            test_helper::default_signer(),
+            test_helper::default_custody_address(),
+            &mut engine,
+        )
+        .await;
+        let height = engine.get_confirmed_height().block_number;
+        engine
+            .enter_hypersnap_mode(
+                Some(height),
+                crate::version::version::EngineVersion::latest(),
+            )
+            .unwrap();
+        // The fee balance in the replica pays for the casts (§12).
+        engine
+            .db
+            .put(
+                &crate::chain::shard0::keys::fee_balance(FID_FOR_TEST),
+                &crate::chain::shard0::keys::u64_value(1_000_000_000),
+            )
+            .unwrap();
+
+        // The test limit is 4 casts; send 6.
+        let current_time = factory::time::farcaster_time();
+        let casts: Vec<_> = (0..6)
+            .map(|i| {
+                messages_factory::casts::create_cast_add(
+                    FID_FOR_TEST,
+                    &format!("kept_{}", i),
+                    Some(current_time + i),
+                    None,
+                )
+            })
+            .collect();
+        for cast in &casts {
+            commit_message(&mut engine, cast).await;
+        }
+        assert_eq!(
+            engine
+                .get_casts_by_fid(FID_FOR_TEST)
+                .unwrap()
+                .messages
+                .len(),
+            6
+        );
+        for cast in &casts {
+            assert!(message_exists_in_trie(&mut engine, cast));
+        }
+    }
+
     /// Hyper stores must use a disjoint key prefix range (30-37) that
     /// does not overlap with Legacy prefixes (1-22). This ensures a
     /// snapchain node reading the same RocksDB sees only its own data.
@@ -5192,8 +5248,8 @@ mod tests {
     /// to a plain snapchain node.
     #[tokio::test]
     async fn test_legacy_context_preserves_original_prefixes() {
-        use crate::hyper::StateContext;
         use crate::storage::constants::RootPrefix;
+        use crate::storage::store::state_context::StateContext;
 
         let ctx = StateContext::Legacy;
         assert_eq!(ctx.root_prefix(RootPrefix::User), RootPrefix::User as u8);
@@ -6904,6 +6960,63 @@ mod tests {
         );
         commit_message(&mut engine, &unfollow).await;
 
+        assert_eq!(
+            ReactionStore::follower_count(store, &channel_id).unwrap(),
+            0
+        );
+        assert_eq!(
+            ReactionStore::is_following(store, FID_FOR_TEST, &channel_id).unwrap(),
+            None
+        );
+    }
+
+    /// A Hypersnap node does not derive the snapchain channel follows: Hypersnap
+    /// channels are the ones of FIP-native-channels
+    /// (FIP-proof-of-work-tokenization §17.7).
+    #[tokio::test]
+    async fn test_hypersnap_mode_writes_no_channel_follow_index() {
+        use crate::core::channel_uri::{channel_registrar_for_network, ChannelAssetId};
+        use crate::storage::store::account::ReactionStore;
+
+        let (mut engine, _tmpdir) = test_helper::new_engine().await;
+        let signer = test_helper::default_signer();
+        test_helper::register_user(
+            FID_FOR_TEST,
+            signer.clone(),
+            default_custody_address(),
+            &mut engine,
+        )
+        .await;
+        let height = engine.get_confirmed_height().block_number;
+        engine
+            .enter_hypersnap_mode(
+                Some(height),
+                crate::version::version::EngineVersion::latest(),
+            )
+            .unwrap();
+        // The fee balance in the replica pays for the reaction (§12).
+        engine
+            .db
+            .put(
+                &crate::chain::shard0::keys::fee_balance(FID_FOR_TEST),
+                &crate::chain::shard0::keys::u64_value(1_000_000_000),
+            )
+            .unwrap();
+
+        let channel_id = [0x5au8; 32];
+        let registrar = channel_registrar_for_network(engine.network).unwrap();
+        let follow = messages_factory::reactions::create_reaction_add(
+            FID_FOR_TEST,
+            ReactionType::Like,
+            Target::TargetUrl(
+                ChannelAssetId::for_channel(&registrar, channel_id).canonical_string(),
+            ),
+            None,
+            Some(&signer),
+        );
+        // The reaction merges; it is not a channel follow.
+        commit_message(&mut engine, &follow).await;
+        let store = &engine.get_stores().reaction_store;
         assert_eq!(
             ReactionStore::follower_count(store, &channel_id).unwrap(),
             0

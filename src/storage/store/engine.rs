@@ -8,7 +8,6 @@ use crate::core::{
     error::HubError, message::HubEventExt, types::Height, util::FarcasterTime, validations,
     validations::verification,
 };
-use crate::hyper::StateContext;
 use crate::mempool::mempool::MempoolMessagesRequest;
 use crate::proto::message_data::Body;
 use crate::proto::shard_trie_entry_with_message::TrieMessage;
@@ -28,6 +27,7 @@ use crate::storage::store::engine_metrics::Metrics;
 use crate::storage::store::mempool_poller::{MempoolMessage, MempoolPoller, MempoolPollerError};
 use crate::storage::store::migrations::{MigrationContext, MigrationRunner};
 use crate::storage::store::node_local_state;
+use crate::storage::store::state_context::StateContext;
 use crate::storage::store::stores::{StoreLimits, Stores};
 use crate::storage::trie::{self, merkle_trie};
 use crate::utils::statsd_wrapper::StatsdClientWrapper;
@@ -78,6 +78,12 @@ pub enum EngineError {
 
     #[error("Replicator merge error: {0}")]
     ReplicatorError(String),
+
+    #[error("rejected by the Hypersnap rules: {0}")]
+    HypersnapRejected(String),
+
+    #[error("content replay: {0}")]
+    ContentReplay(String),
 }
 
 #[derive(Error, Debug, Clone)]
@@ -147,7 +153,11 @@ pub struct Senders {
 
 impl Senders {
     pub fn new() -> Senders {
-        let (events_tx, _events_rx) = broadcast::channel::<HubEvent>(10_000); // About 10s of events with full blocks
+        Self::with_capacity(10_000) // About 10s of events with full blocks
+    }
+
+    fn with_capacity(capacity: usize) -> Senders {
+        let (events_tx, _events_rx) = broadcast::channel::<HubEvent>(capacity);
         Senders { events_tx }
     }
 }
@@ -166,6 +176,10 @@ struct CachedTransaction {
     max_block_event_seqnum: u64,
     block_events_hash: Vec<u8>,
     txn: RocksDbTransactionBatch,
+    /// Hypersnap mode: the key of the execution (`execution_key`): the
+    /// height, the shard-0 references and the time of the block, and the
+    /// state root that the execution gives.
+    replica_key: Vec<u8>,
 }
 
 /// How a `MergeMessage` BlockEvent's message is merged into a data shard's local store.
@@ -197,6 +211,40 @@ pub struct ShardEngine {
     fname_signer_address: Option<alloy_primitives::Address>,
     post_commit_tx: Option<mpsc::Sender<PostCommitMessage>>,
     pub mempool_poller: MempoolPoller,
+    /// Shadow Keccak state trie (plan R0). `None` unless enabled.
+    shadow_trie: Option<crate::storage::trie::shadow_trie::ShadowTrie>,
+    /// Set while a backfill thread owns the shadow trie records.
+    shadow_backfill_running: Arc<std::sync::atomic::AtomicBool>,
+    /// After the epoch-1 pivot: the Keccak trie is the state commitment and
+    /// the blake3 shard root is an internal value, not checked against the
+    /// chunk header (FIP §16.13, §17.7).
+    hypersnap_mode: bool,
+    /// Hypersnap mode: the snapchain engine version of the fork block.
+    frozen_version: Option<EngineVersion>,
+    /// The content replay (FIP §17.4): snapchain chunks with no pruning.
+    /// The state differs from snapchain's, so the snapchain roots are not
+    /// checked.
+    content_replay: bool,
+    /// Hypersnap mode: the height of the block being built or checked, and
+    /// the shard-0 outbox entries that it applies first (FIP §17.7).
+    hypersnap_height: u64,
+    hypersnap_replica: Vec<proto::OutboxEntry>,
+    hypersnap_replica_key: Vec<u8>,
+    /// The height and encoding of the Hypersnap block that
+    /// `hypersnap_commit` commits: it goes in the batch of its state.
+    committing_block: Option<(u64, Vec<u8>)>,
+    /// An engine of `new_readonly`: it runs messages to check them and
+    /// keeps nothing, so it updates no trie.
+    simulation: bool,
+}
+
+/// Result of replaying a Hypersnap block body on shard 1 or 2.
+#[derive(Clone, Debug)]
+pub struct HypersnapReplay {
+    /// Keccak state root after the block (the header `state_root`).
+    pub state_root: [u8; 32],
+    /// Internal blake3 root after the block.
+    pub blake3_root: Vec<u8>,
 }
 
 impl ShardEngine {
@@ -268,9 +316,73 @@ impl ShardEngine {
             }
         }
 
-        let hyper_stores = Some(stores.with_state_context(StateContext::Hyper));
+        Ok(Self::assemble(
+            db,
+            network,
+            stores,
+            shard_id,
+            statsd_client,
+            max_messages_per_block,
+            messages_request_tx,
+            fname_signer_address,
+            post_commit_tx,
+            Senders::new(),
+        ))
+    }
 
-        Ok(ShardEngine {
+    /// An engine that only simulates messages (the submit checks): it runs no
+    /// migration, its events go nowhere, and it updates no trie (the account
+    /// root of a simulation is not used). A submit makes one: the event
+    /// channel of a full engine and the trie updates were most of the cost
+    /// of a submit.
+    pub fn new_readonly(
+        db: Arc<RocksDB>,
+        network: proto::FarcasterNetwork,
+        trie: merkle_trie::MerkleTrie,
+        shard_id: u32,
+        store_limits: StoreLimits,
+        statsd_client: StatsdClientWrapper,
+    ) -> ShardEngine {
+        let stores = Stores::new_with_opts(
+            db.clone(),
+            shard_id,
+            trie,
+            store_limits,
+            network,
+            statsd_client.clone(),
+            StoreOptions::default(),
+        );
+        let mut engine = Self::assemble(
+            db,
+            network,
+            stores,
+            shard_id,
+            statsd_client,
+            100,
+            None,
+            None,
+            None,
+            Senders::with_capacity(1),
+        );
+        engine.simulation = true;
+        engine
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
+        db: Arc<RocksDB>,
+        network: proto::FarcasterNetwork,
+        stores: Stores,
+        shard_id: u32,
+        statsd_client: StatsdClientWrapper,
+        max_messages_per_block: u32,
+        messages_request_tx: Option<mpsc::Sender<MempoolMessagesRequest>>,
+        fname_signer_address: Option<alloy_primitives::Address>,
+        post_commit_tx: Option<mpsc::Sender<PostCommitMessage>>,
+        senders: Senders,
+    ) -> ShardEngine {
+        let hyper_stores = Some(stores.with_state_context(StateContext::Hyper));
+        ShardEngine {
             shard_id,
             network,
             hyper_stores,
@@ -278,11 +390,12 @@ impl ShardEngine {
             mempool_poller: MempoolPoller {
                 shard_id,
                 max_messages_per_block,
+                max_bytes: None,
                 messages_request_tx,
                 network,
                 statsd_client: statsd_client.clone(),
             },
-            senders: Senders::new(),
+            senders,
             db,
             metrics: Metrics {
                 statsd_client,
@@ -292,7 +405,617 @@ impl ShardEngine {
             halt_record_checked: false,
             fname_signer_address,
             post_commit_tx,
+            shadow_trie: None,
+            shadow_backfill_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            hypersnap_mode: false,
+            frozen_version: None,
+            content_replay: false,
+            hypersnap_height: 0,
+            hypersnap_replica: vec![],
+            hypersnap_replica_key: vec![],
+            committing_block: None,
+            simulation: false,
+        }
+    }
+
+    /// Hypersnap mode: no on-chain event goes into a block of shard 1 or 2
+    /// (FIP §17.6). IdRegistry and KeyRegistry events come from the shard-0
+    /// outbox; Hypersnap does not take `StorageRegistry` events.
+    fn hypersnap_onchain_check(&self, event: &proto::OnChainEvent) -> Result<(), String> {
+        Err(format!(
+            "on-chain event of type {:?} in a block of shard {}",
+            event.r#type(),
+            self.shard_id
+        ))
+    }
+
+    /// Switch to Hypersnap execution (after the pivot). The Keccak trie must
+    /// be complete and live; on a fresh chain it is empty and goes live at
+    /// `genesis_height`.
+    pub fn enter_hypersnap_mode(
+        &mut self,
+        genesis_height: Option<u64>,
+        engine_version: EngineVersion,
+    ) -> Result<(), HubError> {
+        use crate::storage::trie::shadow_trie::{ShadowStatus, ShadowTrie};
+        if self.shadow_trie.is_none() {
+            let shadow = ShadowTrie::open(self.db.clone())
+                .map_err(|e| HubError::invalid_internal_state(&e.to_string()))?;
+            self.shadow_trie = Some(shadow);
+        }
+        let shadow = self.shadow_trie.as_mut().unwrap();
+        match (shadow.status(), genesis_height) {
+            (ShadowStatus::Live { .. }, _) => {}
+            (ShadowStatus::Absent, Some(height)) => {
+                let mut txn = RocksDbTransactionBatch::new();
+                shadow.mark_live(height, &mut txn);
+                self.db.commit(txn)?;
+            }
+            (status, _) => {
+                return Err(HubError::invalid_internal_state(&format!(
+                    "Hypersnap mode needs a live state trie, found {:?}",
+                    status
+                )))
+            }
+        }
+        self.hypersnap_mode = true;
+        self.frozen_version = Some(engine_version);
+        self.stores.hypersnap_unbounded = true;
+        // A Hypersnap block fills by bytes (FIP §4.2).
+        self.mempool_poller.max_bytes = Some(crate::chain::block::PULL_BYTES);
+        // Hypersnap channels are the ones of FIP-native-channels: the
+        // snapchain channel follows are not derived (§17.7).
+        self.stores.reaction_store =
+            crate::storage::store::account::ReactionStore::without_follow_index(
+                &self.stores.reaction_store,
+            );
+        // The stores themselves keep every message now (§17.6).
+        self.hyper_stores = None;
+        Ok(())
+    }
+
+    /// Run snapchain chunks with no pruning (FIP §17.4): the content replay
+    /// that gives the genesis state of a shard. The validation rules are
+    /// the snapchain rules of each chunk's version; revocations apply. The
+    /// Keccak trie is live from the first chunk.
+    pub fn enter_content_replay(&mut self) -> Result<(), HubError> {
+        use crate::storage::trie::shadow_trie::{ShadowStatus, ShadowTrie};
+        let mut shadow = ShadowTrie::open(self.db.clone())
+            .map_err(|e| HubError::invalid_internal_state(&e.to_string()))?;
+        match shadow.status() {
+            ShadowStatus::Live { .. } => {}
+            ShadowStatus::Absent if self.get_last_shard_chunk().is_none() => {
+                let mut txn = RocksDbTransactionBatch::new();
+                shadow.mark_live(0, &mut txn);
+                self.db.commit(txn)?;
+            }
+            status => {
+                return Err(HubError::invalid_internal_state(&format!(
+                    "the content replay needs a live state trie, found {:?}",
+                    status
+                )))
+            }
+        }
+        self.shadow_trie = Some(shadow);
+        self.content_replay = true;
+        self.hyper_stores = None;
+        Ok(())
+    }
+
+    /// Content replay: apply a snapchain chunk and commit it. The caller
+    /// gives the chunks in order.
+    pub async fn commit_replayed_chunk(&mut self, chunk: &ShardChunk) -> Result<(), EngineError> {
+        use crate::storage::trie::shadow_trie::ShadowStatus;
+        let missing = || EngineError::ContentReplay("a chunk has no header or height".into());
+        let header = chunk.header.as_ref().ok_or_else(missing)?;
+        let height = header.height.ok_or_else(missing)?.block_number;
+        self.stores.event_handler.set_current_height(height);
+        let timestamp = FarcasterTime::new(header.timestamp);
+        let version = self.version_for(&timestamp);
+        let mut txn = RocksDbTransactionBatch::new();
+        let (events, max_block_event_seqnum) = self.replay_proposal(
+            &merkle_trie::Context::new(),
+            &mut txn,
+            &chunk.transactions,
+            &[],
+            ProposalSource::Commit,
+            version,
+            &timestamp,
+        )?;
+        self.commit_and_emit_events(chunk, events, max_block_event_seqnum, txn)
+            .await;
+        // The genesis root comes from this trie: a failed update is an error
+        // here, not a diagnostic.
+        match self.shadow_trie.as_ref().map(|t| t.status()) {
+            Some(ShadowStatus::Live { height: h }) if h == height => Ok(()),
+            status => Err(EngineError::ContentReplay(format!(
+                "the state trie is {:?} after chunk {}",
+                status, height
+            ))),
+        }
+    }
+
+    pub fn is_content_replay(&self) -> bool {
+        self.content_replay
+    }
+
+    pub fn is_hypersnap_mode(&self) -> bool {
+        self.hypersnap_mode
+    }
+
+    /// Keccak state root (committed).
+    pub fn state_root(&self) -> Option<[u8; 32]> {
+        self.shadow_trie.as_ref().map(|t| t.report().root)
+    }
+
+    /// Set the height of the next Hypersnap block and the outbox entries of
+    /// shard 0 that it applies before its transactions.
+    pub fn set_hypersnap_block(
+        &mut self,
+        height: u64,
+        replica: Vec<proto::OutboxEntry>,
+        replica_key: Vec<u8>,
+    ) {
+        self.hypersnap_height = height;
+        self.hypersnap_replica = replica;
+        self.hypersnap_replica_key = replica_key;
+    }
+
+    /// The writes of `txn` that are in the shard state trie without a hub
+    /// event (FIP §16.13): the gasless-key nonces and last-use times, from
+    /// the content replay on, and after the pivot the replica records, fee
+    /// charges and content fingerprints.
+    fn hypersnap_raw_ops(&self, txn: &RocksDbTransactionBatch) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
+        if !self.hypersnap_mode && !self.content_replay {
+            return vec![];
+        }
+        use crate::storage::constants::RootPrefix as P;
+        // The replica records, and the records of shard 1 or 2 itself.
+        let own = [
+            P::HyperUnsettledCharge as u8,
+            P::HyperContentFingerprint as u8,
+            P::HyperChainMeta as u8,
+            P::HyperFalconSignerLastUse as u8,
+        ];
+        let raw = |p: &u8| crate::chain::shard0::REPLICATED.contains(p) || own.contains(p);
+        let mut ops: Vec<(Vec<u8>, Option<Vec<u8>>)> = txn
+            .batch
+            .iter()
+            .filter(|(k, _)| {
+                crate::storage::trie::shadow_entries::is_gasless_state_key(k)
+                    || (self.hypersnap_mode && k.first().is_some_and(raw))
+            })
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        ops.sort_by(|a, b| a.0.cmp(&b.0));
+        ops
+    }
+
+    /// Apply the shard-0 outbox entries of this block (FIP §17.7): replica
+    /// writes, replayed snapchain messages and on-chain events.
+    fn apply_hypersnap_replica(
+        &mut self,
+        trie_ctx: &merkle_trie::Context,
+        txn_batch: &mut RocksDbTransactionBatch,
+    ) -> Result<Vec<HubEvent>, EngineError> {
+        if !self.hypersnap_mode || self.hypersnap_replica.is_empty() {
+            return Ok(vec![]);
+        }
+        let entries = self.hypersnap_replica.clone();
+        let settled_key = crate::chain::shard0::keys::settled_height(self.shard_id);
+        let mut events = vec![];
+        for entry in &entries {
+            for w in &entry.writes {
+                if w.key == settled_key {
+                    let old = crate::storage::store::account::get_from_db_or_txn(
+                        &self.db,
+                        txn_batch,
+                        &settled_key,
+                    )?
+                    .map(|v| crate::chain::shard0::keys::decode_u64(&v))
+                    .unwrap_or(0);
+                    let new = crate::chain::shard0::keys::decode_u64(&w.value);
+                    crate::chain::replica::prune_settled(&self.db, txn_batch, old, new)
+                        .map_err(|e| EngineError::ReplicatorError(e.to_string()))?;
+                }
+                if w.delete {
+                    // A removed Falcon-512 signer has no last use.
+                    if let Some(k) = crate::chain::replica::last_use_key_of_signer(&w.key) {
+                        txn_batch.delete(k);
+                    }
+                    txn_batch.delete(w.key.clone());
+                } else {
+                    txn_batch.put(w.key.clone(), w.value.clone());
+                }
+            }
+            if let Some(message) = &entry.replay_message {
+                // A verification that shard 0 merged goes in the order of
+                // shard 0 (the force-override merge), with no fee; shard 0
+                // replays no channel messages (FIP §17.7).
+                let merged = if matches!(
+                    message.msg_type(),
+                    MessageType::VerificationAddEthAddress | MessageType::VerificationRemove
+                ) {
+                    self.merge_replayed_verification(message, txn_batch)
+                } else {
+                    self.merge_message(message, txn_batch, false)
+                };
+                match merged {
+                    Ok(hub_events) => {
+                        for event in &hub_events {
+                            self.update_trie(trie_ctx, event, txn_batch)?;
+                        }
+                        events.extend(hub_events);
+                    }
+                    Err(e) => warn!(fid = entry.fid, "Replica message not merged: {}", e),
+                }
+            }
+            if let Some(event) = &entry.replay_event {
+                match self
+                    .stores
+                    .onchain_event_store
+                    .merge_onchain_event(event.clone(), txn_batch)
+                {
+                    Ok(hub_event) => {
+                        self.update_trie(trie_ctx, &hub_event, txn_batch)?;
+                        events.push(hub_event);
+                    }
+                    Err(e) => warn!(fid = entry.fid, "Replica event not merged: {}", e),
+                }
+            }
+            if !entry.remove_gasless_key.is_empty() {
+                let record = crate::storage::store::account::get_gasless_key_record(
+                    &self.db,
+                    txn_batch,
+                    entry.fid,
+                    &entry.remove_gasless_key,
+                )?;
+                if let Some(record) = record {
+                    crate::chain::shard0::registry::remove_gasless_key(
+                        &self.db,
+                        txn_batch,
+                        entry.fid,
+                        &entry.remove_gasless_key,
+                    )
+                    .map_err(|e| EngineError::ReplicatorError(e.to_string()))?;
+                    let revoke = HubEvent::new_event(
+                        HubEventType::RevokeMessage,
+                        proto::hub_event::Body::RevokeMessageBody(proto::RevokeMessageBody {
+                            message: record.message,
+                        }),
+                    );
+                    self.update_trie(trie_ctx, &revoke, txn_batch)?;
+                    events.push(revoke);
+                }
+            }
+        }
+        Ok(events)
+    }
+
+    fn keccak_root_with(
+        &mut self,
+        events: &[HubEvent],
+        raw: &[(Vec<u8>, Option<Vec<u8>>)],
+    ) -> Result<[u8; 32], EngineError> {
+        let shadow = self
+            .shadow_trie
+            .as_mut()
+            .ok_or_else(|| EngineError::HashMismatch)?;
+        shadow.root_with_ops(events, raw).map_err(|e| {
+            error!(shard_id = self.shard_id, "Keccak root: {}", e);
+            EngineError::HashMismatch
         })
+    }
+
+    /// Hypersnap proposer: execute `messages` and return the per-FID
+    /// transactions with the Keccak root after them. The pending batch is
+    /// cached for the commit, as in `propose_state_change`.
+    pub fn hypersnap_propose(
+        &mut self,
+        messages: Vec<MempoolMessage>,
+        timestamp: FarcasterTime,
+    ) -> Result<(ShardStateChange, [u8; 32]), EngineError> {
+        // The hub events of the block: its height, and the sequence from 1
+        // (snapchain resets them in `start_round`).
+        self.stores
+            .event_handler
+            .set_current_height(self.hypersnap_height);
+        let messages = messages
+            .into_iter()
+            .filter(|m| match m {
+                MempoolMessage::OnchainEvent(e) => self.hypersnap_onchain_check(e).is_ok(),
+                _ => true,
+            })
+            .collect();
+        let change = self.propose_state_change(self.shard_id, messages, Some(timestamp));
+        let raw = self
+            .pending_txn
+            .as_ref()
+            .map(|c| self.hypersnap_raw_ops(&c.txn))
+            .unwrap_or_default();
+        let root = self.keccak_root_with(&change.events, &raw)?;
+        if let Some(cached) = self.pending_txn.as_mut() {
+            cached.replica_key = Self::execution_key(&self.hypersnap_replica_key, &root);
+        }
+        Ok((change, root))
+    }
+
+    /// The key of the execution of a Hypersnap block: its replica key and the
+    /// Keccak state root that the execution gives. The commit reuses an
+    /// execution only for a block with that root (the events hash of a block
+    /// does not cover its user messages).
+    fn execution_key(replica_key: &[u8], state_root: &[u8]) -> Vec<u8> {
+        [replica_key, state_root].concat()
+    }
+
+    /// Hypersnap validator: replay a block body and return its roots. The
+    /// caller compares `state_root` with the header. The pending batch is
+    /// cached for the commit.
+    pub fn hypersnap_validate(
+        &mut self,
+        transactions: &[Transaction],
+        height: Height,
+        timestamp: &FarcasterTime,
+    ) -> Result<HypersnapReplay, EngineError> {
+        let mut txn = RocksDbTransactionBatch::new();
+        self.stores
+            .event_handler
+            .set_current_height(height.block_number);
+        let version = self.version_for(timestamp);
+        let replay = self.replay_proposal(
+            &merkle_trie::Context::new(),
+            &mut txn,
+            transactions,
+            &[],
+            ProposalSource::Validate,
+            version,
+            timestamp,
+        );
+        let result = match replay {
+            Ok((events, max_block_event_seqnum)) => {
+                let blake3_root = self.stores.trie.root_hash()?;
+                let raw = self.hypersnap_raw_ops(&txn);
+                match self.keccak_root_with(&events, &raw) {
+                    Ok(state_root) => {
+                        self.pending_txn = Some(CachedTransaction {
+                            shard_root: blake3_root.clone(),
+                            txn,
+                            events,
+                            max_block_event_seqnum,
+                            block_events_hash: Self::compute_block_events_hash(transactions),
+                            replica_key: Self::execution_key(
+                                &self.hypersnap_replica_key,
+                                &state_root,
+                            ),
+                        });
+                        Ok(HypersnapReplay {
+                            state_root,
+                            blake3_root,
+                        })
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            Err(e) => Err(e),
+        };
+        self.stores.trie.reload(&self.db).unwrap();
+        result
+    }
+
+    /// Commit a decided Hypersnap block of shard 1 or 2. Returns the Keccak
+    /// root after it, which equals the header `state_root` for a valid block.
+    pub async fn hypersnap_commit(
+        &mut self,
+        block: &crate::proto::HypersnapBlock,
+    ) -> Result<[u8; 32], EngineError> {
+        let header = block.header.as_ref().ok_or(EngineError::HashMismatch)?;
+        // The execution of a proposal is reused only for a block with its
+        // inputs and its state root: other proposals of the height can have
+        // other messages and the same events hash.
+        self.hypersnap_replica_key =
+            Self::execution_key(&self.hypersnap_replica_key, &header.state_root);
+        let blake3_root = match &self.pending_txn {
+            Some(cached) if cached.replica_key == self.hypersnap_replica_key => {
+                cached.shard_root.clone()
+            }
+            // The execution of another block, or none: the commit runs the
+            // block.
+            _ => {
+                self.pending_txn = None;
+                vec![]
+            }
+        };
+        let chunk = ShardChunk {
+            header: Some(proto::ShardHeader {
+                height: Some(Height::new(self.shard_id, header.height)),
+                timestamp: header.timestamp,
+                parent_hash: header.parent_hash.clone(),
+                shard_root: blake3_root,
+            }),
+            hash: block.hash.clone(),
+            transactions: block.transactions.clone(),
+            commits: None,
+        };
+        self.committing_block = Some((header.height, prost::Message::encode_to_vec(block)));
+        self.commit_shard_chunk(&chunk).await;
+        self.committing_block = None;
+        self.state_root().ok_or(EngineError::HashMismatch)
+    }
+
+    /// Turn on the shadow Keccak trie (plan R0). If the shard has no complete
+    /// trie yet, this takes a read-only snapshot at the confirmed height and
+    /// starts a backfill thread; commits keep running and the engine takes the
+    /// trie over when the backfill has caught up.
+    pub fn enable_shadow_trie(&mut self) -> Result<(), HubError> {
+        use crate::storage::trie::{shadow_backfill, shadow_trie};
+        use std::sync::atomic::Ordering;
+
+        let internal =
+            |e: shadow_trie::ShadowTrieError| HubError::invalid_internal_state(&e.to_string());
+        let shadow = shadow_trie::ShadowTrie::open(self.db.clone()).map_err(internal)?;
+        let status = shadow.status();
+        self.shadow_trie = Some(shadow);
+
+        let resume_from = match status {
+            shadow_trie::ShadowStatus::Live { height } => {
+                info!(shard_id = self.shard_id, height, "Shadow trie is live");
+                return Ok(());
+            }
+            shadow_trie::ShadowStatus::Built { height } => Some(height),
+            shadow_trie::ShadowStatus::Absent | shadow_trie::ShadowStatus::Building { .. } => None,
+        };
+
+        let snapshot = match resume_from {
+            Some(_) => None,
+            None => {
+                let removed = shadow_backfill::clear_trie_records(&self.db).map_err(internal)?;
+                let snapshot_height = self.get_confirmed_height().block_number;
+                let read_only = self.db.open_read_only().map_err(|e| {
+                    HubError::invalid_internal_state(&format!("read-only snapshot: {}", e))
+                })?;
+                let mut txn = RocksDbTransactionBatch::new();
+                shadow_trie::ShadowStatus::Building { snapshot_height }.stage(&mut txn);
+                self.db.commit(txn)?;
+                info!(
+                    shard_id = self.shard_id,
+                    snapshot_height,
+                    removed_partial_records = removed,
+                    "Shadow trie backfill starting"
+                );
+                Some((Arc::new(read_only), snapshot_height))
+            }
+        };
+
+        let running = self.shadow_backfill_running.clone();
+        running.store(true, Ordering::SeqCst);
+        let db = self.db.clone();
+        let shard_id = self.shard_id;
+        let network = self.network;
+        let statsd = self.metrics.statsd_client.clone();
+        std::thread::Builder::new()
+            .name(format!("shadow-backfill-{}", shard_id))
+            .spawn(move || {
+                let result = (|| -> Result<u64, shadow_trie::ShadowTrieError> {
+                    let from = match (resume_from, snapshot) {
+                        (Some(height), _) => height,
+                        (None, Some((read_only, snapshot_height))) => {
+                            let stores = Stores::new(
+                                read_only,
+                                shard_id,
+                                merkle_trie::MerkleTrie::new().unwrap(),
+                                StoreLimits::default(),
+                                network,
+                                statsd,
+                            );
+                            let outcome = shadow_backfill::build_from_snapshot(
+                                &stores,
+                                db.clone(),
+                                snapshot_height,
+                            )?;
+                            info!(
+                                shard_id,
+                                snapshot_height,
+                                leaf_count = outcome.leaf_count,
+                                unresolved_keys = outcome.unresolved_keys,
+                                root = hex::encode(outcome.root),
+                                "Shadow trie built from snapshot"
+                            );
+                            let mut txn = RocksDbTransactionBatch::new();
+                            shadow_trie::ShadowStatus::Built {
+                                height: snapshot_height,
+                            }
+                            .stage(&mut txn);
+                            db.commit(txn)
+                                .map_err(|e| shadow_trie::ShadowTrieError::Trie(e.to_string()))?;
+                            snapshot_height
+                        }
+                        (None, None) => unreachable!(),
+                    };
+                    let shard_store =
+                        crate::storage::store::shard::ShardStore::new(db.clone(), shard_id);
+                    shadow_backfill::catch_up(db.clone(), from, || {
+                        shard_store.max_block_number().unwrap_or(0)
+                    })
+                })();
+                match result {
+                    Ok(height) => info!(shard_id, height, "Shadow trie caught up; handing off"),
+                    Err(e) => error!(shard_id, "Shadow trie backfill failed: {}", e),
+                }
+                running.store(false, Ordering::SeqCst);
+            })
+            .map_err(|e| HubError::invalid_internal_state(&format!("spawn backfill: {}", e)))?;
+        Ok(())
+    }
+
+    /// Root, size and status of the shadow trie, if it is enabled.
+    pub fn shadow_trie_report(
+        &self,
+    ) -> Option<crate::storage::trie::shadow_trie::ShadowRootReport> {
+        self.shadow_trie.as_ref().map(|t| t.report())
+    }
+
+    /// True while a backfill thread owns the shadow trie records.
+    pub fn shadow_backfill_running(&self) -> bool {
+        self.shadow_backfill_running
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Commit hook of the shadow trie: stage this chunk's trie writes into
+    /// the chunk batch, or take the trie over from a finished backfill.
+    fn stage_shadow_trie(
+        &mut self,
+        events: &[HubEvent],
+        height: u64,
+        txn: &mut RocksDbTransactionBatch,
+    ) {
+        use crate::storage::trie::{shadow_backfill, shadow_trie::ShadowStatus};
+        use std::sync::atomic::Ordering;
+
+        let raw = self.hypersnap_raw_ops(txn);
+        let Some(shadow) = self.shadow_trie.as_mut() else {
+            return;
+        };
+        let staged = match shadow.status() {
+            ShadowStatus::Live { .. } => shadow.stage_chunk_with_ops(events, &raw, height, txn),
+            _ if self.shadow_backfill_running.load(Ordering::SeqCst) => return,
+            _ => {
+                if let Err(e) = shadow.reload(&self.db) {
+                    error!(shard_id = self.shard_id, "Shadow trie reload failed: {}", e);
+                    self.shadow_trie = None;
+                    return;
+                }
+                match shadow.status() {
+                    ShadowStatus::Built { height: built } if built < height => {
+                        shadow_backfill::events_for_heights(&self.db, built + 1, height - 1)
+                            .and_then(|replay| shadow.go_live(&replay, events, height, txn))
+                    }
+                    _ => return,
+                }
+            }
+        };
+        match staged {
+            Ok(Some(root)) => {
+                self.metrics.gauge("shadow_trie.height", height);
+                self.metrics
+                    .gauge("shadow_trie.leaf_count", shadow.report().leaf_count);
+                debug!(
+                    shard_id = self.shard_id,
+                    height,
+                    root = hex::encode(root),
+                    "Shadow trie updated"
+                );
+            }
+            Ok(None) => {}
+            Err(e) => {
+                // Diagnostic structure: never stop the shard for it. Drop it
+                // for this run; the next start rebuilds it.
+                error!(
+                    shard_id = self.shard_id,
+                    "Shadow trie update failed, disabling: {}", e
+                );
+                self.shadow_trie = None;
+            }
+        }
     }
 
     pub fn shard_id(&self) -> u32 {
@@ -376,7 +1099,7 @@ impl ShardEngine {
             })
             .collect_vec();
 
-        let mut events = vec![];
+        let mut events = self.apply_hypersnap_replica(trie_ctx, txn_batch)?;
         let mut validation_error_count = 0;
         let mut max_block_event_seqnum = self.stores.block_event_store.max_seqnum()?;
         for snapchain_txn in &mut snapchain_txns {
@@ -419,8 +1142,11 @@ impl ShardEngine {
         Ok(result)
     }
 
+    /// The snapchain rules version at `timestamp`. In Hypersnap mode it is
+    /// the version of the fork block, at every time (FIP §17.7).
     pub fn version_for(&self, timestamp: &FarcasterTime) -> EngineVersion {
-        EngineVersion::version_for(timestamp, self.network)
+        self.frozen_version
+            .unwrap_or_else(|| EngineVersion::version_for(timestamp, self.network))
     }
 
     pub fn start_round(&mut self, height: Height, _round: Round) {
@@ -468,6 +1194,7 @@ impl ShardEngine {
             txn,
             max_block_event_seqnum: result.max_block_event_seqnum,
             block_events_hash,
+            replica_key: self.hypersnap_replica_key.clone(),
         });
 
         let proposal_duration = now.elapsed();
@@ -545,10 +1272,17 @@ impl ShardEngine {
         let mut events = vec![];
         let mut max_block_event_seqnum = self.stores.block_event_store.max_seqnum()?;
         // Validate that the trie is in a good place to start with
-        match self.get_last_shard_chunk() {
+        match self
+            .stores
+            .shard_store
+            .get_last_shard_header()
+            .ok()
+            .flatten()
+        {
             None => { // There are places where it's hard to provide a parent hash-- e.g. tests so make this an option and skip validation if not present
             }
-            Some(shard_chunk) => match self.stores.trie.root_hash() {
+            Some(_) if self.content_replay => {}
+            Some(parent_header) => match self.stores.trie.root_hash() {
                 Err(err) => {
                     warn!(
                         source = source.to_string(),
@@ -556,7 +1290,7 @@ impl ShardEngine {
                     )
                 }
                 Ok(root_hash) => {
-                    let parent_shard_root = shard_chunk.header.unwrap().shard_root;
+                    let parent_shard_root = parent_header.shard_root;
                     if root_hash != parent_shard_root {
                         warn!(
                             shard_id = self.shard_id,
@@ -570,6 +1304,7 @@ impl ShardEngine {
             },
         }
 
+        events.extend(self.apply_hypersnap_replica(trie_ctx, txn_batch)?);
         for snapchain_txn in transactions {
             let (account_root, txn_events, _, last_block_event_seqnum) = self
                 .replay_snapchain_txn(
@@ -582,7 +1317,7 @@ impl ShardEngine {
                     max_block_event_seqnum,
                 )?;
             // Reject early if account roots fail to match (shard roots will definitely fail)
-            if &account_root != &snapchain_txn.account_root {
+            if !self.content_replay && &account_root != &snapchain_txn.account_root {
                 warn!(
                     fid = snapchain_txn.fid,
                     new_account_root = hex::encode(&account_root),
@@ -600,7 +1335,10 @@ impl ShardEngine {
         }
 
         let root1 = self.stores.trie.root_hash()?;
-        if &root1 != shard_root {
+        // Hypersnap mode: the blake3 root is internal; the caller checks the
+        // Keccak root against the block header instead.
+        let skip_root_check = (self.hypersnap_mode && shard_root.is_empty()) || self.content_replay;
+        if !skip_root_check && &root1 != shard_root {
             warn!(
                 shard_id = self.shard_id,
                 new_shard_root = hex::encode(&root1),
@@ -814,8 +1552,7 @@ impl ShardEngine {
                 let mut channel_messages_enabled = false;
                 if let Some(feature) = feature_gate {
                     let block_ts = block_event.block_timestamp();
-                    let version =
-                        EngineVersion::version_for(&FarcasterTime::new(block_ts), self.network);
+                    let version = self.version_for(&FarcasterTime::new(block_ts));
                     if !version.is_enabled(feature) {
                         warn!(
                             msg_type = msg_type.into_u8(),
@@ -888,8 +1625,7 @@ impl ShardEngine {
                 // store the rest of the code can't reason about. The gate ships WITH the type:
                 // a type that can merge before its gate exists is a permanent replay divergence.
                 let block_ts = block_event.block_timestamp();
-                let version =
-                    EngineVersion::version_for(&FarcasterTime::new(block_ts), self.network);
+                let version = self.version_for(&FarcasterTime::new(block_ts));
                 if !version.is_enabled(ProtocolFeature::ChannelOwnershipEvents) {
                     warn!(
                         onchain_event_type = on_chain_event.r#type,
@@ -1298,6 +2034,15 @@ impl ShardEngine {
         });
         for msg in sorted_system_messages {
             if let Some(onchain_event) = &msg.on_chain_event {
+                if self.hypersnap_mode {
+                    if let Err(reason) = self.hypersnap_onchain_check(onchain_event) {
+                        if source == ProposalSource::Validate {
+                            return Err(EngineError::HypersnapRejected(reason));
+                        }
+                        warn!(shard_id = self.shard_id, "Skipped: {}", reason);
+                        continue;
+                    }
+                }
                 if onchain_event.r#type() == OnChainEventType::EventTypeTierPurchase
                     && !version.is_enabled(ProtocolFeature::FarcasterPro)
                 {
@@ -1628,7 +2373,11 @@ impl ShardEngine {
                                 user_messages_count += 1;
                             }
                             events.extend(merge_events.clone());
-                            message_types_to_prune.insert(msg.msg_type());
+                            // After the pivot and in the content replay, no
+                            // message is pruned (§17.4, §17.6).
+                            if !self.hypersnap_mode && !self.content_replay {
+                                message_types_to_prune.insert(msg.msg_type());
+                            }
                         }
                         Err(err) => {
                             if source != ProposalSource::Simulate {
@@ -1709,10 +2458,13 @@ impl ShardEngine {
             }
         }
 
-        let account_root =
+        let account_root = if self.simulation {
+            vec![]
+        } else {
             self.stores
                 .trie
-                .get_hash(&self.db, txn_batch, &TrieKey::for_fid(snapchain_txn.fid))?;
+                .get_hash(&self.db, txn_batch, &TrieKey::for_fid(snapchain_txn.fid))?
+        };
 
         debug!(
             shard_id = self.shard_id,
@@ -1846,8 +2598,7 @@ impl ShardEngine {
         let mt = MessageType::try_from(data.r#type)
             .or(Err(MessageValidationError::InvalidMessageType(data.r#type)))?;
 
-        let version =
-            EngineVersion::version_for(&FarcasterTime::new(data.timestamp as u64), self.network);
+        let version = self.version_for(&FarcasterTime::new(data.timestamp as u64));
         let gasless_enabled = version.is_enabled(ProtocolFeature::GaslessSigners);
         // Version-gated merge decisions (e.g. type-scoped link compaction under
         // ProtocolFeature::BlockLinks) are made inside each store's StoreDef from this context.
@@ -1952,6 +2703,21 @@ impl ShardEngine {
                 ));
             }
         };
+        // FIP §12 fee gate, after the pivot only (before it, the shards
+        // follow snapchain and charge nothing). It runs after the merge, so a
+        // duplicate or invalid message gives its own error; the charge and
+        // the cast fingerprint go on the same batch as the merge.
+        if self.hypersnap_mode {
+            let fee =
+                crate::chain::replica::charge_fee(&self.db, txn_batch, msg, self.hypersnap_height)
+                    .map_err(|e| {
+                        MessageValidationError::StoreError(
+                            crate::core::error::HubError::validation_failure(&e.to_string()),
+                        )
+                    })?;
+            let _ = fee;
+            crate::chain::fingerprint_store::record_cast(&self.db, msg, txn_batch);
+        }
         let elapsed = now.elapsed();
         self.metrics
             .time_with_shard("merge_message_time_us", elapsed.as_micros() as u64);
@@ -1974,10 +2740,7 @@ impl ShardEngine {
             };
             // Same version derivation as merge_message so the hyper shadow stores make the
             // same version-gated merge decisions as the canonical stores.
-            let version = EngineVersion::version_for(
-                &FarcasterTime::new(data.timestamp as u64),
-                self.network,
-            );
+            let version = self.version_for(&FarcasterTime::new(data.timestamp as u64));
             let ctx = MergeContext { version };
             let result = match mt {
                 MessageType::CastAdd | MessageType::CastRemove => {
@@ -2029,10 +2792,9 @@ impl ShardEngine {
         // would on the shard that admitted it. Verifications carry no follow index today; the
         // context is threaded so that stays true by construction rather than by omission.
         let ctx = MergeContext {
-            version: EngineVersion::version_for(
-                &FarcasterTime::new(message.data.as_ref().map_or(0, |data| data.timestamp) as u64),
-                self.network,
-            ),
+            version: self.version_for(&FarcasterTime::new(
+                message.data.as_ref().map_or(0, |data| data.timestamp) as u64,
+            )),
         };
         Ok(vec![self
             .stores
@@ -2051,12 +2813,9 @@ impl ShardEngine {
     ) {
         if let Some(ref hyper) = self.hyper_stores {
             let ctx = MergeContext {
-                version: EngineVersion::version_for(
-                    &FarcasterTime::new(
-                        message.data.as_ref().map_or(0, |data| data.timestamp) as u64
-                    ),
-                    self.network,
-                ),
+                version: self.version_for(&FarcasterTime::new(
+                    message.data.as_ref().map_or(0, |data| data.timestamp) as u64,
+                )),
             };
             if let Err(e) = hyper
                 .verification_store
@@ -2151,11 +2910,18 @@ impl ShardEngine {
         event: &proto::HubEvent,
         txn_batch: &mut RocksDbTransactionBatch,
     ) -> Result<(), EngineError> {
+        if self.simulation {
+            return Ok(());
+        }
         let now = std::time::Instant::now();
 
         self.stores
             .trie
             .update_for_event(ctx, &self.db, event, txn_batch)?;
+        // The KEY_REMOVE leaves of the state trie have no other store.
+        if self.content_replay || self.hypersnap_mode {
+            crate::storage::store::account::stage_key_remove_messages(txn_batch, event);
+        }
 
         let elapsed = now.elapsed();
         self.metrics
@@ -2192,25 +2958,53 @@ impl ShardEngine {
             .as_ref()
             .ok_or(MessageValidationError::NoMessageData)?;
 
-        let is_pro_user = self
-            .stores
-            .is_pro_user(message.fid(), timestamp)
-            .map_err(|err| HubError::internal_db_error(&err.to_string()))?;
-        validations::message::validate_message(
+        // After the pivot every FID behaves as Pro (FIP §17.6), and a
+        // migrated FID signs with Falcon-512 against the replica (FIP §16.8).
+        let replica_signer = if self.hypersnap_mode {
+            crate::chain::replica::check_signer(
+                &self.db,
+                txn_batch,
+                message,
+                self.network,
+                timestamp.to_u64(),
+            )
+            .map_err(|e| {
+                MessageValidationError::StoreError(HubError::validation_failure(&e.to_string()))
+            })?
+        } else {
+            crate::chain::replica::SignerCheck::Snapchain
+        };
+        let is_pro_user = self.hypersnap_mode
+            || self
+                .stores
+                .is_pro_user(message.fid(), timestamp)
+                .map_err(|err| HubError::internal_db_error(&err.to_string()))?;
+        validations::message::validate_message_with(
             message,
             self.network,
             is_pro_user,
             timestamp,
             version,
+            replica_signer == crate::chain::replica::SignerCheck::Snapchain,
         )?;
 
-        // 1. Check that the user has a custody address
-        // If not in the temp cache, fall back to the DB
-        self.stores
-            .onchain_event_store
-            .get_id_register_event_by_fid(message_data.fid, Some(read_txn))
-            .map_err(|_| MessageValidationError::MissingFid)?
+        // 1. Check that the user has a custody address: an IdRegistry event,
+        // or, after the pivot, the replica of the native FID registry.
+        let native = self.hypersnap_mode && message_data.fid >> 63 == 1;
+        if native {
+            crate::storage::store::account::get_from_db_or_txn(
+                &self.db,
+                read_txn,
+                &crate::chain::shard0::onboarding::native_fid_key(message_data.fid),
+            )?
             .ok_or(MessageValidationError::MissingFid)?;
+        } else {
+            self.stores
+                .onchain_event_store
+                .get_id_register_event_by_fid(message_data.fid, Some(read_txn))
+                .map_err(|_| MessageValidationError::MissingFid)?
+                .ok_or(MessageValidationError::MissingFid)?;
+        }
 
         // 2. Check that the user has a valid signer.
         //
@@ -2233,7 +3027,7 @@ impl ShardEngine {
                 message_data.r#type,
             ));
         }
-        if !is_key_message {
+        if !is_key_message && replica_signer == crate::chain::replica::SignerCheck::Snapchain {
             let active_key = crate::storage::store::account::get_active_key(
                 &self.stores.onchain_event_store,
                 &self.db,
@@ -2338,6 +3132,12 @@ impl ShardEngine {
         // and the store widens it to `u64` internally for the comparison. The block clock
         // (`timestamp.to_u64()`) is already farcaster-epoch `u64` — matches the store's
         // `current_block_timestamp: u64` parameter with no cast.
+        // The Falcon-512 signers of a migrated FID have the same sliding TTL.
+        if let crate::chain::replica::SignerCheck::Verified(Some(used)) = &replica_signer {
+            if !is_key_message {
+                crate::chain::replica::record_use(txn_batch, used, message_data.timestamp as u64);
+            }
+        }
         if let Some(ttl) = gasless_ttl_for_bump {
             let current_block_timestamp = timestamp.to_u64();
             crate::storage::store::account::check_and_bump_last_used_at(
@@ -2364,7 +3164,7 @@ impl ShardEngine {
     ) -> Result<Option<UserNameProof>, MessageValidationError> {
         // TODO(aditi): The fnames proofs should live in the username proof store.
         if name.ends_with(".eth") {
-            let version = EngineVersion::current(self.network);
+            let version = self.version_for(&FarcasterTime::current());
             let batch_txn = if version.is_enabled(ProtocolFeature::DependentMessagesInBulkSubmit) {
                 txn
             } else {
@@ -2521,6 +3321,7 @@ impl ShardEngine {
                     events,
                     max_block_event_seqnum,
                     block_events_hash,
+                    replica_key: self.hypersnap_replica_key.clone(),
                 });
             }
         }
@@ -2591,19 +3392,48 @@ impl ShardEngine {
         _ = self.emit_commit_metrics(&shard_chunk, &events);
 
         let now = std::time::Instant::now();
+        // F033: stage the shard-chunk write on the same RocksDB batch
+        // as the state mutations so trie/messages + chunk + header
+        // all commit atomically. A crash between separate commits
+        // could leave the trie at height H with the header still at
+        // H-1, producing on-restart consensus divergence and
+        // polluting bootstrap snapshots downstream.
+        // A Hypersnap block goes in the same batch, so a restart finds the
+        // state and the block at the same height. Its transactions are
+        // stored once, in the block: the chunk keeps the header and the
+        // hash, and a read of the chunk takes the transactions from the
+        // block.
+        let header_only;
+        let stored_chunk = match self.committing_block.take() {
+            Some((block_height, block)) => {
+                txn.put(
+                    crate::chain::shard_blocks::HypersnapBlockStore::key(block_height),
+                    block,
+                );
+                header_only = ShardChunk {
+                    header: shard_chunk.header.clone(),
+                    hash: shard_chunk.hash.clone(),
+                    transactions: vec![],
+                    commits: shard_chunk.commits.clone(),
+                };
+                &header_only
+            }
+            None => shard_chunk,
+        };
+        if let Err(e) = self
+            .stores
+            .shard_store
+            .stage_shard_chunk(&mut txn, stored_chunk)
+        {
+            error!("Unable to stage shard chunk write: {}", e);
+        }
+        self.stage_shadow_trie(&events, height.block_number, &mut txn);
         self.db.commit(txn).unwrap();
         for mut event in events {
             event.timestamp = header.timestamp;
             let _ = self.senders.events_tx.send(event);
         }
         self.stores.trie.reload(&self.db).unwrap();
-
-        match self.stores.shard_store.put_shard_chunk(shard_chunk) {
-            Err(err) => {
-                error!("Unable to write shard chunk to store {}", err)
-            }
-            Ok(()) => {}
-        }
         let elapsed = now.elapsed();
         self.metrics
             .time_with_shard("commit_time", elapsed.as_millis() as u64);
@@ -2630,7 +3460,9 @@ impl ShardEngine {
         let block_timestamp = shard_chunk.header.as_ref().unwrap().timestamp;
         self.metrics.gauge(
             "block_delay_seconds",
-            FarcasterTime::current().to_u64() - block_timestamp,
+            FarcasterTime::current()
+                .to_u64()
+                .saturating_sub(block_timestamp),
         );
 
         let trie_size = self.stores.trie.items()?;
@@ -2770,6 +3602,11 @@ impl ShardEngine {
 
         // TODO(aditi): Ideally we would handle this by putting max block event seqnum in the block header but this requires a protocol upgrade.
         // Compute block events hash from transactions and compare with cached hash
+        if cached_txn.replica_key != self.hypersnap_replica_key {
+            self.metrics
+                .count("commit.cache_miss", 1, vec![("reason", "replica_mismatch")]);
+            return false;
+        }
         let computed_hash = Self::compute_block_events_hash(transactions);
         if computed_hash != cached_txn.block_events_hash {
             error!(
@@ -2892,6 +3729,15 @@ impl ShardEngine {
         &mut self,
         message: &proto::Message,
     ) -> Result<(), MessageValidationError> {
+        self.simulate_message_at(message, &FarcasterTime::current())
+    }
+
+    /// `simulate_message` at `timestamp`.
+    pub(crate) fn simulate_message_at(
+        &mut self,
+        message: &proto::Message,
+        timestamp: &FarcasterTime,
+    ) -> Result<(), MessageValidationError> {
         let mut txn = RocksDbTransactionBatch::new();
         let snapchain_txn = Transaction {
             fid: message.fid() as u64,
@@ -2899,7 +3745,7 @@ impl ShardEngine {
             system_messages: vec![],
             user_messages: vec![message.clone()],
         };
-        let version = self.version_for(&FarcasterTime::current());
+        let version = self.version_for(timestamp);
         let max_block_event_seqnum = self.stores.block_event_store.max_seqnum().unwrap_or(0);
         let result = self.replay_snapchain_txn(
             &merkle_trie::Context::new(),
@@ -2907,17 +3753,19 @@ impl ShardEngine {
             &mut txn,
             ProposalSource::Simulate,
             version,
-            &FarcasterTime::current(),
+            timestamp,
             max_block_event_seqnum,
         );
 
         match result {
             Ok((_, _, errors, _)) => {
-                self.stores.trie.reload(&self.db).map_err(|e| {
-                    MessageValidationError::StoreError(HubError::invalid_internal_state(
-                        &*e.to_string(),
-                    ))
-                })?;
+                if !self.simulation {
+                    self.stores.trie.reload(&self.db).map_err(|e| {
+                        MessageValidationError::StoreError(HubError::invalid_internal_state(
+                            &*e.to_string(),
+                        ))
+                    })?;
+                }
                 if !errors.is_empty() {
                     return Err(errors[0].clone());
                 } else {
@@ -3004,6 +3852,9 @@ impl ShardEngine {
 
         // The simulation was successful. We must now discard all in-memory changes
         // to the trie and the transaction batch, as we are not committing state here.
+        if self.simulation {
+            return results;
+        }
         match self.stores.trie.reload(&self.db) {
             Ok(()) => results,
             Err(e) => {

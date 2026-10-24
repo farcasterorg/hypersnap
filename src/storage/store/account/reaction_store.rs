@@ -7,9 +7,9 @@ use super::{
     MessagesPage, StoreEventHandler, PAGE_SIZE_MAX, TS_HASH_LENGTH,
 };
 use crate::core::channel_uri::{channel_id_for_follow_target, ChannelRegistrar};
-use crate::hyper::StateContext;
 use crate::storage::store::account::ChannelPage;
 use crate::storage::store::account::CHANNEL_ID_LENGTH;
+use crate::storage::store::state_context::StateContext;
 use crate::{core::error::HubError, proto::SignatureScheme, storage::store::account::StoreOptions};
 use crate::{proto::message_data::Body, storage::db::PageOptions};
 use crate::{
@@ -90,7 +90,7 @@ impl StoreDef for ReactionStoreDef {
             return false;
         }
         let data = message.data.as_ref().unwrap();
-        message.signature_scheme == SignatureScheme::Ed25519 as i32
+        SignatureScheme::is_message_scheme(message.signature_scheme)
             && data.r#type == MessageType::ReactionAdd as i32
             && data.body.is_some()
     }
@@ -101,7 +101,7 @@ impl StoreDef for ReactionStoreDef {
             return false;
         }
         let data = message.data.as_ref().unwrap();
-        message.signature_scheme == SignatureScheme::Ed25519 as i32
+        SignatureScheme::is_message_scheme(message.signature_scheme)
             && data.r#type == MessageType::ReactionRemove as i32
             && data.body.is_some()
     }
@@ -517,6 +517,15 @@ impl ReactionStoreDef {
 pub struct ReactionStore {}
 
 impl ReactionStore {
+    /// The same store with no follow index: a Hypersnap node does not derive
+    /// the snapchain channel follows (FIP §17.7).
+    pub fn without_follow_index(store: &Store<ReactionStoreDef>) -> Store<ReactionStoreDef> {
+        store.with_store_def(ReactionStoreDef {
+            registrar: None,
+            ..store.store_def()
+        })
+    }
+
     /// `registrar` is an explicit argument rather than something the store looks
     /// up, so every caller — production and test alike — has to say which network's
     /// registrar it means. `None` disables follow indexing entirely.

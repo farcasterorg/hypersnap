@@ -154,6 +154,22 @@ pub fn get_current_header(db: &RocksDB) -> Result<Option<proto::ShardHeader>, Sh
 
 pub fn put_shard_chunk(db: &RocksDB, shard_chunk: &ShardChunk) -> Result<(), ShardStorageError> {
     let mut txn = db.txn();
+    stage_shard_chunk(db, &mut txn, shard_chunk)?;
+    db.commit(txn)?;
+    Ok(())
+}
+
+/// Stage the shard-chunk + timestamp-index writes onto a caller-owned
+/// batch. F033 fix: lets the engine merge the chunk write with the
+/// state-mutation batch so trie + chunk + header land in a single
+/// atomic commit. A crash between previously-separate commits could
+/// leave the trie at height H with the header still at H-1 — on
+/// restart the chains diverge and pollute S3 snapshots.
+pub fn stage_shard_chunk(
+    db: &RocksDB,
+    txn: &mut crate::storage::db::RocksDbTransactionBatch,
+    shard_chunk: &ShardChunk,
+) -> Result<(), ShardStorageError> {
     let header = shard_chunk
         .header
         .as_ref()
@@ -170,9 +186,55 @@ pub fn put_shard_chunk(db: &RocksDB, shard_chunk: &ShardChunk) -> Result<(), Sha
     if db.get(&timestamp_index_key)? == None {
         txn.put(timestamp_index_key, primary_key);
     }
-
-    db.commit(txn)?;
     Ok(())
+}
+
+/// A Hypersnap block keeps its transactions once, in the block store; its
+/// chunk keeps the header and the hash. A read of the chunk takes the
+/// transactions from the block.
+fn with_block_transactions(
+    db: &RocksDB,
+    mut shard_chunk: ShardChunk,
+) -> Result<ShardChunk, ShardStorageError> {
+    if !shard_chunk.transactions.is_empty() {
+        return Ok(shard_chunk);
+    }
+    let Some(height) = shard_chunk.header.as_ref().and_then(|h| h.height) else {
+        return Ok(shard_chunk);
+    };
+    let key = crate::chain::shard_blocks::HypersnapBlockStore::key(height.block_number);
+    if let Some(bytes) = db.get(&key)? {
+        shard_chunk.transactions = proto::HypersnapBlock::decode(bytes.as_slice())?.transactions;
+    }
+    Ok(shard_chunk)
+}
+
+/// Stage the delete of the chunk at `block_number` and of its timestamp
+/// index entry. Returns false if there is no chunk at `block_number`.
+pub fn stage_delete_shard_chunk(
+    db: &RocksDB,
+    txn: &mut crate::storage::db::RocksDbTransactionBatch,
+    block_number: u64,
+) -> Result<bool, ShardStorageError> {
+    let primary_key = make_shard_key(block_number);
+    let Some(bytes) = db.get(&primary_key)? else {
+        return Ok(false);
+    };
+    let shard_chunk = ShardChunk::decode(bytes.as_slice())?;
+    let header = shard_chunk
+        .header
+        .as_ref()
+        .ok_or(ShardStorageError::ShardMissingHeader)?;
+    let height = header
+        .height
+        .as_ref()
+        .ok_or(ShardStorageError::ShardMissingHeight)?;
+    let timestamp_index_key = make_block_timestamp_index(height.shard_index, header.timestamp);
+    if db.get(&timestamp_index_key)?.as_deref() == Some(primary_key.as_slice()) {
+        txn.delete(timestamp_index_key);
+    }
+    txn.delete(primary_key);
+    Ok(true)
 }
 
 pub fn get_shard_chunks_in_range(
@@ -202,12 +264,30 @@ impl ShardStore {
         put_shard_chunk(&self.db, shard_chunk)
     }
 
+    /// Batch-aware variant — see [`stage_shard_chunk`].
+    pub fn stage_shard_chunk(
+        &self,
+        txn: &mut crate::storage::db::RocksDbTransactionBatch,
+        shard_chunk: &ShardChunk,
+    ) -> Result<(), ShardStorageError> {
+        stage_shard_chunk(&self.db, txn, shard_chunk)
+    }
+
     pub fn get_first_shard_chunk(&self) -> Result<Option<ShardChunk>, ShardStorageError> {
-        get_first_or_last_shard_chunk(&self.db, FirstOrLast::First)
+        get_first_or_last_shard_chunk(&self.db, FirstOrLast::First)?
+            .map(|c| with_block_transactions(&self.db, c))
+            .transpose()
     }
 
     pub fn get_last_shard_chunk(&self) -> Result<Option<ShardChunk>, ShardStorageError> {
-        get_first_or_last_shard_chunk(&self.db, FirstOrLast::Last)
+        get_first_or_last_shard_chunk(&self.db, FirstOrLast::Last)?
+            .map(|c| with_block_transactions(&self.db, c))
+            .transpose()
+    }
+
+    /// The header of the last chunk, without its transactions.
+    pub fn get_last_shard_header(&self) -> Result<Option<proto::ShardHeader>, ShardStorageError> {
+        get_current_header(&self.db)
     }
 
     pub fn get_chunk_by_height(
@@ -223,7 +303,7 @@ impl ShardStore {
                     error!("Error decoding shard chunk: {:?}", e);
                     ShardStorageError::DecodeError(e)
                 })?;
-                Ok(Some(shard_chunk))
+                Ok(Some(with_block_transactions(&self.db, shard_chunk)?))
             }
         }
     }
@@ -279,7 +359,9 @@ impl ShardStore {
                 start_block_number,
                 stop_block_number,
             )?;
-            shard_chunks.extend(shard_page.shard_chunks);
+            for shard_chunk in shard_page.shard_chunks {
+                shard_chunks.push(with_block_transactions(&self.db, shard_chunk)?);
+            }
             if shard_page.next_page_token.is_none() {
                 break;
             } else {

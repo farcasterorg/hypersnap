@@ -1,391 +1,39 @@
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
+use hypersnap::connectors::onchain_events::ChainClients;
+use hypersnap::consensus::consensus::SystemMessage;
+use hypersnap::mempool::block_receiver::BlockReceiver;
+use hypersnap::mempool::l1_gate::GossipL1Gate;
+use hypersnap::mempool::l1_validator::L1Validator;
+use hypersnap::mempool::mempool::{Mempool, ReadNodeMempool};
+use hypersnap::mempool::routing;
+use hypersnap::network::gossip::{GossipEvent, SnapchainGossip};
+use hypersnap::network::replication::{self, Replicator};
+use hypersnap::node::servers::{api_handlers, init_api, start_servers, AdminInputs};
+use hypersnap::node::shutdown::{close_gossip_connections, shut_down_api, shutdown_signal};
+use hypersnap::node::snapchain_node::SnapchainNode;
+use hypersnap::node::snapchain_read_node::SnapchainReadNode;
+use hypersnap::storage::db::snapshot::{download_snapshots, BootstrapMethod};
+use hypersnap::storage::db::RocksDB;
+use hypersnap::storage::store::block_engine::BlockStores;
+use hypersnap::storage::store::engine::PostCommitMessage;
+use hypersnap::storage::store::node_local_state::{self, LocalStateStore};
+use hypersnap::storage::store::stores::Stores;
+use hypersnap::utils::statsd_wrapper::StatsdClientWrapper;
 use informalsystems_malachitebft_metrics::{Metrics, SharedRegistry};
-use libp2p::PeerId;
-use snapchain::connectors::fname::FnameRequest;
-use snapchain::connectors::onchain_events::{ChainClients, OnchainEventsRequest};
-use snapchain::consensus::consensus::SystemMessage;
-use snapchain::core::types::SnapchainValidatorContext;
-use snapchain::hyper as snapchain_hyper;
-use snapchain::mempool::block_receiver::BlockReceiver;
-use snapchain::mempool::l1_gate::GossipL1Gate;
-use snapchain::mempool::l1_validator::L1Validator;
-use snapchain::mempool::mempool::{Mempool, MempoolRequest, ReadNodeMempool};
-use snapchain::mempool::routing;
-use snapchain::network::admin_server::MyAdminService;
-use snapchain::network::gossip::{GossipEvent, SnapchainGossip};
-use snapchain::network::http_server::HubHttpServiceImpl;
-use snapchain::network::replication::{self, ReplicationServer, Replicator};
-use snapchain::network::server::MyHubService;
-use snapchain::node::snapchain_node::SnapchainNode;
-use snapchain::node::snapchain_read_node::SnapchainReadNode;
-use snapchain::proto::admin_service_server::AdminServiceServer;
-use snapchain::proto::hub_service_server::HubServiceServer;
-use snapchain::proto::replication_service_server::ReplicationServiceServer;
-use snapchain::storage::db::snapshot::{download_snapshots, BootstrapMethod};
-use snapchain::storage::db::RocksDB;
-use snapchain::storage::store::block_engine::BlockStores;
-use snapchain::storage::store::engine::{PostCommitMessage, Senders};
-use snapchain::storage::store::node_local_state::{self, LocalStateStore};
-use snapchain::storage::store::stores::Stores;
-use snapchain::utils::statsd_wrapper::StatsdClientWrapper;
-use snapchain_hyper::CAPABILITY_HYPER;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::future::Future;
-use std::net::SocketAddr;
 use std::process;
 use std::sync::Arc;
 use std::time::Duration;
 use std::{fs, net};
-use tokio::net::TcpListener;
 use tokio::select;
-use tokio::signal::ctrl_c;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio_cron_scheduler::JobScheduler;
-use tonic::transport::Server;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-const VERSION: Option<&str> = option_env!("CARGO_PKG_VERSION");
-
-async fn start_servers(
-    app_config: &snapchain::cfg::Config,
-    gossip_tx: mpsc::Sender<GossipEvent<SnapchainValidatorContext>>,
-    local_peer_id: PeerId,
-    mempool_tx: mpsc::Sender<MempoolRequest>,
-    shutdown_tx: mpsc::Sender<()>,
-    onchain_events_request_tx: broadcast::Sender<OnchainEventsRequest>,
-    fname_request_tx: broadcast::Sender<FnameRequest>,
-    statsd_client: StatsdClientWrapper,
-    shard_stores: HashMap<u32, Stores>,
-    shard_senders: HashMap<u32, Senders>,
-    block_stores: BlockStores,
-    l1_validator: Arc<L1Validator>,
-    replicator: Option<Arc<replication::replicator::Replicator>>,
-    local_state_store: LocalStateStore,
-    api_handler: Option<snapchain::api::ApiHttpHandler>,
-    api_system_search_indexer: Option<Arc<snapchain::api::SearchIndexer>>,
-) {
-    let grpc_addr = app_config.rpc_address.clone();
-    let grpc_socket_addr: SocketAddr = grpc_addr.parse().unwrap();
-
-    let admin_service = MyAdminService::new(
-        app_config.admin_rpc_auth.clone(),
-        mempool_tx.clone(),
-        onchain_events_request_tx,
-        fname_request_tx,
-        shard_stores.clone(),
-        block_stores.clone(),
-        app_config.snapshot.clone(),
-        app_config.fc_network,
-        statsd_client.clone(),
-        local_state_store,
-    );
-
-    // Build hyper shadow stores for API queries (includes pruned messages)
-    let hyper_shard_stores: HashMap<u32, _> = shard_stores
-        .iter()
-        .map(|(&id, s)| {
-            (
-                id,
-                s.with_state_context(snapchain::hyper::StateContext::Hyper),
-            )
-        })
-        .collect();
-
-    // Spawn hyper backfill to populate shadow stores from historical blocks,
-    // then reconcile them against the legacy stores for anything replay missed.
-    {
-        let backfill_db = block_stores.db.clone();
-        let backfill_shard_stores = shard_stores.clone();
-        let backfill_hyper_stores = hyper_shard_stores.clone();
-        tokio::spawn(async move {
-            snapchain::hyper::backfill::run_hyper_backfill(
-                &backfill_db,
-                &backfill_shard_stores,
-                &backfill_hyper_stores,
-            )
-            .await;
-            let cast_hash = snapchain::api::cast_hash_index::CastHashIndexer::new(
-                snapchain::api::config::FeatureConfig {
-                    enabled: true,
-                    ..Default::default()
-                },
-                backfill_db.clone(),
-            );
-            let reconcile = tokio::task::spawn_blocking(move || {
-                snapchain::hyper::reconcile::run_hyper_reconcile(
-                    &backfill_db,
-                    &backfill_shard_stores,
-                    &backfill_hyper_stores,
-                    &cast_hash,
-                );
-            });
-            if let Err(e) = reconcile.await {
-                warn!(error = %e, "Hyper reconciliation task failed");
-            }
-        });
-    }
-
-    let fname_lookup: Option<Arc<dyn snapchain::connectors::fname::FnameTransferLookup>> =
-        if !app_config.fnames.disable && !app_config.fnames.url.is_empty() {
-            Some(Arc::new(
-                snapchain::connectors::fname::HttpFnameTransferLookup::new(
-                    app_config.fnames.url.clone(),
-                ),
-            ))
-        } else {
-            None
-        };
-
-    // Validator public keys (hex) used to classify peers in the mesh view by
-    // deriving each validator's PeerId — the latest set per shard, unioned
-    // (same source as the diagnostics gate, so the two stay consistent).
-    let validator_hex_keys: Vec<String> = app_config.consensus.latest_validator_public_keys();
-
-    let service = Arc::new(MyHubService::new(
-        app_config.rpc_auth.clone(),
-        app_config.admin_rpc_auth.clone(),
-        validator_hex_keys.clone(),
-        block_stores.clone(),
-        shard_stores.clone(),
-        hyper_shard_stores.clone(),
-        shard_senders,
-        statsd_client.clone(),
-        app_config.consensus.num_shards,
-        app_config.fc_network,
-        Box::new(routing::ShardRouter {}),
-        mempool_tx.clone(),
-        gossip_tx.clone(),
-        l1_validator.clone(),
-        VERSION.unwrap_or("unknown").to_string(),
-        local_peer_id.to_string(),
-        fname_lookup.clone(),
-        app_config.mesh.clone(),
-    ));
-
-    // Create a separate API service backed by hyper (un-pruned) stores.
-    // This ensures API consumers see full message history without pruning.
-    let api_service = Arc::new(MyHubService::new(
-        app_config.rpc_auth.clone(),
-        app_config.admin_rpc_auth.clone(),
-        validator_hex_keys,
-        block_stores.clone(),
-        hyper_shard_stores,
-        HashMap::new(), // no shadow stores needed for the API service
-        HashMap::new(), // API service is read-only, no shard senders
-        statsd_client.clone(),
-        app_config.consensus.num_shards,
-        app_config.fc_network,
-        Box::new(routing::ShardRouter {}),
-        mempool_tx.clone(),
-        gossip_tx.clone(),
-        l1_validator,
-        VERSION.unwrap_or("unknown").to_string(),
-        local_peer_id.to_string(),
-        fname_lookup,
-        app_config.mesh.clone(),
-    ));
-
-    // Wire late-bound API handlers that depend on the hub service
-    if let Some(ref handler) = api_handler {
-        if app_config.api.conversations.enabled {
-            let conv = Arc::new(snapchain::api::ConversationService::new(
-                app_config.api.conversations.clone(),
-                api_service.clone(),
-            ));
-            handler.set_conversations(conv);
-        }
-        if app_config.api.feeds.enabled {
-            let social_graph = if app_config.api.social_graph.enabled {
-                Some(Arc::new(snapchain::api::SocialGraphIndexer::new(
-                    app_config.api.social_graph.clone(),
-                    block_stores.db.clone(),
-                )))
-            } else {
-                None
-            };
-            let metrics = if app_config.api.metrics.enabled {
-                Some(Arc::new(snapchain::api::MetricsIndexer::new(
-                    app_config.api.metrics.clone(),
-                    block_stores.db.clone(),
-                )))
-            } else {
-                None
-            };
-            let feeds = Arc::new(snapchain::api::FeedService::new(
-                app_config.api.feeds.clone(),
-                social_graph,
-                metrics,
-                api_service.clone(),
-            ));
-            feeds.warm_trending();
-            handler.set_feeds(feeds.clone());
-            handler.set_channel_feeds(feeds);
-        }
-        if let Some(ref search) = api_system_search_indexer {
-            handler.set_search(search.clone());
-        }
-        // Wire user hydrator for populating User objects in API responses
-        let social_graph_for_hydrator = if app_config.api.social_graph.enabled {
-            Some(Arc::new(snapchain::api::SocialGraphIndexer::new(
-                app_config.api.social_graph.clone(),
-                block_stores.db.clone(),
-            )))
-        } else {
-            None
-        };
-        let hydrator = Arc::new(snapchain::api::HubUserHydrator::new(
-            api_service.clone(),
-            social_graph_for_hydrator,
-        ));
-        // Hold a CustodyAddressLookup view of the hydrator before erasing
-        // it as `dyn UserHydrator`, so the webhook auth verifier can reuse
-        // the same hub-service-backed lookup path.
-        let custody_lookup: Arc<dyn snapchain::api::webhooks::CustodyAddressLookup> =
-            hydrator.clone();
-        handler.set_user_hydrator(hydrator);
-
-        // Wire hub query handler for direct hub data access (cast lookup, reactions, etc.)
-        handler.set_hub_query(api_service.clone());
-
-        // Build one shared auth verifier for every custody-signed
-        // management endpoint (webhooks + mini app registration).
-        // Clones share the same nonce LRU, so a nonce used for
-        // webhook.create can't be replayed as app.create.
-        let shared_auth = if app_config.api.webhooks.enabled || app_config.api.notifications.enabled
-        {
-            Some(snapchain::api::webhooks::WebhookAuthVerifier::new(
-                custody_lookup.clone(),
-                app_config.api.webhooks.signed_at_window_secs,
-            ))
-        } else {
-            None
-        };
-
-        // Optional: webhook management API.
-        if app_config.api.webhooks.enabled {
-            let store = Arc::new(snapchain::api::webhooks::WebhookStore::new(
-                block_stores.db.clone(),
-            ));
-            let webhook_handler = snapchain::api::webhooks::WebhookManagementHandler::new(
-                app_config.api.webhooks.clone(),
-                store,
-                shared_auth.clone().expect("shared_auth built above"),
-            );
-            handler.set_webhooks(webhook_handler);
-        }
-
-        // Optional: mini app registration management API. The stores
-        // were stashed on the handler by `api::initialize`; the helper
-        // reads them and installs the management handler.
-        if app_config.api.notifications.enabled {
-            if let Some(ref auth) = shared_auth {
-                handler
-                    .install_notification_apps(app_config.api.notifications.clone(), auth.clone());
-            }
-        }
-    }
-
-    let replication_service = if let Some(replicator) = replicator {
-        let service = ReplicationServiceServer::new(ReplicationServer::new(
-            replicator,
-            block_stores.clone(),
-            statsd_client.clone(),
-        ));
-        Some(service)
-    } else {
-        None
-    };
-
-    let grpc_service = service.clone();
-    let grpc_shutdown_tx = shutdown_tx.clone();
-
-    tokio::spawn(async move {
-        info!(grpc_addr = grpc_addr, "GrpcService listening",);
-        let mut server = Server::builder().add_service(HubServiceServer::from_arc(grpc_service));
-
-        if admin_service.enabled() {
-            let admin_service = AdminServiceServer::new(admin_service);
-            server = server.add_service(admin_service);
-        }
-
-        if let Some(replication_service) = replication_service {
-            server = server.add_service(replication_service);
-        }
-
-        let resp = server.serve(grpc_socket_addr).await;
-
-        let msg = "grpc server stopped";
-        match resp {
-            Ok(()) => error!(msg),
-            Err(e) => error!(error = ?e, "{}", msg),
-        }
-
-        grpc_shutdown_tx.send(()).await.ok();
-    });
-
-    let http_addr = app_config.http_address.clone();
-    let http_socket_addr: SocketAddr = http_addr.parse().unwrap();
-
-    let http_shutdown_tx = shutdown_tx.clone();
-    let http_server_config = app_config.http_server.clone();
-    // Built once and shared across all connections — maps peers to human-readable
-    // names for the mesh JSON / UI.
-    let mesh_nodes = Arc::new(snapchain::network::mesh::nodes::NodeRegistry::from_config(
-        &app_config.mesh,
-    ));
-    info!(
-        known_nodes = mesh_nodes.len(),
-        "Mesh known-node registry loaded"
-    );
-    tokio::spawn(async move {
-        let listener = TcpListener::bind(http_socket_addr).await.unwrap();
-        info!(http_addr = http_addr, "HttpService listening",);
-
-        let http_service = HubHttpServiceImpl {
-            service: service.clone(),
-        };
-        loop {
-            match listener.accept().await {
-                Ok((stream, _)) => {
-                    let io = TokioIo::new(stream);
-                    let http_server_config = http_server_config.clone();
-                    let service_clone = http_service.clone();
-                    let api = api_handler.clone();
-                    let nodes = mesh_nodes.clone();
-                    tokio::spawn(async move {
-                        let mut router =
-                            snapchain::network::http_server::Router::new(service_clone, nodes);
-                        if let Some(handler) = api {
-                            router = router.with_api_handler(handler);
-                        }
-                        if let Err(err) = http1::Builder::new()
-                            .serve_connection(
-                                io,
-                                service_fn(|r| router.handle(r, &http_server_config)),
-                            )
-                            .await
-                        {
-                            error!("Error serving connection: {}", err);
-                        }
-                    });
-                }
-                Err(e) => {
-                    error!("Error accepting connection: {}", e);
-                    break;
-                }
-            }
-        }
-
-        http_shutdown_tx.send(()).await.ok();
-    });
-}
-
 async fn schedule_background_jobs(
-    app_config: &snapchain::cfg::Config,
+    app_config: &hypersnap::cfg::Config,
     shard_stores: HashMap<u32, Stores>,
     block_stores: BlockStores,
     sync_complete_rx: watch::Receiver<bool>,
@@ -396,7 +44,7 @@ async fn schedule_background_jobs(
     if app_config.read_node {
         if let Some(block_retention) = app_config.pruning.block_retention {
             let schedule = "0 0 10 * * *"; // 10am UTC every day
-            let job = snapchain::jobs::block_pruning::block_pruning_job(
+            let job = hypersnap::jobs::block_pruning::block_pruning_job(
                 schedule,
                 block_retention,
                 block_stores.clone(),
@@ -413,7 +61,7 @@ async fn schedule_background_jobs(
         .event_pruning_schedule
         .as_deref()
         .unwrap_or("0 0 0 * * *"); // default: midnight UTC every day
-    let event_pruning_job = snapchain::jobs::event_pruning::event_pruning_job(
+    let event_pruning_job = hypersnap::jobs::event_pruning::event_pruning_job(
         event_pruning_schedule,
         app_config.pruning.event_retention,
         shard_stores.clone(),
@@ -427,7 +75,7 @@ async fn schedule_background_jobs(
     jobs.push(event_pruning_job);
 
     if app_config.snapshot.snapshot_upload_enabled() {
-        let snapshot_upload_job = snapchain::jobs::snapshot_upload::snapshot_upload_job(
+        let snapshot_upload_job = hypersnap::jobs::snapshot_upload::snapshot_upload_job(
             "0 0 5 * * *", // 5 AM UTC every day
             app_config.snapshot.clone(),
             app_config.fc_network,
@@ -471,7 +119,7 @@ where
 }
 
 fn create_replicator(
-    app_config: &snapchain::cfg::Config,
+    app_config: &hypersnap::cfg::Config,
     shard_stores: HashMap<u32, Stores>,
     statsd_client: StatsdClientWrapper,
 ) -> Result<Arc<replication::Replicator>, Box<dyn Error>> {
@@ -506,8 +154,6 @@ fn create_replicator(
 
     Ok(Arc::new(replicator))
 }
-/// How long shutdown waits for the API indexing system to stop.
-const API_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long the runtime waits for blocking-pool work after `run` returns.
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -524,61 +170,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     result
 }
 
-/// Resolves on Ctrl-C (SIGINT) or SIGTERM and names the signal. Docker and most
-/// process supervisors stop a node with SIGTERM.
-async fn shutdown_signal() -> &'static str {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        match signal(SignalKind::terminate()) {
-            Ok(mut sigterm) => select! {
-                _ = ctrl_c() => "SIGINT",
-                _ = sigterm.recv() => "SIGTERM",
-            },
-            Err(e) => {
-                warn!(error = %e, "Could not install a SIGTERM handler; only Ctrl-C shuts down cleanly");
-                let _ = ctrl_c().await;
-                "SIGINT"
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = ctrl_c().await;
-        "SIGINT"
-    }
-}
-
-/// Has the gossip task close every peer connection before the process exits. Without
-/// it each peer holds a dead connection until its QUIC idle timeout, and a node that
-/// restarts inside that window never receives the peers' gossip subscriptions.
-async fn close_gossip_connections(
-    gossip_tx: &mpsc::Sender<GossipEvent<SnapchainValidatorContext>>,
-) {
-    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-    if gossip_tx.send(GossipEvent::Shutdown(done_tx)).await.is_ok() {
-        // The gossip task bounds its own wait; this only guards a stalled task.
-        let _ = tokio::time::timeout(
-            snapchain::network::gossip::SHUTDOWN_CLOSE_TIMEOUT + Duration::from_secs(1),
-            done_rx,
-        )
-        .await;
-    }
-}
-
-async fn shut_down_api(api: snapchain::api::ApiSystem) {
-    if tokio::time::timeout(API_SHUTDOWN_TIMEOUT, api.shutdown())
-        .await
-        .is_err()
-    {
-        warn!("API indexing system did not stop in time");
-    }
-}
-
 async fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().collect();
 
-    let app_config = match snapchain::cfg::load_and_merge_config(args) {
+    let app_config = match hypersnap::cfg::load_and_merge_config(args) {
         Ok(config) => config,
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -588,7 +183,17 @@ async fn run() -> Result<(), Box<dyn Error>> {
 
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"))
-        .add_directive("tantivy=warn".parse().unwrap());
+        .add_directive("tantivy=warn".parse().unwrap())
+        // Malachite emits WARN for every sync poll when the local
+        // node has no peer subscribed to the consensus topic — the
+        // expected steady state during single-signer / bootstrap /
+        // pre-handshake moments. The malachite consensus paths
+        // (`vote set`, `request sync from`) emit dozens of these per
+        // second on epoch 0 with one validator, drowning real WARN
+        // signal. Demote to `info` so they stay greppable for
+        // debugging via `RUST_LOG=…sync=debug` but don't clutter
+        // the default-WARN production view.
+        .add_directive("informalsystems_malachitebft_sync=info".parse().unwrap());
     match app_config.log_format.as_str() {
         "text" => tracing_subscriber::fmt().with_env_filter(env_filter).init(),
         "json" => tracing_subscriber::fmt()
@@ -659,7 +264,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let mut statsd_sink = None;
     loop {
         let socket = net::UdpSocket::bind("0.0.0.0:0").unwrap();
-        match cadence::UdpMetricSink::from((statsd_host.as_str(), statsd_port), socket) {
+        match cadence::BufferedUdpMetricSink::from((statsd_host.as_str(), statsd_port), socket) {
             Ok(sink) => {
                 statsd_sink = Some(sink);
                 break;
@@ -684,9 +289,13 @@ async fn run() -> Result<(), Box<dyn Error>> {
     }
 
     let statsd_client = match statsd_sink {
-        Some(sink) => {
-            cadence::StatsdClient::builder(app_config.statsd.prefix.as_str(), sink).build()
-        }
+        // A queue thread sends the metrics, many to a packet: a UDP send for
+        // each metric cost a syscall for each message of a block.
+        Some(sink) => cadence::StatsdClient::builder(
+            app_config.statsd.prefix.as_str(),
+            cadence::QueuingMetricSink::from(sink),
+        )
+        .build(),
         None => cadence::StatsdClient::builder(
             app_config.statsd.prefix.as_str(),
             cadence::NopMetricSink,
@@ -694,6 +303,49 @@ async fn run() -> Result<(), Box<dyn Error>> {
         .build(),
     };
     let statsd_client = StatsdClientWrapper::new(statsd_client, app_config.statsd.use_tags);
+    // The rest of a packet goes out each second.
+    {
+        let statsd_client = statsd_client.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                tick.tick().await;
+                statsd_client.flush();
+            }
+        });
+    }
+
+    // After the epoch-1 pivot: run as a Hypersnap validator (FIP §17). A
+    // pivot marker of another PIVOT_HEIGHT is removed, and the snapchain
+    // sync continues (§17.8).
+    let marker = hypersnap::node::pivot_boot::check_marker(
+        std::path::Path::new(&app_config.rocksdb_dir),
+        &app_config.hypersnap.data_dir_for(&app_config.rocksdb_dir),
+        hypersnap::consensus::pivot_guard::params::effective_pivot_height(
+            app_config.fc_network,
+            app_config.consensus.pivot_height_override,
+        ),
+    )?;
+    if app_config.hypersnap.enabled
+        || matches!(marker, hypersnap::node::pivot_boot::MarkerState::Pivot(_))
+    {
+        let result = hypersnap::node::hypersnap_main::run(&app_config, statsd_client).await;
+        // A normal exit runs the C++ static destructors, and RocksDB aborts in
+        // them while its threads still run ("pthread lock: Invalid
+        // argument"). The node stopped its actors, and each write is in the
+        // RocksDB log, so the process ends without the destructors.
+        let code = match result {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("Error: {:?}", e);
+                1
+            }
+        };
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+        unsafe { libc::_exit(code) }
+    }
 
     // We only use snapshots if the db directory doesn't exist or is empty.
     // If the user sets [force_load_db_from_snapshot], load the snapshot without checking directory contents.
@@ -703,10 +355,10 @@ async fn run() -> Result<(), Box<dyn Error>> {
     if db_is_empty {
         match app_config.snapshot.bootstrap_method {
             BootstrapMethod::Replicate => {
-                use rustls::crypto::{self, ring};
-                use snapchain::bootstrap::replication::service::{
+                use hypersnap::bootstrap::replication::service::{
                     ReplicatorBootstrap, WorkUnitResponse,
                 };
+                use rustls::crypto::{self, ring};
                 use tokio::time::{sleep, Duration};
 
                 // Initialize SSL for rustls
@@ -776,12 +428,6 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let (system_tx, mut system_rx) = mpsc::channel::<SystemMessage>(16384);
     let (mempool_tx, mempool_rx) = mpsc::channel(app_config.mempool.queue_size as usize);
 
-    let node_capabilities = if app_config.hyper.enabled {
-        vec![CAPABILITY_HYPER.to_string()]
-    } else {
-        vec![]
-    };
-
     let gossip_result = SnapchainGossip::create(
         keypair.clone(),
         &app_config.gossip,
@@ -789,7 +435,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         app_config.read_node,
         app_config.fc_network,
         statsd_client.clone(),
-        node_capabilities,
+        vec![],
     )
     .await;
 
@@ -801,7 +447,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let mut gossip = gossip_result?;
     // Validator PeerIds permitted to query the mesh-diagnostics behaviour;
     // the gossip responder answers only these peers (fail-closed otherwise).
-    let validator_peers: HashSet<_> = snapchain::network::mesh::view::build_validator_peer_ids(
+    let validator_peers: HashSet<_> = hypersnap::network::mesh::view::build_validator_peer_ids(
         app_config.consensus.latest_validator_public_keys().iter(),
     )
     .into_keys()
@@ -834,6 +480,29 @@ async fn run() -> Result<(), Box<dyn Error>> {
         gossip.start().await;
         info!("Gossip Stopped");
     });
+
+    // The `IdRegistry` `Recover` logs for `EXEMPT_RECOVERIES` (FIP §2).
+    if !app_config.hypersnap.recovery_watcher_rpc_url.is_empty() {
+        let dir = hypersnap::node::pivot_boot::recoveries_dir(std::path::Path::new(
+            &app_config.rocksdb_dir,
+        ));
+        let db = Arc::new(RocksDB::new(&dir.to_string_lossy()));
+        match db.open() {
+            Ok(()) => {
+                let cfg = hypersnap::chain::recovery_watcher::RecoveryWatcherConfig {
+                    rpc_url: app_config.hypersnap.recovery_watcher_rpc_url.clone(),
+                    ..Default::default()
+                };
+                let store = hypersnap::chain::recovery_store::RecoveryEventStore::new(db);
+                tokio::spawn(async move {
+                    if let Err(e) = hypersnap::chain::recovery_watcher::run(cfg, store).await {
+                        error!("Recovery watcher stopped: {}", e);
+                    }
+                });
+            }
+            Err(e) => error!(path = %dir.display(), "Recovery watcher DB: {}", e),
+        }
+    }
 
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
 
@@ -936,53 +605,16 @@ async fn run() -> Result<(), Box<dyn Error>> {
             None
         };
 
-        // Build hyper stores for API search backfill (includes pruned messages)
-        let api_hyper_stores: HashMap<u32, _> = node
-            .shard_stores
-            .iter()
-            .map(|(&id, s)| {
-                (
-                    id,
-                    s.with_state_context(snapchain::hyper::StateContext::Hyper),
-                )
-            })
-            .collect();
-
         // Initialize API indexing system if enabled
-        let api_system = {
-            let hub_event_senders: Vec<(u32, broadcast::Sender<snapchain::proto::HubEvent>)> = node
-                .shard_senders
-                .iter()
-                .map(|(shard_id, senders)| (*shard_id, senders.events_tx.clone()))
-                .collect();
-            let api_chain_client: Option<Arc<dyn snapchain::connectors::onchain_events::ChainAPI>> =
-                if !app_config.l1_rpc_url.is_empty() {
-                    snapchain::connectors::onchain_events::RealL1Client::new(
-                        app_config.l1_rpc_url.clone(),
-                        None,
-                    )
-                    .ok()
-                    .map(|c| Arc::new(c) as _)
-                } else {
-                    None
-                };
-            snapchain::api::initialize(
-                &app_config.api,
-                node.block_stores.db.clone(),
-                hub_event_senders,
-                node.shard_stores.clone(),
-                Some(api_hyper_stores),
-                api_chain_client,
-                Some(statsd_client.clone()),
-            )
-        };
-
-        let api_handler = api_system.as_ref().map(|s| {
-            let mut h = s.http_handler.clone();
-            h.set_statsd(statsd_client.clone());
-            h
-        });
-        let api_search_indexer = api_system.as_ref().and_then(|s| s.search_indexer.clone());
+        let api_system = init_api(
+            &app_config,
+            &node.block_stores,
+            &node.shard_stores,
+            &node.shard_senders,
+            &statsd_client,
+            false,
+        );
+        let (api_handler, api_search_indexer) = api_handlers(api_system.as_ref(), &statsd_client);
 
         let l1_validator = Arc::new(L1Validator::new(
             chains_clients,
@@ -999,17 +631,24 @@ async fn run() -> Result<(), Box<dyn Error>> {
             local_peer_id,
             mempool_tx,
             shutdown_tx,
-            onchain_events_request_tx,
-            fname_request_tx,
+            app_config.consensus.num_shards,
+            Some(AdminInputs {
+                onchain_events_request_tx,
+                fname_request_tx,
+                local_state_store: local_state_store.clone(),
+            }),
             statsd_client,
             node.shard_stores.clone(),
             node.shard_senders.clone(),
             node.block_stores.clone(),
             l1_validator,
             replicator,
-            local_state_store.clone(),
             api_handler,
             api_search_indexer,
+            // `/hyper/v1` is served by a Hypersnap node (`node::hyper_v1`).
+            None,
+            None,
+            Some(node.content_replay.clone()),
         )
         .await;
 
@@ -1139,7 +778,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         );
 
         if !app_config.fnames.disable {
-            let mut fetcher = snapchain::connectors::fname::Fetcher::new(
+            let mut fetcher = hypersnap::connectors::fname::Fetcher::new(
                 app_config.fnames.clone(),
                 mempool_tx.clone(),
                 statsd_client.clone(),
@@ -1154,7 +793,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
 
         if !app_config.onchain_events.rpc_url.is_empty() {
             let mut onchain_events_subscriber =
-                snapchain::connectors::onchain_events::Subscriber::new(
+                hypersnap::connectors::onchain_events::Subscriber::new(
                     &app_config.onchain_events,
                     node_local_state::Chain::Optimism,
                     app_config.fc_network,
@@ -1176,7 +815,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
 
         if !app_config.base_onchain_events.rpc_url.is_empty() {
             let mut onchain_events_subscriber =
-                snapchain::connectors::onchain_events::Subscriber::new(
+                hypersnap::connectors::onchain_events::Subscriber::new(
                     &app_config.base_onchain_events,
                     node_local_state::Chain::Base,
                     app_config.fc_network,
@@ -1260,84 +899,16 @@ async fn run() -> Result<(), Box<dyn Error>> {
         );
         tokio::spawn(gossip_l1_gate_worker.run());
 
-        if let Some(hyper_engine) = node.hyper_block_engine.clone() {
-            let mut hyper_block_rx = block_tx.subscribe();
-            let hyper_gossip_tx = gossip_tx.clone();
-            tokio::spawn(async move {
-                loop {
-                    match hyper_block_rx.recv().await {
-                        Ok(block) => {
-                            let state_root = {
-                                let mut engine = hyper_engine.lock().await;
-                                engine.commit_block(&block);
-                                engine.current_state_root()
-                            };
-                            let envelope =
-                                snapchain_hyper::build_envelope_for_block(&block, state_root)
-                                    .into();
-                            if let Err(err) = hyper_gossip_tx
-                                .send(GossipEvent::BroadcastHyperEnvelope(envelope))
-                                .await
-                            {
-                                warn!(reason = ?err, "Failed to broadcast hyper envelope");
-                            }
-                        }
-                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                            warn!(skipped, "Hyper block subscriber lagged behind");
-                        }
-                        Err(broadcast::error::RecvError::Closed) => break,
-                    }
-                }
-            });
-        }
-
-        // Build hyper stores for API search backfill (includes pruned messages)
-        let api_hyper_stores: HashMap<u32, _> = node
-            .shard_stores
-            .iter()
-            .map(|(&id, s)| {
-                (
-                    id,
-                    s.with_state_context(snapchain::hyper::StateContext::Hyper),
-                )
-            })
-            .collect();
-
         // Initialize API indexing system if enabled
-        let api_system = {
-            let hub_event_senders: Vec<(u32, broadcast::Sender<snapchain::proto::HubEvent>)> = node
-                .shard_senders
-                .iter()
-                .map(|(shard_id, senders)| (*shard_id, senders.events_tx.clone()))
-                .collect();
-            let api_chain_client: Option<Arc<dyn snapchain::connectors::onchain_events::ChainAPI>> =
-                if !app_config.l1_rpc_url.is_empty() {
-                    snapchain::connectors::onchain_events::RealL1Client::new(
-                        app_config.l1_rpc_url.clone(),
-                        None,
-                    )
-                    .ok()
-                    .map(|c| Arc::new(c) as _)
-                } else {
-                    None
-                };
-            snapchain::api::initialize(
-                &app_config.api,
-                node.block_stores.db.clone(),
-                hub_event_senders,
-                node.shard_stores.clone(),
-                Some(api_hyper_stores),
-                api_chain_client,
-                Some(statsd_client.clone()),
-            )
-        };
-
-        let api_handler = api_system.as_ref().map(|s| {
-            let mut h = s.http_handler.clone();
-            h.set_statsd(statsd_client.clone());
-            h
-        });
-        let api_search_indexer = api_system.as_ref().and_then(|s| s.search_indexer.clone());
+        let api_system = init_api(
+            &app_config,
+            &node.block_stores,
+            &node.shard_stores,
+            &node.shard_senders,
+            &statsd_client,
+            false,
+        );
+        let (api_handler, api_search_indexer) = api_handlers(api_system.as_ref(), &statsd_client);
 
         start_servers(
             &app_config,
@@ -1345,17 +916,23 @@ async fn run() -> Result<(), Box<dyn Error>> {
             local_peer_id,
             mempool_tx.clone(),
             shutdown_tx.clone(),
-            onchain_events_request_tx,
-            fname_request_tx,
+            app_config.consensus.num_shards,
+            Some(AdminInputs {
+                onchain_events_request_tx,
+                fname_request_tx,
+                local_state_store: local_state_store.clone(),
+            }),
             statsd_client,
             node.shard_stores.clone(),
             node.shard_senders.clone(),
             node.block_stores.clone(),
             l1_validator,
             replicator,
-            local_state_store.clone(),
             api_handler,
             api_search_indexer,
+            None,
+            None,
+            None,
         )
         .await;
 
@@ -1377,7 +954,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 );
                 let timestamp = chrono::Utc::now().timestamp_millis();
                 dbs.iter().for_each(|(shard_id, db)| {
-                    snapchain::storage::db::backup::backup_db(
+                    hypersnap::storage::db::backup::backup_db(
                         db.clone(),
                         &app_config.snapshot.backup_dir,
                         *shard_id,

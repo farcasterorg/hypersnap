@@ -161,6 +161,19 @@ pub fn get_blocks_in_range(
 
 fn put_block(db: &RocksDB, block: &Block) -> Result<(), BlockStorageError> {
     let mut txn = db.txn();
+    stage_block(db, &mut txn, block)?;
+    db.commit(txn)?;
+    Ok(())
+}
+
+/// F033 fix: batch-aware variant. Lets BlockEngine merge the block
+/// header write with the state-mutation batch so both commit
+/// atomically.
+pub fn stage_block(
+    db: &RocksDB,
+    txn: &mut crate::storage::db::RocksDbTransactionBatch,
+    block: &Block,
+) -> Result<(), BlockStorageError> {
     let header = block
         .header
         .as_ref()
@@ -177,8 +190,6 @@ fn put_block(db: &RocksDB, block: &Block) -> Result<(), BlockStorageError> {
     if db.get(&timestamp_index_key)? == None {
         txn.put(timestamp_index_key, primary_key);
     }
-
-    db.commit(txn)?;
     Ok(())
 }
 
@@ -195,6 +206,16 @@ impl BlockStore {
     #[inline]
     pub fn put_block(&self, block: &Block) -> Result<(), BlockStorageError> {
         put_block(&self.db, block)
+    }
+
+    /// Batch-aware variant — see [`stage_block`].
+    #[inline]
+    pub fn stage_block(
+        &self,
+        txn: &mut crate::storage::db::RocksDbTransactionBatch,
+        block: &Block,
+    ) -> Result<(), BlockStorageError> {
+        stage_block(&self.db, txn, block)
     }
 
     #[inline]

@@ -1,0 +1,13 @@
+[package]
+name = "hypersnap-crypto"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+description = "Cryptographic primitives for hypersnap: the bridge lock leaves, digests and Merkle tree"
+
+[dependencies]
+alloy-primitives = { version = "1", features = ["k256"] }
+thiserror = "1"
+
+[dev-dependencies]
+hex = "0.4"

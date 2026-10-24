@@ -70,7 +70,16 @@ pub enum SnapchainDbOptimizationType {
     #[default]
     Default, // Default read-write DB
     BulkWriteOptimized, // Optimized for very large bulk writes
+    /// A Hypersnap shard DB: `Default`, and each value of `MIN_BLOB_BYTES`
+    /// or more (a block, an undecided proposal) in a blob file. In an SST
+    /// file, the small keys before a large value share its data block, so
+    /// a read of one of them read the whole value (10 MB for a proposal,
+    /// larger than a shard of the block cache, so on each read).
+    Hypersnap,
 }
+
+/// The values that a `Hypersnap` DB keeps in blob files.
+pub const MIN_BLOB_BYTES: u64 = 64 * 1024;
 
 pub enum DBProvider {
     Transaction(TransactionDB),
@@ -222,6 +231,14 @@ impl RocksDB {
             // Default mode: bound memtable memory to 16MB × 2 = 32MB per DB instance
             opts.set_write_buffer_size(16 * 1024 * 1024);
         }
+        if self.db_options_type == SnapchainDbOptimizationType::Hypersnap {
+            opts.set_enable_blob_files(true);
+            opts.set_min_blob_size(MIN_BLOB_BYTES);
+            opts.set_blob_compression_type(rocksdb::DBCompressionType::Lz4);
+            // Compaction rewrites the old blob files, so the blobs of
+            // deleted values (decided proposals, pruned blocks) go.
+            opts.set_enable_blob_gc(true);
+        }
 
         opts.create_if_missing(true); // Creates a database if it does not exist
         opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
@@ -244,6 +261,19 @@ impl RocksDB {
         // }
 
         Ok(())
+    }
+
+    /// A RocksDB checkpoint of this DB in `dest` (hard-linked SST files, a
+    /// consistent copy). `dest` must not exist. Used for the epoch boundary
+    /// checkpoints (FIP §17.7).
+    pub fn create_checkpoint(&self, dest: &str) -> Result<(), RocksdbError> {
+        match self.db().as_ref() {
+            Some(DBProvider::Transaction(db)) => db
+                .create_checkpoint(dest)
+                .map_err(RocksdbError::InternalError),
+            Some(DBProvider::ReadOnly(_)) => Err(RocksdbError::ReadOnly),
+            None => Err(RocksdbError::DbNotOpen),
+        }
     }
 
     pub fn open_read_only(&self) -> Result<Self, RocksdbError> {
@@ -1148,6 +1178,47 @@ mod tests {
         }
 
         test_pagination_helper(&db, 10, 3, Some(vec![0u8]), Some(vec![1u8]));
+    }
+
+    /// A read of a small key next to large values (FIP §4.2 blocks and
+    /// proposals of about 10 MB) stays a small read in a `Hypersnap` DB. In
+    /// a `Default` DB it reads the data block of the large value: about
+    /// 4 ms instead of 5 µs on an aarch64 Mac.
+    #[test]
+    fn a_small_key_next_to_large_values_is_a_small_read() {
+        use crate::storage::db::SnapchainDbOptimizationType;
+        let lookup = |kind: SnapchainDbOptimizationType| {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().to_str().unwrap();
+            let cache = rocksdb::Cache::new_lru_cache(512 * 1024 * 1024);
+            let db = RocksDB::new_with_cache(path, kind, Some(cache.clone()));
+            db.open().unwrap();
+            db.put(&[12u8, 52, 3], &[7u8; 40]).unwrap();
+            let large: Vec<u8> = (0..10 * 1024 * 1024u32)
+                .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+                .collect();
+            for h in 0u8..3 {
+                db.put(&[17u8, 8, h], &large).unwrap();
+            }
+            // Reopen: the recovery writes the WAL to SST files.
+            db.close();
+            let db = RocksDB::new_with_cache(path, kind, Some(cache));
+            db.open().unwrap();
+            assert_eq!(db.get(&[17u8, 8, 1]).unwrap().unwrap(), large);
+            let t = std::time::Instant::now();
+            for _ in 0..100 {
+                assert!(db.get(&[12u8, 52, 3]).unwrap().is_some());
+            }
+            t.elapsed() / 100
+        };
+        let hypersnap = lookup(SnapchainDbOptimizationType::Hypersnap);
+        let default = lookup(SnapchainDbOptimizationType::Default);
+        assert!(
+            hypersnap * 20 < default,
+            "Hypersnap {:?}, Default {:?}",
+            hypersnap,
+            default
+        );
     }
 
     #[test]

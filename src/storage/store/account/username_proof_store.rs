@@ -6,12 +6,12 @@ use super::{
     IntoU8, MessagesPage, StoreEventHandler, TS_HASH_LENGTH,
 };
 use crate::core::message::HubEventExt;
-use crate::hyper::StateContext;
 use crate::proto::message_data::Body;
 use crate::proto::{self, HubEvent, HubEventType, MergeUserNameProofBody, Message, MessageType};
 use crate::storage::constants::{RootPrefix, UserPostfix};
 use crate::storage::db::PageOptions;
 use crate::storage::db::{RocksDB, RocksDbTransactionBatch};
+use crate::storage::store::state_context::StateContext;
 use crate::storage::util;
 use crate::{core::error::HubError, storage::store::account::StoreOptions};
 use std::sync::Arc;
@@ -119,7 +119,7 @@ impl StoreDef for UsernameProofStoreDef {
             return false;
         }
         let data = message.data.as_ref().unwrap();
-        message.signature_scheme == proto::SignatureScheme::Ed25519 as i32
+        crate::proto::SignatureScheme::is_message_scheme(message.signature_scheme)
             && data.r#type == MessageType::UsernameProof.into_u8() as i32
             && data.body.is_some()
     }

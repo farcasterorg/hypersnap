@@ -4,13 +4,13 @@ use super::{
     StoreOptions, TS_HASH_LENGTH,
 };
 use crate::core::error::HubError;
-use crate::hyper::StateContext;
 use crate::proto::{
     message_data::Body, CastingMode, ChannelMemberAction, ChannelModerateAction, ChannelPinBody,
     ChannelUpdateBody, HubEvent, MembershipMode, Message, MessageType, SignatureScheme,
 };
 use crate::storage::constants::{RootPrefix, UserPostfix, PAGE_SIZE_MAX};
 use crate::storage::db::{PageOptions, RocksDB, RocksDbTransactionBatch};
+use crate::storage::store::state_context::StateContext;
 use crate::storage::util::increment_vec_u8;
 use std::sync::Arc;
 use tracing::warn;

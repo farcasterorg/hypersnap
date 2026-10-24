@@ -32,10 +32,13 @@ EOF
 # which isn't ideal.
 COPY Cargo.lock Cargo.toml ./
 COPY proto ./proto
+COPY crates ./crates
 COPY src ./src
 
 ENV RUST_BACKTRACE=full
-RUN cargo build --release --bins
+ARG CARGO_FEATURES=""
+RUN cargo build --release --bins ${CARGO_FEATURES:+--features "$CARGO_FEATURES"}
+RUN cargo build --release -p hypersnap-relay
 
 ## Pre-generate some configurations we can use
 # TOOD: consider doing something different here
@@ -70,6 +73,8 @@ COPY --from=builder \
   /usr/src/app/target/release/perftest \
   /usr/src/app/target/release/repair_block_event \
   /usr/src/app/target/release/inspect_block_event \
+  /usr/src/app/target/release/hypersnap_pivot \
+  /usr/src/app/target/release/hypersnap-relay \
   /app/
 
 ENV RUSTFLAGS="-Awarnings"

@@ -158,7 +158,7 @@ impl UserSearchIndexer {
         let num_shards = stores.len() as u32;
         let router = ShardRouter {};
         for (&shard_id, shard) in stores {
-            let Some(max_fid) = crate::hyper::reconcile::max_registered_fid(shard) else {
+            let Some(max_fid) = crate::storage::store::reconcile::max_registered_fid(shard) else {
                 continue;
             };
             let mut txn = RocksDbTransactionBatch::new();

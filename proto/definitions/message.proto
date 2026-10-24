@@ -1,6 +1,8 @@
 syntax = "proto3";
 
 import "username_proof.proto";
+import "hyper.proto";
+import "hypersnap_bodies.proto";
 
 
 /**
@@ -49,6 +51,43 @@ message MessageData {
     ChannelMemberBody channel_member_body = 22;
     ChannelPinBody channel_pin_body = 23;
     ChannelModerateBody channel_moderate_body = 24;
+
+    // Hypersnap message types (FIP-proof-of-work-tokenization §14), valid
+    // only after the epoch-1 pivot. Field number = 1000 + message type, away
+    // from the numbers snapchain uses. Envelope fields of the hyper.proto
+    // bodies (sender fid, signer key, signature) must be empty here: the
+    // Message envelope carries them (§14.1).
+    HyperValidatorEventBody validator_event_body = 1102;
+    MiniappRegisterBody miniapp_register_body = 1120;
+    MiniappUnregisterBody miniapp_unregister_body = 1121;
+    MiniappUpdateBody miniapp_update_body = 1122;
+    MiniappAddBody miniapp_add_body = 1123;
+    MiniappRemoveBody miniapp_remove_body = 1124;
+    TokenTransferBody token_transfer_body = 1140;
+    TokenEscrowClaimBody token_escrow_claim_body = 1145;
+    TokenEscrowBridgeBody token_escrow_bridge_body = 1146;
+    TokenStakeBody token_stake_body = 1147;
+    TokenUnstakeBody token_unstake_body = 1148;
+    NodeAttestationBody node_attestation_body = 1149;
+    AppUsageReceiptBody app_usage_receipt_body = 1151;
+    DaChallengeResponseBody da_challenge_response_body = 1152;
+    FeeDepositBody fee_deposit_body = 1154;
+    TokenLockBody token_lock_body = 1156;
+    BridgeActionVoteBody bridge_action_vote_body = 1157;
+    SeedCommitBody seed_commit_body = 1158;
+    SeedRevealBody seed_reveal_body = 1159;
+    HyperNativeOnboardBody native_onboard_body = 1160;
+    HyperCustodyRotationBody native_custody_rotation_body = 1161;
+    OnboardingStakeLockBody onboarding_stake_lock_body = 1162;
+    OnboardingStakeReleaseBody onboarding_stake_release_body = 1163;
+    CustodyMigrationBody custody_migration_body = 1170;
+    CustodyRotationBody custody_rotation_body = 1171;
+    SpendKeyAddBody spend_key_add_body = 1172;
+    SpendKeyRevokeBody spend_key_revoke_body = 1173;
+    QctShieldBody qct_shield_body = 1180;
+    QctTransferBody qct_transfer_body = 1181;
+    QctUnshieldBody qct_unshield_body = 1182;
+    QctLockBody qct_lock_body = 1183;
   } // Properties specific to the MessageType
 }
 
@@ -63,6 +102,10 @@ enum SignatureScheme {
   SIGNATURE_SCHEME_NONE = 0;
   SIGNATURE_SCHEME_ED25519 = 1; // Ed25519 signature (default)
   SIGNATURE_SCHEME_EIP712 = 2; // ECDSA signature using EIP-712 scheme
+  // Hypersnap (FIP-proof-of-work-tokenization §16.8). Valid only after the
+  // epoch-1 pivot; pre-pivot validation rejects them like any other scheme.
+  SIGNATURE_SCHEME_ED25519_FALCON512 = 3; // Ed25519 || HyperSignatureExtension
+  SIGNATURE_SCHEME_FALCON512 = 4; // Falcon-512 only; signer = keccak256(key)
 }
 
 /** Type of the MessageBody */
@@ -90,6 +133,42 @@ enum MessageType {
   MESSAGE_TYPE_CHANNEL_MEMBER = 19;
   MESSAGE_TYPE_CHANNEL_PIN = 20;
   MESSAGE_TYPE_CHANNEL_MODERATE = 21;
+
+  // Hypersnap types, 100–999 (FIP-proof-of-work-tokenization §14.2). Valid
+  // only after the epoch-1 pivot; all go to shard 0.
+  MESSAGE_TYPE_VALIDATOR_REGISTER = 102;
+  MESSAGE_TYPE_VALIDATOR_DEREGISTER = 103;
+  MESSAGE_TYPE_MINIAPP_REGISTER = 120;
+  MESSAGE_TYPE_MINIAPP_UNREGISTER = 121;
+  MESSAGE_TYPE_MINIAPP_UPDATE = 122;
+  MESSAGE_TYPE_MINIAPP_ADD = 123;
+  MESSAGE_TYPE_MINIAPP_REMOVE = 124;
+  MESSAGE_TYPE_TOKEN_TRANSFER = 140;
+  MESSAGE_TYPE_TOKEN_ESCROW_CLAIM = 145;
+  MESSAGE_TYPE_TOKEN_ESCROW_BRIDGE = 146;
+  MESSAGE_TYPE_TOKEN_STAKE = 147;
+  MESSAGE_TYPE_TOKEN_UNSTAKE = 148;
+  MESSAGE_TYPE_NODE_ATTESTATION = 149;
+  MESSAGE_TYPE_NODE_ATTESTATION_REVOKE = 150;
+  MESSAGE_TYPE_APP_USAGE_RECEIPT = 151;
+  MESSAGE_TYPE_DA_CHALLENGE_RESPONSE = 152;
+  MESSAGE_TYPE_FEE_DEPOSIT = 154;
+  MESSAGE_TYPE_TOKEN_LOCK = 156;
+  MESSAGE_TYPE_BRIDGE_ACTION_VOTE = 157;
+  MESSAGE_TYPE_SEED_COMMIT = 158;
+  MESSAGE_TYPE_SEED_REVEAL = 159;
+  MESSAGE_TYPE_NATIVE_ONBOARD = 160;
+  MESSAGE_TYPE_NATIVE_CUSTODY_ROTATION = 161;
+  MESSAGE_TYPE_ONBOARDING_STAKE_LOCK = 162;
+  MESSAGE_TYPE_ONBOARDING_STAKE_RELEASE = 163;
+  MESSAGE_TYPE_CUSTODY_MIGRATION = 170;
+  MESSAGE_TYPE_CUSTODY_ROTATION = 171;
+  MESSAGE_TYPE_SPEND_KEY_ADD = 172;
+  MESSAGE_TYPE_SPEND_KEY_REVOKE = 173;
+  MESSAGE_TYPE_QCT_SHIELD = 180;
+  MESSAGE_TYPE_QCT_TRANSFER = 181;
+  MESSAGE_TYPE_QCT_UNSHIELD = 182;
+  MESSAGE_TYPE_QCT_LOCK = 183;
 }
 
 /** Farcaster network the message is intended for */

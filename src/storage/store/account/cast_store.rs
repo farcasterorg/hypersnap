@@ -6,9 +6,9 @@ use super::{
     store::{Store, StoreDef},
     MessagesPage, StoreEventHandler, HASH_LENGTH, PAGE_SIZE_MAX, TRUE_VALUE, TS_HASH_LENGTH,
 };
-use crate::hyper::StateContext;
 use crate::storage::constants::{RootPrefix, UserPostfix};
 use crate::storage::db::PageOptions;
+use crate::storage::store::state_context::StateContext;
 use crate::storage::util::{bytes_compare, increment_vec_u8};
 use crate::{core::error::HubError, storage::store::account::StoreOptions};
 use crate::{
@@ -80,7 +80,7 @@ impl StoreDef for CastStoreDef {
             return false;
         }
         let data = message.data.as_ref().unwrap();
-        message.signature_scheme == message::SignatureScheme::Ed25519 as i32
+        crate::proto::SignatureScheme::is_message_scheme(message.signature_scheme)
             && data.r#type == MessageType::CastAdd as i32
             && data.body.is_some()
     }
@@ -91,7 +91,7 @@ impl StoreDef for CastStoreDef {
             return false;
         }
         let data = message.data.as_ref().unwrap();
-        message.signature_scheme == message::SignatureScheme::Ed25519 as i32
+        crate::proto::SignatureScheme::is_message_scheme(message.signature_scheme)
             && data.r#type == MessageType::CastRemove as i32
             && data.body.is_some()
     }

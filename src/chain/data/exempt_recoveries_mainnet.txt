@@ -1,0 +1,4 @@
+# EXEMPT_RECOVERIES of mainnet (FIP §2): the recovery transfers before
+# RECOVERY_EXEMPTION_CUTOFF. One "<fid> <transaction hash>" per line, sorted.
+# Made after the cutoff with `hypersnap_pivot recovery-list`; part of
+# params_hash.

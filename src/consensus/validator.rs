@@ -8,7 +8,7 @@ use crate::proto::{full_proposal, Commits, FullProposal, ShardHash};
 use crate::storage::store::node_local_state::LocalStateStore;
 use crate::utils::statsd_wrapper::StatsdClientWrapper;
 use informalsystems_malachitebft_core_consensus::ProposedValue;
-use informalsystems_malachitebft_core_types::{Round, ValidatorSet};
+use informalsystems_malachitebft_core_types::{Round, ValidatorSet, Validity};
 use libp2p::identity::ed25519::PublicKey;
 use std::cmp::PartialEq;
 use std::time::Duration;
@@ -54,13 +54,12 @@ impl StoredValidatorSet {
     pub fn new(shard_id: SnapchainShard, config: &ValidatorSetConfig) -> Self {
         let mut validators = SnapchainValidatorSet::new(vec![]);
         for address in &config.validator_public_keys {
-            let validator = SnapchainValidator::new(
+            validators.add(SnapchainValidator::new(
                 shard_id,
                 PublicKey::try_from_bytes(&hex::decode(address).unwrap()).unwrap(),
                 None,
                 config.effective_at,
-            );
-            validators.add(validator);
+            ));
         }
 
         Self {
@@ -87,6 +86,9 @@ pub struct ShardValidator {
     // TODO: Fix once we remove the actor system
     block_proposer: Option<BlockProposer>,
     shard_proposer: Option<ShardProposer>,
+    /// After the pivot: Hypersnap blocks, with Falcon-512 epoch sets
+    /// (`chain::proposer`, `chain::shard0::proposer`).
+    hypersnap_proposer: Option<crate::chain::proposer::HypersnapProposer>,
     pub started: bool,
     local_state_store: LocalStateStore,
     pub statsd: StatsdClientWrapper,
@@ -120,13 +122,56 @@ impl ShardValidator {
             current_proposer: None,
             block_proposer,
             shard_proposer,
+            hypersnap_proposer: None,
             started: false,
             local_state_store,
             statsd,
         }
     }
 
+    /// A validator of a Hypersnap shard after the pivot. The epoch sets
+    /// replace the configured validator sets.
+    pub fn new_hypersnap(
+        address: Address,
+        shard: SnapchainShard,
+        proposer: impl Into<crate::chain::proposer::HypersnapProposer>,
+        local_state_store: LocalStateStore,
+        statsd: StatsdClientWrapper,
+    ) -> ShardValidator {
+        ShardValidator {
+            shard_id: shard.clone(),
+            address,
+            validator_sets: StoredValidatorSets::new(shard.shard_id(), vec![]),
+            current_height: None,
+            proposal_source: ProposalSource::Consensus,
+            current_round: Round::new(0),
+            height_started_at: None,
+            proposed_at: None,
+            current_proposer: None,
+            block_proposer: None,
+            shard_proposer: None,
+            hypersnap_proposer: Some(proposer.into()),
+            started: false,
+            local_state_store,
+            statsd,
+        }
+    }
+
+    /// True for a Hypersnap shard validator (after the pivot).
+    pub fn is_hypersnap(&self) -> bool {
+        self.hypersnap_proposer.is_some()
+    }
+
     pub fn get_validator_set(&self, height: u64) -> SnapchainValidatorSet {
+        if let Some(p) = &self.hypersnap_proposer {
+            // A height whose epoch is not known yet (more than one ahead)
+            // gets the set of the next height; consensus never asks for it
+            // before the parent is decided.
+            return p
+                .validator_set(height)
+                .or_else(|| p.validator_set(p.next_height()))
+                .expect("epoch set of the next height");
+        }
         self.validator_sets.get_validator_set(height)
     }
 
@@ -143,6 +188,8 @@ impl ShardValidator {
             return p.get_confirmed_height();
         } else if let Some(p) = &self.shard_proposer {
             return p.get_confirmed_height();
+        } else if let Some(p) = &self.hypersnap_proposer {
+            return p.get_confirmed_height();
         }
         panic!("No proposer set on validator");
     }
@@ -151,6 +198,8 @@ impl ShardValidator {
         if let Some(p) = &self.block_proposer {
             return p.get_min_height();
         } else if let Some(p) = &self.shard_proposer {
+            return p.get_min_height();
+        } else if let Some(p) = &self.hypersnap_proposer {
             return p.get_min_height();
         }
         panic!("No proposer set on validator");
@@ -218,6 +267,8 @@ impl ShardValidator {
             block_proposer.decide(commits.clone()).await;
         } else if let Some(shard_proposer) = &mut self.shard_proposer {
             shard_proposer.decide(commits.clone()).await;
+        } else if let Some(p) = &mut self.hypersnap_proposer {
+            p.decide(commits.clone()).await;
         } else {
             panic!("No proposer set");
         }
@@ -253,6 +304,8 @@ impl ShardValidator {
             return block_proposer.get_decided_value(height).await;
         } else if let Some(shard_proposer) = &self.shard_proposer {
             return shard_proposer.get_decided_value(height).await;
+        } else if let Some(p) = &self.hypersnap_proposer {
+            return p.get_decided_value(height).await;
         }
         panic!("No proposer set");
     }
@@ -264,18 +317,49 @@ impl ShardValidator {
     ) -> ProposedValue<SnapchainValidatorContext> {
         let value = full_proposal.shard_hash();
         self.proposal_source = proposal_source;
-        if self.shard_id.shard_id() != full_proposal.shard_id().unwrap() {
+        // F002: `FullProposal::shard_id()` returns `Err` when the
+        // proposal's `height` field is `None` (a peer-reachable
+        // condition). Reject the proposal as Invalid instead of
+        // panicking on the unwrap.
+        let proposal_shard = match full_proposal.shard_id() {
+            Ok(s) => s,
+            Err(_) => {
+                warn!("Received proposal with missing height/shard_id; dropping");
+                return ProposedValue {
+                    height: full_proposal.height(),
+                    round: full_proposal.round(),
+                    valid_round: Round::Nil,
+                    proposer: full_proposal.proposer_address(),
+                    value,
+                    validity: Validity::Invalid,
+                };
+            }
+        };
+        if self.shard_id.shard_id() != proposal_shard {
             warn!(
-                "Received proposal for shard {} on shard {}",
-                full_proposal.shard_id().unwrap(),
+                "Received proposal for shard {} on shard {}; dropping",
+                proposal_shard,
                 self.shard_id.shard_id()
             );
-            panic!("Received proposal for wrong shard");
+            return ProposedValue {
+                height: full_proposal.height(),
+                round: full_proposal.round(),
+                valid_round: Round::Nil,
+                proposer: full_proposal.proposer_address(),
+                value,
+                validity: Validity::Invalid,
+            };
         }
         let validity = if let Some(block_proposer) = &mut self.block_proposer {
             block_proposer.add_proposed_value(full_proposal)
         } else if let Some(shard_proposer) = &mut self.shard_proposer {
             shard_proposer.add_proposed_value(full_proposal)
+        } else if let Some(p) = &mut self.hypersnap_proposer {
+            if self.proposal_source == ProposalSource::Sync {
+                p.add_synced_value(full_proposal)
+            } else {
+                p.add_proposed_value(full_proposal)
+            }
         } else {
             panic!("No proposer set");
         };
@@ -311,6 +395,8 @@ impl ShardValidator {
             block_proposer.propose_value(height, round, timeout).await
         } else if let Some(shard_proposer) = &mut self.shard_proposer {
             shard_proposer.propose_value(height, round, timeout).await
+        } else if let Some(p) = &mut self.hypersnap_proposer {
+            p.propose_value(height, round, timeout).await
         } else {
             panic!("No proposer set");
         };
@@ -329,6 +415,8 @@ impl ShardValidator {
             block_proposer.get_proposed_value(shard_hash)
         } else if let Some(shard_proposer) = &mut self.shard_proposer {
             shard_proposer.get_proposed_value(shard_hash)
+        } else if let Some(p) = &mut self.hypersnap_proposer {
+            p.get_proposed_value(shard_hash)
         } else {
             panic!("No proposer set");
         }

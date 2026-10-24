@@ -1,8 +1,7 @@
 [package]
-name = "snapchain-proto"
+name = "hypersnap-proto"
 version = "0.11.0"
 edition = "2021"
-description = "Protocol buffer definitions for Snapchain"
 license = "GPL-3.0"
 
 [dependencies]

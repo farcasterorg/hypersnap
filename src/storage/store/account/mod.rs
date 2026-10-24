@@ -7,6 +7,7 @@ pub use self::gasless_key_merge::*;
 pub use self::key_add_store::*;
 pub use self::key_last_used_at_store::*;
 pub use self::key_nonce_store::*;
+pub use self::key_remove_store::*;
 pub use self::link_store::*;
 pub use self::message::*;
 pub use self::name_registry_events::*;
@@ -33,8 +34,10 @@ mod gasless_key_merge;
 mod key_add_store;
 mod key_last_used_at_store;
 mod key_nonce_store;
+mod key_remove_store;
 mod name_registry_events;
 mod reaction_store;
+pub mod signer_auth_index;
 mod storage_lend_store;
 mod user_data_store;
 mod username_proof_store;
@@ -63,5 +66,7 @@ mod verification_store_test;
 
 #[cfg(test)]
 mod link_store_test;
+#[cfg(test)]
+mod signature_scheme_test;
 #[cfg(test)]
 mod username_proof_store_test;

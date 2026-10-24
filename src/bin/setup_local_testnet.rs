@@ -54,6 +54,21 @@ struct Args {
     #[arg(long, default_value = "4")]
     num_nodes: u32,
 
+    /// Hostname pattern used to derive each node's gossip multiaddr. The
+    /// literal `{i}` is substituted with the 1-based node index. Default
+    /// `127.0.0.1` produces a loopback-only testnet (every node on the
+    /// same host process). For a docker-compose deployment use
+    /// `node{i}` so containers resolve each other via the compose
+    /// service-name DNS instead of loopback.
+    ///
+    /// When the pattern contains `{i}` (i.e. is not the literal default),
+    /// the local listen address is also bound to `0.0.0.0` instead of
+    /// the templated host, so each container listens on all its
+    /// interfaces and the peers' DNS-templated addresses can actually
+    /// connect.
+    #[arg(long, default_value = "127.0.0.1")]
+    gossip_host_template: String,
+
     /// Generate configs that work inside the Docker Compose bridge network.
     #[arg(long, default_value = "false")]
     docker: bool,
@@ -129,6 +144,16 @@ async fn main() {
             }
         }
         let secret_key = hex::encode(&keypairs[i as usize - 1]);
+        // Also materialize the raw 32-byte ed25519 secret to disk so
+        // downstream seeders (snapchain state) and the wallet (live
+        // registration, transfers) can sign as this node's validator
+        // identity. Same bytes as the `private_key = "<hex>"` field in
+        // hypersnap.toml — written out for convenience.
+        std::fs::write(
+            format!("nodes/{id}/validator.key"),
+            keypairs[i as usize - 1].as_ref(),
+        )
+        .expect("Failed to write validator.key");
         let rpc_port = base_rpc_port + i;
         let http_port = if args.docker {
             3381
@@ -136,23 +161,68 @@ async fn main() {
             base_http_port + i
         };
         let gossip_port = base_gossip_port + i;
-        let host = if args.docker {
+        // Gossip multiaddrs: when a templated hostname is in use ({i}
+        // substitution active), bind the local listen address to
+        // 0.0.0.0 so the container is reachable from peers, and template
+        // the announce/bootstrap hosts to the peer's container-DNS name.
+        let templated = args.gossip_host_template.contains("{i}");
+        // RPC/HTTP bind: in templated (container) mode bind on 0.0.0.0 so
+        // docker-compose's port mappings (host:3483 → container:3483) can
+        // actually reach the listener. Loopback-bound listeners are
+        // unreachable from outside the container.
+        let host = if templated || args.docker {
             "0.0.0.0".to_string()
         } else {
             "127.0.0.1".to_string()
         };
         let rpc_address = format!("{host}:{rpc_port}");
         let http_address = format!("{host}:{http_port}");
-        let gossip_multi_addr = format!("/ip4/{host}/udp/{gossip_port}/quic-v1");
+        let local_gossip_host = if templated || args.docker {
+            "0.0.0.0".to_string()
+        } else {
+            args.gossip_host_template.clone()
+        };
+        let gossip_multi_addr = format!("/ip4/{local_gossip_host}/udp/{gossip_port}/quic-v1");
+        // In templated mode the listen address is 0.0.0.0 — peers can't dial
+        // that — so emit an explicit announce_address with this node's own
+        // DNS-templated host. In loopback mode leave it empty so the node's
+        // own fallback (config.address) is used.
+        let announce_gossip_addr = if templated {
+            let self_host = args.gossip_host_template.replace("{i}", &id.to_string());
+            let proto = if self_host.parse::<std::net::Ipv4Addr>().is_ok() {
+                "ip4"
+            } else {
+                "dns4"
+            };
+            format!("/{proto}/{self_host}/udp/{gossip_port}/quic-v1")
+        } else {
+            String::new()
+        };
+        let peer_addr = |peer_i: u32| -> String {
+            let peer_host = args
+                .gossip_host_template
+                .replace("{i}", &peer_i.to_string());
+            let peer_port = base_gossip_port + peer_i;
+            let multiaddr_proto = if peer_host.parse::<std::net::Ipv4Addr>().is_ok() {
+                "ip4"
+            } else {
+                // Compose service names / DNS hostnames must use /dns4/.
+                "dns4"
+            };
+            format!("/{multiaddr_proto}/{peer_host}/udp/{peer_port}/quic-v1")
+        };
         let other_nodes_addresses = (1..=num_nodes)
             .filter(|&x| x != id)
             .map(|x| {
-                let gossip_host = if args.docker {
-                    format!("172.100.0.{}", 10 + x)
+                if args.docker {
+                    format!(
+                        "/ip4/172.100.0.{}/udp/{:?}/quic-v1",
+                        10 + x,
+                        base_gossip_port + x
+                    )
                 } else {
-                    "127.0.0.1".to_string()
-                };
-                format!("/ip4/{gossip_host}/udp/{:?}/quic-v1", base_gossip_port + x)
+                    peer_addr(x)
+                }
             })
             .collect::<Vec<String>>()
             .join(",");
@@ -229,6 +299,7 @@ use_tags={statsd_use_tags}
 
 [gossip]
 address="{gossip_multi_addr}"
+announce_address="{announce_gossip_addr}"
 bootstrap_peers = "{other_nodes_addresses}"
 {direct_peers_line}
 
@@ -276,7 +347,7 @@ enabled = true
             config_file_content,
         )
         .expect("Failed to write config file");
-        // Print a message
     }
+
     println!("Created configs for {num_nodes} nodes");
 }

@@ -3,13 +3,12 @@ use crate::consensus::consensus::{MalachiteEventShard, SystemMessage};
 use crate::consensus::malachite::network_connector::MalachiteNetworkEvent;
 use crate::consensus::malachite::snapchain_codec::SnapchainCodec;
 use crate::core::types::{proto, SnapchainContext, SnapchainValidatorContext};
-use crate::hyper::CAPABILITY_HYPER;
 use crate::mempool::mempool::{MempoolRequest, MempoolSource};
 use crate::network::mesh::diagnostics;
 use crate::network::mesh::metrics::GossipMetrics;
 use crate::proto::{
     gossip_message, read_node_message, ContactInfo, ContactInfoBody, FarcasterNetwork,
-    GossipMessage, HyperEnvelope,
+    GossipMessage,
 };
 use crate::storage::store::account::message_bytes_decode;
 use crate::storage::store::mempool_poller::MempoolMessage;
@@ -50,24 +49,73 @@ const DEFAULT_GOSSIP_HOST: &str = "127.0.0.1";
 pub const SHUTDOWN_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_GOSSIP_MESSAGE_SIZE: usize = 1024 * 1024 * 10; // 10 mb
 
+// F019: per-variant tighter ceilings applied inside
+// `map_gossip_bytes_to_system_message`. The global 10 MB cap above is
+// libp2p's transport-level guard; these are the application-level
+// caps that match the natural max size of each topic. Anything
+// larger is a Sybil-flood / amplification vector and is dropped at
+// ingress.
+const MAX_MEMPOOL_MESSAGE_BYTES: usize = 256 * 1024;
+/// A Hypersnap node gossips its mempool messages in batches: one gossip
+/// message (one signature, one frame for each peer) for each
+/// `MEMPOOL_BATCH_BYTES` of messages, or for what came in
+/// `MEMPOOL_BATCH_INTERVAL`. One gossip message for each user message was
+/// most of the CPU of a node at 2,000 messages each second.
+const MEMPOOL_BATCH_BYTES: usize = 256 * 1024;
+const MEMPOOL_BATCH_INTERVAL: Duration = Duration::from_millis(50);
+/// The largest batch that a node takes from a peer.
+const MAX_MEMPOOL_BATCH_BYTES: usize = 4 * MEMPOOL_BATCH_BYTES;
+const MAX_CONTACT_INFO_BYTES: usize = 4 * 1024;
+const MAX_STATUS_BYTES: usize = 4 * 1024;
+const MAX_CONSENSUS_BYTES: usize = 64 * 1024;
+
+/// F022 fix: per-variant size cap on `FullProposal` and `DecidedValue`
+/// gossip frames. Pre-fix these paths were bounded only by the libp2p
+/// transport ceiling (10 MB) — letting a single attacker frame allocate
+/// tens of megabytes of decoded state inside the actor. Sized to fit a
+/// fully-loaded honest block (proposer parts + commits + carried
+/// payload) with comfortable headroom.
+const MAX_FULL_PROPOSAL_BYTES: usize = 2 * 1024 * 1024; // 2 MB
+const MAX_DECIDED_VALUE_BYTES: usize = 2 * 1024 * 1024;
+/// A Hypersnap network carries blocks of up to `MAX_BLOCK_BYTES` (FIP §4.2),
+/// with room for the proposal wrapper and the certificate.
+const HYPERSNAP_MAX_VALUE_BYTES: usize = crate::chain::block::MAX_BLOCK_BYTES + 1024 * 1024;
+const HYPERSNAP_MAX_GOSSIP_MESSAGE_SIZE: usize = HYPERSNAP_MAX_VALUE_BYTES + 1024 * 1024;
+/// A sync response of a Hypersnap network carries one block of up to
+/// `MAX_BLOCK_BYTES`: 30 s moves a full block at about 4.5 Mbit/s. The
+/// snapchain timeouts (2 s and 5 s) need more than 25 Mbit/s for it.
+pub const HYPERSNAP_SYNC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub(crate) const CONSENSUS_TOPIC: &str = "consensus";
 pub(crate) const MEMPOOL_TOPIC: &str = "mempool";
 const DECIDED_VALUES: &str = "decided-values";
 const READ_NODE_PEER_STATUSES: &str = "read-node-peers";
 const CONTACT_INFO: &str = "contact-info";
-const HYPER_TOPIC: &str = "hyper";
+/// Hypersnap: `ValidatorTransitionAlert`s (FIP §4.6, §4.10).
+const MEMBERSHIP_TOPIC: &str = "membership";
+/// Hypersnap: the certificate aggregation rounds (FIP §16.5, R2).
+const CERTIFICATE_TOPIC: &str = "certificate";
 
 /// All gossip topics this node may participate in. The single source of truth
 /// for valid topic names — used to bound the per-peer gossip-metrics
 /// sampler/eviction and to validate the mesh view's `?topics=` selection.
-pub(crate) const ALL_TOPICS: [&str; 6] = [
+pub(crate) const ALL_TOPICS: [&str; 7] = [
     CONSENSUS_TOPIC,
     MEMPOOL_TOPIC,
     DECIDED_VALUES,
     READ_NODE_PEER_STATUSES,
     CONTACT_INFO,
-    HYPER_TOPIC,
+    MEMBERSHIP_TOPIC,
+    CERTIFICATE_TOPIC,
 ];
+
+/// Reads the registration of a Hypersnap validator (FIP §4.10).
+pub type HypersnapContactFn = Arc<dyn Fn() -> Option<proto::HypersnapContact> + Send + Sync>;
+
+/// The shards of a Hypersnap node. In a namespace, each shard has its own
+/// consensus, mempool and decided-value topic (FIP §4.10).
+const HYPERSNAP_SHARDS: [u32; 3] = [0, 1, 2];
+const SHARDED_TOPICS: [&str; 3] = [CONSENSUS_TOPIC, MEMPOOL_TOPIC, DECIDED_VALUES];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -92,6 +140,117 @@ pub struct Config {
     pub enable_autodiscovery: bool,
     // Comma-separated list of peer IDs to always connect to directly.
     pub direct_peers: String,
+    /// Topic and protocol namespace. Empty for snapchain. A Hypersnap node
+    /// sets `hypersnap/<network_id>` (FIP §4.7), so it cannot share a mesh
+    /// with snapchain peers. Set in code only.
+    #[serde(skip)]
+    pub namespace: String,
+    /// A Hypersnap node: the snapchain engine version of the network
+    /// (FIP §17.7), which routes mempool messages to their shard topic. Set
+    /// in code only.
+    #[serde(skip)]
+    pub engine_version: Option<crate::version::version::EngineVersion>,
+}
+
+/// `<namespace>/<name>`, or `name` with no namespace.
+pub fn topic_name(namespace: &str, name: &str) -> String {
+    if namespace.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}/{}", namespace, name)
+    }
+}
+
+fn ident(namespace: &str, name: &str) -> gossipsub::IdentTopic {
+    gossipsub::IdentTopic::new(topic_name(namespace, name))
+}
+
+/// The topic name without the namespace.
+fn bare_topic<'a>(namespace: &str, topic: &'a str) -> &'a str {
+    if namespace.is_empty() {
+        return topic;
+    }
+    topic
+        .strip_prefix(namespace)
+        .and_then(|t| t.strip_prefix('/'))
+        .unwrap_or(topic)
+}
+
+/// `<name>/<shard>` in a namespace (FIP §4.10), or `name` with no namespace.
+fn shard_topic(namespace: &str, name: &str, shard: u32) -> String {
+    if namespace.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}/{}", name, shard)
+    }
+}
+
+/// The topics of `name`: one per shard for a sharded topic in a namespace.
+fn topic_variants(namespace: &str, name: &str) -> Vec<String> {
+    if namespace.is_empty() || !SHARDED_TOPICS.contains(&name) {
+        vec![name.to_string()]
+    } else {
+        HYPERSNAP_SHARDS
+            .iter()
+            .map(|s| shard_topic(namespace, name, *s))
+            .collect()
+    }
+}
+
+/// The shard of a mempool message on a Hypersnap node (FIP §17.6): shard 0
+/// for its types and events, else the shard of the FID.
+fn mempool_shard(message: &MempoolMessage, version: crate::version::version::EngineVersion) -> u32 {
+    use crate::mempool::routing::{self, MessageRouter, ShardRouter};
+    let router: Box<dyn MessageRouter> = Box::new(ShardRouter {});
+    match message {
+        MempoolMessage::UserMessage(m) => routing::route_message(&router, m, 2, version),
+        MempoolMessage::OnchainEvent(e)
+            if e.r#type() == proto::OnChainEventType::EventTypeStorageRent =>
+        {
+            router.route_fid(e.fid, 2)
+        }
+        MempoolMessage::OnchainEvent(_) | MempoolMessage::OnchainEventForMigration(_) => 0,
+        MempoolMessage::FnameTransfer(t) => {
+            router.route_fid(t.proof.as_ref().map_or(0, |p| p.fid), 2)
+        }
+        MempoolMessage::BlockEvent { for_shard, .. } => *for_shard,
+    }
+}
+
+/// The shard of a decided value.
+fn decided_value_shard(value: &proto::DecidedValue) -> u32 {
+    /// The header of an encoded `HypersnapBlock`, without its body.
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct HeaderOnly {
+        #[prost(message, optional, tag = "1")]
+        header: Option<proto::HypersnapBlockHeader>,
+    }
+    match &value.value {
+        Some(proto::decided_value::Value::Shard(chunk)) => chunk
+            .header
+            .as_ref()
+            .and_then(|h| h.height)
+            .map_or(0, |h| h.shard_index),
+        Some(proto::decided_value::Value::HypersnapBlock(bytes)) => {
+            HeaderOnly::decode(bytes.as_slice())
+                .ok()
+                .and_then(|b| b.header)
+                .map_or(0, |h| h.shard_id)
+        }
+        _ => 0,
+    }
+}
+
+/// The topic name without the namespace and the shard.
+fn base_topic<'a>(namespace: &str, topic: &'a str) -> &'a str {
+    let bare = bare_topic(namespace, topic);
+    if namespace.is_empty() {
+        return bare;
+    }
+    match bare.rsplit_once('/') {
+        Some((base, shard)) if shard.parse::<u32>().is_ok() => base,
+        _ => bare,
+    }
 }
 
 impl Default for Config {
@@ -109,11 +268,28 @@ impl Default for Config {
             bootstrap_reconnect_interval: Duration::from_secs(30),
             enable_autodiscovery: false,
             direct_peers: "".to_string(),
+            namespace: String::new(),
+            engine_version: None,
         }
     }
 }
 
 impl Config {
+    /// The namespace of a Hypersnap network (FIP §4.7).
+    pub fn hypersnap_namespace(network: FarcasterNetwork) -> String {
+        format!("hypersnap/{}", network as i32)
+    }
+
+    pub fn with_namespace(mut self, namespace: String) -> Self {
+        self.namespace = namespace;
+        self
+    }
+
+    pub fn with_engine_version(mut self, version: crate::version::version::EngineVersion) -> Self {
+        self.engine_version = Some(version);
+        self
+    }
+
     pub fn new(address: String, bootstrap_peers: String) -> Self {
         Config::default()
             .with_address(address)
@@ -186,7 +362,6 @@ pub enum GossipEvent<Ctx: SnapchainContext> {
     BroadcastSignedProposal(SignedProposal<Ctx>),
     BroadcastFullProposal(proto::FullProposal),
     BroadcastMempoolMessage(MempoolMessage),
-    BroadcastHyperEnvelope(HyperEnvelope),
     BroadcastStatus(sync::Status<SnapchainValidatorContext>),
     SyncRequest(
         MalachitePeerId,
@@ -195,6 +370,8 @@ pub enum GossipEvent<Ctx: SnapchainContext> {
     ),
     SyncReply(InboundRequestId, sync::Response<SnapchainValidatorContext>),
     BroadcastDecidedValue(proto::DecidedValue),
+    /// Hypersnap: a `ValidatorTransitionAlert` on the `membership` topic.
+    BroadcastTransitionAlert(proto::ValidatorTransitionAlert),
     SubscribeToDecidedValuesTopic(),
     /// Source-tagged connected peers: COLLECTED (peer-attested `ContactInfoBody`)
     /// and DERIVED (PeerId + observed address) entries, the latter so connected
@@ -217,11 +394,13 @@ pub enum GossipEvent<Ctx: SnapchainContext> {
 }
 
 pub enum GossipTopic {
-    Consensus,
-    DecidedValues,
+    /// The shard of the message (its topic in a Hypersnap namespace).
+    Consensus(u32),
+    DecidedValues(u32),
     ReadNodePeerStatuses,
-    Mempool,
-    Hyper,
+    Mempool(u32),
+    /// Hypersnap `membership` topic.
+    Membership,
     SyncRequest(MalachitePeerId, oneshot::Sender<OutboundRequestId>),
     SyncReply(InboundRequestId),
 }
@@ -305,7 +484,6 @@ pub struct SnapchainGossip {
     statsd_client: StatsdClientWrapper,
     peers: BTreeMap<PeerId, ContactInfoBody>,
     capabilities: Vec<String>,
-    hyper_enabled: bool,
     /// Optional set of peers whose inbound gossip messages will be silently
     /// dropped. Empty in production. Tests inject peer ids here to simulate a
     /// network partition without tearing down libp2p connections.
@@ -355,6 +533,12 @@ pub struct SnapchainGossip {
     /// custom statsd recorder. Wrapped in `Arc<AtomicU64>` for the same
     /// reason as `boot_resub_done`.
     direct_peer_force_bounce_count: Arc<AtomicU64>,
+    /// Debounce timestamp for validator-triggered subscription re-announcement.
+    /// When a known validator (re)connects we re-broadcast our topic
+    /// subscriptions so its gossipsub mesh can re-form (see the reconnect fix in
+    /// `on ConnectionEstablished`); this bounds it to one cycle per
+    /// [`VALIDATOR_RESUB_COOLDOWN`] window across connection flaps.
+    last_validator_resub_at: Option<tokio::time::Instant>,
     /// Prometheus-style per-peer/per-topic gossip counters + rate sampler.
     /// Cumulative counters are the store of record; rates are derived. Cloned
     /// into `main` for registration into the shared registry. See
@@ -366,6 +550,9 @@ pub struct SnapchainGossip {
     /// holds only peer-attested `ContactInfoBody`) so derived data is never
     /// conflated with collected contact info. Cleared on full disconnect.
     observed_addrs: HashMap<PeerId, Multiaddr>,
+    /// Hypersnap: the mempool messages of each shard for the next batch, and
+    /// their bytes.
+    mempool_batches: BTreeMap<u32, (Vec<proto::MempoolMessage>, usize)>,
     /// In-flight outbound mesh-diagnostics requests (the crawl): maps the
     /// `OutboundRequestId` returned by `send_request` to the oneshot the crawler
     /// is awaiting. Resolved on the matching inbound `Response` or on
@@ -379,23 +566,22 @@ pub struct SnapchainGossip {
     /// from the configured validator set (see [`Self::set_validator_peers`]).
     /// **Fail-closed:** an empty set answers no one.
     validator_peers: HashSet<PeerId>,
+    /// A Hypersnap validator's registration, for its contact info (FIP
+    /// §4.10). Read at each publish, so it follows the shard-0 state.
+    hypersnap_contact: Option<HypersnapContactFn>,
+    /// See `Config::namespace`.
+    namespace: String,
+    /// See `Config::engine_version`.
+    engine_version: crate::version::version::EngineVersion,
 }
 
-impl SnapchainGossip {
-    pub(crate) fn encode_hyper_envelope(&self, envelope: HyperEnvelope) -> Option<Vec<u8>> {
-        if !self.hyper_enabled {
-            warn!("Hyper envelope dropped; node is not hyper-enabled");
-            None
-        } else {
-            let gossip_message = proto::GossipMessage {
-                gossip_message: Some(proto::gossip_message::GossipMessage::HyperEnvelope(
-                    envelope.into(),
-                )),
-            };
-            Some(gossip_message.encode_to_vec())
-        }
-    }
+/// Minimum spacing between validator-triggered subscription re-announcements.
+/// A restarting validator can produce several `ConnectionEstablished` events in
+/// quick succession (QUIC re-dials, lingering old connections); this collapses
+/// them into a single mesh-recovery cycle so we don't thrash every peer's mesh.
+const VALIDATOR_RESUB_COOLDOWN: Duration = Duration::from_secs(15);
 
+impl SnapchainGossip {
     pub async fn create(
         keypair: Keypair,
         config: &Config,
@@ -405,6 +591,8 @@ impl SnapchainGossip {
         statsd_client: StatsdClientWrapper,
         capabilities: Vec<String>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let namespace = config.namespace.clone();
+        let id_namespace = namespace.clone();
         let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair.clone().into())
             .with_tokio()
             .with_tcp(
@@ -414,7 +602,7 @@ impl SnapchainGossip {
             )?
             .with_quic()
             .with_behaviour(|key| {
-                let message_id_fn = |message: &gossipsub::Message| {
+                let message_id_fn = move |message: &gossipsub::Message| {
                     // This is the default implementation inside libp2p
                     let default_message_id_fn = |message: &gossipsub::Message| {
                         let mut source_string = if let Some(peer_id) = message.source.as_ref() {
@@ -429,8 +617,10 @@ impl SnapchainGossip {
                         MessageId::from(source_string)
                     };
 
-                    match message.topic.as_str() {
-                        MEMPOOL_TOPIC | CONTACT_INFO => {
+                    // Content-addressed: every validator publishes the same
+                    // transition alert (FIP §4.6).
+                    match base_topic(&id_namespace, message.topic.as_str()) {
+                        MEMPOOL_TOPIC | CONTACT_INFO | MEMBERSHIP_TOPIC => {
                             let mut s = DefaultHasher::new();
                             message.data.hash(&mut s);
                             gossipsub::MessageId::from(s.finish().to_string())
@@ -440,17 +630,27 @@ impl SnapchainGossip {
                 };
 
                 // Set a custom gossipsub configuration
-                let gossipsub_config = gossipsub::ConfigBuilder::default()
+                let mut gossipsub_builder = gossipsub::ConfigBuilder::default();
+                gossipsub_builder
                     .heartbeat_interval(Duration::from_millis(500)) // This might need to be lowered to 1/3 of the block time
                     .validation_mode(gossipsub::ValidationMode::Strict) // This sets the kind of message validation. The default is Strict (enforce message signing)
                     .message_id_fn(message_id_fn) // content-address mempool messages
-                    .max_transmit_size(MAX_GOSSIP_MESSAGE_SIZE) // maximum message size that can be transmitted
+                    .max_transmit_size(if namespace.is_empty() {
+                        MAX_GOSSIP_MESSAGE_SIZE
+                    } else {
+                        HYPERSNAP_MAX_GOSSIP_MESSAGE_SIZE
+                    }) // maximum message size that can be transmitted
                     .mesh_n(10) // Try setting D to a higher value to see if it helps with slow sync (nodes will consume more bandwidth)
                     .mesh_n_high(20) // 2x D, which is the recommended value
                     // Redial dropped explicit peers more aggressively (default 300 ≈ 150s
                     // at 500ms heartbeat). 60 ticks ≈ 30s — defense in depth alongside
                     // the per-tick targeted-disconnect machinery in `start()`.
-                    .check_explicit_peers_ticks(60)
+                    .check_explicit_peers_ticks(60);
+                if !namespace.is_empty() {
+                    // A peer of another namespace cannot negotiate gossipsub.
+                    gossipsub_builder.protocol_id_prefix(format!("/{}/meshsub", namespace));
+                }
+                let gossipsub_config = gossipsub_builder
                     .build()
                     .map_err(|msg| io::Error::new(io::ErrorKind::Other, msg))?; // Temporary hack because `build` does not return a proper `std::error::Error`.
 
@@ -460,14 +660,35 @@ impl SnapchainGossip {
                     gossipsub_config,
                 )?;
 
+                // F017 fix: enable libp2p gossipsub peer scoring with
+                // the default thresholds. Without this a Sybil-poisoned
+                // mesh has no eviction path; misbehaving peers (slow,
+                // duplicate-flooding, invalid-message-rate) keep their
+                // mesh slots indefinitely. The defaults conservative
+                // enough to use without per-topic tuning while still
+                // exercising the scoring + greylist machinery.
+                let peer_score_params = gossipsub::PeerScoreParams::default();
+                let peer_score_thresholds = gossipsub::PeerScoreThresholds::default();
+                if let Err(e) = gossipsub.with_peer_score(peer_score_params, peer_score_thresholds)
+                {
+                    warn!(
+                        error = %e,
+                        "gossipsub: with_peer_score failed; mesh runs with no scoring"
+                    );
+                }
+
                 for peer_id in config.direct_peers() {
                     info!(peer_id = peer_id.to_string(), "Adding direct peer");
                     gossipsub.add_explicit_peer(&peer_id);
                 }
 
-                let rpc = sync::Behaviour::new(
-                    sync::Config::default().with_request_timeout(Duration::from_secs(5)),
-                );
+                let rpc = sync::Behaviour::new(sync::Config::default().with_request_timeout(
+                    if namespace.is_empty() {
+                        Duration::from_secs(5)
+                    } else {
+                        HYPERSNAP_SYNC_REQUEST_TIMEOUT
+                    },
+                ));
 
                 let diagnostics = diagnostics::Behaviour::new(
                     [(
@@ -504,7 +725,7 @@ impl SnapchainGossip {
         let mut local_topics: Vec<gossipsub::IdentTopic> = Vec::new();
 
         if read_node {
-            let topic = gossipsub::IdentTopic::new(READ_NODE_PEER_STATUSES);
+            let topic = ident(&namespace, READ_NODE_PEER_STATUSES);
             let result = swarm.behaviour_mut().gossipsub.subscribe(&topic);
             if let Err(e) = result {
                 warn!("Failed to subscribe to topic: {:?}", e);
@@ -512,7 +733,7 @@ impl SnapchainGossip {
             }
             local_topics.push(topic);
 
-            let topic = gossipsub::IdentTopic::new(MEMPOOL_TOPIC);
+            let topic = ident(&namespace, MEMPOOL_TOPIC);
             let result = swarm.behaviour_mut().gossipsub.subscribe(&topic);
             if let Err(e) = result {
                 warn!("Failed to subscribe to topic: {:?}", e);
@@ -520,24 +741,24 @@ impl SnapchainGossip {
             }
             local_topics.push(topic);
         } else {
-            let topic = gossipsub::IdentTopic::new(CONSENSUS_TOPIC);
-            let result = swarm.behaviour_mut().gossipsub.subscribe(&topic);
-            if let Err(e) = result {
-                warn!("Failed to subscribe to topic: {:?}", e);
-                return Err(Box::new(e));
+            let mut names = topic_variants(&namespace, CONSENSUS_TOPIC);
+            names.extend(topic_variants(&namespace, MEMPOOL_TOPIC));
+            if !namespace.is_empty() {
+                names.push(MEMBERSHIP_TOPIC.to_string());
+                names.push(CERTIFICATE_TOPIC.to_string());
             }
-            local_topics.push(topic);
-
-            let topic = gossipsub::IdentTopic::new(MEMPOOL_TOPIC);
-            let result = swarm.behaviour_mut().gossipsub.subscribe(&topic);
-            if let Err(e) = result {
-                warn!("Failed to subscribe to topic: {:?}", e);
-                return Err(Box::new(e));
+            for name in names {
+                let topic = ident(&namespace, &name);
+                let result = swarm.behaviour_mut().gossipsub.subscribe(&topic);
+                if let Err(e) = result {
+                    warn!("Failed to subscribe to topic: {:?}", e);
+                    return Err(Box::new(e));
+                }
+                local_topics.push(topic);
             }
-            local_topics.push(topic);
         }
 
-        let topic = gossipsub::IdentTopic::new(CONTACT_INFO);
+        let topic = ident(&namespace, CONTACT_INFO);
         let result = swarm.behaviour_mut().gossipsub.subscribe(&topic);
         if let Err(e) = result {
             warn!("Failed to subscribe to topic: {:?}", e);
@@ -564,15 +785,6 @@ impl SnapchainGossip {
 
         // ~5 seconds of buffer (assuming 1K msgs/pec)
         let (tx, rx) = mpsc::channel(5000);
-        let hyper_enabled = capabilities.iter().any(|cap| cap == CAPABILITY_HYPER);
-        if hyper_enabled {
-            let topic = gossipsub::IdentTopic::new(HYPER_TOPIC);
-            if let Err(e) = swarm.behaviour_mut().gossipsub.subscribe(&topic) {
-                warn!("Failed to subscribe to topic: {:?}", e);
-            }
-            local_topics.push(topic);
-        }
-
         let direct_peers: HashSet<PeerId> = config.direct_peers().into_iter().collect();
 
         Ok(SnapchainGossip {
@@ -594,20 +806,26 @@ impl SnapchainGossip {
             peers: BTreeMap::new(),
             peer_blocklist: Arc::new(Mutex::new(HashSet::new())),
             capabilities,
-            hyper_enabled,
             direct_peers,
             bootstrap_peer_addrs: HashMap::new(),
             bounced_bootstrap_addrs: HashSet::new(),
             force_bounce_streak: HashMap::new(),
             local_topics,
             boot_resub_done: Arc::new(AtomicBool::new(false)),
+            last_validator_resub_at: None,
             last_force_bounce_at: HashMap::new(),
             peer_connected_at: HashMap::new(),
             direct_peer_force_bounce_count: Arc::new(AtomicU64::new(0)),
             metrics: GossipMetrics::new(),
             observed_addrs: HashMap::new(),
+            mempool_batches: BTreeMap::new(),
             diagnostics_requests: HashMap::new(),
             validator_peers: HashSet::new(),
+            hypersnap_contact: None,
+            namespace,
+            engine_version: config
+                .engine_version
+                .unwrap_or_else(|| crate::version::version::EngineVersion::current(fc_network)),
         })
     }
 
@@ -739,6 +957,11 @@ impl SnapchainGossip {
         }
     }
 
+    /// Put the registration of this Hypersnap validator in its contact info.
+    pub fn set_hypersnap_contact(&mut self, contact: HypersnapContactFn) {
+        self.hypersnap_contact = Some(contact);
+    }
+
     pub fn publish_contact_info(&mut self) {
         let current_version = EngineVersion::current(self.fc_network).protocol_version();
         let contact_info = ContactInfo {
@@ -753,6 +976,7 @@ impl SnapchainGossip {
                     .unwrap()
                     .as_millis() as u64,
                 capabilities: self.capabilities.clone(),
+                hypersnap: self.hypersnap_contact.as_ref().and_then(|f| f()),
             }),
         };
 
@@ -768,9 +992,19 @@ impl SnapchainGossip {
         let mut reconnect_timer = tokio::time::interval(self.bootstrap_reconnect_interval);
 
         let mut publish_contact_info_timer = tokio::time::interval(self.contact_info_interval);
+        let mut mempool_batch_timer = tokio::time::interval(MEMPOOL_BATCH_INTERVAL);
 
         loop {
             tokio::select! {
+                _ = mempool_batch_timer.tick(), if !self.mempool_batches.is_empty() => {
+                    let shards: Vec<u32> = self.mempool_batches.keys().copied().collect();
+                    for shard in shards {
+                        if let Some((_, encoded)) = self.take_mempool_batch(shard) {
+                            let topic = shard_topic(&self.namespace, MEMPOOL_TOPIC, shard);
+                            self.publish(encoded, &topic);
+                        }
+                    }
+                }
                 _ = reconnect_timer.tick() => {
                     self.check_and_reconnect_to_bootstrap_peers().await;
                     self.statsd_client.gauge("gossip.connected_peers", self.swarm.connected_peers().count() as u64, vec![]);
@@ -790,7 +1024,7 @@ impl SnapchainGossip {
                     // and read nodes — so its absence is unambiguous evidence
                     // the SUBSCRIBE round-trip didn't complete after connect.
                     // Fix: targeted disconnect to force a fresh handshake.
-                    let contact_info_hash = gossipsub::IdentTopic::new(CONTACT_INFO).hash();
+                    let contact_info_hash = ident(&self.namespace, CONTACT_INFO).hash();
                     let now = Instant::now();
                     let bounce_cooldown = Duration::from_secs(60);
                     // SUBSCRIBE round-trip settle window. `gossipsub.all_peers()` reports
@@ -957,6 +1191,40 @@ impl SnapchainGossip {
                                     warn!("Failed to send connection established message: {}", e);
                                 }
                             }
+                            // Mesh recovery on validator (re)connection — the fix for the
+                            // restarted-validator gossip stall. libp2p gossipsub only sends
+                            // its subscriptions on a peer's FIRST connection
+                            // (`other_established == 0`, behaviour.rs:2969). When a validator
+                            // RESTARTS, peers often still hold its stale connection, so the
+                            // restarted node's new connection is NOT the first — peers skip
+                            // sending their subscriptions to it. It therefore never learns
+                            // which topics they're subscribed to, never GRAFTs them into its
+                            // OUTBOUND mesh, and every message it publishes (consensus votes,
+                            // sync requests) reaches no one — while inbound still
+                            // works (its own fresh boot re-announced its subs). We break the
+                            // asymmetry by re-announcing OUR subscriptions (cycle unsub/sub,
+                            // the only way to force a fresh SUBSCRIBE — plain subscribe is a
+                            // no-op when already subscribed) whenever a known validator
+                            // connects, so the reconnecting peer relearns our topics and its
+                            // mesh re-forms in both directions. Debounced so a burst of
+                            // reconnect events collapses to one cycle. Keyed on the validator
+                            // set, NOT direct/explicit peers.
+                            if self.validator_peers.contains(&peer_id) {
+                                let now = tokio::time::Instant::now();
+                                let due = self
+                                    .last_validator_resub_at
+                                    .map_or(true, |t| now.duration_since(t) >= VALIDATOR_RESUB_COOLDOWN);
+                                if due {
+                                    self.last_validator_resub_at = Some(now);
+                                    info!(peer = %peer_id, "Validator (re)connected — re-announcing subscriptions for mesh recovery");
+                                    for topic in &self.local_topics {
+                                        let _ = self.swarm.behaviour_mut().gossipsub.unsubscribe(topic);
+                                        let _ = self.swarm.behaviour_mut().gossipsub.subscribe(topic);
+                                    }
+                                    self.statsd_client.count("gossip.validator_resub_fired", 1, vec![]);
+                                }
+                            }
+
                             match endpoint {
                                 libp2p::core::ConnectedPoint::Dialer { address, ..} => {
                                     if self.bootstrap_addrs.contains(&address.to_string()) {
@@ -1068,14 +1336,14 @@ impl SnapchainGossip {
                             // derived by the sampler on the periodic tick.
                             self.metrics.record_message(
                                 &peer_id,
-                                message.topic.as_str(),
+                                base_topic(&self.namespace, message.topic.as_str()),
                                 message.data.len() as u64,
                             );
                             // Take an owned sender if present to avoid holding an immutable borrow during mutable self call
                             let maybe_sender = self.system_tx.as_ref().cloned();
                             if let Some(system_tx) = maybe_sender {
                                 let data = message.data.clone();
-                                if let Some(system_message) = self.map_gossip_bytes_to_system_message(peer_id, data) {
+                                for system_message in self.map_gossip_bytes_to_system_messages(peer_id, data) {
                                     if let Err(e) = system_tx.send(system_message).await {
                                         warn!("Failed to send system block message: {}", e);
                                     }
@@ -1195,11 +1463,20 @@ impl SnapchainGossip {
                     if let Some((gossip_topics, encoded_message)) = self.process_gossip_event(event) {
                         for gossip_topic in gossip_topics {
                             match gossip_topic {
-                                GossipTopic::Consensus => self.publish(encoded_message.clone(), CONSENSUS_TOPIC),
-                                GossipTopic::DecidedValues=> self.publish(encoded_message.clone(), DECIDED_VALUES),
+                                GossipTopic::Consensus(shard) => {
+                                    let topic = shard_topic(&self.namespace, CONSENSUS_TOPIC, shard);
+                                    self.publish(encoded_message.clone(), &topic)
+                                }
+                                GossipTopic::DecidedValues(shard) => {
+                                    let topic = shard_topic(&self.namespace, DECIDED_VALUES, shard);
+                                    self.publish(encoded_message.clone(), &topic)
+                                }
                                 GossipTopic::ReadNodePeerStatuses => self.publish(encoded_message.clone(), READ_NODE_PEER_STATUSES),
-                                GossipTopic::Mempool => self.publish(encoded_message.clone(), MEMPOOL_TOPIC),
-                                GossipTopic::Hyper => self.publish(encoded_message.clone(), HYPER_TOPIC),
+                                GossipTopic::Mempool(shard) => {
+                                    let topic = shard_topic(&self.namespace, MEMPOOL_TOPIC, shard);
+                                    self.publish(encoded_message.clone(), &topic)
+                                }
+                                GossipTopic::Membership => self.publish(encoded_message.clone(), MEMBERSHIP_TOPIC),
                                 GossipTopic::SyncRequest(peer_id, reply_tx) => {
                                     let peer = peer_id.to_libp2p();
                                     let request_id = self.swarm.behaviour_mut().rpc.send_request(peer, Bytes::from(encoded_message.clone()));
@@ -1261,14 +1538,32 @@ impl SnapchainGossip {
     }
 
     fn publish(&mut self, message: Vec<u8>, topic: &str) {
-        let publish_topic = gossipsub::IdentTopic::new(topic);
+        let publish_topic = ident(&self.namespace, topic);
         if let Err(e) = self
             .swarm
             .behaviour_mut()
             .gossipsub
             .publish(publish_topic, message)
         {
-            warn!("Failed to publish gossip message: {} ({:?})", e, topic);
+            // `InsufficientPeers` is the expected steady-state error
+            // for any single-signer / bootstrap / partition-recovery
+            // moment when no other validator has subscribed to the
+            // topic yet — e.g., epoch-0 with one DKLS signer,
+            // peers still mid-handshake, or the genesis node booting
+            // before nodes 2..N. `Duplicate` similarly fires on
+            // benign gossip re-sends (mesh fan-in). Both are noisy
+            // false positives at `warn`; demote so real publish
+            // failures (MessageTooLarge, queue exhaustion, sign
+            // errors) still surface above the bootstrap chatter.
+            use libp2p::gossipsub::PublishError as Pe;
+            match e {
+                Pe::InsufficientPeers | Pe::Duplicate => {
+                    debug!("Gossip publish skipped: {} ({:?})", e, topic);
+                }
+                _ => {
+                    warn!("Failed to publish gossip message: {} ({:?})", e, topic);
+                }
+            }
             // Without this a dropped publish is visible only in logs: a mempool message
             // the RPC layer already reported as submitted never leaves the node.
             self.statsd_client
@@ -1277,7 +1572,13 @@ impl SnapchainGossip {
     }
 
     pub fn handle_contact_info(&mut self, contact_info: ContactInfo, peer_id: PeerId) {
-        // TODO(aditi): We might want to persist peers and reconnect to them on restart
+        // F021: peer-controlled body. Two hardening rules:
+        //   1. The inner `peer_id` byte-string must parse — log + drop
+        //      on failure instead of `.unwrap()` panicking.
+        //   2. The libp2p `peer_id` of the sender must match the inner
+        //      `peer_id` claim. Without this binding any connected
+        //      peer can flood-dial a read node with attacker
+        //      multiaddrs (eclipse).
         if contact_info.body.is_none() {
             warn!("Received empty contact info from peer: {}", peer_id);
             return;
@@ -1289,7 +1590,29 @@ impl SnapchainGossip {
             "Received contact info from peer"
         );
 
-        let contact_peer_id = PeerId::from_bytes(&contact_info_body.peer_id).unwrap();
+        let contact_peer_id = match PeerId::from_bytes(&contact_info_body.peer_id) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(
+                    peer_id = peer_id.to_string(),
+                    error = %e,
+                    "Dropping contact info: inner peer_id failed to parse"
+                );
+                return;
+            }
+        };
+
+        // The inner peer_id must match the libp2p sender — otherwise
+        // any peer could announce attacker-controlled multiaddrs on
+        // behalf of arbitrary other peer_ids.
+        if contact_peer_id != peer_id {
+            warn!(
+                sender = peer_id.to_string(),
+                claimed = contact_peer_id.to_string(),
+                "Dropping contact info: inner peer_id does not match libp2p sender"
+            );
+            return;
+        }
 
         self.peers
             .insert(contact_peer_id, contact_info_body.clone());
@@ -1333,14 +1656,112 @@ impl SnapchainGossip {
         }
     }
 
+    /// The size cap of a proposal or a decided value: snapchain's, or the
+    /// Hypersnap block limit in a Hypersnap namespace.
+    fn max_value_bytes(&self, snapchain_cap: usize) -> usize {
+        if self.namespace.is_empty() {
+            snapchain_cap
+        } else {
+            HYPERSNAP_MAX_VALUE_BYTES
+        }
+    }
+
     pub fn map_gossip_bytes_to_system_message(
         &mut self,
         peer_id: PeerId,
         gossip_message: Vec<u8>,
     ) -> Option<SystemMessage> {
         match proto::GossipMessage::decode(gossip_message.as_slice()) {
-            Ok(gossip_message) => match gossip_message.gossip_message {
+            Ok(gossip_message) => self.map_gossip_message(peer_id, gossip_message),
+            Err(e) => {
+                warn!("Failed to decode gossip message: {}", e);
+                None
+            }
+        }
+    }
+
+    /// The system messages of a gossip message: one, or one for each message
+    /// of a mempool batch.
+    pub fn map_gossip_bytes_to_system_messages(
+        &mut self,
+        peer_id: PeerId,
+        gossip_message: Vec<u8>,
+    ) -> Vec<SystemMessage> {
+        match proto::GossipMessage::decode(gossip_message.as_slice()) {
+            Ok(proto::GossipMessage {
+                gossip_message: Some(gossip_message::GossipMessage::MempoolBatch(batch)),
+            }) => {
+                if batch.encoded_len() > MAX_MEMPOOL_BATCH_BYTES {
+                    warn!(
+                        peer_id = peer_id.to_string(),
+                        len = batch.encoded_len(),
+                        cap = MAX_MEMPOOL_BATCH_BYTES,
+                        "Dropping oversized MempoolBatch"
+                    );
+                    return vec![];
+                }
+                batch
+                    .messages
+                    .into_iter()
+                    .filter_map(|m| Self::mempool_add(peer_id, m))
+                    .collect()
+            }
+            Ok(gossip_message) => self
+                .map_gossip_message(peer_id, gossip_message)
+                .into_iter()
+                .collect(),
+            Err(e) => {
+                warn!("Failed to decode gossip message: {}", e);
+                vec![]
+            }
+        }
+    }
+
+    /// A mempool message from a peer, for the mempool.
+    fn mempool_add(peer_id: PeerId, message: proto::MempoolMessage) -> Option<SystemMessage> {
+        if message.encoded_len() > MAX_MEMPOOL_MESSAGE_BYTES {
+            warn!(
+                peer_id = peer_id.to_string(),
+                len = message.encoded_len(),
+                cap = MAX_MEMPOOL_MESSAGE_BYTES,
+                "Dropping oversized MempoolMessage"
+            );
+            return None;
+        }
+        let Some(proto::mempool_message::MempoolMessage::UserMessage(message)) =
+            message.mempool_message
+        else {
+            warn!("Unknown mempool message from peer: {}", peer_id);
+            return None;
+        };
+        let mut message_with_data = message;
+        message_bytes_decode(&mut message_with_data);
+        Some(SystemMessage::Mempool(MempoolRequest::AddMessage(
+            MempoolMessage::UserMessage(message_with_data),
+            MempoolSource::Gossip,
+            None,
+        )))
+    }
+
+    fn map_gossip_message(
+        &mut self,
+        peer_id: PeerId,
+        gossip_message: proto::GossipMessage,
+    ) -> Option<SystemMessage> {
+        {
+            match gossip_message.gossip_message {
                 Some(gossip_message::GossipMessage::ContactInfoMessage(contact_info)) => {
+                    // F019: cap per-variant bytes far below the
+                    // transport-level 10 MB ceiling.
+                    if contact_info.encoded_len() > MAX_CONTACT_INFO_BYTES {
+                        warn!(
+                            peer_id = peer_id.to_string(),
+                            len = contact_info.encoded_len(),
+                            cap = MAX_CONTACT_INFO_BYTES,
+                            "Dropping oversized ContactInfo"
+                        );
+                        return None;
+                    }
                     self.handle_contact_info(contact_info, peer_id);
                     None
                 }
@@ -1351,6 +1772,18 @@ impl SnapchainGossip {
                         None => None,
                         Some(read_node_message) => match read_node_message {
                             read_node_message::ReadNodeMessage::DecidedValue(decided_value) => {
+                                // F022 fix: per-variant size cap on
+                                // DecidedValue ingress.
+                                let cap = self.max_value_bytes(MAX_DECIDED_VALUE_BYTES);
+                                if decided_value.encoded_len() > cap {
+                                    warn!(
+                                        peer_id = peer_id.to_string(),
+                                        len = decided_value.encoded_len(),
+                                        cap,
+                                        "Dropping oversized DecidedValue"
+                                    );
+                                    return None;
+                                }
                                 Some(SystemMessage::DecidedValueForReadNode(decided_value))
                             }
                         },
@@ -1358,7 +1791,43 @@ impl SnapchainGossip {
                 }
 
                 Some(proto::gossip_message::GossipMessage::FullProposal(full_proposal)) => {
-                    let height = full_proposal.height();
+                    // F022 fix: per-variant size cap. Without this the
+                    // FullProposal path was bounded only by the 10 MB
+                    // libp2p ceiling — a memory-amplification DoS.
+                    let cap = self.max_value_bytes(MAX_FULL_PROPOSAL_BYTES);
+                    if full_proposal.encoded_len() > cap {
+                        warn!(
+                            peer_id = peer_id.to_string(),
+                            len = full_proposal.encoded_len(),
+                            cap,
+                            "Dropping oversized FullProposal"
+                        );
+                        return None;
+                    }
+                    // F013 fix: `FullProposal::height()` unwrapped a
+                    // peer-controlled `Option<Height>` BEFORE the
+                    // shard-id guard, so any subscribed peer could crash
+                    // every node by sending a height-less FullProposal
+                    // frame. Validate `height` (and `round`) before
+                    // using them.
+                    let Some(height) = full_proposal.height.clone() else {
+                        warn!(
+                            peer_id = peer_id.to_string(),
+                            "Dropping FullProposal with missing height"
+                        );
+                        return None;
+                    };
+                    if full_proposal.round < 0 {
+                        // `FullProposal::round()` (proto/src/lib.rs) calls
+                        // `Round::new(self.round.try_into().unwrap())`
+                        // which panics on negative values. Drop here.
+                        warn!(
+                            peer_id = peer_id.to_string(),
+                            round = full_proposal.round,
+                            "Dropping FullProposal with negative round"
+                        );
+                        return None;
+                    }
                     debug!(
                         "Received block with height {} from peer: {}",
                         height, peer_id
@@ -1379,6 +1848,15 @@ impl SnapchainGossip {
                     Some(SystemMessage::MalachiteNetwork(shard, event))
                 }
                 Some(proto::gossip_message::GossipMessage::Consensus(signed_consensus_msg)) => {
+                    if signed_consensus_msg.encoded_len() > MAX_CONSENSUS_BYTES {
+                        warn!(
+                            peer_id = peer_id.to_string(),
+                            len = signed_consensus_msg.encoded_len(),
+                            cap = MAX_CONSENSUS_BYTES,
+                            "Dropping oversized Consensus message"
+                        );
+                        return None;
+                    }
                     let malachite_peer_id = MalachitePeerId::from_libp2p(&peer_id);
                     let bytes = Bytes::from(signed_consensus_msg.encode_to_vec());
                     let event = MalachiteNetworkEvent::Message(
@@ -1395,6 +1873,15 @@ impl SnapchainGossip {
                     Some(SystemMessage::MalachiteNetwork(shard, event))
                 }
                 Some(proto::gossip_message::GossipMessage::Status(status)) => {
+                    if status.encoded_len() > MAX_STATUS_BYTES {
+                        warn!(
+                            peer_id = peer_id.to_string(),
+                            len = status.encoded_len(),
+                            cap = MAX_STATUS_BYTES,
+                            "Dropping oversized Status message"
+                        );
+                        return None;
+                    }
                     let encoded = status.encode_to_vec();
                     let Some(height) = status.height else {
                         warn!(
@@ -1412,40 +1899,29 @@ impl SnapchainGossip {
                     );
                     Some(SystemMessage::MalachiteNetwork(shard, event))
                 }
-                Some(proto::gossip_message::GossipMessage::HyperEnvelope(_)) => {
-                    warn!(
-                        "Received hyper envelope from peer {}, ignoring (not yet supported)",
-                        peer_id
+                Some(proto::gossip_message::GossipMessage::TransitionAlert(alert)) => {
+                    // Every node derives the transitions from its shard-0
+                    // state; the alert is a notice (FIP §4.6).
+                    info!(
+                        peer_id = peer_id.to_string(),
+                        validator = hex::encode(&alert.validator_key),
+                        effective_epoch = alert.effective_epoch,
+                        transition = ?alert.transition(),
+                        alert_block = alert.alert_block,
+                        "Validator transition alert"
                     );
                     None
                 }
                 Some(proto::gossip_message::GossipMessage::MempoolMessage(message)) => {
-                    if let Some(mempool_message_proto) = message.mempool_message {
-                        let mempool_message = match mempool_message_proto {
-                            proto::mempool_message::MempoolMessage::UserMessage(message) => {
-                                let mut message_with_data = message.clone();
-                                message_bytes_decode(&mut message_with_data);
-                                MempoolMessage::UserMessage(message_with_data)
-                            }
-                        };
-                        Some(SystemMessage::Mempool(MempoolRequest::AddMessage(
-                            mempool_message,
-                            MempoolSource::Gossip,
-                            None,
-                        )))
-                    } else {
-                        warn!("Unknown mempool message from peer: {}", peer_id);
-                        None
-                    }
+                    Self::mempool_add(peer_id, message)
                 }
+                // `map_gossip_bytes_to_system_messages` takes the messages of a
+                // batch.
+                Some(proto::gossip_message::GossipMessage::MempoolBatch(_)) => None,
                 None => {
                     warn!("Empty message from peer: {}", peer_id);
                     None
                 }
-            },
-            Err(e) => {
-                warn!("Failed to decode gossip message: {}", e);
-                None
             }
         }
     }
@@ -1499,6 +1975,20 @@ impl SnapchainGossip {
     }
 
     // Return the bytes for the associated network message if there's one
+    /// The waiting mempool batch of `shard`, for its mempool topic.
+    fn take_mempool_batch(&mut self, shard: u32) -> Option<(Vec<GossipTopic>, Vec<u8>)> {
+        let (messages, _) = self.mempool_batches.remove(&shard)?;
+        let gossip_message = proto::GossipMessage {
+            gossip_message: Some(proto::gossip_message::GossipMessage::MempoolBatch(
+                proto::MempoolBatch { messages },
+            )),
+        };
+        Some((
+            vec![GossipTopic::Mempool(shard)],
+            gossip_message.encode_to_vec(),
+        ))
+    }
+
     pub fn process_gossip_event(
         &mut self,
         event: Option<GossipEvent<SnapchainValidatorContext>>,
@@ -1506,14 +1996,28 @@ impl SnapchainGossip {
         let snapchain_codec = SnapchainCodec {};
         match event {
             Some(GossipEvent::SubscribeToDecidedValuesTopic()) => {
-                let topic = gossipsub::IdentTopic::new(DECIDED_VALUES);
-                let result = self.swarm.behaviour_mut().gossipsub.subscribe(&topic);
-                if let Err(e) = result {
-                    error!("Failed to subscribe to {} topic: {}", DECIDED_VALUES, e);
+                for name in topic_variants(&self.namespace, DECIDED_VALUES) {
+                    let topic = ident(&self.namespace, &name);
+                    let result = self.swarm.behaviour_mut().gossipsub.subscribe(&topic);
+                    if let Err(e) = result {
+                        error!("Failed to subscribe to {} topic: {}", name, e);
+                    }
                 }
                 None
             }
+            Some(GossipEvent::BroadcastTransitionAlert(alert)) => {
+                let gossip_message = proto::GossipMessage {
+                    gossip_message: Some(proto::gossip_message::GossipMessage::TransitionAlert(
+                        alert,
+                    )),
+                };
+                Some((
+                    vec![GossipTopic::Membership],
+                    gossip_message.encode_to_vec(),
+                ))
+            }
             Some(GossipEvent::BroadcastDecidedValue(decided_value)) => {
+                let shard = decided_value_shard(&decided_value);
                 let gossip_message = proto::GossipMessage {
                     gossip_message: Some(proto::gossip_message::GossipMessage::ReadNodeMessage(
                         proto::ReadNodeMessage {
@@ -1526,12 +2030,13 @@ impl SnapchainGossip {
                     )),
                 };
                 Some((
-                    vec![GossipTopic::DecidedValues],
+                    vec![GossipTopic::DecidedValues(shard)],
                     gossip_message.encode_to_vec(),
                 ))
             }
             Some(GossipEvent::BroadcastSignedVote(vote)) => {
                 let vote_proto = vote.to_proto();
+                let shard = vote_proto.height.map_or(0, |h| h.shard_index);
                 let gossip_message = proto::GossipMessage {
                     gossip_message: Some(proto::gossip_message::GossipMessage::Consensus(
                         proto::ConsensusMessage {
@@ -1542,10 +2047,14 @@ impl SnapchainGossip {
                         },
                     )),
                 };
-                Some((vec![GossipTopic::Consensus], gossip_message.encode_to_vec()))
+                Some((
+                    vec![GossipTopic::Consensus(shard)],
+                    gossip_message.encode_to_vec(),
+                ))
             }
             Some(GossipEvent::BroadcastSignedProposal(proposal)) => {
                 let proposal_proto = proposal.to_proto();
+                let shard = proposal_proto.height.map_or(0, |h| h.shard_index);
                 let gossip_message = proto::GossipMessage {
                     gossip_message: Some(proto::gossip_message::GossipMessage::Consensus(
                         proto::ConsensusMessage {
@@ -1558,28 +2067,45 @@ impl SnapchainGossip {
                         },
                     )),
                 };
-                Some((vec![GossipTopic::Consensus], gossip_message.encode_to_vec()))
+                Some((
+                    vec![GossipTopic::Consensus(shard)],
+                    gossip_message.encode_to_vec(),
+                ))
             }
             Some(GossipEvent::BroadcastFullProposal(full_proposal)) => {
+                let shard = full_proposal.height.map_or(0, |h| h.shard_index);
                 let gossip_message = proto::GossipMessage {
                     gossip_message: Some(proto::gossip_message::GossipMessage::FullProposal(
                         full_proposal,
                     )),
                 };
-                Some((vec![GossipTopic::Consensus], gossip_message.encode_to_vec()))
+                Some((
+                    vec![GossipTopic::Consensus(shard)],
+                    gossip_message.encode_to_vec(),
+                ))
             }
             Some(GossipEvent::BroadcastMempoolMessage(message)) => {
+                let shard = mempool_shard(&message, self.engine_version);
                 let proto_message = message.to_proto();
+                if !self.namespace.is_empty() {
+                    let (batch, bytes) = self.mempool_batches.entry(shard).or_default();
+                    *bytes += proto_message.encoded_len();
+                    batch.push(proto_message);
+                    if *bytes < MEMPOOL_BATCH_BYTES {
+                        return None;
+                    }
+                    return self.take_mempool_batch(shard);
+                }
                 let gossip_message = proto::GossipMessage {
                     gossip_message: Some(proto::gossip_message::GossipMessage::MempoolMessage(
                         proto_message,
                     )),
                 };
-                Some((vec![GossipTopic::Mempool], gossip_message.encode_to_vec()))
+                Some((
+                    vec![GossipTopic::Mempool(shard)],
+                    gossip_message.encode_to_vec(),
+                ))
             }
-            Some(GossipEvent::BroadcastHyperEnvelope(envelope)) => self
-                .encode_hyper_envelope(envelope)
-                .map(|bytes| (vec![GossipTopic::Hyper], bytes)),
             Some(GossipEvent::SyncRequest(peer_id, request, reply_tx)) => {
                 let encoded = snapchain_codec.encode(&request);
                 match encoded {
@@ -1610,16 +2136,21 @@ impl SnapchainGossip {
                 let encoded = snapchain_codec.encode(&status);
                 match encoded {
                     Ok(encoded) => {
+                        let status = proto::StatusMessage::decode(encoded).unwrap();
+                        let shard = status.height.map_or(0, |h| h.shard_index);
                         let gossip_message = proto::GossipMessage {
                             gossip_message: Some(proto::gossip_message::GossipMessage::Status(
-                                proto::StatusMessage::decode(encoded).unwrap(),
+                                status,
                             )),
                         };
 
                         let topics = if self.read_node {
                             vec![GossipTopic::ReadNodePeerStatuses]
                         } else {
-                            vec![GossipTopic::Consensus, GossipTopic::ReadNodePeerStatuses]
+                            vec![
+                                GossipTopic::Consensus(shard),
+                                GossipTopic::ReadNodePeerStatuses,
+                            ]
                         };
 
                         // Should probably use a separate topic for status messages, but these are infrequent
@@ -1703,12 +2234,21 @@ impl SnapchainGossip {
             .all_peers()
             .map(|(p, ts)| (*p, ts.into_iter().cloned().collect()))
             .collect();
-        // Mesh membership per known topic (the set of peers we mesh with).
+        // Mesh membership per known topic (the set of peers we mesh with);
+        // a sharded topic is the union of its shard topics.
+        let hashes = |topic: &str| -> Vec<gossipsub::TopicHash> {
+            topic_variants(&self.namespace, topic)
+                .iter()
+                .map(|name| ident(&self.namespace, name).hash())
+                .collect()
+        };
         let topic_mesh: HashMap<&str, HashSet<PeerId>> = ALL_TOPICS
             .iter()
             .map(|topic| {
-                let hash = gossipsub::IdentTopic::new(*topic).hash();
-                let mesh = gossipsub.mesh_peers(&hash).cloned().collect();
+                let mesh = hashes(topic)
+                    .iter()
+                    .flat_map(|hash| gossipsub.mesh_peers(hash).cloned().collect::<Vec<_>>())
+                    .collect();
                 (*topic, mesh)
             })
             .collect();
@@ -1724,8 +2264,9 @@ impl SnapchainGossip {
                 let topics = ALL_TOPICS
                     .iter()
                     .filter_map(|topic| {
-                        let hash = gossipsub::IdentTopic::new(*topic).hash();
-                        let is_subscribed = subscribed.map(|s| s.contains(&hash)).unwrap_or(false);
+                        let is_subscribed = subscribed
+                            .map(|s| hashes(topic).iter().any(|h| s.contains(h)))
+                            .unwrap_or(false);
                         let in_mesh = topic_mesh
                             .get(*topic)
                             .map(|m| m.contains(&peer))
@@ -1811,5 +2352,65 @@ impl SnapchainGossip {
             peers,
             generated_at,
         }
+    }
+}
+
+#[cfg(test)]
+mod topic_tests {
+    use super::*;
+
+    #[test]
+    fn hypersnap_topics_are_per_shard() {
+        let ns = Config::hypersnap_namespace(FarcasterNetwork::Devnet);
+        assert_eq!(
+            topic_variants(&ns, CONSENSUS_TOPIC),
+            vec!["consensus/0", "consensus/1", "consensus/2"]
+        );
+        assert_eq!(topic_variants(&ns, CONTACT_INFO), vec!["contact-info"]);
+        // Snapchain keeps one topic of each.
+        assert_eq!(topic_variants("", CONSENSUS_TOPIC), vec!["consensus"]);
+        assert_eq!(shard_topic("", MEMPOOL_TOPIC, 2), "mempool");
+
+        let full = topic_name(&ns, &shard_topic(&ns, MEMPOOL_TOPIC, 2));
+        assert_eq!(full, format!("{}/mempool/2", ns));
+        assert_eq!(base_topic(&ns, &full), MEMPOOL_TOPIC);
+        assert_eq!(
+            base_topic(&ns, &topic_name(&ns, MEMBERSHIP_TOPIC)),
+            MEMBERSHIP_TOPIC
+        );
+    }
+
+    #[test]
+    fn mempool_messages_go_to_the_shard_of_their_state() {
+        use crate::storage::store::test_helper::default_storage_event;
+        let router = crate::mempool::routing::ShardRouter {};
+        use crate::mempool::routing::MessageRouter;
+        let cast = crate::utils::factory::messages_factory::casts::create_cast_add(
+            123, "hello", None, None,
+        );
+        assert_eq!(
+            mempool_shard(
+                &MempoolMessage::UserMessage(cast),
+                crate::version::version::EngineVersion::V20
+            ),
+            router.route_fid(123, 2)
+        );
+        let rent = default_storage_event(123);
+        assert_eq!(
+            mempool_shard(
+                &MempoolMessage::OnchainEvent(rent),
+                crate::version::version::EngineVersion::V20
+            ),
+            router.route_fid(123, 2)
+        );
+        let mut id = crate::storage::store::test_helper::default_storage_event(123);
+        id.r#type = proto::OnChainEventType::EventTypeIdRegister as i32;
+        assert_eq!(
+            mempool_shard(
+                &MempoolMessage::OnchainEvent(id),
+                crate::version::version::EngineVersion::V20
+            ),
+            0
+        );
     }
 }

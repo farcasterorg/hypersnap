@@ -15,6 +15,7 @@ use tracing::{error, warn};
 
 pub use crate::proto; // TODO: reconsider how this is imported
 
+use crate::core::consensus_keys::{ConsensusDomain, ConsensusPrivateKey, ConsensusPublicKey};
 use crate::proto::{Commits, FullProposal};
 pub use proto::Height;
 pub use proto::ShardHash;
@@ -105,21 +106,55 @@ impl fmt::Debug for Address {
 
 impl informalsystems_malachitebft_core_types::Address for Address {}
 
+/// The consensus signing scheme: Ed25519 before the pivot, Falcon-512 after
+/// it (`core::consensus_keys`).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Ed25519 {}
+pub struct ConsensusScheme {}
 
+/// Signs and verifies consensus messages with Ed25519 or Falcon-512 keys.
 #[derive(Clone, Debug)]
-pub struct Ed25519Provider {
-    keypair: Arc<Keypair>,
+pub struct ConsensusSigningProvider {
+    key: ConsensusPrivateKey,
 }
 
-impl Ed25519Provider {
+/// Name kept for the snapchain call sites.
+pub type Ed25519Provider = ConsensusSigningProvider;
+
+impl ConsensusSigningProvider {
     pub fn new(keypair: Arc<Keypair>) -> Self {
-        Self { keypair }
+        Self {
+            key: ConsensusPrivateKey::Ed25519(keypair),
+        }
+    }
+
+    pub fn with_key(key: ConsensusPrivateKey) -> Self {
+        Self { key }
     }
 }
 
-impl SigningProvider<SnapchainValidatorContext> for Ed25519Provider {
+/// The bytes a vote signature covers: the snapchain protobuf encoding for
+/// Ed25519, the vote digest for Falcon-512 (FIP §16.5).
+pub fn vote_sign_bytes(key: &ConsensusPublicKey, vote: &Vote) -> Vec<u8> {
+    match key {
+        ConsensusPublicKey::Ed25519(_) => vote.to_sign_bytes(),
+        ConsensusPublicKey::Falcon(_) => {
+            let (shard, hash) = match &vote.shard_hash {
+                NilOrVal::Val(v) => (v.shard_index, Some(v.hash.as_slice())),
+                NilOrVal::Nil => (vote.height.shard_index, None),
+            };
+            crate::core::consensus_keys::vote_digest(
+                vote.vote_type == VoteType::Precommit,
+                shard,
+                vote.height.block_number,
+                vote.round.as_i64().max(0) as u32,
+                hash,
+            )
+            .to_vec()
+        }
+    }
+}
+
+impl SigningProvider<SnapchainValidatorContext> for ConsensusSigningProvider {
     fn sign_vote(
         &self,
         vote: <SnapchainValidatorContext as informalsystems_malachitebft_core_types::Context>::Vote,
@@ -127,7 +162,8 @@ impl SigningProvider<SnapchainValidatorContext> for Ed25519Provider {
         SnapchainValidatorContext,
         <SnapchainValidatorContext as informalsystems_malachitebft_core_types::Context>::Vote,
     > {
-        let signature = self.keypair.sign(&vote.to_sign_bytes());
+        let bytes = vote_sign_bytes(&self.key.public_key(), &vote);
+        let signature = self.key.sign(ConsensusDomain::Vote, &bytes);
         SignedVote::new(vote, Signature(signature))
     }
 
@@ -137,7 +173,11 @@ impl SigningProvider<SnapchainValidatorContext> for Ed25519Provider {
         signature: &informalsystems_malachitebft_core_types::Signature<SnapchainValidatorContext>,
         public_key: &informalsystems_malachitebft_core_types::PublicKey<SnapchainValidatorContext>,
     ) -> bool {
-        let valid = public_key.verify(&vote.to_sign_bytes(), &signature.0);
+        let valid = public_key.verify(
+            ConsensusDomain::Vote,
+            &vote_sign_bytes(public_key, vote),
+            &signature.0,
+        );
         if !valid {
             error!(
                 "Invalid signature on vote for {:?} at height {:?} by {:?}",
@@ -148,7 +188,9 @@ impl SigningProvider<SnapchainValidatorContext> for Ed25519Provider {
     }
 
     fn sign_proposal(&self, proposal: Proposal) -> SignedProposal<SnapchainValidatorContext> {
-        let signature = self.keypair.sign(&proposal.to_sign_bytes());
+        let signature = self
+            .key
+            .sign(ConsensusDomain::Proposal, &proposal.to_sign_bytes());
         SignedProposal::new(proposal, Signature(signature))
     }
 
@@ -158,7 +200,11 @@ impl SigningProvider<SnapchainValidatorContext> for Ed25519Provider {
         signature: &informalsystems_malachitebft_core_types::Signature<SnapchainValidatorContext>,
         public_key: &informalsystems_malachitebft_core_types::PublicKey<SnapchainValidatorContext>,
     ) -> bool {
-        let valid = public_key.verify(&proposal.to_sign_bytes(), &signature.0);
+        let valid = public_key.verify(
+            ConsensusDomain::Proposal,
+            &proposal.to_sign_bytes(),
+            &signature.0,
+        );
         if !valid {
             error!(
                 "Invalid signature on proposal for {:?} at height {:?} by {:?}",
@@ -172,7 +218,10 @@ impl SigningProvider<SnapchainValidatorContext> for Ed25519Provider {
         &self,
         proposal_part: <SnapchainValidatorContext as informalsystems_malachitebft_core_types::Context>::ProposalPart,
     ) -> SignedMessage<SnapchainValidatorContext, <SnapchainValidatorContext as informalsystems_malachitebft_core_types::Context>::ProposalPart>{
-        let signature = self.keypair.sign(&proposal_part.to_sign_bytes());
+        let signature = self.key.sign(
+            ConsensusDomain::ProposalPart,
+            &proposal_part.to_sign_bytes(),
+        );
         SignedProposalPart::new(proposal_part, Signature(signature))
     }
 
@@ -182,7 +231,11 @@ impl SigningProvider<SnapchainValidatorContext> for Ed25519Provider {
         signature: &informalsystems_malachitebft_core_types::Signature<SnapchainValidatorContext>,
         public_key: &informalsystems_malachitebft_core_types::PublicKey<SnapchainValidatorContext>,
     ) -> bool {
-        let valid = public_key.verify(&proposal_part.to_sign_bytes(), &signature.0);
+        let valid = public_key.verify(
+            ConsensusDomain::ProposalPart,
+            &proposal_part.to_sign_bytes(),
+            &signature.0,
+        );
         if !valid {
             error!(
                 "Invalid signature on proposal part at height {:?} by {:?}",
@@ -259,11 +312,11 @@ pub struct Signature(pub Vec<u8>);
 pub type PublicKey = libp2p::identity::ed25519::PublicKey;
 pub type PrivateKey = libp2p::identity::ed25519::SecretKey;
 
-impl informalsystems_malachitebft_core_types::SigningScheme for Ed25519 {
+impl informalsystems_malachitebft_core_types::SigningScheme for ConsensusScheme {
     type DecodingError = InvalidSignatureError;
     type Signature = Signature;
-    type PublicKey = PublicKey;
-    type PrivateKey = PrivateKey;
+    type PublicKey = ConsensusPublicKey;
+    type PrivateKey = ConsensusPrivateKey;
 
     fn decode_signature(_bytes: &[u8]) -> Result<Self::Signature, Self::DecodingError> {
         todo!()
@@ -284,8 +337,8 @@ impl Display for Hash {
     }
 }
 
-// Malachite Height and Value trait impls are now in snapchain-proto crate
-// Most FullProposal methods are now in snapchain-proto crate
+// Malachite Height and Value trait impls are now in hypersnap-proto crate
+// Most FullProposal methods are now in hypersnap-proto crate
 
 // Extension trait for FullProposal that depends on main crate types (Address)
 pub trait FullProposalExt {
@@ -302,7 +355,7 @@ impl FullProposalExt for FullProposal {
 pub struct SnapchainValidator {
     pub shard_index: u32,
     pub address: Address,
-    pub public_key: PublicKey,
+    pub public_key: ConsensusPublicKey,
     pub rpc_address: Option<String>,
     pub current_height: u64,
 }
@@ -317,8 +370,24 @@ impl SnapchainValidator {
         Self {
             shard_index: shard_index.shard_id(),
             address: Address(public_key.to_bytes()),
-            public_key,
+            public_key: ConsensusPublicKey::Ed25519(public_key),
             rpc_address,
+            current_height,
+        }
+    }
+
+    /// A Falcon-512 validator of a Hypersnap epoch set (FIP §4.9).
+    pub fn new_falcon(
+        shard_index: SnapchainShard,
+        public_key: Arc<hypersnap_falcon::FalconPublicKey>,
+        current_height: u64,
+    ) -> Self {
+        let public_key = ConsensusPublicKey::Falcon(public_key);
+        Self {
+            shard_index: shard_index.shard_id(),
+            address: public_key.address(),
+            public_key,
+            rpc_address: None,
             current_height,
         }
     }
@@ -327,14 +396,41 @@ impl SnapchainValidator {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SnapchainValidatorSet {
     pub validators: Vec<SnapchainValidator>,
+    /// Hypersnap epoch sets only (FIP §4.9): `order[i]` is the index into
+    /// `validators` of the i-th member of `order(e)`. `None` for snapchain
+    /// sets, which use round-robin.
+    pub epoch_order: Option<Vec<usize>>,
 }
 
 impl SnapchainValidatorSet {
     pub fn new(validators: Vec<SnapchainValidator>) -> Self {
-        let mut set = Self { validators: vec![] };
+        let mut set = Self {
+            validators: vec![],
+            epoch_order: None,
+        };
         for validator in validators {
             set.add(validator);
         }
+        set
+    }
+
+    /// A Hypersnap epoch set: `order(e)` sorts the members by
+    /// `keccak256(epoch_seed(e) || consensus_key_hash)` (FIP §4.9).
+    pub fn new_epoch(validators: Vec<SnapchainValidator>, epoch_seed: [u8; 32]) -> Self {
+        let mut set = Self::new(validators);
+        let mut order: Vec<(alloy_primitives::B256, usize)> = set
+            .validators
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let mut preimage = Vec::with_capacity(64);
+                preimage.extend_from_slice(&epoch_seed);
+                preimage.extend_from_slice(&v.address.0);
+                (alloy_primitives::keccak256(&preimage), i)
+            })
+            .collect();
+        order.sort();
+        set.epoch_order = Some(order.into_iter().map(|(_, i)| i).collect());
         set
     }
 
@@ -499,6 +595,7 @@ impl Proposal {
             proposer: Address::from_vec(proto.proposer),
         }
     }
+
     pub fn try_from_proto(proto: proto::Proposal) -> Result<Self, &'static str> {
         let height = proto.height.ok_or("Proposal::height missing")?;
         let shard_hash = proto.value.ok_or("Proposal::value missing")?;
@@ -520,24 +617,29 @@ impl Proposal {
 
 #[derive(Clone, Debug)]
 pub struct SnapchainValidatorContext {
-    keypair: Arc<Keypair>,
-    signing_provider: Ed25519Provider,
+    key: ConsensusPrivateKey,
+    signing_provider: ConsensusSigningProvider,
 }
 
 impl SnapchainValidatorContext {
+    /// Snapchain (Ed25519) context.
     pub fn new(keypair: Keypair) -> Self {
-        let keypair = Arc::new(keypair);
+        Self::new_with_key(ConsensusPrivateKey::Ed25519(Arc::new(keypair)))
+    }
+
+    /// Context with any consensus key; Hypersnap validators use Falcon-512.
+    pub fn new_with_key(key: ConsensusPrivateKey) -> Self {
         Self {
-            keypair: keypair.clone(),
-            signing_provider: Ed25519Provider::new(keypair),
+            signing_provider: ConsensusSigningProvider::with_key(key.clone()),
+            key,
         }
     }
 
-    pub fn public_key(&self) -> PublicKey {
-        self.keypair.public()
+    pub fn public_key(&self) -> ConsensusPublicKey {
+        self.key.public_key()
     }
 
-    pub fn signing_provider(&self) -> Ed25519Provider {
+    pub fn signing_provider(&self) -> ConsensusSigningProvider {
         self.signing_provider.clone()
     }
 }
@@ -555,7 +657,7 @@ impl informalsystems_malachitebft_core_types::Context for SnapchainValidatorCont
     type ValidatorSet = SnapchainValidatorSet;
     type Value = ShardHash;
     type Vote = Vote;
-    type SigningScheme = Ed25519;
+    type SigningScheme = ConsensusScheme;
     type Extension = ();
 
     fn select_proposer<'a>(
@@ -567,11 +669,22 @@ impl informalsystems_malachitebft_core_types::Context for SnapchainValidatorCont
         assert!(validator_set.validators.len() > 0);
         assert!(round != Round::Nil && round.as_i64() >= 0);
 
-        let proposer_index = {
-            let height = height.as_u64() as usize;
-            let round = round.as_i64() as usize;
+        let proposer_index = match &validator_set.epoch_order {
+            // Hypersnap: proposer(shard, h, r) = order(e)[(h + r + shard) mod |order(e)|]
+            Some(order) => {
+                let n = order.len() as u64;
+                let slot = (height.block_number % n
+                    + round.as_i64() as u64 % n
+                    + height.shard_index as u64 % n)
+                    % n;
+                order[slot as usize]
+            }
+            None => {
+                let height = height.as_u64() as usize;
+                let round = round.as_i64() as usize;
 
-            (height - 1 + round) % validator_set.validators.len()
+                (height - 1 + round) % validator_set.validators.len()
+            }
         };
 
         validator_set
@@ -630,7 +743,7 @@ impl informalsystems_malachitebft_core_types::ProposalPart<SnapchainValidatorCon
     }
 }
 
-// impl Eq for FullProposal is now in the snapchain-proto crate
+// impl Eq for FullProposal is now in the hypersnap-proto crate
 
 impl informalsystems_malachitebft_core_types::Proposal<SnapchainValidatorContext> for Proposal {
     fn height(&self) -> Height {
@@ -727,7 +840,7 @@ impl informalsystems_malachitebft_core_types::Validator<SnapchainValidatorContex
         &self.address
     }
 
-    fn public_key(&self) -> &PublicKey {
+    fn public_key(&self) -> &ConsensusPublicKey {
         &self.public_key
     }
 

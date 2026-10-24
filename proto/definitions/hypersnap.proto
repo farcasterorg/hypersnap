@@ -1,0 +1,203 @@
+syntax = "proto3";
+
+// Hypersnap block format, certificates, validator sets and pivot records
+// (FIP-proof-of-work-tokenization §4, §13.4, §16.5, §17). These types are
+// used from the epoch-1 pivot. The snapchain `Block`/`ShardChunk`/`Commits`
+// in blocks.proto stay for the pre-pivot read path.
+
+import "message.proto";
+import "blocks.proto";
+import "onchain_event.proto";
+import "hyper.proto";
+import "hypersnap_state.proto";
+
+// §17.7. The block hash is keccak256 of the canonical encoding of the header.
+message HypersnapBlockHeader {
+  uint32 shard_id = 1;
+  uint64 height = 2;
+  uint64 timestamp = 3;
+  bytes parent_hash = 4;
+  uint64 epoch = 5;
+  bytes state_root = 6;                 // Keccak trie root after this block
+  bytes messages_root = 7;              // Keccak Merkle root over the messages of this block
+  bytes last_commit_hash = 8;           // Hash of the commit certificate of the parent block
+  uint32 version = 9;
+  uint64 epoch_ref_height = 10;         // Shards 1 and 2 only (§4.3)
+  repeated ShardLink shard_links = 11;  // Shard 0 only
+  bytes bridge_lock_root = 12;          // Shard 0 only (§13.3)
+  bytes pivot_record_hash = 13;         // Pivot blocks only
+  bytes epoch_record_hash = 14;         // Shard 0, epoch boundary blocks: keccak256 of the EpochBoundaryRecord
+  bytes bridge_action_hash = 15;        // Shard 0, a block with a bridge action (§13.7)
+}
+
+message ShardLink {
+  uint32 shard_id = 1;
+  uint64 height = 2;
+  bytes block_hash = 3;
+  bytes state_root = 4;
+}
+
+// System messages are not user messages: the proposer includes them and
+// every validator recomputes them (FIP §17.6, §17.7; plan 2C). A validator
+// prevotes nil if an included system message differs from its own.
+message HypersnapSystemMessage {
+  oneof message {
+    OnChainEvent on_chain_event = 1;
+    FnameTransfer fname_transfer = 2;
+    HyperInboundBurn inbound_burn = 3;
+    EpochBoundaryRecord epoch_boundary = 4;
+    PivotRecord pivot = 5;
+    ScoringResult scoring_result = 6;
+    FeeSettlement fee_settlement = 7;
+  }
+}
+
+// The header and hash of an encoded `HypersnapBlock`, decoded without the
+// body (prost skips the other fields by length).
+message HypersnapBlockView {
+  HypersnapBlockHeader header = 1;
+  bytes hash = 2;
+}
+
+message HypersnapBlock {
+  HypersnapBlockHeader header = 1;
+  bytes hash = 2;                                   // keccak256(encode(header))
+  repeated Message messages = 3;                    // User messages, in execution order
+  repeated HypersnapSystemMessage system_messages = 4;
+  CommitCertificate certificate = 5;                // Attached when the block is decided
+  repeated CommitCertificate aggregate_certificates = 6; // Aggregate compactions of earlier heights (R2)
+  // The certificate of the parent block that `header.last_commit_hash`
+  // names. Validators can hold different quorums for the same parent, so the
+  // proposer includes the one it chose. Empty for a pivot block.
+  CommitCertificate parent_certificate = 7;
+  // Shards 1 and 2: the messages grouped into one transaction for each FID,
+  // as in snapchain, in execution order. `messages` and `system_messages` are
+  // then empty, and the leaves of `messages_root` are the encoded
+  // transactions (kind byte 0x02).
+  repeated Transaction transactions = 8;
+}
+
+// §16.5.
+message CommitCertificate {
+  uint32 shard_id = 1;
+  uint64 height = 2;
+  uint32 round = 3;
+  bytes block_hash = 4;
+  uint64 epoch = 5;
+  bytes signer_bitmap = 6;           // Bit i = member i of set(epoch), in sorted order
+  oneof form {
+    BundledSignatures bundled = 7;   // One Falcon-512 signature for each signer
+    bytes aggregate = 8;             // One aggregate signature (R2)
+  }
+}
+
+message BundledSignatures {
+  repeated bytes signatures = 1;     // In the order of signer_bitmap
+}
+
+// §4.9. Stored at [RootPrefix::HyperValidatorSet] ++ [epoch_be].
+message HyperValidatorSetRecord {
+  uint64 epoch = 1;
+  repeated HyperValidatorSetMember members = 2;  // Sorted by consensus_key_hash
+  uint64 total_weight = 3;
+  bytes set_root = 4;                             // §16.6
+}
+
+message HyperValidatorSetMember {
+  bytes consensus_key_hash = 1;  // keccak256(consensus_key)
+  uint64 weight = 2;             // 1 for each validator
+  bytes node_key_hash = 3;       // keccak256(falcon_node_key)
+  uint64 fid = 4;
+}
+
+// §4.6. Carried on the `membership` topic.
+message ValidatorTransitionAlert {
+  bytes validator_key = 1;
+  uint64 effective_epoch = 2;    // The epoch when the change takes effect
+  TransitionType transition = 3;
+  uint64 alert_block = 4;        // The block that made this alert
+}
+
+enum TransitionType {
+  TRANSITION_NONE = 0;
+  TRANSITION_DEPARTING = 1;
+  TRANSITION_JOINING = 2;
+  TRANSITION_DELAYED = 3;
+  TRANSITION_INACTIVE = 4;   // §4.8: the set asks new validators to register
+}
+
+// §13.4. In each shard-0 epoch boundary block.
+message EpochBoundaryRecord {
+  uint64 epoch = 1;
+  bytes state_root = 2;          // Shard-0 state root at the boundary
+  uint64 block_height = 3;
+  bytes next_set_root = 4;       // set_root(epoch + 1)
+  uint64 next_total_weight = 5;
+}
+
+// §17.4. In the shard-0 pivot block.
+message PivotRecord {
+  uint64 pivot_height = 1;
+  bytes fork_block_hash = 2;
+  repeated ShardForkPoint shard_forks = 3;   // One entry for shard 1 and one for shard 2
+  repeated bytes genesis_state_roots = 4;    // Keccak trie roots of shards 0, 1, 2
+  bytes trust_snapshot_root = 5;             // Merkle root over (fid, trust_score, eligibility)
+  bytes genesis_validators_hash = 6;
+  bytes set_root_epoch1 = 7;
+  uint64 onchain_cursor = 8;                 // Highest Optimism block of an on-chain event in epoch-0 state
+  uint64 fname_cursor = 9;                   // Highest fname transfer ID in epoch-0 state
+  bytes params_hash = 10;                    // Hash of all consensus parameters
+  uint32 snapchain_engine_version = 11;      // Snapchain rules of shards 1 and 2 after the pivot: the version at the fork block (§17.7)
+}
+
+message ShardForkPoint {
+  uint32 shard_id = 1;
+  uint64 fork_height = 2;    // H_s
+  bytes chunk_hash = 3;      // Hash of the shard-s chunk at H_s
+}
+
+// §17.3. One entry of the genesis validator file: three signed messages of
+// the bootstrap validator FID, validated with the normal block rules and
+// applied in this order over the epoch-0 state.
+message GenesisValidator {
+  Message custody_migration = 1;    // CUSTODY_MIGRATION (§16.9)
+  Message node_attestation = 2;     // NODE_ATTESTATION (§3)
+  Message validator_register = 3;   // VALIDATOR_REGISTER, registration_epoch = 1 (§4.5)
+}
+
+message GenesisValidatorFile {
+  uint32 version = 1;
+  repeated GenesisValidator validators = 2;   // Sorted by MessageData.fid
+}
+
+// Diagnostic only, before the pivot (§17.5 "Preparation in epoch 0", plan R0).
+message ShadowRoot {
+  uint32 shard_id = 1;
+  uint64 height = 2;                 // Last applied snapchain height of the shard
+  bytes keccak_root = 3;             // Root of the shadow Keccak trie (§16.13)
+  uint64 leaf_count = 4;
+  bytes snapchain_root = 5;          // The blake3 trie root at the same height
+  string status = 6;                 // absent | building | built | live
+}
+
+message GetShadowRootsRequest {
+  uint64 height = 1;                 // 0 = current; else a multiple of 1,000 (recorded history)
+}
+
+message GetShadowRootsResponse {
+  repeated ShadowRoot roots = 1;     // One entry for each local shard
+  // The content replay of each shard (FIP §17.4), on a read node that runs
+  // it. These are the candidate genesis roots.
+  repeated ShadowRoot replay_roots = 2;
+}
+
+// GetCertifiedBlocks (FIP Appendix A): certified blocks of one shard in
+// ascending order with no gaps. Without stop_height the stream follows the
+// tip. A height that the node does not have gives OUT_OF_RANGE.
+message CertifiedBlocksRequest {
+  uint32 shard_id = 1;
+  uint64 start_height = 2;          // Inclusive
+  optional uint64 stop_height = 3;  // Exclusive
+}
+
+message GetPivotRecordRequest {}

@@ -1,0 +1,35 @@
+# Output of: sage -python estimate.py <lattice-estimator> --full
+# lattice-estimator 53da5982597709ba0fdf94ea37a84d822310fd84 (2026-08-19), SageMath 10.6
+# Run 2026-10-16 on the LWE-FSA provisional v1 parameter set.
+
+=== LWE-FSA provisional v1 (LWE_PARAM_SET_ID 1) ===
+q=4193633 n=1280 m=1280 k=256 kappa=60 eta=1 gamma1=2^18 gamma2=131051
+beta=60 B=262083 zeta(weak)=262103 zeta(strong)=524206
+expected attempts 2.427, pk 901124 bytes, sig 3072 bytes
+Goldilocks: max |row . (z, c)| = 1406822210601600 = 2^50.32 < (p-1)/2 = 2^63.00, headroom x6556
+
+LWEParameters(n=1280, q=4193633, Xs=D(σ=0.82), Xe=D(σ=0.82), m=1280, tag='LWE-FSA-v1 key recovery')
+SISParameters(n=1280, q=4193633, length_bound=262103, m=2816, norm=+Infinity, tag='LWE-FSA-v1 SIS weak unforgeability')
+SISParameters(n=1280, q=4193633, length_bound=524206, m=2816, norm=+Infinity, tag='LWE-FSA-v1 SIS strong unforgeability')
+
+--- core-SVP, RC.ADPS16 ---
+LWE primal uSVP                    beta= 547  core-SVP classical 2^159.7  quantum 2^145.0   (rop 2^159.7)
+LWE primal BDD                     beta= 547  core-SVP classical 2^159.7  quantum 2^145.0   (rop 2^160.7)
+LWE dual                           beta= 559  core-SVP classical 2^163.2  quantum 2^148.1   (rop 2^163.2)
+LWE dual hybrid                    beta= 529  core-SVP classical 2^154.5  quantum 2^140.2   (rop 2^154.5)
+SIS weak unforgeability (inf)      beta= 562  core-SVP classical 2^164.1  quantum 2^148.9   (rop 2^164.1)
+SIS strong unforgeability (inf)    beta= 500  core-SVP classical 2^146.0  quantum 2^132.5   (rop 2^146.0)
+quantum mode check: SIS strong, ADPS16(quantum): beta=500 rop=2^132.5
+
+minimum beta 500 -> core-SVP classical 2^146.0, quantum 2^132.5 (target: quantum >= 2^128, beta >= 484)
+[20 s]
+
+--- LWE.estimate, default cost model (MATZOV), all attacks ---
+bkw                  :: rop: ≈2^283.5, m: ≈2^268.7, mem: ≈2^269.2, b: 12, t1: 2, t2: 36, ℓ: 11, #cod: 1136, #top: 0, #test: 120, tag: coded-bkw
+usvp                 :: rop: ≈2^184.7, red: ≈2^184.7, δ: 1.003192, β: 547, d: 2432, tag: usvp
+bdd                  :: rop: ≈2^182.4, red: ≈2^181.9, svp: ≈2^180.8, β: 537, η: 571, d: 2420, tag: bdd
+dual                 :: rop: ≈2^189.6, mem: ≈2^125.3, m: 1218, β: 561, d: 2498, ↻: 1, tag: dual
+dual_hybrid          :: rop: ≈2^179.3, red: ≈2^179.3, guess: ≈2^170.2, β: 524, p: 3, ζ: 20, t: 70, β': 525, N: ≈2^107.7, m: 1280
+--- SIS.estimate, default cost model ---
+lattice  :: rop: ≈2^176.1, red: ≈2^175.2, sieve: ≈2^175.0, β: 512, η: 514, ζ: 0, d: 2816, prob: 1, ↻: 1, tag: infinity
+[160 s]

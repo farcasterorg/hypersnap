@@ -363,7 +363,20 @@ pub fn verify_signed_key_request_metadata(
 /// mixed-binary nodes at the same engine version would then disagree on a KEY_ADD's validity.
 /// Message types with no merge path are therefore denied explicitly; admitting them is a
 /// deliberate, feature-gated decision for the increment that gives them semantics.
-fn validate_key_add_scopes(scopes: &[i32]) -> Result<(), ValidationError> {
+///
+/// The Hypersnap types (100–999) are not snapchain scopes, so a snapchain `KEY_ADD` with one is
+/// invalid, as on snapchain.
+pub fn validate_key_add_scopes(scopes: &[i32]) -> Result<(), ValidationError> {
+    validate_scopes(scopes, false)
+}
+
+/// The scopes of a Falcon-512 signer on shard 0 (FIP §16.10): the snapchain scopes, and the
+/// Hypersnap types (FIP §14.2). The snapchain cap applies.
+pub fn validate_falcon_signer_scopes(scopes: &[i32]) -> Result<(), ValidationError> {
+    validate_scopes(scopes, true)
+}
+
+fn validate_scopes(scopes: &[i32], hypersnap_types: bool) -> Result<(), ValidationError> {
     if scopes.is_empty() {
         return Err(ValidationError::EmptyScopes);
     }
@@ -398,6 +411,40 @@ fn validate_key_add_scopes(scopes: &[i32]) -> Result<(), ValidationError> {
             | Ok(MessageType::ChannelMember)
             | Ok(MessageType::ChannelPin)
             | Ok(MessageType::ChannelModerate) => false,
+            // Hypersnap types: scopes of a Falcon-512 signer only.
+            Ok(MessageType::ValidatorRegister)
+            | Ok(MessageType::ValidatorDeregister)
+            | Ok(MessageType::MiniappRegister)
+            | Ok(MessageType::MiniappUnregister)
+            | Ok(MessageType::MiniappUpdate)
+            | Ok(MessageType::MiniappAdd)
+            | Ok(MessageType::MiniappRemove)
+            | Ok(MessageType::TokenTransfer)
+            | Ok(MessageType::TokenEscrowClaim)
+            | Ok(MessageType::TokenEscrowBridge)
+            | Ok(MessageType::TokenStake)
+            | Ok(MessageType::TokenUnstake)
+            | Ok(MessageType::NodeAttestation)
+            | Ok(MessageType::NodeAttestationRevoke)
+            | Ok(MessageType::AppUsageReceipt)
+            | Ok(MessageType::DaChallengeResponse)
+            | Ok(MessageType::BridgeActionVote)
+            | Ok(MessageType::SeedCommit)
+            | Ok(MessageType::SeedReveal)
+            | Ok(MessageType::FeeDeposit)
+            | Ok(MessageType::TokenLock)
+            | Ok(MessageType::NativeOnboard)
+            | Ok(MessageType::NativeCustodyRotation)
+            | Ok(MessageType::OnboardingStakeLock)
+            | Ok(MessageType::OnboardingStakeRelease)
+            | Ok(MessageType::CustodyMigration)
+            | Ok(MessageType::CustodyRotation)
+            | Ok(MessageType::SpendKeyAdd)
+            | Ok(MessageType::SpendKeyRevoke)
+            | Ok(MessageType::QctShield)
+            | Ok(MessageType::QctTransfer)
+            | Ok(MessageType::QctUnshield)
+            | Ok(MessageType::QctLock) => hypersnap_types,
             Err(_) => false,
         };
         if !admissible {
@@ -941,8 +988,12 @@ mod tests {
             MessageType::ChannelPin,
             MessageType::ChannelModerate,
         ];
+        // The Hypersnap types (100–999) are scopes of Falcon-512 signers only.
+        let hypersnap: Vec<MessageType> = (100..1000)
+            .filter_map(|v| MessageType::try_from(v).ok())
+            .collect();
         assert_eq!(
-            admissible.len() + denied.len(),
+            admissible.len() + denied.len() + hypersnap.len(),
             MessageType::VARIANT_COUNT,
             "a MessageType variant is classified by neither list"
         );
@@ -956,7 +1007,7 @@ mod tests {
                 message_type
             );
         }
-        for message_type in denied {
+        for message_type in denied.into_iter().chain(hypersnap) {
             let mut body = sample_key_add_body();
             body.scopes = vec![MessageType::CastAdd as i32, message_type as i32];
             assert_eq!(
@@ -1064,6 +1115,24 @@ mod tests {
         assert_eq!(
             validate_key_remove_body(&body),
             Err(ValidationError::InvalidSignatureType)
+        );
+    }
+
+    #[test]
+    fn hypersnap_types_are_scopes_of_falcon_signers_only() {
+        for t in (100..1000).filter_map(|v| MessageType::try_from(v).ok()) {
+            let scope = t as i32;
+            assert_eq!(
+                validate_key_add_scopes(&[scope]),
+                Err(ValidationError::InvalidScope(scope)),
+                "{t:?}"
+            );
+            assert_eq!(validate_falcon_signer_scopes(&[scope]), Ok(()), "{t:?}");
+        }
+        let key_add = MessageType::KeyAdd as i32;
+        assert_eq!(
+            validate_falcon_signer_scopes(&[key_add]),
+            Err(ValidationError::InvalidScope(key_add))
         );
     }
 

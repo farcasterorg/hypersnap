@@ -265,13 +265,16 @@ impl Host {
 
                 // Only publish decided values if you're the proposer to reduce network traffic
                 if proposed_value.proposer_address() == state.shard_validator.get_address() {
-                    state
+                    // The gossip task is gone only at shutdown.
+                    if let Err(e) = state
                         .gossip_tx
                         .send(GossipEvent::BroadcastDecidedValue(proto::DecidedValue {
                             value: decided_value,
                         }))
                         .await
-                        .unwrap();
+                    {
+                        warn!("Could not publish a decided value: {}", e);
+                    }
                 }
 
                 let elapsed = now.elapsed();
@@ -336,6 +339,13 @@ impl Host {
                             certificate: commits.to_commit_certificate(),
                             value_bytes: Bytes::from(shard_chunk.encode_to_vec()),
                         }),
+                        // Already the encoded `HypersnapBlock`.
+                        full_proposal::ProposedValue::HypersnapBlock(bytes) => {
+                            Some(RawDecidedValue {
+                                certificate: commits.to_commit_certificate(),
+                                value_bytes: Bytes::from(bytes),
+                            })
+                        }
                     },
                     None => None,
                 };
@@ -352,26 +362,51 @@ impl Host {
                 state
                     .statsd
                     .count_with_shard(height.shard_index, "sync.process_value", 1, vec![]);
-                let proposal = if height.shard_index == 0 {
-                    let decoded_block = Block::decode(value_bytes.as_ref()).unwrap();
-                    FullProposal {
-                        height: Some(height),
-                        round: round.as_i64(),
-                        proposer: validator_address.to_vec(),
-                        proposed_value: Some(full_proposal::ProposedValue::Block(decoded_block)),
-                    }
+                // `value_bytes` comes from a sync peer: a decode failure is
+                // an invalid value, not a reason to stop the actor.
+                let proposed_value_inner = if state.shard_validator.is_hypersnap() {
+                    Some(full_proposal::ProposedValue::HypersnapBlock(
+                        value_bytes.to_vec(),
+                    ))
+                } else if height.shard_index == 0 {
+                    Block::decode(value_bytes.as_ref())
+                        .ok()
+                        .map(full_proposal::ProposedValue::Block)
                 } else {
-                    let chunk = ShardChunk::decode(value_bytes.as_ref()).unwrap();
-                    FullProposal {
-                        height: Some(height),
-                        round: round.as_i64(),
-                        proposer: validator_address.to_vec(),
-                        proposed_value: Some(full_proposal::ProposedValue::Shard(chunk)),
+                    ShardChunk::decode(value_bytes.as_ref())
+                        .ok()
+                        .map(full_proposal::ProposedValue::Shard)
+                };
+                let proposed_value = match proposed_value_inner {
+                    Some(value) => {
+                        let proposal = FullProposal {
+                            height: Some(height),
+                            round: round.as_i64(),
+                            proposer: validator_address.to_vec(),
+                            proposed_value: Some(value),
+                        };
+                        state
+                            .shard_validator
+                            .add_proposed_value(&proposal, ProposalSource::Sync)
+                    }
+                    None => {
+                        warn!(
+                            height = height.to_string(),
+                            "Synced value does not decode; marking it invalid"
+                        );
+                        informalsystems_malachitebft_core_consensus::ProposedValue {
+                            height,
+                            round,
+                            valid_round: informalsystems_malachitebft_core_types::Round::Nil,
+                            proposer: validator_address,
+                            value: proto::ShardHash {
+                                shard_index: height.shard_index,
+                                hash: vec![],
+                            },
+                            validity: informalsystems_malachitebft_core_types::Validity::Invalid,
+                        }
                     }
                 };
-                let proposed_value = state
-                    .shard_validator
-                    .add_proposed_value(&proposal, ProposalSource::Sync);
                 info!(
                     height = height.to_string(),
                     shard = height.shard_index,

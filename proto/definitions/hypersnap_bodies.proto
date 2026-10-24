@@ -1,0 +1,266 @@
+syntax = "proto3";
+
+// Bodies of the Hypersnap message types (FIP-proof-of-work-tokenization §3,
+// §4.5, §5.2, §7.3, §13, §16.9, §16.11, §16.12; plan 2C), copied from the
+// FIP. `MessageData.fid`, `Message.signer` and `Message.signature` are the
+// envelope; a body does not repeat them (FIP §14.1). The miniapp and
+// native-onboarding bodies are in hyper.proto. hyper.proto has no imports,
+// so message.proto can import this file.
+
+import "hyper.proto";
+
+// §4.5. VALIDATOR_REGISTER (102) and VALIDATOR_DEREGISTER (103).
+message HyperValidatorEventBody {
+  reserved 3, 4, 8, 9, 10;
+  HyperValidatorEventType event_type = 1;
+  bytes validator_key = 2;         // keccak256(consensus_key)
+  uint64 registration_epoch = 5;   // Epoch of the block that includes the message
+  bytes operator_address = 6;      // Optional operator
+  bytes signature = 7;             // Falcon-512 proof of possession by consensus_key
+  bytes libp2p_peer_id = 11;       // Transport identity
+  bytes consensus_key = 12;        // Falcon-512 consensus public key (§16.4)
+  bytes falcon_node_key = 13;      // Falcon-512 node key (§3)
+  bytes node_signature = 14;       // Falcon-512 proof of possession by falcon_node_key
+}
+
+// §3. NODE_ATTESTATION (149) and NODE_ATTESTATION_REVOKE (150).
+message NodeAttestationBody {
+  bytes node_public_key = 2;   // Falcon-512 public key of the node (897 bytes)
+  uint64 nonce = 3;            // Shares the HyperTokenNonce stream of the FID
+  bytes node_signature = 6;    // Falcon-512 signature by node_public_key
+  bytes libp2p_peer_id = 7;    // Transport identity of the node
+}
+
+// §5.2. DA_CHALLENGE_RESPONSE (152), signed by the node key.
+message DaChallengeResponseBody {
+  uint64 epoch = 1;
+  uint32 challenge_index = 2;
+  bytes leaf_key = 3;          // Key of the challenged leaf
+  bytes leaf_value = 4;        // Stored bytes of the challenged leaf
+  bytes proof = 5;             // Inclusion proof of the leaf (§16.13 encoding)
+}
+
+// §13.7. BRIDGE_ACTION_VOTE (157): a vote of a validator for a bridge
+// action, signed by its node key.
+message BridgeActionVoteBody {
+  uint32 kind = 1;              // 1 upgrade, 2 cancel an upgrade, 3 pause
+  uint32 chain_id = 2;          // EIP-155 chain ID; 0 = all chains
+  bytes target = 3;             // 20 bytes: the implementation; zero for a pause
+  uint64 epoch = 4;             // The epoch of the block that includes the vote
+}
+
+// §4.9. SEED_COMMIT (158) and SEED_REVEAL (159), signed by the node key of a
+// validator.
+message SeedCommitBody {
+  uint64 target_epoch = 1;      // The epoch whose seed the secret is for
+  bytes commitment = 2;         // keccak256("hypersnap-seed-reveal-v1" || target_epoch || secret)
+}
+
+message SeedRevealBody {
+  uint64 target_epoch = 1;
+  bytes secret = 2;             // 32 bytes
+}
+
+// §7.3. APP_USAGE_RECEIPT (151).
+message AppUsageReceiptBody {
+  bytes miniapp_id = 1;       // 16-byte miniapp ID
+  string action_type = 3;     // Action label from the app
+  uint64 epoch = 6;           // Epoch of the receipt
+  uint64 nonce = 7;           // Receipt nonce of the user
+}
+
+// §13.1. TOKEN_TRANSFER (140).
+message TokenTransferBody {
+  uint64 recipient_fid = 2;
+  uint64 amount = 3;            // Micro-units (1 token = 1,000,000)
+  uint64 nonce = 4;             // Nonce stream of the signer key (§16.11)
+  bytes memo = 7;               // Optional, 256 bytes maximum
+}
+
+// §13.1. TOKEN_STAKE (147).
+message TokenStakeBody {
+  uint64 amount = 2;
+  StakeType stake_type = 3;
+  uint64 nonce = 4;
+  uint64 vouchee_fid = 7;            // STAKE_TYPE_VOUCH only
+}
+
+// §13.1. TOKEN_UNSTAKE (148): the same fields as TokenStakeBody.
+message TokenUnstakeBody {
+  uint64 amount = 2;
+  StakeType stake_type = 3;
+  uint64 nonce = 4;
+  uint64 vouchee_fid = 7;
+}
+
+// §12, §13.1. FEE_DEPOSIT (154).
+message FeeDepositBody {
+  uint64 amount = 2;
+  uint64 nonce = 3;
+}
+
+// §13.9. TOKEN_ESCROW_CLAIM (145). Exactly one pair is set:
+// (custody_address, eip712_signature) or (falcon_custody_key, falcon_signature).
+message TokenEscrowClaimBody {
+  bytes custody_address = 1;      // Escrow of an Optimism custody address (20 bytes)
+  uint64 destination_fid = 2;
+  uint64 nonce = 3;
+  bytes eip712_signature = 4;     // By custody_address
+  bytes falcon_custody_key = 5;   // Escrow of a previous Falcon-512 custody key
+  bytes falcon_signature = 6;     // By falcon_custody_key
+}
+
+// §13.9. TOKEN_ESCROW_BRIDGE (146). The same pair rule as TokenEscrowClaimBody.
+message TokenEscrowBridgeBody {
+  bytes custody_address = 1;
+  uint64 amount = 2;
+  uint32 destination_chain_id = 3;   // EIP-155 chain ID
+  bytes destination_address = 4;     // 20-byte EVM address
+  uint64 nonce = 6;
+  bytes eip712_signature = 7;
+  bytes falcon_custody_key = 8;
+  bytes falcon_signature = 9;
+}
+
+message CustodyMigrationBody {
+  bytes falcon_custody_key = 2;     // Falcon-512 public key (897 bytes)
+  bytes falcon_recovery_key = 3;    // Optional Falcon-512 public key
+  uint64 nonce = 4;
+  uint32 deadline = 5;              // Farcaster timestamp
+  bytes eip712_signature = 6;       // By the classical custody address of the FID
+}
+
+message CustodyRotationBody {
+  bytes new_falcon_custody_key = 2;
+  bytes new_falcon_recovery_key = 3;  // Optional
+  uint64 nonce = 4;
+  uint32 deadline = 5;
+  bytes new_key_signature = 7;        // By new_falcon_custody_key (proof of possession)
+}
+
+message SpendKeyAddBody {
+  bytes spend_key = 2;                     // Falcon-512 public key (897 bytes)
+  uint64 app_fid = 3;                      // FID of the app that holds the key (information only)
+  uint64 epoch_cap = 4;                    // Maximum micro-units in each epoch
+  uint64 expires_at_epoch = 5;             // Last epoch in which the key is valid
+  repeated uint64 allowed_recipients = 6;  // Empty: all recipients
+  uint64 nonce = 7;                        // Nonce stream of the FID (HyperTokenNonce)
+  bytes spend_key_signature = 9;           // By spend_key (proof of possession)
+}
+
+message SpendKeyRevokeBody {
+  bytes spend_key_hash = 2;                // keccak256(spend_key)
+  uint64 nonce = 3;                        // Nonce stream of the signer key
+}
+
+message QctShieldBody {
+  uint64 amount = 2;
+  uint64 nonce = 3;
+  bytes qct3_output = 6;          // QCT3 output note and its proof
+}
+
+message QctTransferBody {
+  bytes qct3_transaction = 1;     // QCT3 transaction in QCT_PROOF_FORMAT
+}
+
+message QctUnshieldBody {
+  uint64 recipient_fid = 1;
+  uint64 amount = 2;
+  bytes qct3_transaction = 3;
+}
+
+message QctLockBody {
+  uint64 amount = 1;
+  uint32 destination_chain_id = 2;
+  bytes destination_address = 3;
+  bytes qct3_transaction = 4;
+}
+
+message TokenLockBody {
+  uint64 amount = 2;
+  uint64 nonce = 3;
+  uint32 destination_chain_id = 4;   // EIP-155 chain ID
+  bytes destination_address = 5;     // 20-byte EVM address
+}
+
+// Native Miniapp Index FIP §3, in the message model (PoW FIP §17.9): the
+// signing FID is `MessageData.fid`.
+
+// MINIAPP_REGISTER (120).
+message MiniappRegisterBody {
+  reserved 1;
+  string domain = 2;
+  MiniappMetadata metadata = 3;
+  AccountAssociationProof proof = 4;   // JFS proof that the FID controls the domain
+}
+
+// MINIAPP_UNREGISTER (121).
+message MiniappUnregisterBody {
+  reserved 1;
+  string domain = 2;
+}
+
+// MINIAPP_UPDATE (122).
+message MiniappUpdateBody {
+  reserved 1;
+  string domain = 2;
+  MiniappMetadata metadata = 3;
+}
+
+// MINIAPP_ADD (123).
+message MiniappAddBody {
+  reserved 1;
+  string domain = 2;
+}
+
+// MINIAPP_REMOVE (124).
+message MiniappRemoveBody {
+  reserved 1;
+  string domain = 2;
+}
+
+// Hyper-Native Onboarding FIP §5, with the changes of PoW FIP §16.9 and
+// §17.9. NATIVE_ONBOARD (160). The validators assign the FID, so
+// `MessageData.fid` is 0. Without `falcon_custody_key` the message has
+// `SIGNATURE_SCHEME_NONE` and `custody_signature` authorizes it; with it,
+// `falcon_custody_key` signs the message (`SIGNATURE_SCHEME_FALCON512`) and the
+// new FID is migrated from its first block.
+message HyperNativeOnboardBody {
+  bytes custody_address = 1;        // 20-byte Ethereum EOA
+  bytes custody_signature = 2;      // EIP-712 by custody_address
+  uint64 anchor_block_height = 3;   // A recent shard-0 height
+  bytes anchor_block_hash = 4;      // The hash of that block
+  oneof gate_proof {
+    PowSolution pow = 5;
+    StakeProof stake = 6;
+  }
+  bytes falcon_custody_key = 7;     // Optional (PoW FIP §16.9)
+  bytes falcon_recovery_key = 8;    // Optional
+}
+
+// NATIVE_CUSTODY_ROTATION (161) of a native FID that is not migrated. The
+// current custody address authorizes it, so the message has `fid = 0` and
+// `SIGNATURE_SCHEME_NONE`, and the body names the FID.
+message HyperCustodyRotationBody {
+  uint64 fid = 1;
+  bytes current_custody = 2;
+  bytes new_custody = 3;
+  uint64 nonce = 4;
+  bytes current_custody_signature = 5;
+}
+
+// ONBOARDING_STAKE_LOCK (162). The account key of the sponsor signs it.
+message OnboardingStakeLockBody {
+  reserved 1, 6, 7;
+  bytes stake_lock_id = 2;         // SHA-256("hyper.onboarding.stake.lock:" || fid || nonce)
+  uint64 amount_atoms = 3;
+  uint64 lock_duration_blocks = 4;
+  uint64 nonce = 5;                // Account-key nonce stream of the sponsor
+}
+
+// ONBOARDING_STAKE_RELEASE (163). The account key of the sponsor signs it.
+message OnboardingStakeReleaseBody {
+  reserved 1, 4, 5;
+  bytes stake_lock_id = 2;
+  uint64 nonce = 3;
+}

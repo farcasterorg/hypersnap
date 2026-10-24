@@ -3,7 +3,6 @@ use crate::core::error::HubError;
 use crate::core::message::HubEventExt;
 use crate::core::validations;
 use crate::core::{types::Height, util::FarcasterTime};
-use crate::hyper::StateContext;
 use crate::mempool::mempool::MempoolMessagesRequest;
 use crate::proto::{
     self, block_event_data, Block, BlockEvent, BlockEventData, BlockEventType, FarcasterNetwork,
@@ -403,26 +402,6 @@ impl BlockStores {
         }
     }
 
-    pub fn with_state_context(&self, ctx: StateContext) -> Self {
-        BlockStores {
-            block_store: self.block_store.clone(),
-            block_event_store: self.block_event_store.clone(),
-            onchain_event_store: self.onchain_event_store.with_state_context(ctx),
-            storage_lend_store: self.storage_lend_store.with_state_context(ctx),
-            verification_store: self.verification_store.with_state_context(ctx),
-            // Channel authority keys live under the unshadowed `Channel` prefix, so every
-            // context shares one copy.
-            channel_update_store: self.channel_update_store.clone(),
-            channel_member_store: self.channel_member_store.clone(),
-            channel_pin_store: self.channel_pin_store.clone(),
-            channel_moderate_store: self.channel_moderate_store.clone(),
-            network: self.network,
-            db: self.db.clone(),
-            trie: self.trie.clone(),
-            event_handler: self.event_handler.clone(),
-        }
-    }
-
     pub fn get_block_by_event_seqnum(&self, seqnum: u64) -> Option<Block> {
         let block_event = self
             .block_event_store
@@ -590,6 +569,7 @@ impl BlockEngine {
             shard_id: 0,
             mempool_poller: MempoolPoller {
                 max_messages_per_block,
+                max_bytes: None,
                 messages_request_tx,
                 network,
                 shard_id: 0,
@@ -608,10 +588,6 @@ impl BlockEngine {
         self.stores.clone()
     }
 
-    pub fn stores_with_state_context(&self, ctx: StateContext) -> BlockStores {
-        self.stores.with_state_context(ctx)
-    }
-
     pub fn trie_root_hash(&self) -> Vec<u8> {
         self.stores.trie.root_hash().unwrap()
     }
@@ -624,6 +600,18 @@ impl BlockEngine {
                 error!("Error checking if sync id exists: {:?}", err);
                 false
             })
+    }
+
+    /// Trie keys beginning with `prefix`.
+    pub fn trie_values_with_prefix(
+        &mut self,
+        ctx: &merkle_trie::Context,
+        prefix: &[u8],
+    ) -> Vec<Vec<u8>> {
+        self.stores
+            .trie
+            .get_all_values(ctx, &self.db, prefix)
+            .unwrap_or_default()
     }
 
     fn set_height(&self, version: &EngineVersion, height: Height) {
@@ -2274,11 +2262,16 @@ impl BlockEngine {
                     panic!("State change commit failed: {}", err);
                 }
                 Ok(()) => {
-                    self.db.commit(txn).unwrap();
-                    let result = self.stores.block_store.put_block(block);
-                    if result.is_err() {
-                        error!("Failed to store block: {:?}", result.err());
+                    // F033: stage the block header write on the same
+                    // batch as the state mutations so both commit
+                    // atomically. A crash between previously-separate
+                    // commits could leave the trie at height H and
+                    // the header at H-1, diverging the chain on
+                    // restart.
+                    if let Err(e) = self.stores.block_store.stage_block(&mut txn, block) {
+                        error!("Failed to stage block write: {}", e);
                     }
+                    self.db.commit(txn).unwrap();
                     self.stores.trie.reload(&self.db).unwrap();
                     self.metrics
                         .publish_transaction_counts(&block.transactions, ProposalSource::Commit);
@@ -2310,10 +2303,6 @@ impl BlockEngine {
                 None
             }
         }
-    }
-
-    pub fn current_state_root(&self) -> Vec<u8> {
-        self.stores.trie.root_hash().unwrap_or_default()
     }
 
     pub fn get_block_by_height(&self, height: Height) -> Option<Block> {

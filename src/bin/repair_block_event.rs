@@ -1,6 +1,6 @@
-use snapchain::proto::BlockEventType;
-use snapchain::storage::db::{RocksDB, RocksDbTransactionBatch};
-use snapchain::storage::store::account::BlockEventStore;
+use hypersnap::proto::BlockEventType;
+use hypersnap::storage::db::{RocksDB, RocksDbTransactionBatch};
+use hypersnap::storage::store::account::BlockEventStore;
 
 // Repairs a gap in a message shard's block event store by copying the missing
 // event from the local block shard (shard 0), where commit_block regenerates

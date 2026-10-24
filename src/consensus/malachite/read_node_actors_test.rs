@@ -70,6 +70,7 @@ mod tests {
             shard_id,
             test_helper::statsd_client(),
             config,
+            None,
         )
         .await
         .unwrap();

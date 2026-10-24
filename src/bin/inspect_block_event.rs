@@ -1,8 +1,8 @@
-use snapchain::core::util::FarcasterTime;
-use snapchain::proto::{block_event_data, BlockEventType, FarcasterNetwork, MessageType};
-use snapchain::storage::db::RocksDB;
-use snapchain::storage::store::account::BlockEventStore;
-use snapchain::version::version::{EngineVersion, ProtocolFeature};
+use hypersnap::core::util::FarcasterTime;
+use hypersnap::proto::{block_event_data, BlockEventType, FarcasterNetwork, MessageType};
+use hypersnap::storage::db::RocksDB;
+use hypersnap::storage::store::account::BlockEventStore;
+use hypersnap::version::version::{EngineVersion, ProtocolFeature};
 
 // Read-only ground-truth inspector for the shard-1 wedge investigation. Dumps the
 // decoded contents of a range of block events from a shard's block_event_store:

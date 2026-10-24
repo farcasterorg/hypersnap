@@ -1,0 +1,7 @@
+out/
+cache/
+broadcast/
+
+# Foundry installs git submodules under lib/. Tracked via .gitmodules; the
+# subdirectories themselves are ignored from the parent repo's tracking.
+lib/

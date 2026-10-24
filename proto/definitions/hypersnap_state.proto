@@ -1,0 +1,149 @@
+syntax = "proto3";
+
+// Shard-0 state records (FIP-proof-of-work-tokenization §3, §4, §12, §13,
+// §16.9-§16.11, §17.7). The FIP gives the storage key of each record; the
+// key is noted on each message.
+
+import "hyper.proto";
+import "message.proto";
+import "onchain_event.proto";
+
+// §16.9. [HyperFidCustody] ++ fid_be
+message FidCustodyRecord {
+  bytes falcon_custody_key = 1;
+  bytes falcon_recovery_key = 2;      // Empty if the FID has no recovery key
+  uint64 migrated_at_block = 3;
+  uint64 migrated_at_timestamp = 4;
+  uint64 last_rotation_timestamp = 5; // 0 before the first rotation
+  uint64 nonce = 6;                   // Nonce of the last custody message
+}
+
+// §16.10. [HyperFalconSigner] ++ fid_be ++ keccak256(falcon_key)
+message FalconSignerRecord {
+  bytes falcon_key = 1;
+  bytes paired_ed25519_key = 2;       // Empty for a Falcon-512-only signer
+  repeated int32 scopes = 3;          // KeyAddBody.scopes
+  uint32 ttl = 4;                     // KeyAddBody.ttl
+  uint64 added_at = 5;                // Shard-0 height
+  uint64 added_at_time = 6;           // MessageData.timestamp of the KEY_ADD
+}
+
+// §16.11. [HyperSpendKey] ++ fid_be ++ keccak256(spend_key)
+message SpendKeyRecord {
+  bytes spend_key = 1;
+  uint64 app_fid = 2;
+  uint64 epoch_cap = 3;
+  uint64 expires_at_epoch = 4;
+  repeated uint64 allowed_recipients = 5;
+  uint64 nonce = 6;
+  uint64 added_at_block = 7;
+  bool revoked = 8;
+}
+
+// §3. [HyperNodeAttestation] ++ keccak256(node_public_key)
+message NodeAttestationState {
+  uint64 fid = 1;
+  bytes node_public_key = 2;
+  uint64 attested_at_block = 3;
+  uint64 attested_at_epoch = 4;
+  bytes libp2p_peer_id = 5;
+}
+
+// §4.5, §4.7, §4.8. [HyperValidatorEvent] ++ consensus_key_hash
+//
+// A validator is a member of set(e) if `join_epoch <= e` and
+// (`leave_epoch == 0` or `e < leave_epoch`).
+message ValidatorRecord {
+  uint64 fid = 1;
+  bytes consensus_key_hash = 2;       // keccak256(consensus_key)
+  bytes consensus_key = 3;            // Falcon-512 consensus public key (§16.4)
+  bytes node_key_hash = 4;
+  bytes libp2p_peer_id = 5;
+  bytes operator_address = 6;
+  uint64 registration_epoch = 7;
+  uint64 join_epoch = 8;              // registration_epoch + 2; 1 for the bootstrap set
+  uint64 leave_epoch = 9;             // 0, or the epoch of the deregistration + 2
+  bool auto_deregistered = 10;        // §4.7
+  bool inactive = 11;                 // §4.8
+  uint64 consecutive_missed = 12;     // Missed proposals in a row (§4.7)
+}
+
+// §6.7. [HyperTokenVouchStaked] ++ voucher_fid_be ++ vouchee_fid_be
+message VouchRecord {
+  uint64 amount = 1;
+  uint64 first_stake_epoch = 2;
+  VouchStatus status = 3;
+  uint64 pending_unstake = 4;         // Unstake requested before the evaluation
+}
+
+enum VouchStatus {
+  VOUCH_STATUS_PENDING = 0;
+  VOUCH_STATUS_PROVEN = 1;
+}
+
+// §17.7. [HyperOutbox] ++ height_be ++ index_be. One change of the replica of
+// shard `s`, applied in order. Hypersnap records travel as writes; the
+// snapchain records (gasless keys, storage lends, on-chain events) travel as
+// the message or event, which shard `s` merges again with the snapchain
+// store logic.
+message OutboxEntry {
+  uint32 shard_id = 1;
+  uint64 fid = 2;
+  repeated ReplicaWrite writes = 3;
+  Message replay_message = 4;         // KEY_ADD, KEY_REMOVE, LEND_STORAGE
+  OnChainEvent replay_event = 5;      // IdRegistry or KeyRegistry event
+  bytes remove_gasless_key = 6;       // Ed25519 half of a pair that custody removed
+}
+
+message ReplicaWrite {
+  bytes key = 1;
+  bytes value = 2;                    // Empty with `delete`
+  bool delete = 3;
+}
+
+// §5, §6, §7, §8.5. The deferred results of one epoch, in the shard-0 block
+// at `boundary_height + SCORING_DELAY`.
+message ScoringResult {
+  uint64 epoch = 1;
+  repeated ScoredFid trust = 2;           // Sorted by fid
+  repeated MarketReward rewards = 3;      // Sorted by (fid, market)
+  repeated VouchEvaluation vouches = 4;   // Sorted by (voucher_fid, vouchee_fid)
+  uint64 minted = 5;                      // Sum of the rewards
+}
+
+message ScoredFid {
+  uint64 fid = 1;
+  uint32 trust_fp = 2;                    // floor(trust · 10^6)
+  uint32 eligibility = 3;                 // Bit-packed F0-F6 flags (§8.3)
+}
+
+message MarketReward {
+  uint64 fid = 1;
+  WorkMarket market = 2;                  // DATA_AVAILABILITY, GROWTH or APP_USAGE
+  uint64 amount = 3;
+}
+
+message VouchEvaluation {
+  uint64 voucher_fid = 1;
+  uint64 vouchee_fid = 2;
+  bool passed = 3;
+  uint64 burned = 4;
+}
+
+// The system messages of shard 0 that are not in hypersnap.proto
+// (`HypersnapSystemMessage` fields 6 and up).
+message FeeSettlement {
+  uint32 shard_id = 1;
+  uint64 height = 2;                     // The shard-s block whose charges settle
+  repeated FeeCharge charges = 3;        // Sorted by fid
+  uint64 proposer_fid = 4;
+  // The epoch and the round of the certificate of the block, from the parent
+  // certificate of block height + 1 (§4.7, §12).
+  uint64 epoch = 5;
+  uint32 round = 6;
+}
+
+message FeeCharge {
+  uint64 fid = 1;
+  uint64 amount = 2;
+}

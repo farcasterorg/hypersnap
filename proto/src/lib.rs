@@ -8,6 +8,51 @@ pub use proto::*;
 
 // Basic impls for proto types that don't depend on main crate
 
+impl proto::MessageType {
+    /// A Hypersnap message type (values 100–999, FIP §14.2): valid only
+    /// after the pivot, and always routed to shard 0.
+    pub fn is_hypersnap(self) -> bool {
+        (100..1000).contains(&(self as i32))
+    }
+}
+
+impl proto::message_data::Body {
+    /// A body of a Hypersnap message type (field number 1000 + type).
+    pub fn is_hypersnap(&self) -> bool {
+        use proto::message_data::Body::*;
+        !matches!(
+            self,
+            CastAddBody(_)
+                | CastRemoveBody(_)
+                | ReactionBody(_)
+                | VerificationAddAddressBody(_)
+                | VerificationRemoveBody(_)
+                | UserDataBody(_)
+                | LinkBody(_)
+                | UsernameProofBody(_)
+                | FrameActionBody(_)
+                | LinkCompactStateBody(_)
+                | LendStorageBody(_)
+                | KeyAddBody(_)
+                | KeyRemoveBody(_)
+        )
+    }
+}
+
+impl proto::SignatureScheme {
+    /// Schemes a user `Message` can carry once it has passed validation:
+    /// Ed25519 (snapchain), and the Hypersnap dual and Falcon-only schemes
+    /// (FIP-proof-of-work-tokenization §16.8). Stores use this so a validated
+    /// scheme-3/4 message is merged instead of silently dropped; whether a
+    /// scheme is acceptable at all (pivot, custody state) is decided in
+    /// validation, not here.
+    pub fn is_message_scheme(scheme: i32) -> bool {
+        scheme == proto::SignatureScheme::Ed25519 as i32
+            || scheme == proto::SignatureScheme::Ed25519Falcon512 as i32
+            || scheme == proto::SignatureScheme::Falcon512 as i32
+    }
+}
+
 impl informalsystems_malachitebft_core_types::Height for proto::Height {
     const ZERO: Self = Self::new(0, 0);
     const INITIAL: Self = Self::new(0, 1);
@@ -154,9 +199,30 @@ impl proto::FullProposal {
                 shard_index: self.height().shard_index as u32,
                 hash: shard_chunk.hash.clone(),
             },
+            Some(proto::full_proposal::ProposedValue::HypersnapBlock(bytes)) => proto::ShardHash {
+                shard_index: self.height().shard_index as u32,
+                hash: {
+                    use prost::Message;
+                    proto::HypersnapBlockView::decode(bytes.as_slice())
+                        .map(|v| v.hash)
+                        .unwrap_or_default()
+                },
+            },
             _ => {
                 panic!("Invalid proposal type");
             }
+        }
+    }
+
+    /// The proposed Hypersnap block (post-pivot), decoded. `None` if the
+    /// proposal is not a Hypersnap block or does not decode.
+    pub fn hypersnap_block(&self) -> Option<proto::HypersnapBlock> {
+        use prost::Message;
+        match &self.proposed_value {
+            Some(proto::full_proposal::ProposedValue::HypersnapBlock(bytes)) => {
+                proto::HypersnapBlock::decode(bytes.as_slice()).ok()
+            }
+            _ => None,
         }
     }
 
@@ -182,10 +248,17 @@ impl proto::FullProposal {
         }
     }
 
+    /// Panics if `height` is missing — callers receiving peer-controlled
+    /// `FullProposal` frames MUST validate `self.height.is_some()` before
+    /// calling. The gossip ingress path does this (see F013); all
+    /// remaining callers are post-validation (block-proposed, signed,
+    /// produced locally), where `height` is invariantly populated.
     pub fn height(&self) -> proto::Height {
         self.height.clone().unwrap()
     }
 
+    /// Same contract as `height`: caller must have rejected
+    /// peer-controlled values with negative `round` before this point.
     pub fn round(&self) -> informalsystems_malachitebft_core_types::Round {
         informalsystems_malachitebft_core_types::Round::new(self.round.try_into().unwrap())
     }

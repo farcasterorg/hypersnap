@@ -28,6 +28,8 @@ pub struct SnapchainReadNode {
     pub shard_senders: HashMap<u32, Senders>,
     pub block_stores: BlockStores,
     pub address: Address,
+    /// The content replay DBs (FIP §17.4), with `consensus.content_replay`.
+    pub content_replay: crate::node::content_replay::ReplayDbs,
 }
 
 impl SnapchainReadNode {
@@ -62,6 +64,21 @@ impl SnapchainReadNode {
             farcaster_network,
         );
         let block_stores = engine.stores();
+        let pivot_guard = crate::consensus::pivot_guard::params::effective_pivot_height(
+            farcaster_network,
+            config.pivot_height_override,
+        )
+        .map(|h| {
+            info!(
+                pivot_height = h,
+                "Pivot guard on: shard chunks wait for a shard-0 witness"
+            );
+            crate::consensus::pivot_guard::PivotGuard::new(
+                h,
+                block_stores.block_store.clone(),
+                config.shard_ids.clone(),
+            )
+        });
         info!(
             "Block db height {}",
             block_stores.block_store.max_block_number().unwrap()
@@ -71,6 +88,7 @@ impl SnapchainReadNode {
 
         let mut shard_senders: HashMap<u32, Senders> = HashMap::new();
         let mut shard_stores: HashMap<u32, Stores> = HashMap::new();
+        let content_replay = crate::node::content_replay::ReplayDbs::default();
 
         // Create the shard validators
         for shard_id in config.shard_ids.clone() {
@@ -88,7 +106,7 @@ impl SnapchainReadNode {
                 block_cache.clone(),
             );
             let trie = merkle_trie::MerkleTrie::new().unwrap(); //TODO: don't unwrap()
-            let engine = match ShardEngine::new(
+            let mut engine = match ShardEngine::new(
                 db.clone(),
                 farcaster_network,
                 trie,
@@ -110,6 +128,22 @@ impl SnapchainReadNode {
                     );
                 }
             };
+
+            if config.shadow_trie {
+                if let Err(e) = engine.enable_shadow_trie() {
+                    warn!(shard_id, "Shadow trie not enabled: {}", e);
+                }
+            }
+            if config.content_replay {
+                crate::node::content_replay::spawn_follower(
+                    std::path::PathBuf::from(&rocksdb_dir),
+                    shard_id,
+                    farcaster_network,
+                    engine.get_stores().shard_store,
+                    statsd_client.clone(),
+                    content_replay.clone(),
+                );
+            }
 
             shard_senders.insert(shard_id, engine.get_senders());
             shard_stores.insert(shard_id, engine.get_stores());
@@ -139,6 +173,7 @@ impl SnapchainReadNode {
                 shard_id,
                 statsd_client.clone(),
                 config.clone(),
+                pivot_guard.clone(),
             )
             .await;
 
@@ -160,6 +195,7 @@ impl SnapchainReadNode {
             block_shard.shard_id(),
             statsd_client.clone(),
             config.clone(),
+            pivot_guard.clone(),
         )
         .await;
         if block_actor.is_err() {
@@ -173,6 +209,7 @@ impl SnapchainReadNode {
             shard_senders,
             shard_stores,
             block_stores,
+            content_replay,
         }
     }
 
@@ -187,6 +224,11 @@ impl SnapchainReadNode {
         }
     }
     pub fn dispatch_decided_value(&self, decided_value: proto::DecidedValue) {
+        // Post-pivot blocks are not part of the snapchain read path.
+        if let Some(proto::decided_value::Value::HypersnapBlock(_)) = decided_value.value {
+            warn!("Dropping a Hypersnap block from the snapchain read path");
+            return;
+        }
         let Some(height) = ReadValidator::decided_value_height(&decided_value) else {
             warn!("Dropping decided value with missing header or height");
             return;

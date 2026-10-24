@@ -40,7 +40,7 @@ use crate::version::version::{EngineVersion, ProtocolFeature};
 use governor::{Quota, RateLimiter};
 use moka::sync::{Cache, CacheBuilder};
 use std::num::NonZeroU32;
-use tracing::{error, warn};
+use tracing::{debug, error, info, warn};
 
 type DirectRateLimiter = RateLimiter<NotKeyed, InMemoryState, QuantaClock>;
 
@@ -393,6 +393,10 @@ pub struct MempoolMessagesRequest {
     pub shard_id: u32,
     pub message_tx: oneshot::Sender<Vec<MempoolMessage>>,
     pub max_messages_per_block: u32,
+    /// The encoded bytes of the messages of one pull (a Hypersnap block
+    /// fills by bytes, FIP §4.2). A message that does not fit stays in the
+    /// mempool for a later block. `None`: no limit (snapchain).
+    pub max_bytes: Option<usize>,
 }
 
 pub struct ReadNodeMempool {
@@ -404,6 +408,11 @@ pub struct ReadNodeMempool {
     gossip_tx: mpsc::Sender<GossipEvent<SnapchainValidatorContext>>,
     statsd_client: StatsdClientWrapper,
     network: FarcasterNetwork,
+    /// After the pivot: the Hypersnap routing of on-chain events (FIP §17.6).
+    hypersnap: bool,
+    /// After the pivot: the snapchain engine version of the fork block
+    /// (FIP §17.7).
+    frozen_version: Option<EngineVersion>,
 }
 
 impl ReadNodeMempool {
@@ -425,7 +434,16 @@ impl ReadNodeMempool {
             gossip_tx,
             statsd_client,
             network,
+            hypersnap: false,
+            frozen_version: None,
         }
+    }
+
+    /// The snapchain rules version for routing and admission: the fork
+    /// block's version on a Hypersnap node, else the current one.
+    pub fn engine_version(&self) -> EngineVersion {
+        self.frozen_version
+            .unwrap_or_else(|| EngineVersion::current(self.network))
     }
 
     fn message_already_exists(&self, shard: u32, message: &MempoolMessage) -> bool {
@@ -509,7 +527,7 @@ impl ReadNodeMempool {
         let fid_shard = self
             .message_router
             .route_fid(message.fid(), self.num_shards);
-        let version = EngineVersion::current(self.network);
+        let version = self.engine_version();
 
         // Fname transfers are mirrored to both the sender and receiver shard.
         match message {
@@ -528,6 +546,16 @@ impl ReadNodeMempool {
                 // TODO(aditi): Remove this codepath after migrating onchain events to shard 0
                 vec![0]
             }
+            // FIP §17.6: after the pivot, IdRegistry and KeyRegistry events go
+            // to shard 0 (shards 1 and 2 get them from its outbox). Hypersnap
+            // does not take StorageRegistry or TierRegistry events.
+            MempoolMessage::OnchainEvent(event) if self.hypersnap => match event.r#type() {
+                OnChainEventType::EventTypeStorageRent
+                | OnChainEventType::EventTypeTierPurchase => {
+                    vec![]
+                }
+                _ => vec![0],
+            },
             MempoolMessage::OnchainEvent(_) => {
                 // Onchain events need to get to shard 0 so that we can support other messages (lend storage) in shard 0.
                 vec![0, fid_shard]
@@ -658,9 +686,63 @@ pub struct Mempool {
     key_add_rate_limits: KeyAddRateLimits,
     live_at_rate_limits: LiveAtRateLimits,
     live_at_messages_by_fid: HashMap<(u32, u64), MempoolKey>,
+    /// After the pivot: native FIDs and Hypersnap types are normal messages
+    /// (FIP §14.1; Hyper-Native Onboarding §9 no longer applies).
+    hypersnap: bool,
+    /// Hypersnap: the shard-0 parameters for the FID-0 prechecks, and the
+    /// pending message of each dedupe key (`chain::shard0::precheck`).
+    shard0_params: Option<crate::chain::shard0::Shard0Params>,
+    fid0_keys: HashMap<Vec<u8>, MempoolKey>,
 }
 
 impl Mempool {
+    /// Run with the Hypersnap rules (after the pivot).
+    /// A Hypersnap node: shard-0 checks with `shard0_params`, and the
+    /// snapchain rules of `engine_version`, the version of the fork block
+    /// (FIP §17.7).
+    pub fn set_hypersnap(
+        &mut self,
+        shard0_params: crate::chain::shard0::Shard0Params,
+        engine_version: EngineVersion,
+    ) {
+        self.hypersnap = true;
+        self.read_node_mempool.hypersnap = true;
+        self.read_node_mempool.frozen_version = Some(engine_version);
+        self.shard0_params = Some(shard0_params);
+    }
+
+    /// Hypersnap: an FID-0 message for shard 0 carries a valid
+    /// authorization, and no other pending message has its dedupe key (the
+    /// escrow and nonce, or the onboarding custody address).
+    fn check_fid0(&mut self, shard: u32, message: &MempoolMessage) -> Result<(), HubError> {
+        let (Some(params), MempoolMessage::UserMessage(user_msg)) = (&self.shard0_params, message)
+        else {
+            return Ok(());
+        };
+        if shard != 0 {
+            return Ok(());
+        }
+        let now = FarcasterTime::current().to_u64();
+        let key = match crate::chain::shard0::precheck::fid0_dedupe_key(user_msg, params, now) {
+            Ok(Some(key)) => key,
+            Ok(None) => return Ok(()),
+            Err(e) => return Err(HubError::validation_failure(&e.to_string())),
+        };
+        if let Some(pending) = self.fid0_keys.get(&key) {
+            if self
+                .messages
+                .get(&0)
+                .is_some_and(|messages| messages.contains_key(pending))
+            {
+                return Err(HubError::duplicate(
+                    "a message for this escrow nonce or custody address is pending",
+                ));
+            }
+        }
+        self.fid0_keys.insert(key, message.mempool_key());
+        Ok(())
+    }
+
     pub fn new(
         config: Config,
         network: FarcasterNetwork,
@@ -696,6 +778,9 @@ impl Mempool {
                 num_shards,
             ),
             live_at_messages_by_fid: HashMap::new(),
+            hypersnap: false,
+            shard0_params: None,
+            fid0_keys: HashMap::new(),
             config,
             read_node_mempool: ReadNodeMempool::new(
                 mempool_rx,
@@ -759,11 +844,19 @@ impl Mempool {
 
     async fn pull_messages(&mut self, request: MempoolMessagesRequest) {
         let mut messages = vec![];
+        let mut bytes = 0usize;
         while messages.len() < request.max_messages_per_block as usize {
             let shard_messages = self.messages.get_mut(&request.shard_id);
             match shard_messages {
                 None => break,
                 Some(shard_messages) => {
+                    if let (Some(max), Some((_, next))) =
+                        (request.max_bytes, shard_messages.first_key_value())
+                    {
+                        if !messages.is_empty() && bytes + next.encoded_len() > max {
+                            break;
+                        }
+                    }
                     match shard_messages.pop_first() {
                         None => break,
                         Some((key, next_message)) => {
@@ -779,6 +872,7 @@ impl Mempool {
                             let result =
                                 self.message_is_valid(request.shard_id, &next_message, false);
                             if result.is_ok() {
+                                bytes += next_message.encoded_len();
                                 messages.push(next_message);
                             }
                         }
@@ -787,8 +881,20 @@ impl Mempool {
             }
         }
 
-        if let Err(_) = request.message_tx.send(messages) {
-            error!("Unable to send message from mempool");
+        if let Err(messages) = request.message_tx.send(messages) {
+            // The proposer stopped waiting: the messages stay for a later
+            // pull.
+            warn!(
+                count = messages.len(),
+                "A proposer did not wait for its messages; they stay in the mempool"
+            );
+            for message in messages {
+                self.index_live_at_insert(request.shard_id, &message);
+                self.messages
+                    .entry(request.shard_id)
+                    .or_default()
+                    .insert(message.mempool_key(), message);
+            }
         }
     }
 
@@ -798,6 +904,18 @@ impl Mempool {
         message: &MempoolMessage,
         at_admission: bool,
     ) -> Result<(), HubError> {
+        // FIP-hyper-native-onboarding §9.1: hyper-native FIDs (fid >= 2^63)
+        // belong on the hyper gossip topic and the hyper trie, never on
+        // snapchain gossip / snapchain mempool. Drop them here so they
+        // can't pollute snapchain block proposals with messages
+        // snapchain-only peers cannot interpret.
+        if let MempoolMessage::UserMessage(user_msg) = message {
+            if !self.hypersnap && crate::chain::is_hyper_fid(user_msg.fid()) {
+                return Err(HubError::validation_failure(
+                    "hyper-native FID (fid >= 2^63) message arrived on snapchain mempool — must use hyper gossip topic",
+                ));
+            }
+        }
         // Pre-feature admission gate for KEY_ADD / KEY_REMOVE. Provisional until
         // NEYN-10619 consolidates feature-gating into a single validate_user_message
         // hook at mempool admission.
@@ -810,7 +928,7 @@ impl Mempool {
                     | MessageType::ChannelPin
                     | MessageType::ChannelModerate
             ) {
-                let version = EngineVersion::current(self.read_node_mempool.network);
+                let version = self.read_node_mempool.engine_version();
                 if !version.is_enabled(ProtocolFeature::ChannelMessages) {
                     return Err(HubError::validation_failure(
                         "channel messages not yet active",
@@ -818,7 +936,7 @@ impl Mempool {
                 }
             }
             if matches!(msg_type, MessageType::KeyAdd | MessageType::KeyRemove) {
-                let version = EngineVersion::current(self.read_node_mempool.network);
+                let version = self.read_node_mempool.engine_version();
                 if !version.is_enabled(ProtocolFeature::GaslessSigners) {
                     return Err(HubError::validation_failure(
                         "gasless signers not yet active",
@@ -844,6 +962,9 @@ impl Mempool {
 
         if self.message_already_exists(shard, message) {
             return Err(HubError::duplicate("message has already been merged"));
+        }
+        if at_admission {
+            self.check_fid0(shard, message)?;
         }
         // Rate-limit checks are token-consuming (the KEY_ADD limiter uses
         // `governor::RateLimiter::check`, which decrements the bucket). They must run
@@ -933,12 +1054,14 @@ impl Mempool {
 
     async fn insert(
         &mut self,
-        message: MempoolMessage,
+        mut message: MempoolMessage,
         source: MempoolSource,
     ) -> Result<(), HubError> {
         // RPC submissions are fully simulated before they get here; gossip from any peer is not.
-        if let (MempoolMessage::UserMessage(user_message), MempoolSource::Gossip) =
-            (&message, &source)
+        // After the pivot these snapchain checks would refuse the Hypersnap types and the
+        // Falcon-512 signatures (FIP §16.8), which the engines check.
+        if let (false, MempoolMessage::UserMessage(user_message), MempoolSource::Gossip) =
+            (self.hypersnap, &message, &source)
         {
             if let Err(err) =
                 validate_gossiped_message(user_message, self.read_node_mempool.network)
@@ -946,6 +1069,11 @@ impl Mempool {
                 self.statsd_client
                     .count("mempool.gossip_validation_failure", 1, vec![]);
                 return Err(HubError::validation_failure(&err.to_string()));
+            }
+        }
+        if self.hypersnap {
+            if let MempoolMessage::UserMessage(m) = &mut message {
+                crate::chain::block::compact_message(m);
             }
         }
 
@@ -957,11 +1085,20 @@ impl Mempool {
                 .insert_into_shard(shard_id, message.clone(), source.clone())
                 .await
             {
-                error!(
-                    shard_id = shard_id.to_string(),
-                    "Unable to insert message into mempool for shard: {}",
-                    err.to_string()
-                );
+                // A duplicate is normal: a message comes from several peers.
+                if err.code == "bad_request.duplicate" {
+                    debug!(
+                        shard_id = shard_id.to_string(),
+                        "Message already in the mempool: {}",
+                        err.to_string()
+                    );
+                } else {
+                    error!(
+                        shard_id = shard_id.to_string(),
+                        "Unable to insert message into mempool for shard: {}",
+                        err.to_string()
+                    );
+                }
                 errors.push(err)
             }
         }
@@ -1174,7 +1311,9 @@ impl Mempool {
                                     }
                                 }
                                 Err(mpsc::error::TryRecvError::Disconnected) => {
-                                    panic!("Mempool tx is disconnected")
+                                    // Every sender is gone: the node is stopping.
+                                    info!("Mempool request channel closed; stopping the mempool");
+                                    return;
                                 }
                                 Err(mpsc::error::TryRecvError::Empty) => {
                                     break;
