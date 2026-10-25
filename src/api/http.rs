@@ -5,7 +5,7 @@
 
 use crate::api::channels::ChannelsIndexer;
 use crate::api::conversations::{Conversation as ConversationData, ConversationError};
-use crate::api::feeds::{FeedError, FeedHandler};
+use crate::api::feeds::{FeedError, FeedHandler, SignerFilter, TrendingFeedOptions};
 use crate::api::indexer::Indexer;
 use crate::api::metrics::MetricsIndexer;
 use crate::api::notifications::{
@@ -974,9 +974,9 @@ impl ApiHttpHandler {
             };
         }
         // `time_window` for trending feeds; defaults to 24h, rejects unknown values.
-        macro_rules! trending_window {
-            ($params:expr) => {
-                match $params.get("time_window").map(|v| v.as_str()) {
+        macro_rules! trending_options {
+            ($params:expr) => {{
+                let window = match $params.get("time_window").map(|v| v.as_str()) {
                     None | Some("") => crate::api::feeds::TrendingWindow::default(),
                     Some(v) => match crate::api::feeds::TrendingWindow::parse(v) {
                         Some(window) => window,
@@ -987,8 +987,16 @@ impl ApiHttpHandler {
                             ))
                         }
                     },
-                }
-            };
+                };
+                let signers = match SignerFilter::parse(
+                    $params.get("include_signer_fids").map(String::as_str),
+                    $params.get("exclude_signer_fids").map(String::as_str),
+                ) {
+                    Ok(signers) => signers,
+                    Err(error) => return Ok(Self::error_response(StatusCode::BAD_REQUEST, &error)),
+                };
+                TrendingFeedOptions { window, signers }
+            }};
         }
         macro_rules! require_fid {
             ($params:expr) => {
@@ -1198,14 +1206,14 @@ impl ApiHttpHandler {
                     }
                     _ => {
                         let fid: Option<u64> = params.get("fid").and_then(|s| s.parse().ok());
-                        let window = trending_window!(params);
+                        let options = trending_options!(params);
                         let with_recasts = params.get("with_recasts").is_some_and(|v| v == "true");
                         self.handle_feed(
                             feed_type,
                             fid,
                             cursor.as_deref(),
                             limit,
-                            window,
+                            &options,
                             with_recasts,
                             viewer_fid,
                         )
@@ -1220,15 +1228,15 @@ impl ApiHttpHandler {
                     .await
             }
             "/v2/farcaster/feed/trending" => {
-                let window = trending_window!(params);
-                self.handle_trending_feed(cursor.as_deref(), limit, window, viewer_fid)
+                let options = trending_options!(params);
+                self.handle_trending_feed(cursor.as_deref(), limit, &options, viewer_fid)
                     .await
             }
             "/v2/farcaster/feed/for_you" => {
                 // "For you" feed — alias to trending as personalization
                 // requires model inference not available on-node
-                let window = trending_window!(params);
-                self.handle_trending_feed(cursor.as_deref(), limit, window, viewer_fid)
+                let options = trending_options!(params);
+                self.handle_trending_feed(cursor.as_deref(), limit, &options, viewer_fid)
                     .await
             }
             "/v2/farcaster/feed/channels" => {
@@ -1253,8 +1261,8 @@ impl ApiHttpHandler {
             }
             "/v2/farcaster/feed/topic" => {
                 // Topics alias to trending feed
-                let window = trending_window!(params);
-                self.handle_trending_feed(cursor.as_deref(), limit, window, viewer_fid)
+                let options = trending_options!(params);
+                self.handle_trending_feed(cursor.as_deref(), limit, &options, viewer_fid)
                     .await
             }
             "/v2/farcaster/feed/user/replies_and_recasts" => {
@@ -1935,7 +1943,7 @@ impl ApiHttpHandler {
         &self,
         cursor: Option<&str>,
         limit: usize,
-        window: crate::api::feeds::TrendingWindow,
+        options: &TrendingFeedOptions,
         viewer_fid: Option<u64>,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
         let handler = self.feeds.read().unwrap().clone();
@@ -1953,7 +1961,7 @@ impl ApiHttpHandler {
             ));
         }
 
-        match handler.get_trending_feed(cursor, limit, window).await {
+        match handler.get_trending_feed(cursor, limit, options).await {
             Ok(feed_response) => {
                 let casts = self
                     .convert_feed_items(&feed_response.items, viewer_fid)
@@ -2688,7 +2696,7 @@ impl ApiHttpHandler {
         fid: Option<u64>,
         cursor: Option<&str>,
         limit: usize,
-        window: crate::api::feeds::TrendingWindow,
+        options: &TrendingFeedOptions,
         with_recasts: bool,
         viewer_fid: Option<u64>,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
@@ -2704,10 +2712,8 @@ impl ApiHttpHandler {
                     ))
                 }
             }
-            _ => {
-                self.handle_trending_feed(cursor, limit, window, viewer_fid)
-                    .await
-            }
+            _ => self.handle_trending_feed(cursor, limit, options, viewer_fid)
+                .await,
         }
     }
 

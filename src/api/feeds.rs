@@ -21,7 +21,8 @@ use crate::api::social_graph::SocialGraphIndexer;
 use crate::proto::{self, Message};
 use async_trait::async_trait;
 use serde::Serialize;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::future::Future;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -92,8 +93,70 @@ pub trait FeedHandler: Send + Sync {
         &self,
         cursor: Option<&str>,
         limit: usize,
-        window: TrendingWindow,
+        options: &TrendingFeedOptions,
     ) -> Result<FeedResponse, FeedError>;
+}
+
+/// Options shared by trending feeds and their HTTP aliases.
+#[derive(Debug, Default)]
+pub struct TrendingFeedOptions {
+    pub window: TrendingWindow,
+    pub signers: SignerFilter,
+}
+
+/// Filters by the app FID that registered a cast's signing key.
+#[derive(Debug, Default)]
+pub struct SignerFilter {
+    include: HashSet<u64>,
+    exclude: HashSet<u64>,
+}
+
+impl SignerFilter {
+    pub fn parse(include: Option<&str>, exclude: Option<&str>) -> Result<Self, String> {
+        Ok(Self {
+            include: Self::parse_fids(include, "include_signer_fids")?,
+            exclude: Self::parse_fids(exclude, "exclude_signer_fids")?,
+        })
+    }
+
+    fn parse_fids(value: Option<&str>, name: &str) -> Result<HashSet<u64>, String> {
+        let Some(value) = value.filter(|v| !v.trim().is_empty()) else {
+            return Ok(HashSet::new());
+        };
+        let mut fids = HashSet::new();
+        for value in value.split(',') {
+            let value = value.trim();
+            let fid = value
+                .parse::<u64>()
+                .ok()
+                .filter(|fid| *fid > 0 && value.bytes().all(|b| b.is_ascii_digit()))
+                .ok_or_else(|| format!("{name} must be a comma-separated list of positive FIDs"))?;
+            fids.insert(fid);
+            if fids.len() > 100 {
+                return Err(format!("{name} must contain at most 100 FIDs"));
+            }
+        }
+        Ok(fids)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.include.is_empty() && self.exclude.is_empty()
+    }
+
+    /// Unknown apps match only when no inclusion list is set. Exclusions win.
+    fn matches(&self, app_fid: Option<u64>) -> bool {
+        (self.include.is_empty() || app_fid.is_some_and(|fid| self.include.contains(&fid)))
+            && !app_fid.is_some_and(|fid| self.exclude.contains(&fid))
+    }
+}
+
+fn signer_app_fid(signer: &proto::Signer) -> Option<u64> {
+    if let Some(event) = &signer.onchain_event {
+        if let Some(proto::on_chain_event::Body::SignerEventBody(body)) = &event.body {
+            return crate::connectors::onchain_events::get_request_fid_from_signer_event(body);
+        }
+    }
+    signer.request_fid
 }
 
 /// The time windows the trending feed ranks over.
@@ -234,8 +297,125 @@ impl PartialOrd for TimestampedCast {
 /// Casts kept in a trending ranking snapshot; deeper pages come back empty.
 const TRENDING_RANKING_SIZE: usize = 1000;
 
-/// A trending ranking as `(fid, hash, score)`, highest score first.
-type TrendingRanking = Arc<Vec<(u64, Vec<u8>, f64)>>;
+struct TrendingCast {
+    fid: u64,
+    hash: Vec<u8>,
+    score: f64,
+    signer: Vec<u8>,
+}
+
+/// Signer keys come from the cast reads already needed to build the ranking.
+/// App metadata is loaded only for filtered requests and shared by all filters.
+struct RankedCasts {
+    casts: Vec<TrendingCast>,
+    signer_apps: tokio::sync::OnceCell<Arc<Vec<Option<u64>>>>,
+}
+
+type TrendingRanking = Arc<RankedCasts>;
+
+struct TrendingPage<'a> {
+    casts: Vec<&'a TrendingCast>,
+    next_cursor: Option<String>,
+}
+
+impl RankedCasts {
+    fn new(casts: Vec<TrendingCast>) -> Self {
+        Self {
+            casts,
+            signer_apps: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    fn page(
+        &self,
+        offset: usize,
+        limit: usize,
+        signers: Option<(&SignerFilter, &[Option<u64>])>,
+    ) -> TrendingPage<'_> {
+        if limit == 0 {
+            return TrendingPage {
+                casts: Vec::new(),
+                next_cursor: None,
+            };
+        }
+        let mut matching = self
+            .casts
+            .iter()
+            .enumerate()
+            .skip(offset)
+            .filter(|(i, _)| signers.is_none_or(|(filter, apps)| filter.matches(apps[*i])));
+        let mut casts = Vec::with_capacity(limit.min(self.casts.len()));
+        let mut next_offset = offset;
+        for (index, cast) in matching.by_ref().take(limit) {
+            casts.push(cast);
+            next_offset = index + 1;
+        }
+        let next_cursor = matching.next().map(|_| next_offset.to_string());
+        TrendingPage { casts, next_cursor }
+    }
+
+    /// Detached initialization survives a cancelled request. Only the winner
+    /// performs lookups, on the blocking pool so local store reads cannot
+    /// occupy an async worker or delay unfiltered requests on that worker.
+    async fn signer_apps<F, Fut>(
+        self: &Arc<Self>,
+        resolve: F,
+    ) -> Result<Arc<Vec<Option<u64>>>, FeedError>
+    where
+        F: FnMut(u64, Vec<u8>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<Option<u64>, FeedError>> + Send,
+    {
+        if let Some(apps) = self.signer_apps.get() {
+            return Ok(apps.clone());
+        }
+        let ranking = self.clone();
+        tokio::spawn(async move {
+            ranking
+                .signer_apps
+                .get_or_try_init(|| async {
+                    let ranking = ranking.clone();
+                    let runtime = tokio::runtime::Handle::current();
+                    tokio::task::spawn_blocking(move || {
+                        runtime.block_on(ranking.resolve_signer_apps(resolve))
+                    })
+                    .await
+                    .map_err(|e| {
+                        FeedError::ServiceError(format!("Signer lookup task failed: {e}"))
+                    })?
+                    .map(Arc::new)
+                })
+                .await
+                .cloned()
+        })
+        .await
+        .map_err(|e| FeedError::ServiceError(format!("Signer cache task failed: {e}")))?
+    }
+
+    async fn resolve_signer_apps<F, Fut>(
+        &self,
+        mut resolve: F,
+    ) -> Result<Vec<Option<u64>>, FeedError>
+    where
+        F: FnMut(u64, Vec<u8>) -> Fut,
+        Fut: Future<Output = Result<Option<u64>, FeedError>>,
+    {
+        let mut known_signers = HashMap::new();
+        let mut apps = Vec::with_capacity(self.casts.len());
+        for cast in &self.casts {
+            let key = (cast.fid, cast.signer.clone());
+            let app = match known_signers.get(&key) {
+                Some(app) => *app,
+                None => {
+                    let app = resolve(cast.fid, cast.signer.clone()).await?;
+                    known_signers.insert(key, app);
+                    app
+                }
+            };
+            apps.push(app);
+        }
+        Ok(apps)
+    }
+}
 
 /// A computed trending ranking. Ranking reads every hour bucket in the window
 /// and looks up each candidate cast, so requests share one snapshot per window.
@@ -355,13 +535,19 @@ where
                     fid,
                     hash: hash.clone(),
                 };
-                let created = hub
-                    .get_cast(Request::new(cast_id))
-                    .await
-                    .ok()
-                    .and_then(|r| r.into_inner().data.map(|d| d.timestamp as u64));
-                if created.is_some_and(|ts| ts >= cutoff) {
-                    ranking.push((fid, hash, score));
+                if let Ok(response) = hub.get_cast(Request::new(cast_id)).await {
+                    let cast = response.into_inner();
+                    if cast
+                        .data
+                        .is_some_and(|data| data.timestamp as u64 >= cutoff)
+                    {
+                        ranking.push(TrendingCast {
+                            fid,
+                            hash,
+                            score,
+                            signer: cast.signer,
+                        });
+                    }
                 }
             }
 
@@ -374,7 +560,7 @@ where
             );
             *snapshot.write().unwrap() = Some(TrendingSnapshot {
                 computed_at: Instant::now(),
-                ranking: Arc::new(ranking),
+                ranking: Arc::new(RankedCasts::new(ranking)),
             });
         });
     }
@@ -560,7 +746,7 @@ where
         &self,
         cursor: Option<&str>,
         limit: usize,
-        window: TrendingWindow,
+        options: &TrendingFeedOptions,
     ) -> Result<FeedResponse, FeedError> {
         if !self.config.enabled {
             return Err(FeedError::FeatureDisabled);
@@ -575,45 +761,60 @@ where
         let offset: usize = cursor.and_then(|c| c.parse().ok()).unwrap_or(0);
         let limit = limit.min(100);
 
-        let ranking = self.trending_ranking(metrics, window).await?;
-        let trending: Vec<_> = ranking.iter().skip(offset).take(limit).cloned().collect();
-
-        // Fetch full cast data for each trending cast
-        let mut items = Vec::with_capacity(trending.len());
-        for (fid, hash, score) in &trending {
-            match self.fetch_cast(*fid, hash).await {
-                Ok(cast) => {
-                    let metrics_data = metrics.get_cast_metrics(*fid, hash).unwrap_or_default();
-
-                    items.push(FeedItem {
-                        cast,
-                        likes: metrics_data.likes,
-                        recasts: metrics_data.recasts,
-                        replies: metrics_data.replies,
-                        score: *score,
-                        recaster: None,
-                    });
-                }
-                Err(_) => {
-                    // Cast may have been deleted, skip it
-                    continue;
-                }
+        let ranking = self.trending_ranking(metrics, options.window).await?;
+        let apps = if options.signers.is_empty() || limit == 0 || offset >= ranking.casts.len() {
+            None
+        } else {
+            let hub = self.hub_service.clone();
+            Some(
+                ranking
+                    .signer_apps(move |fid, key| Self::fetch_signer_app(hub.clone(), fid, key))
+                    .await?,
+            )
+        };
+        let signers = apps
+            .as_ref()
+            .map(|apps| (&options.signers, apps.as_slice()));
+        let page = ranking.page(offset, limit, signers);
+        let mut items = Vec::with_capacity(page.casts.len());
+        for entry in page.casts {
+            if let Ok(cast) = self.fetch_cast(entry.fid, &entry.hash).await {
+                let metrics_data = metrics
+                    .get_cast_metrics(entry.fid, &entry.hash)
+                    .unwrap_or_default();
+                items.push(FeedItem {
+                    cast,
+                    likes: metrics_data.likes,
+                    recasts: metrics_data.recasts,
+                    replies: metrics_data.replies,
+                    score: entry.score,
+                    recaster: None,
+                });
             }
         }
 
-        // Generate next cursor while the ranking has more entries. Deleted
-        // casts are skipped above, so a short page is not the end.
-        let next_cursor = if offset + limit < ranking.len() {
-            Some((offset + limit).to_string())
-        } else {
-            None
-        };
-
         Ok(FeedResponse {
             items,
-            next_cursor,
+            next_cursor: page.next_cursor,
             total: None,
         })
+    }
+
+    async fn fetch_signer_app(
+        hub: Arc<S>,
+        fid: u64,
+        key: Vec<u8>,
+    ) -> Result<Option<u64>, FeedError> {
+        let request = proto::SignerRequest { fid, signer: key };
+        match hub.get_signer(Request::new(request)).await {
+            Ok(response) => Ok(response
+                .into_inner()
+                .signer
+                .as_ref()
+                .and_then(signer_app_fid)),
+            Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
+            Err(status) => Err(FeedError::ServiceError(status.message().to_string())),
+        }
     }
 
     /// Fetch a single cast.
@@ -724,9 +925,9 @@ where
         &self,
         cursor: Option<&str>,
         limit: usize,
-        window: TrendingWindow,
+        options: &TrendingFeedOptions,
     ) -> Result<FeedResponse, FeedError> {
-        FeedService::get_trending_feed(self, cursor, limit, window).await
+        FeedService::get_trending_feed(self, cursor, limit, options).await
     }
 }
 
@@ -749,6 +950,270 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn test_ranking(signers: &[(u64, u8)]) -> TrendingRanking {
+        Arc::new(RankedCasts::new(
+            signers
+                .iter()
+                .enumerate()
+                .map(|(index, (fid, signer))| TrendingCast {
+                    fid: *fid,
+                    hash: (index as u64).to_be_bytes().to_vec(),
+                    score: (signers.len() - index) as f64,
+                    signer: vec![*signer; 32],
+                })
+                .collect(),
+        ))
+    }
+
+    #[test]
+    fn unfiltered_pages_preserve_offsets_without_loading_signers() {
+        let ranking = test_ranking(&[(1, 1), (2, 2), (3, 3), (4, 4)]);
+        let first = ranking.page(0, 2, None);
+        assert_eq!(
+            first.casts.iter().map(|c| c.fid).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(first.next_cursor.as_deref(), Some("2"));
+        let second = ranking.page(2, 2, None);
+        assert_eq!(
+            second.casts.iter().map(|c| c.fid).collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        assert!(second.next_cursor.is_none());
+        assert!(ranking.signer_apps.get().is_none());
+    }
+
+    #[test]
+    fn filtered_pages_select_only_matches_and_skip_excluded_tail() {
+        let ranking = test_ranking(&[(1, 1), (2, 2), (3, 1), (4, 2), (5, 1)]);
+        let filter = SignerFilter::parse(None, Some("9152")).unwrap();
+        let apps = [
+            Some(9152),
+            Some(309857),
+            Some(9152),
+            Some(309857),
+            Some(9152),
+        ];
+        let first = ranking.page(0, 1, Some((&filter, &apps)));
+        assert_eq!(first.casts.len(), 1);
+        assert_eq!(first.casts[0].fid, 2);
+        assert_eq!(first.next_cursor.as_deref(), Some("2"));
+        let second = ranking.page(2, 1, Some((&filter, &apps)));
+        assert_eq!(second.casts.len(), 1);
+        assert_eq!(second.casts[0].fid, 4);
+        assert!(second.next_cursor.is_none());
+    }
+
+    #[test]
+    fn sparse_filter_selects_one_cast_from_a_thousand_candidates() {
+        let ranking = test_ranking(&vec![(1, 1); TRENDING_RANKING_SIZE]);
+        let mut apps = vec![Some(9152); TRENDING_RANKING_SIZE];
+        apps[TRENDING_RANKING_SIZE - 1] = Some(309857);
+        let filter = SignerFilter::parse(Some("309857"), None).unwrap();
+        let page = ranking.page(0, 25, Some((&filter, &apps)));
+        assert_eq!(page.casts.len(), 1);
+        assert_eq!(page.casts[0].hash, ranking.casts.last().unwrap().hash);
+        assert!(page.next_cursor.is_none());
+    }
+
+    #[test]
+    fn empty_zero_limit_and_past_end_pages_have_no_cursor() {
+        let empty = test_ranking(&[]);
+        assert!(empty.page(0, 25, None).next_cursor.is_none());
+        let ranking = test_ranking(&[(1, 1)]);
+        for (offset, limit) in [(0, 0), (1, 25), (usize::MAX, 25)] {
+            let page = ranking.page(offset, limit, None);
+            assert!(page.casts.is_empty());
+            assert!(page.next_cursor.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn signer_lookups_are_shared_across_concurrent_requests_and_filters() {
+        let ranking = test_ranking(&[(1, 1), (1, 2), (1, 2), (2, 2)]);
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let resolve = {
+            let lookups = lookups.clone();
+            move |_, key: Vec<u8>| {
+                lookups.fetch_add(1, Ordering::SeqCst);
+                async move { Ok(Some(if key[0] == 1 { 9152 } else { 309857 })) }
+            }
+        };
+        let (first, concurrent) = tokio::join!(
+            ranking.signer_apps(resolve.clone()),
+            ranking.signer_apps(resolve),
+        );
+        let first = first.unwrap();
+        assert!(Arc::ptr_eq(&first, &concurrent.unwrap()));
+        // Repeated (FID, key) is resolved once; the same key on another FID is distinct.
+        assert_eq!(lookups.load(Ordering::SeqCst), 3);
+        let cached = ranking
+            .signer_apps(|_, _| async { Err(FeedError::ServiceError("unexpected lookup".into())) })
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &cached));
+        for filter in [
+            SignerFilter::parse(None, Some("9152")).unwrap(),
+            SignerFilter::parse(Some("309857"), None).unwrap(),
+        ] {
+            assert_eq!(ranking.page(0, 25, Some((&filter, &cached))).casts.len(), 3);
+        }
+        assert_eq!(lookups.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn unfiltered_pages_remain_available_during_blocking_signer_lookups() {
+        let ranking = test_ranking(&[(1, 1)]);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let warming = {
+            let ranking = ranking.clone();
+            tokio::spawn(async move {
+                let mut gate = Some((started_tx, release_rx));
+                ranking
+                    .signer_apps(move |_, _| {
+                        let gate = gate.take();
+                        async move {
+                            if let Some((started, release)) = gate {
+                                started.send(()).unwrap();
+                                release.recv_timeout(Duration::from_secs(5)).unwrap();
+                            }
+                            Ok(Some(9152))
+                        }
+                    })
+                    .await
+            })
+        };
+        started_rx.await.unwrap();
+        let page = ranking.page(0, 1, None);
+        assert_eq!(page.casts.len(), 1);
+        assert!(ranking.signer_apps.get().is_none());
+        release_tx.send(()).unwrap();
+        warming.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_request_does_not_restart_signer_warming() {
+        let ranking = test_ranking(&[(1, 1)]);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let caller = {
+            let ranking = ranking.clone();
+            tokio::spawn(async move {
+                let mut gate = Some((started_tx, release_rx));
+                ranking
+                    .signer_apps(move |_, _| {
+                        let (started, release) = gate.take().unwrap();
+                        async move {
+                            started.send(()).unwrap();
+                            release.await.unwrap();
+                            Ok(Some(9152))
+                        }
+                    })
+                    .await
+            })
+        };
+        started_rx.await.unwrap();
+        caller.abort();
+        release_tx.send(()).unwrap();
+        let apps = ranking
+            .signer_apps(|_, _| async { Err(FeedError::ServiceError("unexpected restart".into())) })
+            .await
+            .unwrap();
+        assert_eq!(apps.as_slice(), &[Some(9152)]);
+    }
+
+    #[tokio::test]
+    async fn signer_cache_failure_is_retryable_and_does_not_affect_unfiltered_pages() {
+        let ranking = test_ranking(&[(1, 1)]);
+        let failed = ranking
+            .signer_apps(|_, _| async { Err(FeedError::ServiceError("store unavailable".into())) })
+            .await;
+        assert!(failed.is_err());
+        assert_eq!(ranking.page(0, 1, None).casts.len(), 1);
+        let retried = ranking
+            .signer_apps(|_, _| async { Ok(None) })
+            .await
+            .unwrap();
+        assert_eq!(retried.as_slice(), &[None]);
+    }
+
+    #[tokio::test]
+    async fn new_ranking_refreshes_signer_metadata() {
+        let old = test_ranking(&[(1, 1)]);
+        old.signer_apps(|_, _| async { Ok(Some(9152)) })
+            .await
+            .unwrap();
+        let refreshed = test_ranking(&[(1, 1)]);
+        assert!(refreshed.signer_apps.get().is_none());
+        let apps = refreshed
+            .signer_apps(|_, _| async { Ok(Some(309857)) })
+            .await
+            .unwrap();
+        assert_eq!(apps.as_slice(), &[Some(309857)]);
+    }
+
+    #[test]
+    fn signer_filters_include_multiple_apps_and_exclusions_win() {
+        let filter = SignerFilter::parse(Some("9152, 309857,42,309857"), Some("9152,42")).unwrap();
+        assert!(filter.matches(Some(309857)));
+        assert!(!filter.matches(Some(9152)));
+        assert!(!filter.matches(Some(42)));
+        assert!(!filter.matches(Some(100)));
+        assert!(!filter.matches(None));
+    }
+
+    #[test]
+    fn exclusion_only_filter_keeps_other_and_unknown_apps() {
+        let filter = SignerFilter::parse(None, Some("9152,42")).unwrap();
+        assert!(filter.matches(Some(309857)));
+        assert!(filter.matches(None));
+        assert!(!filter.matches(Some(9152)));
+        assert!(!filter.matches(Some(42)));
+    }
+
+    #[test]
+    fn empty_signer_filters_match_every_app() {
+        let filter = SignerFilter::parse(Some(" "), Some("")).unwrap();
+        assert!(filter.is_empty());
+        assert!(filter.matches(Some(9152)));
+        assert!(filter.matches(None));
+    }
+
+    #[test]
+    fn signer_filters_reject_invalid_fids() {
+        for invalid in [
+            "0",
+            "-1",
+            "+1",
+            "warpcast",
+            "1,,2",
+            "1,",
+            "18446744073709551616",
+        ] {
+            let error = SignerFilter::parse(Some(invalid), None).unwrap_err();
+            assert!(error.contains("include_signer_fids"), "{invalid}: {error}");
+            let error = SignerFilter::parse(None, Some(invalid)).unwrap_err();
+            assert!(error.contains("exclude_signer_fids"), "{invalid}: {error}");
+        }
+        let too_many = (1..=101)
+            .map(|fid| fid.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(SignerFilter::parse(Some(&too_many), None).is_err());
+    }
+
+    #[test]
+    fn gasless_signer_uses_registered_app_fid() {
+        let signer = proto::Signer {
+            request_fid: Some(309857),
+            ..Default::default()
+        };
+        assert_eq!(signer_app_fid(&signer), Some(309857));
+        assert_eq!(signer_app_fid(&proto::Signer::default()), None);
+    }
 
     #[test]
     fn test_timestamped_cast_ordering() {
