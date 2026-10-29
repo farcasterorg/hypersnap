@@ -436,32 +436,42 @@ impl SocialGraphIndexer {
 
         match msg_type {
             MessageType::LinkAdd => {
-                // Update counts
-                self.increment_follower_count(target_fid, txn)?;
-                self.increment_following_count(source_fid, txn)?;
-
-                // Store the actual relationship
                 // Follower entry: target_fid has follower source_fid
                 let follower_key = Self::make_follower_key(target_fid, source_fid);
-                let timestamp = data.timestamp.to_be_bytes().to_vec();
-                txn.put(follower_key, timestamp.clone());
-
                 // Following entry: source_fid follows target_fid
                 let following_key = Self::make_following_key(source_fid, target_fid);
+
+                // The same LinkAdd can reach the indexer more than once: process_event and
+                // process_batch share this code, and the block backfill re-reads messages the
+                // live path may already have indexed. The two writes below are keyed by the
+                // pair and so are idempotent, but the counters are not, so they move only when
+                // the relationship is new. Otherwise a replay leaves the sets right and the
+                // counts permanently too high.
+                if !self.relationship_exists(&follower_key, txn)? {
+                    self.increment_follower_count(target_fid, txn)?;
+                    self.increment_following_count(source_fid, txn)?;
+                }
+
+                // Store the actual relationship
+                let timestamp = data.timestamp.to_be_bytes().to_vec();
+                txn.put(follower_key, timestamp.clone());
                 txn.put(following_key, timestamp);
 
                 self.items_indexed.fetch_add(1, Ordering::Relaxed);
             }
             MessageType::LinkRemove => {
-                // Update counts
-                self.decrement_follower_count(target_fid, txn)?;
-                self.decrement_following_count(source_fid, txn)?;
+                let follower_key = Self::make_follower_key(target_fid, source_fid);
+                let following_key = Self::make_following_key(source_fid, target_fid);
+
+                // Likewise: only a remove that takes an existing relationship away may move the
+                // counts, or a replayed LinkRemove drives them below the real figure.
+                if self.relationship_exists(&follower_key, txn)? {
+                    self.decrement_follower_count(target_fid, txn)?;
+                    self.decrement_following_count(source_fid, txn)?;
+                }
 
                 // Remove the relationship entries
-                let follower_key = Self::make_follower_key(target_fid, source_fid);
                 txn.delete(follower_key);
-
-                let following_key = Self::make_following_key(source_fid, target_fid);
                 txn.delete(following_key);
             }
             _ => {}
@@ -571,12 +581,16 @@ impl SocialGraphIndexer {
         let timestamp = 0u32.to_be_bytes().to_vec();
         for &target_fid in target_fids {
             let follower_key = Self::make_follower_key(target_fid, source_fid);
-            txn.put(follower_key, timestamp.clone());
-
             let following_key = Self::make_following_key(source_fid, target_fid);
-            txn.put(following_key, timestamp.clone());
 
-            self.increment_follower_count(target_fid, txn)?;
+            // A target kept from the previous state had its follower count taken off above, so
+            // it is counted again here; one that is genuinely still indexed is not counted twice.
+            if !self.relationship_exists(&follower_key, txn)? {
+                self.increment_follower_count(target_fid, txn)?;
+            }
+
+            txn.put(follower_key, timestamp.clone());
+            txn.put(following_key, timestamp.clone());
         }
 
         // Set correct following count
@@ -590,6 +604,23 @@ impl SocialGraphIndexer {
             .fetch_add(target_fids.len() as u64, Ordering::Relaxed);
 
         Ok(())
+    }
+
+    /// Whether a relationship key is already indexed, counting a write pending in this
+    /// transaction. A pending entry is `Some(Some(_))` for a put and `Some(None)` for a delete,
+    /// so a relationship removed earlier in the same batch reads as absent.
+    fn relationship_exists(
+        &self,
+        key: &[u8],
+        txn: &RocksDbTransactionBatch,
+    ) -> Result<bool, IndexerError> {
+        if let Some(pending) = txn.batch.get(key) {
+            return Ok(pending.is_some());
+        }
+        self.db
+            .get(key)
+            .map(|v| v.is_some())
+            .map_err(|e| IndexerError::Storage(e.to_string()))
     }
 
     fn get_count_from_txn_or_db(
@@ -1370,5 +1401,103 @@ mod tests {
 
         // User 50: 1 follower (user 200, from compact state)
         assert_eq!(indexer.get_follower_count(50).unwrap(), 1);
+    }
+
+    /// Guards the counters against replays. process_event and process_batch share
+    /// process_link_message, and the block backfill re-reads messages the live path may already
+    /// have indexed. The relationship writes are keyed by the pair and absorb that; the counters
+    /// used to move every time, leaving counts at roughly double the real sets.
+    #[tokio::test]
+    async fn test_replayed_follow_counts_once() {
+        let db = make_test_db();
+        let config = FeatureConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let indexer = SocialGraphIndexer::new(config, db);
+
+        let msg = make_follow_message(1, 2, true);
+        for _ in 0..3 {
+            indexer
+                .process_event(&IndexEvent::message(msg.clone(), 0, 1))
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(indexer.get_following_count(1).unwrap(), 1);
+        assert_eq!(indexer.get_follower_count(2).unwrap(), 1);
+        let (followers, _) = indexer.get_followers(2, None, 10).unwrap();
+        assert_eq!(followers, vec![1]);
+    }
+
+    /// A backfill re-reading blocks the live path already indexed: the counts must still match
+    /// the lists afterwards.
+    #[tokio::test]
+    async fn test_backfill_after_live_indexing_does_not_inflate() {
+        let db = make_test_db();
+        let config = FeatureConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let indexer = SocialGraphIndexer::new(config, db);
+
+        let msgs = [
+            make_follow_message(1, 9, true),
+            make_follow_message(2, 9, true),
+            make_follow_message(3, 9, true),
+        ];
+        for m in &msgs {
+            indexer
+                .process_event(&IndexEvent::message(m.clone(), 0, 1))
+                .await
+                .unwrap();
+        }
+
+        let events: Vec<IndexEvent> = msgs
+            .iter()
+            .cloned()
+            .map(|m| IndexEvent::message(m, 0, 1))
+            .collect();
+        indexer.process_batch(&events).await.unwrap();
+
+        assert_eq!(indexer.get_follower_count(9).unwrap(), 3);
+        let (followers, _) = indexer.get_followers(9, None, 10).unwrap();
+        assert_eq!(followers, vec![1, 2, 3]);
+    }
+
+    /// The mirror case: a replayed LinkRemove must not drive the counts below the real set.
+    #[tokio::test]
+    async fn test_replayed_unfollow_does_not_undercount() {
+        let db = make_test_db();
+        let config = FeatureConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let indexer = SocialGraphIndexer::new(config, db);
+
+        for source in [1, 2] {
+            indexer
+                .process_event(&IndexEvent::message(
+                    make_follow_message(source, 5, true),
+                    0,
+                    1,
+                ))
+                .await
+                .unwrap();
+        }
+        assert_eq!(indexer.get_follower_count(5).unwrap(), 2);
+
+        let unfollow = make_follow_message(1, 5, false);
+        for _ in 0..3 {
+            indexer
+                .process_event(&IndexEvent::message(unfollow.clone(), 0, 2))
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(indexer.get_follower_count(5).unwrap(), 1);
+        assert_eq!(indexer.get_following_count(1).unwrap(), 0);
+        let (followers, _) = indexer.get_followers(5, None, 10).unwrap();
+        assert_eq!(followers, vec![2]);
     }
 }
