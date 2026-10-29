@@ -447,6 +447,16 @@ impl SocialGraphIndexer {
                 // pair and so are idempotent, but the counters are not, so they move only when
                 // the relationship is new. Otherwise a replay leaves the sets right and the
                 // counts permanently too high.
+                //
+                // One probe decides both counters. The two keys are the same relationship under
+                // two prefixes and every path writes and deletes them together, so either one
+                // answers for both; taking a single answer also stops the counters ever
+                // disagreeing about whether a link was new.
+                debug_assert_eq!(
+                    self.relationship_exists(&follower_key, txn)?,
+                    self.relationship_exists(&following_key, txn)?,
+                    "follower and following entries must be written and deleted together",
+                );
                 if !self.relationship_exists(&follower_key, txn)? {
                     self.increment_follower_count(target_fid, txn)?;
                     self.increment_following_count(source_fid, txn)?;
@@ -464,7 +474,13 @@ impl SocialGraphIndexer {
                 let following_key = Self::make_following_key(source_fid, target_fid);
 
                 // Likewise: only a remove that takes an existing relationship away may move the
-                // counts, or a replayed LinkRemove drives them below the real figure.
+                // counts, or a replayed LinkRemove drives them below the real figure. One probe
+                // again, for the reason given above.
+                debug_assert_eq!(
+                    self.relationship_exists(&follower_key, txn)?,
+                    self.relationship_exists(&following_key, txn)?,
+                    "follower and following entries must be written and deleted together",
+                );
                 if self.relationship_exists(&follower_key, txn)? {
                     self.decrement_follower_count(target_fid, txn)?;
                     self.decrement_following_count(source_fid, txn)?;
