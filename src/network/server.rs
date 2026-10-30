@@ -57,7 +57,7 @@ use crate::storage::store::account::{
 use crate::storage::store::account::{
     get_channel_keys_by_owner_address, get_channel_keys_for_owner_addresses,
 };
-use crate::storage::store::account::{make_ts_hash, message_bytes_decode, IntoI32, PAGE_SIZE_MAX};
+use crate::storage::store::account::{make_ts_hash, message_bytes_decode, IntoI32};
 use crate::storage::store::account::{EventsPage, HubEventIdGenerator};
 use crate::storage::store::block_engine::{self, BlockStores};
 use crate::storage::store::engine::{self, Senders, ShardEngine};

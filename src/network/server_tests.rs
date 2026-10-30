@@ -6990,6 +6990,164 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trending_signer_filters_fill_pages_and_preserve_ranking() {
+        use crate::api::config::{FeedConfig, MetricsConfig};
+        use crate::api::events::IndexEvent;
+        use crate::api::feeds::{FeedService, SignerFilter, TrendingFeedOptions};
+        use crate::api::indexer::Indexer;
+        use crate::api::metrics::MetricsIndexer;
+        use alloy_sol_types::SolValue;
+
+        alloy_sol_types::sol! {
+            struct TrendingSignerMetadata {
+                uint256 requestFid;
+                address requestSigner;
+                bytes signature;
+                uint256 deadline;
+            }
+        }
+
+        let (_, _, [mut engine, _engine2], _block_engine, service, _shard_tx, _block_tx) =
+            make_server(None).await;
+        let fid = SHARD1_FID;
+        register_user(
+            fid,
+            test_helper::default_signer(),
+            test_helper::default_custody_address(),
+            &mut engine,
+        )
+        .await;
+        let metrics_dir = tempfile::tempdir().unwrap();
+        let metrics_db = RocksDB::new(metrics_dir.path().to_str().unwrap());
+        metrics_db.open().unwrap();
+        let metrics = Arc::new(MetricsIndexer::new(
+            MetricsConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            Arc::new(metrics_db),
+        ));
+        let mut casts = Vec::new();
+        for (index, app_fid) in [Some(9152u64), Some(309857), Some(42), None]
+            .into_iter()
+            .enumerate()
+        {
+            let key = generate_signer();
+            let mut event = events_factory::create_signer_event(
+                fid,
+                key.clone(),
+                proto::SignerEventType::Add,
+                None,
+                None,
+            );
+            if let (Some(app_fid), Some(proto::on_chain_event::Body::SignerEventBody(body))) =
+                (app_fid, &mut event.body)
+            {
+                body.metadata = TrendingSignerMetadata {
+                    requestFid: alloy_primitives::U256::from(app_fid),
+                    requestSigner: alloy_primitives::Address::ZERO,
+                    signature: vec![0; 65].into(),
+                    deadline: alloy_primitives::U256::MAX,
+                }
+                .abi_encode();
+            }
+            commit_event(&mut engine, &event).await;
+            let cast = messages_factory::casts::create_cast_add(
+                fid,
+                &format!("trending {index}"),
+                None,
+                Some(&key),
+            );
+            test_helper::commit_message(&mut engine, &cast).await;
+            for liker in 0..(4 - index) {
+                let like = messages_factory::reactions::create_reaction_add(
+                    1000 + liker as u64,
+                    proto::ReactionType::Like,
+                    proto::reaction_body::Target::TargetCastId(proto::CastId {
+                        fid,
+                        hash: cast.hash.clone(),
+                    }),
+                    None,
+                    None,
+                );
+                metrics
+                    .process_event(&IndexEvent::message(like, 1, 1))
+                    .await
+                    .unwrap();
+            }
+            casts.push(cast);
+        }
+        let feeds = FeedService::new(
+            FeedConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            None,
+            Some(metrics),
+            Arc::new(service),
+        );
+        let options = TrendingFeedOptions {
+            signers: SignerFilter::parse(None, Some("9152")).unwrap(),
+            ..Default::default()
+        };
+        let first = feeds.get_trending_feed(None, 2, &options).await.unwrap();
+        assert_eq!(
+            first
+                .items
+                .iter()
+                .map(|item| &item.cast.hash)
+                .collect::<Vec<_>>(),
+            vec![&casts[1].hash, &casts[2].hash]
+        );
+        let second = feeds
+            .get_trending_feed(first.next_cursor.as_deref(), 2, &options)
+            .await
+            .unwrap();
+        assert_eq!(second.items.len(), 1);
+        assert_eq!(second.items[0].cast.hash, casts[3].hash);
+        assert!(second.next_cursor.is_none());
+
+        let combined = TrendingFeedOptions {
+            signers: SignerFilter::parse(Some("9152,309857,42"), Some("9152,42")).unwrap(),
+            ..Default::default()
+        };
+        let filtered = feeds.get_trending_feed(None, 2, &combined).await.unwrap();
+        assert_eq!(filtered.items.len(), 1);
+        assert_eq!(filtered.items[0].cast.hash, casts[1].hash);
+        assert!(filtered.next_cursor.is_none());
+
+        let unfiltered = feeds
+            .get_trending_feed(None, 4, &TrendingFeedOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(unfiltered.items.len(), 4);
+        assert_eq!(unfiltered.items[0].cast.hash, casts[0].hash);
+        assert!(unfiltered.next_cursor.is_none());
+
+        // Preserve the original page budget even if a ranked cast was deleted.
+        let remove = messages_factory::casts::create_cast_remove(fid, &casts[0].hash, None, None);
+        test_helper::commit_message(&mut engine, &remove).await;
+        let short_page = feeds
+            .get_trending_feed(None, 2, &TrendingFeedOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(short_page.items.len(), 1);
+        assert_eq!(short_page.items[0].cast.hash, casts[1].hash);
+        assert_eq!(short_page.next_cursor.as_deref(), Some("2"));
+        let next_page = feeds
+            .get_trending_feed(
+                short_page.next_cursor.as_deref(),
+                2,
+                &TrendingFeedOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(next_page.items.len(), 2);
+        assert_eq!(next_page.items[0].cast.hash, casts[2].hash);
+        assert!(next_page.next_cursor.is_none());
+    }
+
+    #[tokio::test]
     async fn test_get_on_chain_signers_by_fid() {
         let (
             _stores,
