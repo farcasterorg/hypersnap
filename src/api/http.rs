@@ -1199,12 +1199,14 @@ impl ApiHttpHandler {
                     _ => {
                         let fid: Option<u64> = params.get("fid").and_then(|s| s.parse().ok());
                         let window = trending_window!(params);
+                        let with_recasts = params.get("with_recasts").is_some_and(|v| v == "true");
                         self.handle_feed(
                             feed_type,
                             fid,
                             cursor.as_deref(),
                             limit,
                             window,
+                            with_recasts,
                             viewer_fid,
                         )
                         .await
@@ -1213,7 +1215,8 @@ impl ApiHttpHandler {
             }
             "/v2/farcaster/feed/following" => {
                 let fid: u64 = require_fid!(params);
-                self.handle_following_feed(fid, cursor.as_deref(), limit, viewer_fid)
+                let with_recasts = params.get("with_recasts").is_some_and(|v| v == "true");
+                self.handle_following_feed(fid, cursor.as_deref(), limit, with_recasts, viewer_fid)
                     .await
             }
             "/v2/farcaster/feed/trending" => {
@@ -1871,12 +1874,13 @@ impl ApiHttpHandler {
         })
     }
 
-    /// Handle GET /v2/farcaster/feed/following/?fid=X
+    /// Handle GET /v2/farcaster/feed/following/?fid=X&with_recasts=true
     async fn handle_following_feed(
         &self,
         fid: u64,
         cursor: Option<&str>,
         limit: usize,
+        with_recasts: bool,
         viewer_fid: Option<u64>,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
         let handler = self.feeds.read().unwrap().clone();
@@ -1894,7 +1898,10 @@ impl ApiHttpHandler {
             ));
         }
 
-        match handler.get_following_feed(fid, cursor, limit).await {
+        match handler
+            .get_following_feed(fid, cursor, limit, with_recasts)
+            .await
+        {
             Ok(feed_response) => {
                 // Convert internal feed response to Farcaster format
                 let casts = self
@@ -2164,6 +2171,7 @@ impl ApiHttpHandler {
             channel: None,
             viewer_context: None,
             author_channel_context: None,
+            recaster: None,
         }
     }
 
@@ -2681,12 +2689,13 @@ impl ApiHttpHandler {
         cursor: Option<&str>,
         limit: usize,
         window: crate::api::feeds::TrendingWindow,
+        with_recasts: bool,
         viewer_fid: Option<u64>,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
         match feed_type {
             "following" => {
                 if let Some(fid) = fid {
-                    self.handle_following_feed(fid, cursor, limit, viewer_fid)
+                    self.handle_following_feed(fid, cursor, limit, with_recasts, viewer_fid)
                         .await
                 } else {
                     Ok(Self::error_response(
@@ -3883,6 +3892,9 @@ impl ApiHttpHandler {
             cast.replies = CastReplies {
                 count: item.replies,
             };
+            if let Some(recaster) = item.recaster {
+                cast.recaster = Some(self.get_user(recaster).await);
+            }
             casts.push(cast);
         }
         self.add_viewer_context(&mut casts, viewer_fid).await;

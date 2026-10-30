@@ -21,7 +21,7 @@ use crate::api::social_graph::SocialGraphIndexer;
 use crate::proto::{self, Message};
 use async_trait::async_trait;
 use serde::Serialize;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -55,6 +55,8 @@ pub struct FeedItem {
     pub replies: u64,
     /// Engagement score (for ranking).
     pub score: f64,
+    /// The followed FID whose recast put this cast in the feed, if any.
+    pub recaster: Option<u64>,
 }
 
 /// A feed response with pagination.
@@ -76,12 +78,13 @@ pub trait FeedHandler: Send + Sync {
     /// Check if feeds are enabled.
     fn is_enabled(&self) -> bool;
 
-    /// Get the following feed for a user.
+    /// Get the following feed for a user, optionally with followed users' recasts.
     async fn get_following_feed(
         &self,
         fid: u64,
         cursor: Option<&str>,
         limit: usize,
+        with_recasts: bool,
     ) -> Result<FeedResponse, FeedError>;
 
     /// Get the trending feed over a time window.
@@ -146,12 +149,63 @@ impl Default for TrendingWindow {
 }
 
 /// Helper struct for merge-sorting casts by timestamp.
+///
+/// For a recast, `fid` and `hash` identify the recast cast, `timestamp` is
+/// when it was recast, and `cast` holds the reaction message.
 #[derive(Debug)]
 struct TimestampedCast {
     timestamp: u32,
     fid: u64,
     hash: Vec<u8>,
     cast: Message,
+    recaster: Option<u64>,
+}
+
+impl TimestampedCast {
+    /// A feed entry for a cast add or a recast message; `None` for anything else.
+    fn from_message(msg: Message) -> Option<Self> {
+        let data = msg.data.as_ref()?;
+        let (timestamp, author) = (data.timestamp, data.fid);
+        match &data.body {
+            Some(proto::message_data::Body::CastAddBody(_)) => Some(Self {
+                timestamp,
+                fid: author,
+                hash: msg.hash.clone(),
+                cast: msg,
+                recaster: None,
+            }),
+            Some(proto::message_data::Body::ReactionBody(body))
+                if body.r#type == proto::ReactionType::Recast as i32 =>
+            {
+                let Some(proto::reaction_body::Target::TargetCastId(target)) = &body.target else {
+                    return None;
+                };
+                Some(Self {
+                    timestamp,
+                    fid: target.fid,
+                    hash: target.hash.clone(),
+                    cast: msg,
+                    recaster: Some(author),
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Pop up to `limit` entries, newest first, showing each cast once: a cast
+/// recast by several followed users, or also cast by one, keeps only its
+/// newest entry.
+fn take_newest(heap: &mut BinaryHeap<TimestampedCast>, limit: usize) -> Vec<TimestampedCast> {
+    let mut seen = HashSet::new();
+    let mut entries = Vec::with_capacity(limit);
+    while entries.len() < limit {
+        let Some(tc) = heap.pop() else { break };
+        if seen.insert(tc.hash.clone()) {
+            entries.push(tc);
+        }
+    }
+    entries
 }
 
 impl PartialEq for TimestampedCast {
@@ -349,11 +403,13 @@ where
     /// Get the following feed for a user.
     ///
     /// Returns casts from users that the given FID follows, sorted by timestamp (newest first).
+    /// With `with_recasts`, their recasts are included too, placed at the time of the recast.
     pub async fn get_following_feed(
         &self,
         fid: u64,
         cursor: Option<&str>,
         limit: usize,
+        with_recasts: bool,
     ) -> Result<FeedResponse, FeedError> {
         if !self.config.enabled {
             return Err(FeedError::FeatureDisabled);
@@ -412,39 +468,42 @@ where
                         page_token: None,
                         reverse: Some(true),
                     };
-                    match hub.get_casts_by_fid(Request::new(request)).await {
-                        Ok(resp) => {
-                            let mut casts = resp.into_inner().messages;
-                            if let Some(before) = ts {
-                                casts.retain(|m| {
-                                    m.data
-                                        .as_ref()
-                                        .map(|d| d.timestamp < before)
-                                        .unwrap_or(false)
-                                });
-                            }
-                            casts
-                        }
+                    let mut messages = match hub.get_casts_by_fid(Request::new(request)).await {
+                        Ok(resp) => resp.into_inner().messages,
                         Err(_) => vec![],
+                    };
+                    if with_recasts {
+                        let request = proto::ReactionsByFidRequest {
+                            fid: followed_fid,
+                            reaction_type: Some(proto::ReactionType::Recast as i32),
+                            page_size: Some(lim as u32),
+                            page_token: None,
+                            reverse: Some(true),
+                        };
+                        if let Ok(resp) = hub.get_reactions_by_fid(Request::new(request)).await {
+                            messages.extend(resp.into_inner().messages);
+                        }
                     }
+                    if let Some(before) = ts {
+                        messages.retain(|m| {
+                            m.data
+                                .as_ref()
+                                .map(|d| d.timestamp < before)
+                                .unwrap_or(false)
+                        });
+                    }
+                    messages
                 }));
             }
             for handle in handles {
-                if let Ok(casts) = handle.await {
-                    for cast in casts {
-                        if let Some(data) = &cast.data {
+                if let Ok(messages) = handle.await {
+                    heap.extend(
+                        messages
+                            .into_iter()
+                            .filter_map(TimestampedCast::from_message)
                             // Skip forward-dated casts
-                            if data.timestamp > max_timestamp {
-                                continue;
-                            }
-                            heap.push(TimestampedCast {
-                                timestamp: data.timestamp,
-                                fid: data.fid,
-                                hash: cast.hash.clone(),
-                                cast,
-                            });
-                        }
-                    }
+                            .filter(|tc| tc.timestamp <= max_timestamp),
+                    );
                 }
             }
         }
@@ -453,23 +512,30 @@ where
         let mut items = Vec::with_capacity(limit);
         let mut last_timestamp = None;
 
-        while let Some(tc) = heap.pop() {
-            if items.len() >= limit {
-                break;
-            }
+        for tc in take_newest(&mut heap, limit) {
+            last_timestamp = Some(tc.timestamp);
+
+            // A recast carries the reaction; show the cast it points at
+            let (cast, recaster) = match tc.recaster {
+                None => (tc.cast, None),
+                Some(recaster) => match self.fetch_cast(tc.fid, &tc.hash).await {
+                    Ok(cast) => (cast, Some(recaster)),
+                    // Recast cast was deleted
+                    Err(_) => continue,
+                },
+            };
 
             // Get metrics for this cast
             let (likes, recasts, replies, score) = self.get_cast_metrics(tc.fid, &tc.hash);
 
             items.push(FeedItem {
-                cast: tc.cast,
+                cast,
                 likes,
                 recasts,
                 replies,
                 score,
+                recaster,
             });
-
-            last_timestamp = Some(tc.timestamp);
         }
 
         // Generate next cursor if there are more items
@@ -525,6 +591,7 @@ where
                         recasts: metrics_data.recasts,
                         replies: metrics_data.replies,
                         score: *score,
+                        recaster: None,
                     });
                 }
                 Err(_) => {
@@ -621,6 +688,7 @@ where
                 recasts,
                 replies,
                 score,
+                recaster: None,
             });
         }
 
@@ -647,8 +715,9 @@ where
         fid: u64,
         cursor: Option<&str>,
         limit: usize,
+        with_recasts: bool,
     ) -> Result<FeedResponse, FeedError> {
-        FeedService::get_following_feed(self, fid, cursor, limit).await
+        FeedService::get_following_feed(self, fid, cursor, limit, with_recasts).await
     }
 
     async fn get_trending_feed(
@@ -691,24 +760,79 @@ mod tests {
             fid: 1,
             hash: vec![1],
             cast: Message::default(),
+            recaster: None,
         });
         heap.push(TimestampedCast {
             timestamp: 300,
             fid: 2,
             hash: vec![2],
             cast: Message::default(),
+            recaster: None,
         });
         heap.push(TimestampedCast {
             timestamp: 200,
             fid: 3,
             hash: vec![3],
             cast: Message::default(),
+            recaster: None,
         });
 
         // Should pop in order: 300, 200, 100 (newest first)
         assert_eq!(heap.pop().unwrap().timestamp, 300);
         assert_eq!(heap.pop().unwrap().timestamp, 200);
         assert_eq!(heap.pop().unwrap().timestamp, 100);
+    }
+
+    #[test]
+    fn test_recasts_merge_newest_first_once() {
+        use crate::utils::factory::messages_factory::{casts, reactions};
+
+        let cast = casts::create_cast_add(10, "hello", Some(100), None);
+        let target = proto::reaction_body::Target::TargetCastId(proto::CastId {
+            fid: 10,
+            hash: cast.hash.clone(),
+        });
+        let recast = |fid, ts| {
+            reactions::create_reaction_add(
+                fid,
+                proto::ReactionType::Recast,
+                target.clone(),
+                Some(ts),
+                None,
+            )
+        };
+        let like = reactions::create_reaction_add(
+            11,
+            proto::ReactionType::Like,
+            target.clone(),
+            Some(400),
+            None,
+        );
+        let other = casts::create_cast_add(12, "later", Some(250), None);
+
+        let mut heap: BinaryHeap<_> = [cast.clone(), recast(11, 200), recast(13, 300), like, other]
+            .into_iter()
+            .filter_map(TimestampedCast::from_message)
+            .collect();
+        assert_eq!(heap.len(), 4, "likes are not feed entries");
+
+        // The newest recast stands for the cast; its older recast and the cast itself drop out
+        let entries = take_newest(&mut heap, 10);
+        let got: Vec<_> = entries
+            .iter()
+            .map(|tc| (tc.timestamp, tc.fid, tc.recaster))
+            .collect();
+        assert_eq!(got, vec![(300, 10, Some(13)), (250, 12, None)]);
+        assert_eq!(entries[0].hash, cast.hash);
+        assert!(heap.is_empty());
+
+        // The limit counts distinct casts
+        let mut heap: BinaryHeap<_> = [recast(11, 200), recast(13, 300), cast]
+            .into_iter()
+            .filter_map(TimestampedCast::from_message)
+            .collect();
+        assert_eq!(take_newest(&mut heap, 1).len(), 1);
+        assert_eq!(heap.len(), 2);
     }
 
     #[test]

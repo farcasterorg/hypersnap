@@ -177,6 +177,9 @@ pub struct Cast {
     pub viewer_context: Option<CastViewerContext>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub author_channel_context: Option<ChannelUserContext>,
+    /// The followed user whose recast put this cast in a following feed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recaster: Option<User>,
 }
 
 impl Default for Cast {
@@ -203,6 +206,7 @@ impl Default for Cast {
             channel: None,
             viewer_context: None,
             author_channel_context: None,
+            recaster: None,
         }
     }
 }
