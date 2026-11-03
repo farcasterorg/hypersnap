@@ -1142,7 +1142,7 @@ const BLOCK_BACKFILL_BATCH: u64 = 100;
 /// checkpoint per (indexer, shard) so that adding a new indexer later
 /// triggers a fresh backfill only for that indexer instead of being
 /// silently skipped by a shared already-complete flag.
-fn backfill_checkpoint_name(indexer_name: &str) -> String {
+pub(crate) fn backfill_checkpoint_name(indexer_name: &str) -> String {
     format!("api_block_backfill:{}", indexer_name)
 }
 
