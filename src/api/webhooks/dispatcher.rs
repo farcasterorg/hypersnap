@@ -42,7 +42,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{trace, warn};
-use uuid::Uuid;
 
 /// Default capacity for the delivery channel. Matches the
 /// `IndexEvent` channel default so backpressure thresholds are aligned.
@@ -281,6 +280,7 @@ mod tests {
     };
     use crate::storage::db::RocksDB;
     use tempfile::TempDir;
+    use uuid::Uuid;
 
     fn fresh_store() -> (TempDir, Arc<WebhookStore>) {
         let dir = TempDir::new().unwrap();

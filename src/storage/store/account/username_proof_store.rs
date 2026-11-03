@@ -209,7 +209,7 @@ impl StoreDef for UsernameProofStoreDef {
         txn: &RocksDbTransactionBatch,
         message: &Message,
         ts_hash: &[u8; TS_HASH_LENGTH],
-        ctx: StateContext,
+        _ctx: StateContext,
     ) -> Result<Vec<Message>, HubError> {
         if message.data.is_none() {
             return Err(HubError {

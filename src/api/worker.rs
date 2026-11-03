@@ -12,7 +12,6 @@ use tracing::{debug, error, info, warn};
 pub struct IndexWorkerPool {
     config: ApiConfig,
     event_rx: IndexEventReceiver,
-    db: Arc<RocksDB>,
     indexers: Vec<Arc<dyn Indexer>>,
     shutdown_tx: broadcast::Sender<()>,
     shutdown_rx: broadcast::Receiver<()>,
@@ -20,13 +19,12 @@ pub struct IndexWorkerPool {
 
 impl IndexWorkerPool {
     /// Create a new worker pool.
-    pub fn new(config: ApiConfig, event_rx: IndexEventReceiver, db: Arc<RocksDB>) -> Self {
+    pub fn new(config: ApiConfig, event_rx: IndexEventReceiver, _db: Arc<RocksDB>) -> Self {
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
 
         Self {
             config,
             event_rx,
-            db,
             indexers: Vec::new(),
             shutdown_tx,
             shutdown_rx,
@@ -194,7 +192,6 @@ impl IndexWorkerPoolBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::indexer::NoOpIndexer;
     use tokio::sync::mpsc;
 
     #[tokio::test]

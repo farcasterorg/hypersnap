@@ -14,14 +14,14 @@ use crate::api::notifications::{
 use crate::api::search::SearchIndexer;
 use crate::api::social_graph::SocialGraphIndexer;
 use crate::api::types::{
-    self, Bio, BlockListResponse, BulkCastsResponse, BulkUsersResponse, Cast, CastReactions,
+    self, BlockListResponse, BulkCastsResponse, BulkUsersResponse, Cast, CastReactions,
     CastReplies, CastResponse, CastWithReplies, CastsSearchResponse, CastsSearchResult, Channel,
     ChannelMember, ChannelMemberListResponse, ChannelResponse, ChannelsResponse, Conversation,
     ConversationResponse, Embed, ErrorResponse, FeedResponse, FnameAvailabilityResponse,
     FollowersResponse, NextCursor, Notification, NotificationsResponse, OnChainEventEntry,
     OnChainEventsResponse, ParentAuthor, Reaction, ReactionCastRef, ReactionsResponse,
     StorageAllocation, StorageAllocationsResponse, StorageUsage, StorageUsageResponse, User,
-    UserProfile, UserResponse, UsernameProofResponse, VerifiedAddresses,
+    UserResponse, UsernameProofResponse,
 };
 use crate::api::webhooks::WebhookManagementHandler;
 use async_trait::async_trait;
@@ -2712,8 +2712,10 @@ impl ApiHttpHandler {
                     ))
                 }
             }
-            _ => self.handle_trending_feed(cursor, limit, options, viewer_fid)
-                .await,
+            _ => {
+                self.handle_trending_feed(cursor, limit, options, viewer_fid)
+                    .await
+            }
         }
     }
 
@@ -6183,6 +6185,9 @@ mod tests {
             cast_lookup: Some(mock_cast(target_fid, target_cast_id.hash)),
             direct_reply_count: 0,
             probes: Default::default(),
+            casts: vec![],
+            links: vec![],
+            reactions: vec![],
         }));
 
         for (flag, expected) in [(false, ["reply", "likes"]), (true, ["quote", "recasts"])] {

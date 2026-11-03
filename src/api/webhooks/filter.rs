@@ -29,7 +29,6 @@
 
 use crate::api::webhooks::types::{
     CastFilter, EventTypeByte, FollowFilter, ReactionFilter, UserUpdatedFilter, Webhook,
-    WebhookSubscription,
 };
 use crate::proto::{
     cast_add_body::Parent, link_body::Target as LinkTarget, message_data::Body,
@@ -585,7 +584,7 @@ mod tests {
         WebhookSecret, WebhookSubscription,
     };
     use crate::proto::{
-        self, link_body::Target as LinkTarget, message_data::Body, CastAddBody, CastId, LinkBody,
+        link_body::Target as LinkTarget, message_data::Body, CastAddBody, CastId, LinkBody,
         Message, MessageData, MessageType, ReactionBody, UserDataBody,
     };
     use uuid::Uuid;

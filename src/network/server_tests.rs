@@ -6297,7 +6297,7 @@ mod tests {
             service,
             _shard_decision_tx,
             _block_decision_tx,
-        ) = make_server(None).await;
+        ) = make_server(None, None).await;
         let engine1 = &mut engine1;
         let engine2 = &mut engine2;
         for (fid, engine) in [(SHARD1_FID, &mut *engine1), (SHARD2_FID, &mut *engine2)] {
@@ -7008,7 +7008,7 @@ mod tests {
         }
 
         let (_, _, [mut engine, _engine2], _block_engine, service, _shard_tx, _block_tx) =
-            make_server(None).await;
+            make_server(None, None).await;
         let fid = SHARD1_FID;
         register_user(
             fid,

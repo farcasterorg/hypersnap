@@ -29,7 +29,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::convert::Infallible;
 use std::sync::Arc;
-use tracing::warn;
 use uuid::Uuid;
 
 const ROUTE_PREFIX: &str = "/v2/farcaster/frame/notifications/";

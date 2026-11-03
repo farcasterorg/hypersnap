@@ -240,9 +240,6 @@ impl LinkStore {
     }
 
     // Generates a unique key used to store a LinkCompactState message key in the store
-    fn link_compact_state_add_key(fid: u64, link_type: &String) -> Result<Vec<u8>, HubError> {
-        Self::link_compact_state_add_key_with_prefix(RootPrefix::User as u8, fid, link_type)
-    }
 
     fn link_compact_state_add_key_with_prefix(
         root_prefix: u8,

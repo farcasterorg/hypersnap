@@ -60,9 +60,6 @@ pub struct SocialGraphIndexer {
 
 impl SocialGraphIndexer {
     pub fn new(config: FeatureConfig, db: Arc<RocksDB>) -> Self {
-        // Load checkpoint from DB
-        let checkpoint = Self::load_checkpoint(&db).unwrap_or(0);
-
         // Check schema version — if outdated, clear backfill checkpoints
         // and all index data so backfill re-runs from scratch.
         let version_key = vec![keys::SOCIAL_GRAPH_PREFIX, keys::SCHEMA_VERSION];

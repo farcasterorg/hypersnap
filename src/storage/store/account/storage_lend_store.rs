@@ -178,11 +178,6 @@ impl StoreDef for StorageLendStoreDef {
 
 impl StorageLendStoreDef {
     #[inline]
-    fn make_storage_lend_primary_key(from_fid: u64, to_fid: u64) -> Vec<u8> {
-        Self::make_storage_lend_primary_key_with_prefix(RootPrefix::User as u8, from_fid, to_fid)
-    }
-
-    #[inline]
     fn make_storage_lend_primary_key_with_prefix(
         root_prefix: u8,
         from_fid: u64,
@@ -194,13 +189,6 @@ impl StorageLendStoreDef {
         key.extend(make_fid_key(to_fid));
 
         key
-    }
-
-    fn by_borrower_secondary_index_key(message: &proto::Message) -> Result<Vec<u8>, HubError> {
-        Self::by_borrower_secondary_index_key_with_prefix(
-            RootPrefix::LendStorageByRecipient as u8,
-            message,
-        )
     }
 
     fn by_borrower_secondary_index_key_with_prefix(

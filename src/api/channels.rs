@@ -626,7 +626,7 @@ impl ChannelsIndexer {
                 Some(prefix),
                 Some(stop_prefix),
                 &page_options,
-                |key, value| {
+                |_key, value| {
                     if value.len() == 32 {
                         if let Ok(url_hash) = <[u8; 32]>::try_from(value) {
                             if let Ok(Some(url)) = self.get_channel_url(&url_hash) {
