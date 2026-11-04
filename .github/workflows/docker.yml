@@ -1,0 +1,40 @@
+name: Docker
+
+# The image is a full release build of every crate, so it only runs when it can
+# change for a reason the Verify debug build wouldn't catch: on main, and on
+# pull requests that touch how the image is built.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - docker-compose.yml
+      - .dockerignore
+      - .github/workflows/docker.yml
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    timeout-minutes: 90
+    runs-on: ${{ vars.RUNS_ON == 'true' && fromJSON(format('["runs-on={0}","runner=64cpu-linux-arm64"]', github.run_id)) || 'ubuntu-24.04-arm' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      # The same image `docker compose build` makes; layers up to the source
+      # copy (toolchain packages, malachite) come from the Actions cache.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: hypersnap-local:dev
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
