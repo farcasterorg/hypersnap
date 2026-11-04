@@ -19,6 +19,10 @@ env:
   ETH_SIGNATURE_VERIFIER_GIT_REF: "8deb4a091982c345949dc66bf8684489d9f11889"
   RUSTFLAGS: "-Dwarnings -A mismatched_lifetime_syntaxes"
   CARGO_TERM_COLOR: always
+  # CI never reads full debug info, and it's much of what compiling, linking
+  # and the cache cost (and the runner's memory). Line tables keep backtraces.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
 # GitHub-hosted arm64 runners by default. Setting the repository variable
 # RUNS_ON to "true" puts the jobs back on the RunsOn 64-CPU runners.
@@ -71,6 +75,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+
+      # mold links the test and node binaries several times faster than ld
+      - uses: rui314/setup-mold@v1
 
       # Dependencies (and malachite) come from the cache, so a PR only
       # recompiles snapchain itself. Only main saves, so PRs can't evict it.
