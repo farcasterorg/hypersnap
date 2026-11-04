@@ -48,7 +48,8 @@ mod keys {
 /// v2: fix batch processing of LinkCompactState (flush txn before compact state)
 /// v3: fix incomplete data clearing (was limited to 100K entries, now loops to completion)
 /// v4: switch to block-based backfill (reads shard chunks, not HubEvents)
-const SOCIAL_GRAPH_SCHEMA_VERSION: u32 = 4;
+/// v5: rebuild follower/following counts that drifted before replays stopped moving them (#49)
+const SOCIAL_GRAPH_SCHEMA_VERSION: u32 = 5;
 
 /// Social graph indexer that tracks follow relationships.
 pub struct SocialGraphIndexer {
@@ -769,21 +770,17 @@ impl SocialGraphIndexer {
             tracing::info!("Cleared {} social graph index entries", total_deleted);
         }
 
-        // Clear per-shard backfill checkpoints for both the old event-based
-        // backfill ("social_graph") and the new block-based backfill
-        // ("api_block_backfill") which is shared across all indexers.
-        for name in ["social_graph", "api_block_backfill"] {
-            let mut cp_prefix = Vec::with_capacity(2 + name.len());
-            cp_prefix.push(0xE3);
-            cp_prefix.push(name.len() as u8);
-            cp_prefix.extend_from_slice(name.as_bytes());
-            let cp_stop = {
-                let mut s = cp_prefix.clone();
-                if let Some(last) = s.last_mut() {
-                    *last += 1;
-                }
-                s
-            };
+        // Clear the per-shard backfill checkpoints so the backfill re-runs: the old
+        // event-based one ("social_graph") and this indexer's block-based one, which
+        // run_block_backfill keys per indexer ("api_block_backfill:social_graph").
+        // Clearing a bare "api_block_backfill" matched no key since the checkpoints
+        // went per indexer, so a schema bump wiped the index without refilling it.
+        for name in [
+            "social_graph".to_string(),
+            crate::api::backfill_checkpoint_name("social_graph"),
+        ] {
+            let cp_prefix = crate::api::backfill::shard_checkpoint_prefix(&name);
+            let cp_stop = crate::storage::util::increment_vec_u8(&cp_prefix);
             let mut cp_keys = Vec::new();
             let page_options = crate::storage::db::PageOptions {
                 page_size: Some(100),
@@ -1512,5 +1509,36 @@ mod tests {
         assert_eq!(indexer.get_following_count(1).unwrap(), 0);
         let (followers, _) = indexer.get_followers(5, None, 10).unwrap();
         assert_eq!(followers, vec![2]);
+    }
+
+    /// A schema upgrade must clear this indexer's block-backfill checkpoint, or the index is
+    /// wiped and never refilled. Other indexers' checkpoints must survive.
+    #[tokio::test]
+    async fn test_schema_upgrade_resets_block_backfill_checkpoint() {
+        use crate::api::backfill::{load_shard_checkpoint, save_shard_checkpoint};
+        let db = make_test_db();
+        let ours = crate::api::backfill_checkpoint_name("social_graph");
+        let theirs = crate::api::backfill_checkpoint_name("channels");
+        for shard in [0, 1] {
+            save_shard_checkpoint(&db, &ours, shard, 500).unwrap();
+            save_shard_checkpoint(&db, &theirs, shard, 500).unwrap();
+        }
+        let version_key = vec![keys::SOCIAL_GRAPH_PREFIX, keys::SCHEMA_VERSION];
+        db.put(
+            &version_key,
+            &(SOCIAL_GRAPH_SCHEMA_VERSION - 1).to_be_bytes(),
+        )
+        .unwrap();
+
+        let config = FeatureConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let _indexer = SocialGraphIndexer::new(config, db.clone());
+
+        for shard in [0, 1] {
+            assert_eq!(load_shard_checkpoint(&db, &ours, shard), 0);
+            assert_eq!(load_shard_checkpoint(&db, &theirs, shard), 500);
+        }
     }
 }
