@@ -1293,6 +1293,8 @@ pub struct OnChainEventResponse {
     pub next_page_token: Option<String>,
 }
 
+// Variant names are the wire format (serde), so they keep the proto spelling.
+#[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 pub enum SignerSource {
     SIGNER_SOURCE_NONE = 0,

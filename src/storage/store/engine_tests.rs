@@ -115,21 +115,6 @@ mod tests {
         );
     }
 
-    /// Assert that a message does NOT exist in the hyper shadow stores
-    /// (e.g. after signer revocation).
-    fn assert_hyper_missing(engine: &ShardEngine, msg: &proto::Message) {
-        let hyper = engine
-            .get_hyper_stores()
-            .expect("hyper stores should be initialized");
-        let fid = msg.data.as_ref().unwrap().fid;
-        let result = CastStore::get_cast_add(&hyper.cast_store, fid, msg.hash.clone());
-        assert!(
-            result.is_err() || result.as_ref().unwrap().is_none(),
-            "message {} should NOT exist in hyper store",
-            to_hex(&msg.hash)
-        );
-    }
-
     fn assert_event_id(event: &HubEvent, expected_block: Option<u64>, expected_event_seq: u64) {
         // Take the last 14 bits of event.id and assert it's equal to event_seq
         let (block, seq) = HubEventIdGenerator::extract_height_and_seq(event.id);

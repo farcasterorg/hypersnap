@@ -371,15 +371,6 @@ mod tests {
         app.app_id
     }
 
-    fn fresh_store() -> (TempDir, Arc<NotificationStore>) {
-        let dir = TempDir::new().unwrap();
-        let db = Arc::new(crate::storage::db::RocksDB::new(
-            dir.path().to_str().unwrap(),
-        ));
-        db.open().unwrap();
-        (dir, Arc::new(NotificationStore::new(db)))
-    }
-
     #[tokio::test]
     async fn route_match() {
         assert!(NotificationWebhookHandler::can_handle(

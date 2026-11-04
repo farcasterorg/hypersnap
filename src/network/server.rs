@@ -38,7 +38,7 @@ use crate::proto::{
     SignerEventType, SignerRequest, SignerResponse, SignerSource, SignersByFidRequest,
     SignersByFidResponse, StorageLimitsResponse, SubscribeRequest, TrieNodeMetadataRequest,
     TrieNodeMetadataResponse, UserDataRequest, UserNameProof, UserNameType, UsernameProofRequest,
-    UsernameProofsResponse, ValidationResponse, VerificationAddAddressBody, VerificationRequest,
+    UsernameProofsResponse, ValidationResponse, VerificationRequest,
 };
 use crate::storage::constants::OnChainEventPostfix;
 use crate::storage::constants::RootPrefix;
@@ -1090,17 +1090,7 @@ impl MyHubService {
         Ok(channel_id)
     }
 
-    async fn simulate_message_for_shard(
-        &self,
-        message: &proto::Message,
-        shard_id: u32,
-    ) -> Result<(), HubError> {
-        self.simulate_message_for_shard_typed(message, shard_id)
-            .await
-            .map_err(simulate_error_to_hub_error)
-    }
-
-    /// Same as `simulate_message_for_shard` but returns the typed
+    /// Simulates `message` on `shard_id`, returning the typed
     /// `engine::MessageValidationError` so callers can match on specific
     /// variants (e.g. `MissingFname` for the on-demand recovery flow).
     async fn simulate_message_for_shard_typed(

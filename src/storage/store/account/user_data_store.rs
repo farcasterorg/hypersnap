@@ -153,10 +153,6 @@ impl UserDataStoreDef {
      * @param dataType type of data being added
      * @returns RocksDB key of the form <root_prefix>:<fid>:<user_postfix>:<dataType?>
      */
-    #[inline]
-    fn make_user_data_adds_key(fid: u64, data_type: i32) -> Vec<u8> {
-        Self::make_user_data_adds_key_with_prefix(RootPrefix::User as u8, fid, data_type)
-    }
 
     #[inline]
     fn make_user_data_adds_key_with_prefix(root_prefix: u8, fid: u64, data_type: i32) -> Vec<u8> {

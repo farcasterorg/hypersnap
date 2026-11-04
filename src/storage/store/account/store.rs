@@ -1,10 +1,9 @@
 use super::{
     super::super::util::{bytes_compare, vec_to_u8_24},
-    delete_message_transaction, delete_message_transaction_with_prefix, get_from_db_or_txn,
-    get_message, get_message_with_prefix, get_messages_page_by_prefix, is_message_in_time_range,
-    make_message_primary_key, make_message_primary_key_with_prefix, make_ts_hash, message_decode,
-    message_encode, put_message_transaction, put_message_transaction_with_prefix, MessagesPage,
-    StoreEventHandler, TS_HASH_LENGTH,
+    delete_message_transaction_with_prefix, get_from_db_or_txn, get_message_with_prefix,
+    get_messages_page_by_prefix, is_message_in_time_range, make_message_primary_key_with_prefix,
+    make_ts_hash, message_decode, message_encode, put_message_transaction_with_prefix,
+    MessagesPage, StoreEventHandler, TS_HASH_LENGTH,
 };
 use crate::core::error::HubError;
 use crate::core::message::HubEventExt;
