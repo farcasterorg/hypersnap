@@ -49,10 +49,11 @@ jobs:
       - working-directory: ./snapchain
         run: cargo fmt --all --check
 
-  # Two jobs in parallel: `unit` (library and binary tests, doc tests, the
-  # binaries, the client parity tests) and `integration` (tests/*, mostly the
-  # serial consensus suite). Both restore one cache that main fills with every
-  # test target, so a pull request recompiles only what it changed.
+  # Three jobs in parallel: `unit` (library and binary tests, doc tests, the
+  # binaries, the client parity tests) and `integration-1`/`integration-2`
+  # (tests/*; the consensus suite runs one test at a time, so each takes half
+  # of it). All restore one cache that main fills with every test target, so
+  # a pull request recompiles only what it changed.
   test:
     name: test (${{ matrix.suite }})
     timeout-minutes: 60
@@ -63,10 +64,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: [unit, integration]
+        suite: [unit, integration-1, integration-2]
     env:
       # main's integration job builds every target and saves the caches
-      SAVE_CACHE: ${{ github.ref == 'refs/heads/main' && matrix.suite == 'integration' }}
+      SAVE_CACHE: ${{ github.ref == 'refs/heads/main' && matrix.suite == 'integration-1' }}
     steps:
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
@@ -137,12 +138,20 @@ jobs:
           CARGO_INCREMENTAL: "1"
         run: cargo build --bins --profile test
 
+      # The consensus tests split by alternating names: integration-2 runs the
+      # even ones, integration-1 the odd ones plus every other integration test.
       - name: Integration tests
-        if: matrix.suite == 'integration'
+        if: startsWith(matrix.suite, 'integration')
         working-directory: ./snapchain
         env:
           CARGO_INCREMENTAL: "1"
-        run: cargo test --test '*'
+        run: |
+          even=$(cargo test --test consensus_test -- --list | sed -n 's/: test$//p' | sort | awk 'NR % 2 == 0')
+          if [ "${{ matrix.suite }}" = integration-1 ]; then
+            cargo test --test '*' -- --exact $(printf -- '--skip %s ' $even)
+          else
+            cargo test --test consensus_test -- --exact $even
+          fi
 
       - if: matrix.suite == 'unit'
         uses: actions/setup-node@v4
