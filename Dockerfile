@@ -1,4 +1,4 @@
-FROM rust:1.95 AS builder
+FROM rust:1.95 AS base
 
 WORKDIR /usr/src/app
 
@@ -9,7 +9,6 @@ ARG ETH_SIGNATURE_VERIFIER_GIT_REPO_URL=https://github.com/CassOnMars/eth-signat
 ENV ETH_SIGNATURE_VERIFIER_GIT_REPO_URL=$ETH_SIGNATURE_VERIFIER_GIT_REPO_URL
 ARG ETH_SIGNATURE_VERIFIER_GIT_REF=8deb4a091982c345949dc66bf8684489d9f11889
 ENV RUST_BACKTRACE=1
-RUN echo "clear cache" # Invalidate cache to pick up latest eth-signature-verifier
 RUN <<EOF
 set -eu
 apt-get update && apt-get install -y build-essential libclang-dev git libjemalloc-dev llvm-dev make protobuf-compiler libssl-dev openssh-client cmake
@@ -22,24 +21,40 @@ cd ..
 git clone $MALACHITE_GIT_REPO_URL
 cd malachite
 git checkout $MALACHITE_GIT_REF
-cd code
-cargo build
 EOF
+# cargo-chef splits the build: every dependency (malachite included) compiles
+# in its own layer, keyed only by Cargo.toml/Cargo.lock, so a source change
+# rebuilds snapchain alone and CI can keep that layer in its cache.
+RUN cargo install cargo-chef --locked
 
-# Unfortunately, we can't prefetch creates without including the source code,
-# since the Cargo configuration references files in src.
-# This means we'll re-fetch all crates every time the source code changes,
-# which isn't ideal.
+FROM base AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM base AS builder
+COPY --from=planner /usr/src/app/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
+
 COPY Cargo.lock Cargo.toml ./
 COPY proto ./proto
 COPY src ./src
 
 ENV RUST_BACKTRACE=full
-RUN cargo build --release --bins
-
+# The binaries go to /out and target/ is dropped in the same layer, so the
+# layer that changes with every commit stays small instead of holding every
+# compiled dependency again.
+RUN <<EOF
+set -eu
+cargo build --release --bins
+mkdir -p /out
+cp target/release/hypersnap target/release/follow_blocks target/release/setup_local_testnet \
+  target/release/submit_message target/release/perftest target/release/repair_block_event \
+  target/release/inspect_block_event /out/
 ## Pre-generate some configurations we can use
 # TOOD: consider doing something different here
-RUN target/release/setup_local_testnet
+/out/setup_local_testnet
+rm -rf target
+EOF
 
 #################################################################################
 
@@ -66,15 +81,7 @@ EOF
 WORKDIR /app
 COPY --from=builder /usr/src/app/proto/definitions /app/proto
 COPY --from=builder /usr/src/app/nodes /app/nodes
-COPY --from=builder \
-  /usr/src/app/target/release/hypersnap \
-  /usr/src/app/target/release/follow_blocks \
-  /usr/src/app/target/release/setup_local_testnet \
-  /usr/src/app/target/release/submit_message \
-  /usr/src/app/target/release/perftest \
-  /usr/src/app/target/release/repair_block_event \
-  /usr/src/app/target/release/inspect_block_event \
-  /app/
+COPY --from=builder /out/ /app/
 
 ENV RUSTFLAGS="-Awarnings"
 ENTRYPOINT ["./hypersnap"]

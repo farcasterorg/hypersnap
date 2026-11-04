@@ -49,9 +49,24 @@ jobs:
       - working-directory: ./snapchain
         run: cargo fmt --all --check
 
+  # Two jobs in parallel: `unit` (library and binary tests, doc tests, the
+  # binaries, the client parity tests) and `integration` (tests/*, mostly the
+  # serial consensus suite). Both restore one cache that main fills with every
+  # test target, so a pull request recompiles only what it changed.
   test:
+    name: test (${{ matrix.suite }})
     timeout-minutes: 60
     runs-on: ${{ vars.RUNS_ON == 'true' && fromJSON(format('["runs-on={0}","runner=64cpu-linux-arm64"]', github.run_id)) || 'ubuntu-24.04-arm' }}
+    permissions:
+      contents: read
+      actions: write # main deletes the incremental caches it supersedes
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [unit, integration]
+    env:
+      # main's integration job builds every target and saves the caches
+      SAVE_CACHE: ${{ github.ref == 'refs/heads/main' && matrix.suite == 'integration' }}
     steps:
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
@@ -72,30 +87,90 @@ jobs:
         with:
           path: ./snapchain
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
       # mold links the test and node binaries several times faster than ld
       - uses: rui314/setup-mold@v1
 
-      # Dependencies (and malachite) come from the cache, so a PR only
-      # recompiles snapchain itself. Only main saves, so PRs can't evict it.
+      # Compiled dependencies (and the cargo registry), pruned to the lockfile.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: snapchain
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          shared-key: verify
+          save-if: ${{ env.SAVE_CACHE == 'true' }}
 
-      - working-directory: ./snapchain
-        run: cargo test
+      # snapchain's own incremental build data: a change to a few files
+      # recompiles about a third of what a clean build of the crate does.
+      # One entry per main commit; older ones are deleted below.
+      - name: Restore incremental build
+        id: incremental
+        uses: actions/cache/restore@v4
+        with:
+          path: snapchain/target/debug/incremental
+          key: incremental-${{ runner.arch }}-${{ hashFiles('snapchain/rust-toolchain.toml', 'snapchain/Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            incremental-${{ runner.arch }}-${{ hashFiles('snapchain/rust-toolchain.toml', 'snapchain/Cargo.lock') }}-
+            incremental-${{ runner.arch }}-
 
-      - working-directory: ./snapchain
-        run: cargo build --bins
+      - name: Build every test target (main, for the cache)
+        if: env.SAVE_CACHE == 'true'
+        working-directory: ./snapchain
+        env:
+          CARGO_INCREMENTAL: "1" # rust-cache turns it off for dependencies
+        run: |
+          cargo test --no-run
+          cargo build --bins --profile test
 
-      - working-directory: ./snapchain/tests/client_parity_tests
+      - name: Unit and doc tests
+        if: matrix.suite == 'unit'
+        working-directory: ./snapchain
+        env:
+          CARGO_INCREMENTAL: "1"
+        run: cargo test --lib --bins --doc
+
+      # The binaries outside the test harness; the test profile reuses what
+      # the tests just compiled instead of building snapchain again.
+      - name: Build the binaries
+        if: matrix.suite == 'unit'
+        working-directory: ./snapchain
+        env:
+          CARGO_INCREMENTAL: "1"
+        run: cargo build --bins --profile test
+
+      - name: Integration tests
+        if: matrix.suite == 'integration'
+        working-directory: ./snapchain
+        env:
+          CARGO_INCREMENTAL: "1"
+        run: cargo test --test '*'
+
+      - if: matrix.suite == 'unit'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: yarn
+          cache-dependency-path: snapchain/tests/client_parity_tests/yarn.lock
+
+      - if: matrix.suite == 'unit'
+        working-directory: ./snapchain/tests/client_parity_tests
         run: |
           npx node-gyp@12.2.0 install
-          yarn install
+          yarn install --frozen-lockfile
 
-      - working-directory: ./snapchain/tests/client_parity_tests
+      - if: matrix.suite == 'unit'
+        working-directory: ./snapchain/tests/client_parity_tests
         run: yarn test
+
+      - name: Save incremental build
+        if: env.SAVE_CACHE == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: snapchain/target/debug/incremental
+          key: ${{ steps.incremental.outputs.cache-primary-key }}
+
+      - name: Delete superseded incremental builds
+        if: env.SAVE_CACHE == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEEP: ${{ steps.incremental.outputs.cache-primary-key }}
+        run: |
+          gh cache list --repo "$GITHUB_REPOSITORY" --key "incremental-${{ runner.arch }}-" --limit 100 --json key --jq '.[].key' |
+            grep -vx "$KEEP" | xargs -r -n1 gh cache delete --repo "$GITHUB_REPOSITORY"
