@@ -13,7 +13,7 @@ use crate::proto::message_data::Body;
 use crate::proto::{Message, MessageType};
 use crate::storage::db::{RocksDB, RocksDbTransactionBatch};
 use async_trait::async_trait;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Key prefixes for social graph index data.
@@ -57,15 +57,46 @@ pub struct SocialGraphIndexer {
     db: Arc<RocksDB>,
     checkpoint: AtomicU64,
     items_indexed: AtomicU64,
+    caught_up: AtomicBool,
 }
 
 impl SocialGraphIndexer {
     pub fn new(config: FeatureConfig, db: Arc<RocksDB>) -> Self {
+        let indexer = Self::open(config, db);
+        indexer
+            .prepare(&AtomicBool::new(false))
+            .expect("Failed to prepare social graph index");
+        indexer.caught_up.store(true, Ordering::Relaxed);
+        indexer
+    }
+
+    /// Open a query handle immediately. The dedicated block worker prepares the
+    /// schema before writing; HTTP readers must share this handle rather than
+    /// constructing another indexer that could clear the index under the writer.
+    pub(crate) fn open(config: FeatureConfig, db: Arc<RocksDB>) -> Self {
+        let checkpoint = Self::load_checkpoint(&db).unwrap_or(0);
+        Self {
+            config,
+            db,
+            checkpoint: AtomicU64::new(checkpoint),
+            items_indexed: AtomicU64::new(0),
+            caught_up: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn set_caught_up(&self, caught_up: bool) {
+        self.caught_up.store(caught_up, Ordering::Relaxed);
+    }
+
+    /// Only the background writer calls this, before replaying any blocks.
+    pub(crate) fn prepare(&self, stop: &AtomicBool) -> Result<(), IndexerError> {
+        let db = &self.db;
         // Check schema version — if outdated, clear backfill checkpoints
         // and all index data so backfill re-runs from scratch.
         let version_key = vec![keys::SOCIAL_GRAPH_PREFIX, keys::SCHEMA_VERSION];
         let stored_version = match db.get(&version_key) {
             Ok(Some(v)) if v.len() == 4 => u32::from_be_bytes(v[..4].try_into().unwrap()),
+            Err(e) => return Err(IndexerError::Storage(e.to_string())),
             _ => 0,
         };
         if stored_version < SOCIAL_GRAPH_SCHEMA_VERSION {
@@ -74,19 +105,15 @@ impl SocialGraphIndexer {
                 stored_version,
                 SOCIAL_GRAPH_SCHEMA_VERSION,
             );
-            Self::clear_all_data(&db);
-            let _ = db.put(&version_key, &SOCIAL_GRAPH_SCHEMA_VERSION.to_be_bytes());
+            Self::clear_all_data(db, stop)?;
+            db.put(&version_key, &SOCIAL_GRAPH_SCHEMA_VERSION.to_be_bytes())
+                .map_err(|e| IndexerError::Storage(e.to_string()))?;
         }
 
         // Re-read checkpoint after potential clear (clear_all_data deletes it)
-        let checkpoint = Self::load_checkpoint(&db).unwrap_or(0);
-
-        Self {
-            config,
-            db,
-            checkpoint: AtomicU64::new(checkpoint),
-            items_indexed: AtomicU64::new(0),
-        }
+        self.checkpoint
+            .store(Self::load_checkpoint(db)?, Ordering::SeqCst);
+        Ok(())
     }
 
     /// Get the number of followers for a FID.
@@ -731,7 +758,7 @@ impl SocialGraphIndexer {
     }
 
     /// Clear all social graph index data and backfill checkpoints.
-    fn clear_all_data(db: &RocksDB) {
+    fn clear_all_data(db: &RocksDB, stop_requested: &AtomicBool) -> Result<(), IndexerError> {
         let prefix = vec![keys::SOCIAL_GRAPH_PREFIX];
         let stop = vec![keys::SOCIAL_GRAPH_PREFIX + 1];
 
@@ -739,32 +766,54 @@ impl SocialGraphIndexer {
         // entries per FID there can be millions of keys. A single page
         // scan of 100K won't cover them all.
         let mut total_deleted = 0u64;
+        let started = std::time::Instant::now();
+        let mut last_log = started;
+        let mut start_key = prefix;
         loop {
+            if stop_requested.load(Ordering::Relaxed) {
+                return Err(IndexerError::Internal(
+                    "Social graph worker stopping".into(),
+                ));
+            }
             let page_options = crate::storage::db::PageOptions {
-                page_size: Some(100_000),
+                page_size: Some(10_000),
                 page_token: None,
                 reverse: false,
             };
             let mut keys = Vec::new();
-            let _ = db.for_each_iterator_by_prefix_paged(
-                Some(prefix.clone()),
+            db.for_each_iterator_by_prefix_paged(
+                Some(start_key.clone()),
                 Some(stop.clone()),
                 &page_options,
                 |key, _| {
                     keys.push(key.to_vec());
                     Ok(false)
                 },
-            );
+            )
+            .map_err(|e| IndexerError::Storage(e.to_string()))?;
             if keys.is_empty() {
                 break;
             }
             let batch_len = keys.len() as u64;
+            // Continue after the last deleted key instead of repeatedly seeking
+            // through the growing tombstone prefix on every batch.
+            start_key = keys.last().unwrap().clone();
+            start_key.push(0);
             let mut txn = RocksDbTransactionBatch::new();
             for key in keys {
                 txn.delete(key);
             }
-            let _ = db.commit(txn);
+            db.commit(txn)
+                .map_err(|e| IndexerError::Storage(e.to_string()))?;
             total_deleted += batch_len;
+            if last_log.elapsed().as_secs() >= 5 {
+                tracing::info!(
+                    total_deleted,
+                    elapsed_secs = started.elapsed().as_secs(),
+                    "Social graph index clear progress"
+                );
+                last_log = std::time::Instant::now();
+            }
         }
         if total_deleted > 0 {
             tracing::info!("Cleared {} social graph index entries", total_deleted);
@@ -787,7 +836,7 @@ impl SocialGraphIndexer {
                 page_token: None,
                 reverse: false,
             };
-            let _ = db.for_each_iterator_by_prefix_paged(
+            db.for_each_iterator_by_prefix_paged(
                 Some(cp_prefix),
                 Some(cp_stop),
                 &page_options,
@@ -795,15 +844,18 @@ impl SocialGraphIndexer {
                     cp_keys.push(key.to_vec());
                     Ok(false)
                 },
-            );
+            )
+            .map_err(|e| IndexerError::Storage(e.to_string()))?;
             if !cp_keys.is_empty() {
                 let mut txn = RocksDbTransactionBatch::new();
                 for key in cp_keys {
                     txn.delete(key);
                 }
-                let _ = db.commit(txn);
+                db.commit(txn)
+                    .map_err(|e| IndexerError::Storage(e.to_string()))?;
             }
         }
+        Ok(())
     }
 }
 
@@ -918,7 +970,8 @@ impl Indexer for SocialGraphIndexer {
             items_indexed: self.items_indexed.load(Ordering::Relaxed),
             last_event_id: self.checkpoint.load(Ordering::SeqCst),
             last_block_height: 0, // TODO: track block height
-            backfill_complete: self.checkpoint.load(Ordering::SeqCst) > 0,
+            backfill_complete: self.caught_up.load(Ordering::Relaxed)
+                && self.checkpoint.load(Ordering::SeqCst) > 0,
             size_bytes: 0, // TODO: estimate size
         }
     }
@@ -928,6 +981,67 @@ impl Indexer for SocialGraphIndexer {
 mod tests {
     use super::*;
     use crate::proto::{LinkBody, MessageData};
+
+    #[test]
+    fn opening_for_background_rebuild_does_not_delete_data() {
+        let db = make_test_db();
+        let version = vec![keys::SOCIAL_GRAPH_PREFIX, keys::SCHEMA_VERSION];
+        db.put(&version, &4u32.to_be_bytes()).unwrap();
+        let count = SocialGraphIndexer::make_follower_count_key(123);
+        db.put(&count, &42u64.to_be_bytes()).unwrap();
+        let indexer = SocialGraphIndexer::open(FeatureConfig::default(), db.clone());
+        assert_eq!(indexer.get_follower_count(123).unwrap(), 42);
+        assert!(!indexer.stats().backfill_complete);
+        assert_eq!(db.get(&version).unwrap().unwrap(), 4u32.to_be_bytes());
+
+        indexer.prepare(&AtomicBool::new(false)).unwrap();
+        assert_eq!(indexer.get_follower_count(123).unwrap(), 0);
+        assert_eq!(
+            db.get(&version).unwrap().unwrap(),
+            SOCIAL_GRAPH_SCHEMA_VERSION.to_be_bytes()
+        );
+    }
+
+    #[test]
+    fn schema_clear_advances_across_multiple_pages_and_preserves_other_indexes() {
+        let db = make_test_db();
+        let mut txn = RocksDbTransactionBatch::new();
+        for fid in 0..20_005 {
+            txn.put(
+                SocialGraphIndexer::make_follower_count_key(fid),
+                1u64.to_be_bytes().to_vec(),
+            );
+        }
+        let unrelated = vec![0xE1, 0x01];
+        txn.put(unrelated.clone(), vec![17]);
+        db.commit(txn).unwrap();
+        let indexer = SocialGraphIndexer::open(FeatureConfig::default(), db.clone());
+        indexer.prepare(&AtomicBool::new(false)).unwrap();
+        for fid in 0..20_005 {
+            assert_eq!(indexer.get_follower_count(fid).unwrap(), 0);
+        }
+        assert_eq!(db.get(&unrelated).unwrap(), Some(vec![17]));
+    }
+
+    #[test]
+    fn interrupted_or_failed_clear_does_not_mark_schema_complete() {
+        let db = make_test_db();
+        let version = vec![keys::SOCIAL_GRAPH_PREFIX, keys::SCHEMA_VERSION];
+        db.put(&version, &4u32.to_be_bytes()).unwrap();
+        db.put(
+            &SocialGraphIndexer::make_follower_count_key(1),
+            &1u64.to_be_bytes(),
+        )
+        .unwrap();
+        let indexer = SocialGraphIndexer::open(FeatureConfig::default(), db.clone());
+        assert!(indexer.prepare(&AtomicBool::new(true)).is_err());
+        assert_eq!(db.get(&version).unwrap().unwrap(), 4u32.to_be_bytes());
+
+        let read_only = Arc::new(db.open_read_only().unwrap());
+        let reader = SocialGraphIndexer::open(FeatureConfig::default(), read_only);
+        assert!(reader.prepare(&AtomicBool::new(false)).is_err());
+        assert_eq!(db.get(&version).unwrap().unwrap(), 4u32.to_be_bytes());
+    }
 
     fn make_test_db() -> Arc<RocksDB> {
         let tmp_path = tempfile::tempdir()

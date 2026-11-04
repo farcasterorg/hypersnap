@@ -39,6 +39,7 @@ pub mod metrics;
 pub mod notifications;
 pub mod search;
 pub mod social_graph;
+mod social_graph_worker;
 pub mod ssrf;
 pub mod types;
 pub mod user_data_index;
@@ -86,6 +87,8 @@ pub fn create_index_channel(capacity: usize) -> (IndexEventSender, IndexEventRec
 pub struct ApiSystem {
     /// Worker pool task handle.
     pub worker_handle: tokio::task::JoinHandle<()>,
+    /// Ordered social graph migration/replay/tailing task.
+    pub social_graph_handle: Option<tokio::task::JoinHandle<()>>,
     /// Bridge task handles (one per shard).
     pub bridge_handles: Vec<tokio::task::JoinHandle<()>>,
     /// Webhook delivery worker task handle.
@@ -116,6 +119,9 @@ impl ApiSystem {
     pub async fn shutdown(self) {
         tracing::info!("Shutting down Farcaster indexing system");
         let _ = self.shutdown_tx.send(());
+        if let Some(handle) = self.social_graph_handle {
+            let _ = handle.await;
+        }
 
         // Wait for worker pool
         if let Err(e) = self.worker_handle.await {
@@ -209,7 +215,7 @@ pub fn initialize(
     // Create indexers
     let social_graph_indexer = if config.social_graph.enabled {
         tracing::info!("Social graph indexer enabled");
-        Some(Arc::new(SocialGraphIndexer::new(
+        Some(Arc::new(SocialGraphIndexer::open(
             config.social_graph.clone(),
             db.clone(),
         )))
@@ -368,11 +374,8 @@ pub fn initialize(
     backfill_indexers.push(cast_hash_indexer.clone());
     backfill_indexers.push(cast_quotes_indexer.clone());
     backfill_indexers.push(user_data_indexer.clone());
-    if config.social_graph.backfill_on_startup {
-        if let Some(ref idx) = social_graph_indexer {
-            backfill_indexers.push(idx.clone());
-        }
-    }
+    // Social graph has its own ordered block worker. Its schema migration and
+    // replay must never gate the other indexers or compete with live writes.
     if config.channels.backfill_on_startup {
         if let Some(ref idx) = channels_indexer {
             backfill_indexers.push(idx.clone());
@@ -403,10 +406,6 @@ pub fn initialize(
     worker_pool.register_arc(user_data_indexer.clone());
     worker_pool.register_arc(custody_indexer.clone());
     worker_pool.register_arc(user_search_indexer.clone());
-
-    if let Some(ref indexer) = social_graph_indexer {
-        worker_pool.register_arc(indexer.clone());
-    }
 
     if let Some(ref indexer) = channels_indexer {
         worker_pool.register_arc(indexer.clone());
@@ -524,6 +523,15 @@ pub fn initialize(
         };
 
     let shutdown_tx = worker_pool.shutdown_sender();
+    let social_graph_handle = social_graph_indexer.as_ref().map(|indexer| {
+        social_graph_worker::spawn(
+            indexer.clone(),
+            db.clone(),
+            shard_stores.clone(),
+            config.social_graph.backfill_on_startup,
+            shutdown_tx.subscribe(),
+        )
+    });
 
     // Spawn worker pool
     let worker_handle = tokio::spawn(async move {
@@ -666,18 +674,7 @@ pub fn initialize(
                 config.notifications.clone(),
                 app_store.clone(),
                 token_store.clone(),
-                // The send handler created here is constructed before
-                // social_graph_indexer's late-binding from main.rs is
-                // possible, so we pass the indexer directly when it's
-                // already enabled in `[api.social_graph]`.
-                if config.social_graph.enabled {
-                    Some(Arc::new(SocialGraphIndexer::new(
-                        config.social_graph.clone(),
-                        db.clone(),
-                    )))
-                } else {
-                    None
-                },
+                http_handler.social_graph_indexer(),
             );
             http_handler.set_notification_sender(send_handler);
 
@@ -702,6 +699,7 @@ pub fn initialize(
 
     Some(ApiSystem {
         worker_handle,
+        social_graph_handle,
         bridge_handles,
         delivery_handle,
         retry_pump_handle,

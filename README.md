@@ -67,6 +67,22 @@ To retain an existing index, stop the old node and copy the entire old index
 directory to `<rocksdb_dir>/search_index` before starting the updated node.
 The backfill status endpoint is `GET /v2/farcaster/_status/backfill`.
 
+### Social graph rebuilds
+
+Social graph schema upgrades clear and rebuild follower/following indexes in a
+dedicated background worker. The node, HTTP server, and other API indexers can
+start while this runs. Follower lists, counts, and feeds that depend on them can
+be incomplete until `social_graph.backfill_complete` is true in the backfill
+status response's `indexers` array.
+
+The worker finishes deleting old index entries before indexing any new ones,
+then replays stored shard blocks and continues following new committed blocks.
+Those blocks serve as the durable queue during the rebuild; per-shard cursors
+resume replay after a restart. Keep block retention long enough to cover the
+rebuild. Logs report deletion and replay progress every five seconds while
+batches complete, and storage failures are logged and retried without skipping
+the failed batch.
+
 ## Contributing 
 
 We welcome contributions from developers of all skill levels. Please look for issues labeled with "help wanted" to find good tickets to work on. If you are working on something that is not explicitly a ticket, we may or may not accept it. We encourage checking with someone on the team before spending a lot of time on something. 

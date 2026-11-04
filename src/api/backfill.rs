@@ -140,10 +140,24 @@ pub fn shard_checkpoint_prefix(indexer_name: &str) -> Vec<u8> {
 }
 
 pub fn load_shard_checkpoint(db: &RocksDB, indexer_name: &str, shard_id: u32) -> u64 {
+    try_load_shard_checkpoint(db, indexer_name, shard_id).unwrap_or(0)
+}
+
+/// Writers that resume ordered replay must distinguish a missing cursor from a
+/// failed read; replaying from zero on a transient error can reorder old follows.
+pub(crate) fn try_load_shard_checkpoint(
+    db: &RocksDB,
+    indexer_name: &str,
+    shard_id: u32,
+) -> Result<u64, IndexerError> {
     let key = make_shard_checkpoint_key(indexer_name, shard_id);
     match db.get(&key) {
-        Ok(Some(bytes)) if bytes.len() == 8 => u64::from_be_bytes(bytes[..8].try_into().unwrap()),
-        _ => 0,
+        Ok(Some(bytes)) if bytes.len() == 8 => {
+            Ok(u64::from_be_bytes(bytes[..8].try_into().unwrap()))
+        }
+        Ok(None) => Ok(0),
+        Ok(Some(_)) => Err(IndexerError::Storage("Invalid backfill checkpoint".into())),
+        Err(e) => Err(IndexerError::Storage(e.to_string())),
     }
 }
 

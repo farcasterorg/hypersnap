@@ -200,14 +200,7 @@ async fn start_servers(
             handler.set_conversations(conv);
         }
         if app_config.api.feeds.enabled {
-            let social_graph = if app_config.api.social_graph.enabled {
-                Some(Arc::new(snapchain::api::SocialGraphIndexer::new(
-                    app_config.api.social_graph.clone(),
-                    block_stores.db.clone(),
-                )))
-            } else {
-                None
-            };
+            let social_graph = handler.social_graph_indexer();
             let metrics = if app_config.api.metrics.enabled {
                 Some(Arc::new(snapchain::api::MetricsIndexer::new(
                     app_config.api.metrics.clone(),
@@ -230,14 +223,7 @@ async fn start_servers(
             handler.set_search(search.clone());
         }
         // Wire user hydrator for populating User objects in API responses
-        let social_graph_for_hydrator = if app_config.api.social_graph.enabled {
-            Some(Arc::new(snapchain::api::SocialGraphIndexer::new(
-                app_config.api.social_graph.clone(),
-                block_stores.db.clone(),
-            )))
-        } else {
-            None
-        };
+        let social_graph_for_hydrator = handler.social_graph_indexer();
         let hydrator = Arc::new(snapchain::api::HubUserHydrator::new(
             api_service.clone(),
             social_graph_for_hydrator,

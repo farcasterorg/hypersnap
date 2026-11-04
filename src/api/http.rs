@@ -307,6 +307,11 @@ const BULK_CAST_PROBE_LIMIT: usize = 3;
 const MAX_THREAD_HOPS: usize = 64;
 
 impl ApiHttpHandler {
+    /// Share the migration owner's read handle with feeds and user hydration.
+    pub fn social_graph_indexer(&self) -> Option<Arc<SocialGraphIndexer>> {
+        self.social_graph.clone()
+    }
+
     /// Create a new handler with optional indexers.
     pub fn new(
         social_graph: Option<Arc<SocialGraphIndexer>>,
