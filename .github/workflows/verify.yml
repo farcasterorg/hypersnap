@@ -124,7 +124,9 @@ jobs:
         working-directory: ./snapchain
         env:
           CARGO_INCREMENTAL: "1"
-        run: cargo test --lib --bins --doc
+        run: |
+          cargo test --lib --bins
+          cargo test --doc
 
       # The binaries outside the test harness; the test profile reuses what
       # the tests just compiled instead of building snapchain again.
