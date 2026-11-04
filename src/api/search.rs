@@ -20,8 +20,10 @@
 use crate::api::config::SearchConfig;
 use crate::api::events::IndexEvent;
 use crate::api::indexer::{Indexer, IndexerError, IndexerStats};
+use crate::api::{backfill, backfill_checkpoint_name, SEARCH_BACKFILL_CHECKPOINT};
 use crate::proto::message_data::Body;
 use crate::proto::{Message, MessageType};
+use crate::storage::db::RocksDB;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -71,6 +73,45 @@ pub struct SearchIndexer {
 }
 
 impl SearchIndexer {
+    /// Open the index on persistent node storage and restore its backfill status.
+    pub fn open(
+        config: SearchConfig,
+        db: &RocksDB,
+        shard_ids: &[u32],
+    ) -> Result<Self, IndexerError> {
+        let db_path = std::path::PathBuf::from(db.location());
+        let rocksdb_dir = db_path.parent().ok_or_else(|| {
+            IndexerError::Storage("API database has no parent directory".to_string())
+        })?;
+        let index_path = config.resolved_index_path(rocksdb_dir);
+        tracing::info!(path = %index_path.display(), "Opening persistent search index");
+        if !Self::exists(&index_path)? {
+            tracing::info!("Search index missing; resetting saved search backfill cursors");
+            // The Tantivy directory may have been lost when an old container was
+            // recreated. Its RocksDB cursors survive, but no longer describe this
+            // index. Reset both backfill paths BEFORE creating the new index so a
+            // crash during initialization cannot leave a new index with old cursors.
+            for &shard_id in shard_ids {
+                backfill::save_shard_checkpoint(db, SEARCH_BACKFILL_CHECKPOINT, shard_id, 0)?;
+                backfill::save_shard_checkpoint(
+                    db,
+                    &backfill_checkpoint_name("search"),
+                    shard_id,
+                    0,
+                )?;
+            }
+        }
+        let search = Self::new(config, &index_path)?;
+        search.set_backfill_complete(
+            !shard_ids.is_empty()
+                && shard_ids.iter().all(|&shard_id| {
+                    backfill::load_shard_checkpoint(db, SEARCH_BACKFILL_CHECKPOINT, shard_id)
+                        == u64::MAX
+                }),
+        );
+        Ok(search)
+    }
+
     /// Create a new search indexer.
     ///
     /// # Arguments
@@ -91,9 +132,12 @@ impl SearchIndexer {
             IndexerError::Storage(format!("Failed to create index directory: {}", e))
         })?;
 
-        let index = Index::create_in_dir(index_path, schema.clone())
-            .or_else(|_| Index::open_in_dir(index_path))
-            .map_err(|e| IndexerError::Storage(format!("Failed to open index: {}", e)))?;
+        let index = if !Self::exists(index_path)? {
+            Index::create_in_dir(index_path, schema)
+        } else {
+            Index::open_in_dir(index_path)
+        }
+        .map_err(|e| IndexerError::Storage(format!("Failed to open index: {}", e)))?;
 
         // Create writer with memory budget
         let memory_bytes = config.memory_budget_mb * 1024 * 1024;
@@ -102,7 +146,7 @@ impl SearchIndexer {
             .map_err(|e| IndexerError::Storage(format!("Failed to create writer: {}", e)))?;
 
         // Create reader
-        let reader = index
+        let reader: IndexReader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::OnCommitWithDelay)
             .try_into()
@@ -115,6 +159,7 @@ impl SearchIndexer {
             timestamp,
         };
 
+        let docs_indexed = reader.searcher().num_docs();
         Ok(Self {
             config,
             index,
@@ -122,8 +167,25 @@ impl SearchIndexer {
             reader,
             fields,
             checkpoint: AtomicU64::new(0),
-            docs_indexed: AtomicU64::new(0),
+            docs_indexed: AtomicU64::new(docs_indexed),
         })
+    }
+
+    pub(crate) fn exists(index_path: &Path) -> Result<bool, IndexerError> {
+        if !index_path.try_exists().map_err(|e| {
+            IndexerError::Storage(format!("Failed to inspect index directory: {}", e))
+        })? {
+            return Ok(false);
+        }
+        let directory = tantivy::directory::MmapDirectory::open(index_path)
+            .map_err(|e| IndexerError::Storage(format!("Failed to open index directory: {}", e)))?;
+        Index::exists(&directory)
+            .map_err(|e| IndexerError::Storage(format!("Failed to inspect index: {}", e)))
+    }
+
+    pub(crate) fn set_backfill_complete(&self, complete: bool) {
+        self.checkpoint
+            .store(if complete { u64::MAX } else { 0 }, Ordering::SeqCst);
     }
 
     /// Search for casts by text.

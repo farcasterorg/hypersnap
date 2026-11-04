@@ -57,6 +57,7 @@ services:
         [api.search]
         enabled = true
         backfill_on_startup = true
+        index_path = ".rocks/search_index"
 
         [api.conversations]
         enabled = true

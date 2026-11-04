@@ -52,6 +52,21 @@ cd snapchain
 
 This ensures your node is always running the latest available version.
 
+### Persistent search index
+
+When search is enabled, its Tantivy index defaults to `search_index` inside
+`rocksdb_dir`. The supplied mainnet and nightly Compose files explicitly use
+`.rocks/search_index`, on the same persistent mount as the node databases.
+If you set `[api.search].index_path` yourself, keep that directory on persistent
+storage too.
+
+Older versions used `./data/search_index`, outside the supplied Docker mounts.
+On the first upgrade, search rebuilds once at the new location when
+`backfill_on_startup = true`; later restarts reuse the index and saved cursors.
+To retain an existing index, stop the old node and copy the entire old index
+directory to `<rocksdb_dir>/search_index` before starting the updated node.
+The backfill status endpoint is `GET /v2/farcaster/_status/backfill`.
+
 ## Contributing 
 
 We welcome contributions from developers of all skill levels. Please look for issues labeled with "help wanted" to find good tickets to work on. If you are working on something that is not explicitly a ticket, we may or may not accept it. We encourage checking with someone on the team before spending a lot of time on something. 

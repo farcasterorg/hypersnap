@@ -262,8 +262,9 @@ pub struct SearchConfig {
     #[serde(default)]
     pub engine: SearchEngine,
 
-    /// Path for Tantivy index files.
-    #[serde(default = "default_index_path")]
+    /// Path for Tantivy index files. Empty uses `search_index` under rocksdb_dir,
+    /// so the index shares the node's persistent volume.
+    #[serde(default)]
     pub index_path: String,
 
     /// Memory budget for Tantivy (in MB).
@@ -278,7 +279,7 @@ impl Default for SearchConfig {
             backfill_on_startup: false,
             backfill_batch_size: default_search_batch_size(),
             engine: SearchEngine::default(),
-            index_path: default_index_path(),
+            index_path: String::new(),
             memory_budget_mb: default_memory_budget_mb(),
         }
     }
@@ -288,8 +289,14 @@ fn default_search_batch_size() -> usize {
     1_000
 }
 
-fn default_index_path() -> String {
-    "./data/search_index".to_string()
+impl SearchConfig {
+    pub fn resolved_index_path(&self, rocksdb_dir: &std::path::Path) -> std::path::PathBuf {
+        if self.index_path.is_empty() {
+            rocksdb_dir.join("search_index")
+        } else {
+            std::path::PathBuf::from(&self.index_path)
+        }
+    }
 }
 
 fn default_memory_budget_mb() -> usize {

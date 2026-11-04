@@ -251,7 +251,8 @@ pub fn initialize(
 
     let search_indexer = if config.search.enabled {
         tracing::info!("Search indexer enabled");
-        match SearchIndexer::new(config.search.clone(), &config.search.index_path) {
+        let shard_ids: Vec<_> = shard_stores.keys().copied().collect();
+        match SearchIndexer::open(config.search.clone(), &db, &shard_ids) {
             Ok(indexer) => Some(Arc::new(indexer)),
             Err(e) => {
                 tracing::warn!("Failed to initialize search indexer: {:?}", e);
@@ -840,11 +841,6 @@ async fn run_search_backfill(
         // Mark shard as complete
         let _ = backfill::save_shard_checkpoint(db, SEARCH_BACKFILL_CHECKPOINT, shard_id, u64::MAX);
 
-        // Update the search indexer's own checkpoint for stats()
-        if let Err(e) = search.save_checkpoint(u64::MAX).await {
-            tracing::warn!(error = %e, "Failed to save search checkpoint");
-        }
-
         tracing::info!(
             shard_id,
             total_indexed,
@@ -852,6 +848,14 @@ async fn run_search_backfill(
         );
     }
 
+    // This also restores status when every shard was already complete.
+    search.set_backfill_complete(
+        !hyper_stores.is_empty()
+            && hyper_stores.keys().all(|&shard_id| {
+                backfill::load_shard_checkpoint(db, SEARCH_BACKFILL_CHECKPOINT, shard_id)
+                    == u64::MAX
+            }),
+    );
     tracing::info!(
         total_indexed,
         elapsed = ?start.elapsed(),
