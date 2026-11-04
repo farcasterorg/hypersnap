@@ -1022,7 +1022,7 @@ impl ApiHttpHandler {
             // === User endpoints ===
             "/v2/farcaster/user" => {
                 let fid: u64 = require_fid!(params);
-                self.handle_user(fid).await
+                self.handle_user(fid, viewer_fid).await
             }
             "/v2/farcaster/user/bulk" => {
                 let fids_str = require_param!(params, "fids");
@@ -1036,7 +1036,7 @@ impl ApiHttpHandler {
                         "No valid fids provided",
                     ));
                 }
-                self.handle_user_bulk(&fids).await
+                self.handle_user_bulk(&fids, viewer_fid).await
             }
             "/v2/farcaster/user/bulk-by-address" => {
                 let addresses = require_param!(params, "addresses");
@@ -1044,7 +1044,7 @@ impl ApiHttpHandler {
             }
             "/v2/farcaster/user/by-username" | "/v2/farcaster/user/by_username" => {
                 let username = require_param!(params, "username");
-                self.handle_user_by_username(&username).await
+                self.handle_user_by_username(&username, viewer_fid).await
             }
             "/v2/farcaster/user/custody-address" => {
                 let custody_address = require_param!(params, "custody_address");
@@ -1990,24 +1990,29 @@ impl ApiHttpHandler {
         }
     }
 
-    /// Handle GET /v2/farcaster/user?fid=N
+    /// Handle GET /v2/farcaster/user?fid=N[&viewer_fid=V]
     async fn handle_user(
         &self,
         fid: u64,
+        viewer_fid: Option<u64>,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
-        let user = self.get_user(fid).await;
+        let mut user = self.get_user(fid).await;
+        self.add_user_viewer_context(std::slice::from_mut(&mut user), viewer_fid)
+            .await;
         Ok(Self::json_response(
             StatusCode::OK,
             &types::UserResponse { user },
         ))
     }
 
-    /// Handle GET /v2/farcaster/user/bulk?fids=1,2,3
+    /// Handle GET /v2/farcaster/user/bulk?fids=1,2,3[&viewer_fid=V]
     async fn handle_user_bulk(
         &self,
         fids: &[u64],
+        viewer_fid: Option<u64>,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
-        let users = self.get_users(fids).await;
+        let mut users = self.get_users(fids).await;
+        self.add_user_viewer_context(&mut users, viewer_fid).await;
         Ok(Self::json_response(
             StatusCode::OK,
             &types::BulkUsersResponse { users },
@@ -2235,14 +2240,27 @@ impl ApiHttpHandler {
                 liked: reacted(crate::proto::ReactionType::Like).await,
                 recasted: reacted(crate::proto::ReactionType::Recast).await,
             });
-            for user in std::iter::once(&mut cast.author).chain(&mut cast.mentioned_profiles) {
-                user.viewer_context = Some(types::ViewerContext {
-                    following: hub.has_link(viewer, "follow", user.fid).await,
-                    followed_by: hub.has_link(user.fid, "follow", viewer).await,
-                    blocking: hub.has_link(viewer, "block", user.fid).await,
-                    blocked_by: hub.has_link(user.fid, "block", viewer).await,
-                });
-            }
+            self.add_user_viewer_context(std::slice::from_mut(&mut cast.author), viewer_fid)
+                .await;
+            self.add_user_viewer_context(&mut cast.mentioned_profiles, viewer_fid)
+                .await;
+        }
+    }
+
+    /// Fill `viewer_context` on each user (follow and block links in both
+    /// directions), as seen by `viewer_fid`. Does nothing without a viewer.
+    async fn add_user_viewer_context(&self, users: &mut [User], viewer_fid: Option<u64>) {
+        let Some(viewer) = viewer_fid else { return };
+        let Some(hub) = self.hub_query.read().unwrap().clone() else {
+            return;
+        };
+        for user in users {
+            user.viewer_context = Some(types::ViewerContext {
+                following: hub.has_link(viewer, "follow", user.fid).await,
+                followed_by: hub.has_link(user.fid, "follow", viewer).await,
+                blocking: hub.has_link(viewer, "block", user.fid).await,
+                blocked_by: hub.has_link(user.fid, "block", viewer).await,
+            });
         }
     }
 
@@ -2467,10 +2485,11 @@ impl ApiHttpHandler {
         ))
     }
 
-    /// Handle GET /v2/farcaster/user/by-username?username=X
+    /// Handle GET /v2/farcaster/user/by-username?username=X[&viewer_fid=V]
     async fn handle_user_by_username(
         &self,
         username: &str,
+        viewer_fid: Option<u64>,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
         let hub = self.hub_query.read().unwrap().clone();
         let Some(hub) = hub else {
@@ -2482,7 +2501,9 @@ impl ApiHttpHandler {
 
         match hub.get_fid_by_username(username).await {
             Some(fid) => {
-                let user = self.get_user(fid).await;
+                let mut user = self.get_user(fid).await;
+                self.add_user_viewer_context(std::slice::from_mut(&mut user), viewer_fid)
+                    .await;
                 Ok(Self::json_response(StatusCode::OK, &UserResponse { user }))
             }
             None => Ok(Self::error_response(
@@ -5951,6 +5972,51 @@ mod tests {
         assert!(json["mentioned_profiles"][0]
             .get("viewer_context")
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_user_viewer_context_only_with_viewer_fid() {
+        let (followed, follower, viewer) = (10, 11, 20);
+        let handler = ApiHttpHandler::new(None, None, None, None, None, None);
+        handler.set_hub_query(Arc::new(MockHubQuery {
+            links: vec![
+                (viewer, "follow", followed),
+                (follower, "follow", viewer),
+                (follower, "block", viewer),
+            ],
+            ..Default::default()
+        }));
+        let context = |following, followed_by, blocked_by| {
+            serde_json::json!({
+                "following": following,
+                "followed_by": followed_by,
+                "blocking": false,
+                "blocked_by": blocked_by,
+            })
+        };
+
+        let json = collect_json(handler.handle_user(followed, Some(viewer)).await.unwrap()).await;
+        assert_eq!(json["user"]["viewer_context"], context(true, false, false));
+        let json = collect_json(handler.handle_user(followed, None).await.unwrap()).await;
+        assert!(json["user"].get("viewer_context").is_none());
+
+        let json = collect_json(
+            handler
+                .handle_user_bulk(&[followed, follower], Some(viewer))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            json["users"][0]["viewer_context"],
+            context(true, false, false)
+        );
+        assert_eq!(
+            json["users"][1]["viewer_context"],
+            context(false, true, true)
+        );
+        let json = collect_json(handler.handle_user_bulk(&[followed], None).await.unwrap()).await;
+        assert!(json["users"][0].get("viewer_context").is_none());
     }
 
     #[tokio::test]
