@@ -13,7 +13,7 @@ use crate::proto::message_data::Body;
 use crate::proto::{Message, MessageType};
 use crate::storage::db::{RocksDB, RocksDbTransactionBatch};
 use async_trait::async_trait;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 /// Key prefixes for social graph index data.
@@ -36,8 +36,23 @@ mod keys {
     /// Allows iteration over all FIDs that this user follows
     pub const FOLLOWING_BY_FID: u8 = 0x04;
 
-    /// Schema version: <prefix><0xFE> -> version:4
+    /// Schema version of the generation readers use: <prefix><0xFE> -> version:4
     pub const SCHEMA_VERSION: u8 = 0xFE;
+
+    /// The four data sub-keys above exist twice: generation 0 as written, and
+    /// generation 1 with this bit set (0x11..0x14). A schema rebuild fills the
+    /// generation readers don't use, then switches them over (see
+    /// `social_graph_worker`), so follower data never disappears mid-rebuild.
+    pub const GENERATION_BIT: u8 = 0x10;
+
+    /// Generation readers use: <prefix><0xFD> -> generation:1 (absent = 0)
+    pub const ACTIVE_GENERATION: u8 = 0xFD;
+
+    /// Generation being rebuilt for the current schema: <prefix><0xFC> -> generation:1
+    pub const BUILDING_GENERATION: u8 = 0xFC;
+
+    /// Old generation still being deleted after a switch: <prefix><0xFB> -> generation:1
+    pub const DELETING_GENERATION: u8 = 0xFB;
 
     /// Checkpoint: <prefix><0xFF> -> event_id:8
     pub const CHECKPOINT: u8 = 0xFF;
@@ -58,6 +73,8 @@ pub struct SocialGraphIndexer {
     checkpoint: AtomicU64,
     items_indexed: AtomicU64,
     caught_up: AtomicBool,
+    /// 0 or `keys::GENERATION_BIT`: which copy of the data this handle reads and writes.
+    generation: AtomicU8,
 }
 
 impl SocialGraphIndexer {
@@ -75,13 +92,117 @@ impl SocialGraphIndexer {
     /// constructing another indexer that could clear the index under the writer.
     pub(crate) fn open(config: FeatureConfig, db: Arc<RocksDB>) -> Self {
         let checkpoint = Self::load_checkpoint(&db).unwrap_or(0);
+        let generation = Self::load_generation(&db, keys::ACTIVE_GENERATION)
+            .ok()
+            .flatten()
+            .unwrap_or(0);
         Self {
             config,
             db,
             checkpoint: AtomicU64::new(checkpoint),
             items_indexed: AtomicU64::new(0),
             caught_up: AtomicBool::new(false),
+            generation: AtomicU8::new(generation),
         }
+    }
+
+    /// A handle on `generation` of the same data, for the rebuild writer.
+    pub(crate) fn view(&self, generation: u8) -> Self {
+        let view = Self::open(self.config.clone(), self.db.clone());
+        view.generation.store(generation, Ordering::SeqCst);
+        view
+    }
+
+    pub(crate) fn generation(&self) -> u8 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    fn load_generation(db: &RocksDB, which: u8) -> Result<Option<u8>, IndexerError> {
+        match db.get(&[keys::SOCIAL_GRAPH_PREFIX, which]) {
+            Ok(Some(v)) if v.len() == 1 => Ok(Some(v[0])),
+            Ok(_) => Ok(None),
+            Err(e) => Err(IndexerError::Storage(e.to_string())),
+        }
+    }
+
+    /// The generation a schema rebuild is filling, if one is under way.
+    pub(crate) fn building_generation(&self) -> Result<Option<u8>, IndexerError> {
+        Self::load_generation(&self.db, keys::BUILDING_GENERATION)
+    }
+
+    /// The old generation still being deleted after a switch, if any.
+    pub(crate) fn deleting_generation(&self) -> Result<Option<u8>, IndexerError> {
+        Self::load_generation(&self.db, keys::DELETING_GENERATION)
+    }
+
+    /// Point readers at `generation`, which a rebuild has caught up to the tip,
+    /// and queue the old one for deletion. One write, so a restart sees either
+    /// the old state or the new one.
+    pub(crate) fn switch_to(&self, generation: u8) -> Result<(), IndexerError> {
+        let old = self.generation();
+        let mut txn = RocksDbTransactionBatch::new();
+        txn.put(
+            vec![keys::SOCIAL_GRAPH_PREFIX, keys::ACTIVE_GENERATION],
+            vec![generation],
+        );
+        txn.put(
+            vec![keys::SOCIAL_GRAPH_PREFIX, keys::SCHEMA_VERSION],
+            SOCIAL_GRAPH_SCHEMA_VERSION.to_be_bytes().to_vec(),
+        );
+        txn.put(
+            vec![keys::SOCIAL_GRAPH_PREFIX, keys::DELETING_GENERATION],
+            vec![old],
+        );
+        txn.delete(vec![keys::SOCIAL_GRAPH_PREFIX, keys::BUILDING_GENERATION]);
+        self.db
+            .commit(txn)
+            .map_err(|e| IndexerError::Storage(e.to_string()))?;
+        self.generation.store(generation, Ordering::SeqCst);
+        tracing::info!(
+            generation,
+            "Social graph rebuild switched readers to the new index"
+        );
+        Ok(())
+    }
+
+    /// Delete up to `budget` keys of `generation`; once none are left, its
+    /// block cursors and the deletion marker go too. Returns whether it's done.
+    pub(crate) fn delete_some(&self, generation: u8, budget: usize) -> Result<bool, IndexerError> {
+        let start = vec![keys::SOCIAL_GRAPH_PREFIX, keys::FOLLOWER_COUNT | generation];
+        let stop = vec![
+            keys::SOCIAL_GRAPH_PREFIX,
+            (keys::FOLLOWING_BY_FID | generation) + 1,
+        ];
+        let mut found = Vec::new();
+        self.db
+            .for_each_iterator_by_prefix_paged(
+                Some(start),
+                Some(stop),
+                &crate::storage::db::PageOptions {
+                    page_size: Some(budget),
+                    page_token: None,
+                    reverse: false,
+                },
+                |key, _| {
+                    found.push(key.to_vec());
+                    Ok(found.len() >= budget)
+                },
+            )
+            .map_err(|e| IndexerError::Storage(e.to_string()))?;
+        let mut txn = RocksDbTransactionBatch::new();
+        let done = found.is_empty();
+        for key in found {
+            txn.delete(key);
+        }
+        if done {
+            Self::delete_cursors(&self.db, &cursor_name(generation))?;
+            txn.delete(vec![keys::SOCIAL_GRAPH_PREFIX, keys::DELETING_GENERATION]);
+            tracing::info!(generation, "Old social graph index deleted");
+        }
+        self.db
+            .commit(txn)
+            .map_err(|e| IndexerError::Storage(e.to_string()))?;
+        Ok(done)
     }
 
     pub(crate) fn set_caught_up(&self, caught_up: bool) {
@@ -99,13 +220,36 @@ impl SocialGraphIndexer {
             Err(e) => return Err(IndexerError::Storage(e.to_string())),
             _ => 0,
         };
-        if stored_version < SOCIAL_GRAPH_SCHEMA_VERSION {
+        if stored_version < SOCIAL_GRAPH_SCHEMA_VERSION
+            && stored_version > 0
+            && self.config.backfill_on_startup
+        {
+            // An index readers rely on: keep serving it, and rebuild the other
+            // generation next to it (social_graph_worker switches them over).
+            if self.building_generation()?.is_none() {
+                let building = self.generation() ^ keys::GENERATION_BIT;
+                tracing::info!(
+                    "Social graph schema upgraded (v{} → v{}), rebuilding generation {} while the old index keeps serving",
+                    stored_version,
+                    SOCIAL_GRAPH_SCHEMA_VERSION,
+                    building >> 4,
+                );
+                db.put(
+                    &[keys::SOCIAL_GRAPH_PREFIX, keys::BUILDING_GENERATION],
+                    &[building],
+                )
+                .map_err(|e| IndexerError::Storage(e.to_string()))?;
+            }
+        } else if stored_version < SOCIAL_GRAPH_SCHEMA_VERSION {
+            // Nothing worth serving yet (a new node), or no backfill to refill
+            // a second generation: clear and build in place, as before.
             tracing::info!(
                 "Social graph schema upgraded (v{} → v{}), clearing index for re-backfill",
                 stored_version,
                 SOCIAL_GRAPH_SCHEMA_VERSION,
             );
             Self::clear_all_data(db, stop)?;
+            self.generation.store(0, Ordering::SeqCst);
             db.put(&version_key, &SOCIAL_GRAPH_SCHEMA_VERSION.to_be_bytes())
                 .map_err(|e| IndexerError::Storage(e.to_string()))?;
         }
@@ -118,7 +262,7 @@ impl SocialGraphIndexer {
 
     /// Get the number of followers for a FID.
     pub fn get_follower_count(&self, fid: u64) -> Result<u64, IndexerError> {
-        let key = Self::make_follower_count_key(fid);
+        let key = self.make_follower_count_key(fid);
         match self.db.get(&key) {
             Ok(Some(value)) => {
                 if value.len() == 8 {
@@ -134,7 +278,7 @@ impl SocialGraphIndexer {
 
     /// Get the number of users this FID is following.
     pub fn get_following_count(&self, fid: u64) -> Result<u64, IndexerError> {
-        let key = Self::make_following_count_key(fid);
+        let key = self.make_following_count_key(fid);
         match self.db.get(&key) {
             Ok(Some(value)) => {
                 if value.len() == 8 {
@@ -152,7 +296,7 @@ impl SocialGraphIndexer {
     /// This is a convenience method that checks both directions.
     pub fn are_mutual_follows(&self, fid_a: u64, fid_b: u64) -> Result<bool, IndexerError> {
         // Check if fid_a follows fid_b
-        let key_a_follows_b = Self::make_following_key(fid_a, fid_b);
+        let key_a_follows_b = self.make_following_key(fid_a, fid_b);
         let a_follows_b = self
             .db
             .get(&key_a_follows_b)
@@ -164,7 +308,7 @@ impl SocialGraphIndexer {
         }
 
         // Check if fid_b follows fid_a
-        let key_b_follows_a = Self::make_following_key(fid_b, fid_a);
+        let key_b_follows_a = self.make_following_key(fid_b, fid_a);
         let b_follows_a = self
             .db
             .get(&key_b_follows_a)
@@ -189,13 +333,13 @@ impl SocialGraphIndexer {
         cursor: Option<u64>,
         limit: usize,
     ) -> Result<(Vec<u64>, Option<u64>), IndexerError> {
-        let prefix = Self::make_follower_prefix(fid);
+        let prefix = self.make_follower_prefix(fid);
         let stop_prefix = Self::increment_prefix(&prefix);
 
         // Build start key based on cursor
         let start_key = if let Some(cursor_fid) = cursor {
             // Start after the cursor (exclusive)
-            Self::make_follower_key(fid, cursor_fid + 1)
+            self.make_follower_key(fid, cursor_fid + 1)
         } else {
             prefix.clone()
         };
@@ -251,13 +395,13 @@ impl SocialGraphIndexer {
         cursor: Option<u64>,
         limit: usize,
     ) -> Result<(Vec<u64>, Option<u64>), IndexerError> {
-        let prefix = Self::make_following_prefix(fid);
+        let prefix = self.make_following_prefix(fid);
         let stop_prefix = Self::increment_prefix(&prefix);
 
         // Build start key based on cursor
         let start_key = if let Some(cursor_fid) = cursor {
             // Start after the cursor (exclusive)
-            Self::make_following_key(fid, cursor_fid + 1)
+            self.make_following_key(fid, cursor_fid + 1)
         } else {
             prefix.clone()
         };
@@ -305,11 +449,11 @@ impl SocialGraphIndexer {
         cursor: Option<u64>,
         limit: usize,
     ) -> Result<(Vec<(u64, u32)>, Option<u64>), IndexerError> {
-        let prefix = Self::make_follower_prefix(fid);
+        let prefix = self.make_follower_prefix(fid);
         let stop_prefix = Self::increment_prefix(&prefix);
 
         let start_key = if let Some(cursor_fid) = cursor {
-            Self::make_follower_key(fid, cursor_fid + 1)
+            self.make_follower_key(fid, cursor_fid + 1)
         } else {
             prefix.clone()
         };
@@ -359,11 +503,11 @@ impl SocialGraphIndexer {
         cursor: Option<u64>,
         limit: usize,
     ) -> Result<(Vec<(u64, u32)>, Option<u64>), IndexerError> {
-        let prefix = Self::make_following_prefix(fid);
+        let prefix = self.make_following_prefix(fid);
         let stop_prefix = Self::increment_prefix(&prefix);
 
         let start_key = if let Some(cursor_fid) = cursor {
-            Self::make_following_key(fid, cursor_fid + 1)
+            self.make_following_key(fid, cursor_fid + 1)
         } else {
             prefix.clone()
         };
@@ -462,9 +606,9 @@ impl SocialGraphIndexer {
         match msg_type {
             MessageType::LinkAdd => {
                 // Follower entry: target_fid has follower source_fid
-                let follower_key = Self::make_follower_key(target_fid, source_fid);
+                let follower_key = self.make_follower_key(target_fid, source_fid);
                 // Following entry: source_fid follows target_fid
-                let following_key = Self::make_following_key(source_fid, target_fid);
+                let following_key = self.make_following_key(source_fid, target_fid);
 
                 // The same LinkAdd can reach the indexer more than once: process_event and
                 // process_batch share this code, and the block backfill re-reads messages the
@@ -495,8 +639,8 @@ impl SocialGraphIndexer {
                 self.items_indexed.fetch_add(1, Ordering::Relaxed);
             }
             MessageType::LinkRemove => {
-                let follower_key = Self::make_follower_key(target_fid, source_fid);
-                let following_key = Self::make_following_key(source_fid, target_fid);
+                let follower_key = self.make_follower_key(target_fid, source_fid);
+                let following_key = self.make_following_key(source_fid, target_fid);
 
                 // Likewise: only a remove that takes an existing relationship away may move the
                 // counts, or a replayed LinkRemove drives them below the real figure. One probe
@@ -526,7 +670,7 @@ impl SocialGraphIndexer {
         fid: u64,
         txn: &mut RocksDbTransactionBatch,
     ) -> Result<(), IndexerError> {
-        let key = Self::make_follower_count_key(fid);
+        let key = self.make_follower_count_key(fid);
         let current = self.get_count_from_txn_or_db(&key, txn)?;
         txn.put(key, (current + 1).to_be_bytes().to_vec());
         Ok(())
@@ -537,7 +681,7 @@ impl SocialGraphIndexer {
         fid: u64,
         txn: &mut RocksDbTransactionBatch,
     ) -> Result<(), IndexerError> {
-        let key = Self::make_follower_count_key(fid);
+        let key = self.make_follower_count_key(fid);
         let current = self.get_count_from_txn_or_db(&key, txn)?;
         if current > 0 {
             txn.put(key, (current - 1).to_be_bytes().to_vec());
@@ -550,7 +694,7 @@ impl SocialGraphIndexer {
         fid: u64,
         txn: &mut RocksDbTransactionBatch,
     ) -> Result<(), IndexerError> {
-        let key = Self::make_following_count_key(fid);
+        let key = self.make_following_count_key(fid);
         let current = self.get_count_from_txn_or_db(&key, txn)?;
         txn.put(key, (current + 1).to_be_bytes().to_vec());
         Ok(())
@@ -561,7 +705,7 @@ impl SocialGraphIndexer {
         fid: u64,
         txn: &mut RocksDbTransactionBatch,
     ) -> Result<(), IndexerError> {
-        let key = Self::make_following_count_key(fid);
+        let key = self.make_following_count_key(fid);
         let current = self.get_count_from_txn_or_db(&key, txn)?;
         if current > 0 {
             txn.put(key, (current - 1).to_be_bytes().to_vec());
@@ -581,7 +725,7 @@ impl SocialGraphIndexer {
         txn: &mut RocksDbTransactionBatch,
     ) -> Result<(), IndexerError> {
         // First, remove all existing following entries for this FID
-        let following_prefix = Self::make_following_prefix(source_fid);
+        let following_prefix = self.make_following_prefix(source_fid);
         let stop_prefix = Self::increment_prefix(&following_prefix);
         let page_options = crate::storage::db::PageOptions {
             page_size: Some(100_000),
@@ -607,22 +751,22 @@ impl SocialGraphIndexer {
 
         // Remove old relationships
         for &old_target in &old_targets {
-            let follower_key = Self::make_follower_key(old_target, source_fid);
+            let follower_key = self.make_follower_key(old_target, source_fid);
             txn.delete(follower_key);
-            let following_key = Self::make_following_key(source_fid, old_target);
+            let following_key = self.make_following_key(source_fid, old_target);
             txn.delete(following_key);
             self.decrement_follower_count(old_target, txn)?;
         }
 
         // Reset following count for source
-        let following_count_key = Self::make_following_count_key(source_fid);
+        let following_count_key = self.make_following_count_key(source_fid);
         txn.put(following_count_key, 0u64.to_be_bytes().to_vec());
 
         // Add new relationships
         let timestamp = 0u32.to_be_bytes().to_vec();
         for &target_fid in target_fids {
-            let follower_key = Self::make_follower_key(target_fid, source_fid);
-            let following_key = Self::make_following_key(source_fid, target_fid);
+            let follower_key = self.make_follower_key(target_fid, source_fid);
+            let following_key = self.make_following_key(source_fid, target_fid);
 
             // A target kept from the previous state had its follower count taken off above, so
             // it is counted again here; one that is genuinely still indexed is not counted twice.
@@ -635,7 +779,7 @@ impl SocialGraphIndexer {
         }
 
         // Set correct following count
-        let following_count_key = Self::make_following_count_key(source_fid);
+        let following_count_key = self.make_following_count_key(source_fid);
         txn.put(
             following_count_key,
             (target_fids.len() as u64).to_be_bytes().to_vec(),
@@ -686,58 +830,58 @@ impl SocialGraphIndexer {
         }
     }
 
-    fn make_follower_count_key(fid: u64) -> Vec<u8> {
+    fn make_follower_count_key(&self, fid: u64) -> Vec<u8> {
         let mut key = Vec::with_capacity(10);
         key.push(keys::SOCIAL_GRAPH_PREFIX);
-        key.push(keys::FOLLOWER_COUNT);
+        key.push(keys::FOLLOWER_COUNT | self.generation());
         key.extend_from_slice(&fid.to_be_bytes());
         key
     }
 
-    fn make_following_count_key(fid: u64) -> Vec<u8> {
+    fn make_following_count_key(&self, fid: u64) -> Vec<u8> {
         let mut key = Vec::with_capacity(10);
         key.push(keys::SOCIAL_GRAPH_PREFIX);
-        key.push(keys::FOLLOWING_COUNT);
+        key.push(keys::FOLLOWING_COUNT | self.generation());
         key.extend_from_slice(&fid.to_be_bytes());
         key
     }
 
     /// Key for storing a follower relationship.
     /// Format: <prefix><0x03><target_fid:8><follower_fid:8>
-    fn make_follower_key(target_fid: u64, follower_fid: u64) -> Vec<u8> {
+    fn make_follower_key(&self, target_fid: u64, follower_fid: u64) -> Vec<u8> {
         let mut key = Vec::with_capacity(18);
         key.push(keys::SOCIAL_GRAPH_PREFIX);
-        key.push(keys::FOLLOWERS_BY_FID);
+        key.push(keys::FOLLOWERS_BY_FID | self.generation());
         key.extend_from_slice(&target_fid.to_be_bytes());
         key.extend_from_slice(&follower_fid.to_be_bytes());
         key
     }
 
     /// Key prefix for iterating all followers of a FID.
-    fn make_follower_prefix(fid: u64) -> Vec<u8> {
+    fn make_follower_prefix(&self, fid: u64) -> Vec<u8> {
         let mut key = Vec::with_capacity(10);
         key.push(keys::SOCIAL_GRAPH_PREFIX);
-        key.push(keys::FOLLOWERS_BY_FID);
+        key.push(keys::FOLLOWERS_BY_FID | self.generation());
         key.extend_from_slice(&fid.to_be_bytes());
         key
     }
 
     /// Key for storing a following relationship.
     /// Format: <prefix><0x04><source_fid:8><target_fid:8>
-    fn make_following_key(source_fid: u64, target_fid: u64) -> Vec<u8> {
+    fn make_following_key(&self, source_fid: u64, target_fid: u64) -> Vec<u8> {
         let mut key = Vec::with_capacity(18);
         key.push(keys::SOCIAL_GRAPH_PREFIX);
-        key.push(keys::FOLLOWING_BY_FID);
+        key.push(keys::FOLLOWING_BY_FID | self.generation());
         key.extend_from_slice(&source_fid.to_be_bytes());
         key.extend_from_slice(&target_fid.to_be_bytes());
         key
     }
 
     /// Key prefix for iterating all users a FID follows.
-    fn make_following_prefix(fid: u64) -> Vec<u8> {
+    fn make_following_prefix(&self, fid: u64) -> Vec<u8> {
         let mut key = Vec::with_capacity(10);
         key.push(keys::SOCIAL_GRAPH_PREFIX);
-        key.push(keys::FOLLOWING_BY_FID);
+        key.push(keys::FOLLOWING_BY_FID | self.generation());
         key.extend_from_slice(&fid.to_be_bytes());
         key
     }
@@ -826,36 +970,73 @@ impl SocialGraphIndexer {
         // went per indexer, so a schema bump wiped the index without refilling it.
         for name in [
             "social_graph".to_string(),
-            crate::api::backfill_checkpoint_name("social_graph"),
+            cursor_name(0),
+            cursor_name(keys::GENERATION_BIT),
         ] {
-            let cp_prefix = crate::api::backfill::shard_checkpoint_prefix(&name);
-            let cp_stop = crate::storage::util::increment_vec_u8(&cp_prefix);
-            let mut cp_keys = Vec::new();
-            let page_options = crate::storage::db::PageOptions {
-                page_size: Some(100),
-                page_token: None,
-                reverse: false,
-            };
-            db.for_each_iterator_by_prefix_paged(
-                Some(cp_prefix),
-                Some(cp_stop),
-                &page_options,
-                |key, _| {
-                    cp_keys.push(key.to_vec());
-                    Ok(false)
-                },
-            )
-            .map_err(|e| IndexerError::Storage(e.to_string()))?;
-            if !cp_keys.is_empty() {
-                let mut txn = RocksDbTransactionBatch::new();
-                for key in cp_keys {
-                    txn.delete(key);
-                }
-                db.commit(txn)
-                    .map_err(|e| IndexerError::Storage(e.to_string()))?;
-            }
+            Self::delete_cursors(db, &name)?;
         }
         Ok(())
+    }
+
+    /// Delete every shard's block cursor saved under `name`.
+    fn delete_cursors(db: &RocksDB, name: &str) -> Result<(), IndexerError> {
+        let cp_prefix = crate::api::backfill::shard_checkpoint_prefix(name);
+        let cp_stop = crate::storage::util::increment_vec_u8(&cp_prefix);
+        let mut cp_keys = Vec::new();
+        let page_options = crate::storage::db::PageOptions {
+            page_size: Some(100),
+            page_token: None,
+            reverse: false,
+        };
+        db.for_each_iterator_by_prefix_paged(
+            Some(cp_prefix),
+            Some(cp_stop),
+            &page_options,
+            |key, _| {
+                cp_keys.push(key.to_vec());
+                Ok(false)
+            },
+        )
+        .map_err(|e| IndexerError::Storage(e.to_string()))?;
+        if !cp_keys.is_empty() {
+            let mut txn = RocksDbTransactionBatch::new();
+            for key in cp_keys {
+                txn.delete(key);
+            }
+            db.commit(txn)
+                .map_err(|e| IndexerError::Storage(e.to_string()))?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(crate) const SOCIAL_GRAPH_SCHEMA_VERSION_FOR_TEST: u32 = SOCIAL_GRAPH_SCHEMA_VERSION;
+
+#[cfg(test)]
+impl SocialGraphIndexer {
+    pub(crate) fn follower_count_key_for_test(&self, fid: u64) -> Vec<u8> {
+        self.make_follower_count_key(fid)
+    }
+
+    pub(crate) fn set_schema_version_for_test(&self, version: u32) {
+        self.db
+            .put(
+                &[keys::SOCIAL_GRAPH_PREFIX, keys::SCHEMA_VERSION],
+                &version.to_be_bytes(),
+            )
+            .unwrap();
+    }
+}
+
+/// The block cursors of `generation`: generation 0 keeps the name it always
+/// had, so an existing node resumes where it was.
+pub(crate) fn cursor_name(generation: u8) -> String {
+    let name = crate::api::backfill_checkpoint_name("social_graph");
+    if generation == 0 {
+        name
+    } else {
+        format!("{name}:g{}", generation >> 4)
     }
 }
 
@@ -979,6 +1160,13 @@ impl Indexer for SocialGraphIndexer {
 
 #[cfg(test)]
 mod tests {
+    /// Generation 0's follower count key, as nodes before generations wrote it.
+    fn gen0_count_key(fid: u64) -> Vec<u8> {
+        let mut key = vec![keys::SOCIAL_GRAPH_PREFIX, keys::FOLLOWER_COUNT];
+        key.extend_from_slice(&fid.to_be_bytes());
+        key
+    }
+
     use super::*;
     use crate::proto::{LinkBody, MessageData};
 
@@ -987,7 +1175,7 @@ mod tests {
         let db = make_test_db();
         let version = vec![keys::SOCIAL_GRAPH_PREFIX, keys::SCHEMA_VERSION];
         db.put(&version, &4u32.to_be_bytes()).unwrap();
-        let count = SocialGraphIndexer::make_follower_count_key(123);
+        let count = gen0_count_key(123);
         db.put(&count, &42u64.to_be_bytes()).unwrap();
         let indexer = SocialGraphIndexer::open(FeatureConfig::default(), db.clone());
         assert_eq!(indexer.get_follower_count(123).unwrap(), 42);
@@ -1007,10 +1195,7 @@ mod tests {
         let db = make_test_db();
         let mut txn = RocksDbTransactionBatch::new();
         for fid in 0..20_005 {
-            txn.put(
-                SocialGraphIndexer::make_follower_count_key(fid),
-                1u64.to_be_bytes().to_vec(),
-            );
+            txn.put(gen0_count_key(fid), 1u64.to_be_bytes().to_vec());
         }
         let unrelated = vec![0xE1, 0x01];
         txn.put(unrelated.clone(), vec![17]);
@@ -1028,11 +1213,7 @@ mod tests {
         let db = make_test_db();
         let version = vec![keys::SOCIAL_GRAPH_PREFIX, keys::SCHEMA_VERSION];
         db.put(&version, &4u32.to_be_bytes()).unwrap();
-        db.put(
-            &SocialGraphIndexer::make_follower_count_key(1),
-            &1u64.to_be_bytes(),
-        )
-        .unwrap();
+        db.put(&gen0_count_key(1), &1u64.to_be_bytes()).unwrap();
         let indexer = SocialGraphIndexer::open(FeatureConfig::default(), db.clone());
         assert!(indexer.prepare(&AtomicBool::new(true)).is_err());
         assert_eq!(db.get(&version).unwrap().unwrap(), 4u32.to_be_bytes());
