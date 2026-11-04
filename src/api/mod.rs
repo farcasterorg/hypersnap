@@ -62,7 +62,7 @@ pub use feeds::{FeedHandler, FeedService};
 pub use http::{ApiHttpHandler, ChannelFeedHandler, ConversationHandler, HubQueryHandler};
 pub use indexer::{Indexer, IndexerError};
 pub use metrics::MetricsIndexer;
-pub use search::SearchIndexer;
+pub use search::{SearchIndexer, SearchSort};
 pub use social_graph::SocialGraphIndexer;
 pub use user_data_index::UserDataIndexer;
 pub use user_hydrator::HubUserHydrator;
@@ -391,12 +391,15 @@ pub fn initialize(
     // ever reconstruct the last few days. It gets a store walk below instead.
     // Search backfill is handled separately using hyper stores (includes pruned data)
     let search_needs_backfill = config.search.backfill_on_startup && search_indexer.is_some();
+    // With hyper stores, the search walk runs alongside the bridges (see below);
+    // only the block-replay fallback still has to run before them.
+    let search_needs_block_backfill = search_needs_backfill && hyper_shard_stores.is_none();
     let daily_stats_needs_backfill =
         config.daily_stats.backfill_on_startup && daily_stats_indexer.is_some();
 
-    // Deliberately excludes daily_stats: its walk runs concurrently with the
-    // bridges rather than blocking them (see below).
-    let needs_backfill = !backfill_indexers.is_empty() || search_needs_backfill;
+    // Deliberately excludes daily_stats and the hyper-store search walk: they
+    // run concurrently with the bridges rather than blocking them (see below).
+    let needs_backfill = !backfill_indexers.is_empty() || search_needs_block_backfill;
 
     // Create worker pool and register indexers
     let mut worker_pool = IndexWorkerPool::new(config.clone(), index_rx, db.clone());
@@ -548,25 +551,19 @@ pub fn initialize(
     if needs_backfill {
         let backfill_db = db.clone();
         let backfill_tx = backfill_done_tx.clone();
-        let search_idx = if search_needs_backfill {
+        let search_idx = if search_needs_block_backfill {
             search_indexer.clone()
         } else {
             None
         };
-        let hyper_stores_for_search = hyper_shard_stores.clone();
         tokio::spawn(async move {
             // Block-based backfill for non-search indexers
             if !backfill_indexers.is_empty() {
                 run_block_backfill(&backfill_db, &shard_stores, backfill_indexers).await;
             }
-            // Search backfill from hyper stores (includes pruned casts)
+            // Without hyper stores, search falls back to block-based backfill
             if let Some(search) = search_idx {
-                if let Some(ref stores) = hyper_stores_for_search {
-                    run_search_backfill(&backfill_db, stores, &search).await;
-                } else {
-                    // Fall back to block-based backfill if no hyper stores
-                    run_block_backfill(&backfill_db, &shard_stores, vec![search]).await;
-                }
+                run_block_backfill(&backfill_db, &shard_stores, vec![search]).await;
             }
             let _ = backfill_tx.send(true);
             tracing::info!("All backfills complete, unblocking bridges");
@@ -600,6 +597,18 @@ pub fn initialize(
                     ),
                 }
             });
+        }
+    }
+
+    // The search walk over hyper stores (every cast ever, so hours to days) runs
+    // alongside the bridges for the same reason as daily stats: gating them on
+    // it would stall every live index and lose what's committed meanwhile. Live
+    // indexing owns casts from `backfill_before` on, the walk everything older,
+    // and search keeps answering from the legacy index during a rebuild.
+    if search_needs_backfill && !search_needs_block_backfill {
+        if let (Some(search), Some(stores)) = (search_indexer.clone(), hyper_shard_stores.clone()) {
+            let db = db.clone();
+            tokio::spawn(async move { run_search_backfill(&db, &stores, &search).await });
         }
     }
 
@@ -718,8 +727,10 @@ const SEARCH_BACKFILL_CHECKPOINT: &str = "search_hyper_backfill";
 
 /// Backfill search index from hyper stores by iterating all cast messages.
 ///
-/// Hyper stores retain pruned messages, so this indexes the full cast history.
-/// Uses a per-shard checkpoint so restarts resume where they left off.
+/// Hyper stores retain pruned messages, so this indexes the full cast history
+/// before `SearchIndexer::backfill_before` (live indexing owns the rest). Uses a
+/// per-shard checkpoint, saved right after a commit, so restarts resume where
+/// they left off.
 async fn run_search_backfill(
     db: &crate::storage::db::RocksDB,
     hyper_stores: &HashMap<u32, Stores>,
@@ -731,6 +742,7 @@ async fn run_search_backfill(
     tracing::info!("Starting search backfill from hyper stores");
     let start = std::time::Instant::now();
     let mut total_indexed: u64 = 0;
+    let before = search.backfill_before();
 
     let mut sorted_shards: Vec<_> = hyper_stores.keys().cloned().collect();
     sorted_shards.sort();
@@ -796,11 +808,21 @@ async fn run_search_backfill(
                         break;
                     }
 
-                    let event = IndexEvent::messages(page.messages.clone(), shard_id, 0);
-                    if let Err(e) = search.process_batch(&[event]).await {
-                        tracing::warn!(error = %e, "Search backfill batch error");
+                    // Committed with the checkpoint below, not per page:
+                    // a commit per fid would take millions of commits.
+                    for message in &page.messages {
+                        if message
+                            .data
+                            .as_ref()
+                            .is_some_and(|d| (d.timestamp as u64) < before)
+                        {
+                            match search.index_cast(message) {
+                                Ok(true) => total_indexed += 1,
+                                Ok(false) => {}
+                                Err(e) => tracing::warn!(error = %e, "Search backfill index error"),
+                            }
+                        }
                     }
-                    total_indexed += page.messages.len() as u64;
 
                     match page.next_page_token {
                         Some(t) if !t.is_empty() => cast_page_token = Some(t),
@@ -810,14 +832,19 @@ async fn run_search_backfill(
 
                 fids_processed += 1;
 
-                // Checkpoint every 1000 FIDs
+                // Commit, then checkpoint past this fid, every 1000 FIDs
                 if fids_processed % 1000 == 0 {
-                    let _ = backfill::save_shard_checkpoint(
-                        db,
-                        SEARCH_BACKFILL_CHECKPOINT,
-                        shard_id,
-                        *fid,
-                    );
+                    match search.commit() {
+                        Ok(()) => {
+                            let _ = backfill::save_shard_checkpoint(
+                                db,
+                                SEARCH_BACKFILL_CHECKPOINT,
+                                shard_id,
+                                *fid + 1,
+                            );
+                        }
+                        Err(e) => tracing::warn!(error = %e, "Search backfill commit error"),
+                    }
                     if fids_processed % 10_000 == 0 {
                         tracing::info!(
                             shard_id,
@@ -826,8 +853,8 @@ async fn run_search_backfill(
                             "Search backfill progress"
                         );
                     }
-                    tokio::task::yield_now().await;
                 }
+                tokio::task::yield_now().await;
             }
 
             match next_token {
@@ -836,7 +863,11 @@ async fn run_search_backfill(
             }
         }
 
-        // Mark shard as complete
+        // Mark shard as complete, once its last casts are committed
+        if let Err(e) = search.commit() {
+            tracing::warn!(shard_id, error = %e, "Search backfill commit error; will resume on restart");
+            continue;
+        }
         let _ = backfill::save_shard_checkpoint(db, SEARCH_BACKFILL_CHECKPOINT, shard_id, u64::MAX);
 
         tracing::info!(
@@ -1354,5 +1385,93 @@ async fn run_block_backfill(
             elapsed_secs = start.elapsed().as_secs(),
             "API block backfill complete for shard"
         );
+    }
+}
+
+#[cfg(test)]
+mod search_backfill_tests {
+    use super::*;
+    use crate::api::config::SearchConfig;
+    use crate::proto::{self, IdRegisterEventType};
+    use crate::storage::db::{RocksDB, RocksDbTransactionBatch};
+    use crate::storage::store::stores::StoreLimits;
+    use crate::storage::store::test_helper::{default_custody_address, default_merge_ctx};
+    use crate::storage::trie::merkle_trie::MerkleTrie;
+    use crate::utils::factory::{events_factory, messages_factory};
+    use crate::utils::statsd_wrapper::StatsdClientWrapper;
+
+    #[tokio::test]
+    async fn walk_leaves_live_casts_to_live_indexing_and_checkpoints_once_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = RocksDB::open_shard_db(dir.path().to_str().unwrap(), 0);
+        let stores = Stores::new(
+            RocksDB::open_shard_db(dir.path().to_str().unwrap(), 1),
+            1,
+            MerkleTrie::new().unwrap(),
+            StoreLimits::default(),
+            proto::FarcasterNetwork::Devnet,
+            StatsdClientWrapper::new(
+                cadence::StatsdClient::builder("test", cadence::NopMetricSink).build(),
+                false,
+            ),
+        );
+        let search = Arc::new(
+            SearchIndexer::open(
+                SearchConfig {
+                    enabled: true,
+                    backfill_on_startup: true,
+                    memory_budget_mb: 50,
+                    ..Default::default()
+                },
+                &db,
+                &[1],
+            )
+            .unwrap(),
+        );
+        let before = search.backfill_before() as u32;
+        let mut txn = RocksDbTransactionBatch::new();
+        for fid in [10, 11] {
+            stores
+                .onchain_event_store
+                .merge_onchain_event(
+                    events_factory::create_id_register_event(
+                        fid,
+                        IdRegisterEventType::Register,
+                        default_custody_address(),
+                        None,
+                    ),
+                    &mut txn,
+                )
+                .unwrap();
+        }
+        // Old enough for the walk, and one live indexing already owns.
+        for (fid, text, timestamp) in [(10, "old #gm", before - 100), (11, "new #gm", before + 1)] {
+            let cast = messages_factory::casts::create_cast_add(fid, text, Some(timestamp), None);
+            stores
+                .cast_store
+                .merge(&cast, &mut txn, &default_merge_ctx())
+                .unwrap();
+        }
+        stores.db.commit(txn).unwrap();
+
+        run_search_backfill(&db, &HashMap::from([(1, stores)]), &search).await;
+
+        assert!(search.stats().backfill_complete);
+        assert_eq!(
+            backfill::load_shard_checkpoint(&db, SEARCH_BACKFILL_CHECKPOINT, 1),
+            u64::MAX
+        );
+        // the reader reloads shortly after the commit
+        for _ in 0..100 {
+            if search.num_docs() > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(search.num_docs(), 1);
+        let found = search
+            .search_casts("#gm", SearchSort::Newest, 0, 10)
+            .unwrap();
+        assert_eq!(found.iter().map(|r| r.fid).collect::<Vec<_>>(), vec![10]);
     }
 }
