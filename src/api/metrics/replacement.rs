@@ -3,7 +3,7 @@
 use super::*;
 use crate::proto::MessageData;
 
-pub(crate) const SCHEMA: u32 = 1;
+pub(crate) const SCHEMA: u32 = 2;
 const GENERATION_BIT: u8 = 0x10;
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -90,7 +90,9 @@ impl MetricsIndexer {
     pub(super) fn read_generation(db: &RocksDB, key: u8) -> Result<Option<u8>, IndexerError> {
         match db.get(&[keys::METRICS_PREFIX, key]).map_err(storage)? {
             None => Ok(None),
-            Some(v) if v == [0] || v == [GENERATION_BIT] => Ok(Some(v[0])),
+            Some(v) if v == [0] || v == [GENERATION_BIT] || v == [0x20] || v == [0x30] => {
+                Ok(Some(v[0]))
+            }
             Some(_) => Err(IndexerError::Storage("Invalid metrics generation".into())),
         }
     }
@@ -110,30 +112,38 @@ impl MetricsIndexer {
             readers: self.readers.clone(),
             fixed_generation: true,
             window_live_since: 0,
-            window_pruned_hour: AtomicU64::new(0),
+            window_pruned_hour: self.window_pruned_hour.clone(),
         }
     }
 
     /// Called in the background. Never deletes the readable generation.
     pub(crate) fn prepare(&self) -> Result<(), IndexerError> {
         let _guard = self.writer.lock();
-        if self
+        let version = self
             .db
             .get(&[keys::METRICS_PREFIX, keys::SCHEMA])
-            .map_err(storage)?
-            .as_deref()
-            == Some(SCHEMA.to_be_bytes().as_slice())
-        {
+            .map_err(storage)?;
+        if version.as_deref() == Some(SCHEMA.to_be_bytes().as_slice()) {
             return Ok(());
         }
-        if self.building_generation()?.is_none() {
-            let building = self.generation() ^ GENERATION_BIT;
+        // v1's completed index is already correct and uses the same records.
+        if version.as_deref() == Some(1u32.to_be_bytes().as_slice()) {
+            self.db
+                .put(&[keys::METRICS_PREFIX, keys::SCHEMA], &SCHEMA.to_be_bytes())
+                .map_err(storage)?;
+            return Ok(());
+        }
+        // An unfinished block replay may have stale contributions. Build from
+        // canonical stores in a fresh namespace; retain both old namespaces
+        // until publication, including any partial v1 rebuild.
+        let building = 0x20;
+        if self.building_generation()? != Some(building) {
             self.db
                 .put(&[keys::METRICS_PREFIX, keys::BUILDING], &[building])
                 .map_err(storage)?;
             tracing::info!(
                 generation = building,
-                "Metrics replacement rebuild started; current metrics remain available"
+                "Metrics canonical-store replacement started; current metrics remain available"
             );
         }
         Ok(())
@@ -155,7 +165,10 @@ impl MetricsIndexer {
         );
         txn.put(
             vec![keys::METRICS_PREFIX, keys::DELETING],
-            vec![self.generation()],
+            [0, 0x10, 0x20, 0x30]
+                .into_iter()
+                .filter(|g| *g != generation)
+                .collect(),
         );
         txn.delete(vec![keys::METRICS_PREFIX, keys::BUILDING]);
         self.commit(txn)?;
@@ -170,9 +183,19 @@ impl MetricsIndexer {
     /// Reclaim only the retired generation, after publication, in bounded batches.
     pub(crate) fn delete_retired(&self, budget: usize) -> Result<bool, IndexerError> {
         let _guard = self.writer.lock();
-        let Some(old) = Self::read_generation(&self.db, keys::DELETING)? else {
+        let Some(mut retired) = self
+            .db
+            .get(&[keys::METRICS_PREFIX, keys::DELETING])
+            .map_err(storage)?
+        else {
             return Ok(true);
         };
+        let Some(&old) = retired.first() else {
+            return Err(storage("Invalid retired metrics generation"));
+        };
+        if ![0, 0x10, 0x20, 0x30].contains(&old) {
+            return Err(storage("Invalid retired metrics generation"));
+        }
         if old == self.generation() {
             return Err(IndexerError::Internal(
                 "Refusing to delete active metrics".into(),
@@ -225,10 +248,15 @@ impl MetricsIndexer {
                     },
                 )
                 .map_err(storage)?;
-            txn.delete(vec![keys::METRICS_PREFIX, keys::DELETING]);
+            retired.remove(0);
+            if retired.is_empty() {
+                txn.delete(vec![keys::METRICS_PREFIX, keys::DELETING]);
+            } else {
+                txn.put(vec![keys::METRICS_PREFIX, keys::DELETING], retired.clone());
+            }
         }
         self.commit(txn)?;
-        Ok(done)
+        Ok(done && retired.is_empty())
     }
 
     fn pending(

@@ -3929,6 +3929,28 @@ impl ApiHttpHandler {
         };
 
         let mut body = serde_json::json!({ "indexers": indexers });
+        if let Some(metrics) = &self.metrics {
+            let dbs = self.shard_dbs.read().unwrap().clone();
+            if let Some(dbs) = dbs {
+                let mut shards = Vec::new();
+                for (id, db) in dbs {
+                    match crate::storage::store::shard::ShardStore::new(db, id).max_block_number() {
+                        Ok(tip) => shards.push((id, tip)),
+                        Err(error) => {
+                            tracing::warn!(shard_id = id, %error, "Cannot read metrics progress tip")
+                        }
+                    }
+                }
+                shards.sort_unstable();
+                match metrics.backfill_progress(&shards) {
+                    Ok(progress) => body["metrics_backfill"] = progress,
+                    Err(error) => {
+                        body["metrics_backfill"] =
+                            serde_json::json!({"phase":"error","error":error.to_string()})
+                    }
+                }
+            }
+        }
         if let Some(progress) = daily_stats_progress {
             body["daily_stats_backfill"] =
                 serde_json::to_value(progress).unwrap_or(serde_json::Value::Null);
@@ -5099,6 +5121,36 @@ mod tests {
     async fn collect_json(res: Response<BoxBody<Bytes, Infallible>>) -> serde_json::Value {
         let body = res.collect().await.unwrap().to_bytes();
         serde_json::from_slice(&body).expect("valid JSON response")
+    }
+
+    #[tokio::test]
+    async fn backfill_status_exposes_metrics_scan_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::storage::db::RocksDB::open_shard_db(dir.path().to_str().unwrap(), 0);
+        let metrics = Arc::new(MetricsIndexer::new(
+            crate::api::config::MetricsConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            db.clone(),
+        ));
+        metrics.prepare().unwrap();
+        let tips = std::collections::HashMap::from([(1, 50_000_000)]);
+        crate::api::metrics_scan::initialize(
+            &metrics.view(metrics.building_generation().unwrap().unwrap()),
+            &db,
+            &tips,
+        )
+        .unwrap();
+        let handler = ApiHttpHandler::new(None, None, Some(metrics), None, None, None);
+        handler.set_shard_dbs(std::collections::HashMap::from([(1, db)]));
+        let body = collect_json(handler.handle_backfill_status().await.unwrap()).await;
+        assert_eq!(body["metrics_backfill"]["phase"], "scanning");
+        assert_eq!(body["metrics_backfill"]["shards"][0]["rows_scanned"], 0);
+        assert_eq!(
+            body["metrics_backfill"]["shards"][0]["next_block"],
+            50_000_001
+        );
     }
 
     #[test]

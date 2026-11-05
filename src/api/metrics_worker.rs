@@ -23,7 +23,7 @@ use tokio::task::JoinHandle;
 const BATCH: u64 = 100;
 const STEP: u64 = 1000;
 
-fn cursor(generation: u8) -> String {
+pub(super) fn cursor(generation: u8) -> String {
     format!("metrics_replacement_v1:{generation}")
 }
 fn storage(e: impl std::fmt::Display) -> IndexerError {
@@ -89,17 +89,32 @@ pub(super) fn spawn(
                     .ok()
                     .flatten()
                     .unwrap_or_else(|| indexer.generation());
+                let rebuilding = indexer.building_generation().ok().flatten().is_some();
                 for (&shard_id, store) in &stores {
-                    if let (Ok(next_block), Ok(tip)) = (
+                    if let (Ok(progress), Ok(next_block), Ok(tip)) = (
+                        super::metrics_scan::progress(&indexer.view(generation), &db, shard_id),
                         backfill::try_load_shard_checkpoint(&db, &cursor(generation), shard_id),
                         store.shard_store.max_block_number(),
                     ) {
+                        let scan_complete = progress["scan_complete"].as_bool().unwrap_or(false);
                         tracing::info!(
                             generation,
                             shard_id,
+                            phase = if rebuilding && !scan_complete {
+                                "scanning"
+                            } else if rebuilding || next_block <= tip {
+                                "catching_up"
+                            } else {
+                                "ready"
+                            },
+                            rows_scanned = progress["rows_scanned"].as_u64().unwrap_or(0),
+                            messages_indexed = progress["messages_indexed"].as_u64().unwrap_or(0),
+                            last_fid = progress["last_fid"].as_u64().unwrap_or(0),
+                            scan_complete,
                             next_block,
                             tip,
-                            percent = (next_block as f64 / (tip + 1) as f64 * 100.0).min(100.0),
+                            tail_percent =
+                                (next_block as f64 / (tip + 1) as f64 * 100.0).min(100.0),
                             "Metrics replacement replay progress"
                         );
                     }
@@ -126,7 +141,8 @@ pub(super) fn spawn(
                         // cursor at startup, never replay old blocks on top of them.
                         let tips = tips?;
                         indexer.prepare()?;
-                        if indexer.building_generation()?.is_some() {
+                        if let Some(building) = indexer.building_generation()? {
+                            super::metrics_scan::initialize(&indexer.view(building), &db, &tips)?;
                             for (id, tip) in tips {
                                 if backfill::try_load_shard_checkpoint(
                                     &db,
@@ -197,6 +213,9 @@ async fn step(
     )
     .await?;
     if let Some(generation) = indexer.building_generation()? {
+        let scan_ready =
+            super::metrics_scan::step(&indexer.view(generation), db, canonical, &tips, stop)
+                .await?;
         let ready = catch_up(
             &indexer.view(generation),
             db,
@@ -206,7 +225,7 @@ async fn step(
             stop,
         )
         .await?;
-        if ready && active_ready {
+        if scan_ready && ready && active_ready {
             indexer.switch_to(generation)?;
         }
         return Ok(true);
@@ -449,47 +468,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebuild_resumes_and_publishes_only_after_every_shard_catches_up() {
+    async fn canonical_scan_resumes_without_replaying_fifty_million_blocks() {
         let dir = tempfile::tempdir().unwrap();
         let db = RocksDB::open_shard_db(dir.path().to_str().unwrap(), 0);
         let store = stores(RocksDB::open_shard_db(dir.path().to_str().unwrap(), 1));
         let source = HashMap::from([(1, store.clone())]);
-        commit(&store, 1, vec![like(1, 1, 100)]);
-        commit(&store, 1005, vec![like(2, 2, 101)]);
+        let messages: Vec<_> = (1..=2500)
+            .map(|fid| like(fid, (fid % 250 + 1) as u8, fid as u32))
+            .collect();
+        commit(&store, 1, messages);
+        put_block(&store, 50_000_000, vec![]);
         legacy(&db);
         let reader = indexer(db.clone());
         reader.prepare().unwrap();
-        let gen = reader.building_generation().unwrap().unwrap();
-        backfill::save_shard_checkpoint(&db, &cursor(reader.generation()), 1, 1006).unwrap();
+        let generation = reader.building_generation().unwrap().unwrap();
+        backfill::save_shard_checkpoint(&db, &cursor(reader.generation()), 1, 50_000_001).unwrap();
         step(&reader, &db, &source, &source, &AtomicBool::new(false))
             .await
             .unwrap();
         assert_eq!(reader.get_cast_metrics(99, &[9; 20]).unwrap().likes, 20);
-        assert_eq!(reader.building_generation().unwrap(), Some(gen));
-        assert_eq!(backfill::load_shard_checkpoint(&db, &cursor(gen), 1), 1000);
-        // New activity while rebuilding survives both restart and the switch.
-        commit(&store, 1006, vec![like(3, 3, 102)]);
+        assert_eq!(reader.building_generation().unwrap(), Some(generation));
+        // The block cursor starts at the live boundary, not at block zero.
+        assert_eq!(
+            backfill::load_shard_checkpoint(&db, &cursor(generation), 1),
+            50_000_001
+        );
+        let progress = reader.backfill_progress(&[(1, 50_000_000)]).unwrap();
+        assert_eq!(progress["phase"], "scanning");
+        assert!(progress["shards"][0]["rows_scanned"].as_u64().unwrap() > 0);
+        let live = like(3000, 3, 3000);
+        commit(&store, 50_000_001, vec![live.clone()]);
+        reader
+            .process_event(&IndexEvent::message(live, 1, 50_000_001))
+            .await
+            .unwrap();
         let resumed = indexer(db.clone());
         resumed.prepare().unwrap();
+        let started = Instant::now();
+        while resumed.building_generation().unwrap().is_some() {
+            step(&resumed, &db, &source, &source, &AtomicBool::new(false))
+                .await
+                .unwrap();
+            assert!(started.elapsed() < Duration::from_secs(10));
+        }
+        assert_eq!(resumed.get_cast_metrics(99, &[9; 20]).unwrap().likes, 2501);
+        assert_eq!(
+            resumed.backfill_progress(&[(1, 50_000_001)]).unwrap()["phase"],
+            "ready"
+        );
+        // Retrying a tail checkpoint does not inflate the replacement.
+        backfill::save_shard_checkpoint(&db, &cursor(generation), 1, 50_000_001).unwrap();
         step(&resumed, &db, &source, &source, &AtomicBool::new(false))
             .await
             .unwrap();
-        assert_eq!(resumed.building_generation().unwrap(), None);
-        assert_eq!(resumed.get_cast_metrics(99, &[9; 20]).unwrap().likes, 3);
-        // Force a checkpoint retry: provenance prevents any double count.
-        backfill::save_shard_checkpoint(&db, &cursor(gen), 1, 0).unwrap();
-        while !catch_up(
-            &resumed.view(gen),
-            &db,
-            &source,
-            &source,
-            &HashMap::from([(1, 1006)]),
-            &AtomicBool::new(false),
-        )
-        .await
-        .unwrap()
-        {}
-        assert_eq!(resumed.get_cast_metrics(99, &[9; 20]).unwrap().likes, 3);
+        assert_eq!(resumed.get_cast_metrics(99, &[9; 20]).unwrap().likes, 2501);
     }
 
     #[tokio::test]
@@ -538,5 +570,143 @@ mod tests {
         assert_eq!(reader.get_cast_metrics(99, &[9; 20]).unwrap().likes, 20);
         assert_eq!(reader.building_generation().unwrap(), Some(gen));
         assert_eq!(backfill::load_shard_checkpoint(&db, &cursor(gen), 1), 0);
+    }
+    #[tokio::test]
+    async fn upgrading_partial_block_rebuild_preserves_both_old_namespaces_until_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = RocksDB::open_shard_db(dir.path().to_str().unwrap(), 0);
+        let store = stores(RocksDB::open_shard_db(dir.path().to_str().unwrap(), 1));
+        commit(&store, 1, vec![like(1, 1, 100)]);
+        let source = HashMap::from([(1, store)]);
+        legacy(&db);
+        let reader = indexer(db.clone());
+        // A v1 rebuild already counted a stale reaction from actor 999.
+        db.put(&[0xE2, 0xF1], &[0x10]).unwrap();
+        reader
+            .view(0x10)
+            .process_event(&IndexEvent::message(like(999, 3, 100), 1, 1))
+            .await
+            .unwrap();
+        reader.prepare().unwrap();
+        assert_eq!(reader.building_generation().unwrap(), Some(0x20));
+        assert_eq!(reader.get_cast_metrics(99, &[9; 20]).unwrap().likes, 20);
+        assert_eq!(
+            reader
+                .view(0x10)
+                .get_cast_metrics(99, &[9; 20])
+                .unwrap()
+                .likes,
+            1
+        );
+        backfill::save_shard_checkpoint(&db, &cursor(reader.generation()), 1, 2).unwrap();
+        step(&reader, &db, &source, &source, &AtomicBool::new(false))
+            .await
+            .unwrap();
+        assert_eq!(reader.get_cast_metrics(99, &[9; 20]).unwrap().likes, 1);
+        // Publication itself deletes neither the prior served data nor v1's staging data.
+        assert_eq!(
+            reader.view(0).get_cast_metrics(99, &[9; 20]).unwrap().likes,
+            20
+        );
+        assert_eq!(
+            reader
+                .view(0x10)
+                .get_cast_metrics(99, &[9; 20])
+                .unwrap()
+                .likes,
+            1
+        );
+        while !reader.delete_retired(100).unwrap() {}
+        assert_eq!(reader.get_cast_metrics(99, &[9; 20]).unwrap().likes, 1);
+        assert_eq!(
+            reader
+                .view(0x10)
+                .get_cast_metrics(99, &[9; 20])
+                .unwrap()
+                .likes,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_v1_replacement_is_reused_without_another_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = RocksDB::open_shard_db(dir.path().to_str().unwrap(), 0);
+        let reader = indexer(db.clone());
+        reader
+            .view(0x10)
+            .process_event(&IndexEvent::message(like(1, 1, 100), 1, 1))
+            .await
+            .unwrap();
+        db.put(&[0xE2, 0xF0], &[0x10]).unwrap();
+        db.put(&[0xE2, 0xF2], &1u32.to_be_bytes()).unwrap();
+        let resumed = indexer(db);
+        resumed.prepare().unwrap();
+        assert_eq!(resumed.generation(), 0x10);
+        assert_eq!(resumed.building_generation().unwrap(), None);
+        assert_eq!(resumed.get_cast_metrics(99, &[9; 20]).unwrap().likes, 1);
+    }
+
+    #[tokio::test]
+    async fn canonical_scan_uses_hyper_namespace_and_skips_unrelated_indexes() {
+        use crate::storage::constants::{RootPrefix, UserPostfix};
+        use crate::storage::store::account::make_user_key_with_prefix;
+        let dir = tempfile::tempdir().unwrap();
+        let db = RocksDB::open_shard_db(dir.path().to_str().unwrap(), 0);
+        let legacy_store = stores(RocksDB::open_shard_db(dir.path().to_str().unwrap(), 1));
+        let hyper = legacy_store.with_state_context(crate::hyper::StateContext::Hyper);
+        commit(&legacy_store, 1, vec![like(99, 9, 100)]);
+        commit(&hyper, 2, vec![like(1, 1, 100), like(2, 2, 100)]);
+        let prefix = make_user_key_with_prefix(RootPrefix::HyperUser as u8, 1);
+        for postfix in [UserPostfix::LinkMessage, UserPostfix::CastAdds] {
+            let key = [prefix.clone(), vec![postfix as u8], vec![0; 24]].concat();
+            hyper.db.put(&key, b"not a protobuf").unwrap();
+        }
+        let sources = HashMap::from([(1, hyper)]);
+        let blocks = HashMap::from([(1, legacy_store)]);
+        let reader = indexer(db.clone());
+        reader.prepare().unwrap();
+        backfill::save_shard_checkpoint(&db, &cursor(reader.generation()), 1, 3).unwrap();
+        step(&reader, &db, &blocks, &sources, &AtomicBool::new(false))
+            .await
+            .unwrap();
+        assert_eq!(reader.get_cast_metrics(99, &[9; 20]).unwrap().likes, 2);
+    }
+
+    #[tokio::test]
+    async fn corrupt_scan_page_cannot_publish_an_empty_replacement() {
+        use crate::storage::constants::UserPostfix;
+        use crate::storage::store::account::make_message_primary_key;
+        let dir = tempfile::tempdir().unwrap();
+        let db = RocksDB::open_shard_db(dir.path().to_str().unwrap(), 0);
+        let store = stores(RocksDB::open_shard_db(dir.path().to_str().unwrap(), 1));
+        put_block(&store, 100, vec![]);
+        let poison =
+            make_message_primary_key(1, UserPostfix::ReactionMessage as u8, Some(&[1; 24]));
+        store.db.put(&poison, b"broken protobuf").unwrap();
+        let sources = HashMap::from([(1, store.clone())]);
+        legacy(&db);
+        let reader = indexer(db.clone());
+        reader.prepare().unwrap();
+        backfill::save_shard_checkpoint(&db, &cursor(reader.generation()), 1, 101).unwrap();
+        assert!(
+            step(&reader, &db, &sources, &sources, &AtomicBool::new(false))
+                .await
+                .is_err()
+        );
+        assert_eq!(reader.get_cast_metrics(99, &[9; 20]).unwrap().likes, 20);
+        assert!(reader.building_generation().unwrap().is_some());
+        assert_eq!(
+            reader.backfill_progress(&[(1, 100)]).unwrap()["shards"][0]["rows_scanned"],
+            0
+        );
+        let mut txn = RocksDbTransactionBatch::new();
+        txn.delete(poison);
+        store.db.commit(txn).unwrap();
+        commit(&store, 101, vec![like(1, 1, 100)]);
+        step(&reader, &db, &sources, &sources, &AtomicBool::new(false))
+            .await
+            .unwrap();
+        assert_eq!(reader.get_cast_metrics(99, &[9; 20]).unwrap().likes, 1);
     }
 }

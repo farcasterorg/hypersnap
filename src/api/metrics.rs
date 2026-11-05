@@ -109,7 +109,7 @@ pub struct MetricsIndexer {
     /// Legacy live-hour boundary. Replacement views replay all retained hours.
     window_live_since: u64,
     /// Last hour whose expired buckets were deleted.
-    window_pruned_hour: AtomicU64,
+    window_pruned_hour: Arc<[AtomicU64; 4]>,
 }
 
 impl MetricsIndexer {
@@ -132,7 +132,7 @@ impl MetricsIndexer {
             checkpoint: AtomicU64::new(checkpoint),
             casts_tracked: AtomicU64::new(0),
             window_live_since,
-            window_pruned_hour: AtomicU64::new(0),
+            window_pruned_hour: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
         }
     }
 
@@ -150,6 +150,52 @@ impl MetricsIndexer {
             tracing::warn!(error = %e, "Failed to persist trending window start");
         }
         now
+    }
+
+    /// Durable per-shard scan and tail positions, rather than the query
+    /// handle's legacy event counter.
+    pub fn backfill_progress(
+        &self,
+        shards: &[(u32, u64)],
+    ) -> Result<serde_json::Value, IndexerError> {
+        let _readers = self.readers.read();
+        let building = self.building_generation()?;
+        let generation = building.unwrap_or_else(|| self.generation());
+        let mut progress = Vec::new();
+        let mut scan_complete = true;
+        let mut caught_up = true;
+        for &(shard, tip) in shards {
+            let mut row = super::metrics_scan::progress(&self.view(generation), &self.db, shard)?;
+            let next = super::backfill::try_load_shard_checkpoint(
+                &self.db,
+                &super::metrics_worker::cursor(generation),
+                shard,
+            )?;
+            scan_complete &= row["scan_complete"].as_bool().unwrap_or(false);
+            caught_up &= next > tip;
+            row["next_block"] = next.into();
+            row["tip"] = tip.into();
+            row["blocks_remaining"] = (tip + 1).saturating_sub(next).into();
+            progress.push(row);
+        }
+        let phase = if building.is_some() {
+            if scan_complete && !shards.is_empty() {
+                "catching_up"
+            } else {
+                "scanning"
+            }
+        } else if self.stats().backfill_complete {
+            if caught_up {
+                "ready"
+            } else {
+                "catching_up"
+            }
+        } else {
+            "initializing"
+        };
+        Ok(
+            serde_json::json!({"phase":phase,"active_generation":self.generation(),"building_generation":building,"shards":progress}),
+        )
     }
 
     /// Get metrics for a cast.
@@ -302,7 +348,10 @@ impl MetricsIndexer {
     fn prune_window(&self, txn: &mut RocksDbTransactionBatch) -> Result<(), IndexerError> {
         let now = crate::core::util::get_farcaster_time().unwrap_or(0);
         let hour = now / 3600;
-        if self.window_pruned_hour.swap(hour, Ordering::Relaxed) == hour {
+        if self.window_pruned_hour[(self.generation() / 0x10) as usize]
+            .swap(hour, Ordering::Relaxed)
+            == hour
+        {
             return Ok(());
         }
         let cutoff = (now.saturating_sub(WINDOW_RETENTION_SECS) / 3600) as u32;

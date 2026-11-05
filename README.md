@@ -107,17 +107,28 @@ does one atomic database write publish the replacement. Retired data is reclaime
 in bounded batches afterward.
 
 Reaction membership and reply identities make repeated events and replay safe;
-reply deletions and signer revocations remove their contributions. Replay checks
-canonical hyper stores (legacy stores if hyper is unavailable) so superseded or
-revoked historical adds are not resurrected. Per-generation shard cursors survive
-restarts, and failed batches are retried without advancing their cursor.
+reply deletions and signer revocations remove their contributions. The replacement
+scans canonical hyper-store message records (legacy stores if hyper is unavailable)
+in key order, skipping unrelated records and secondary indexes. It does not replay
+the entire historical chain or point-fetch every old reaction. Only blocks committed
+from the scan's saved live boundary are replayed to catch concurrent changes.
+
+The scan and live tail have independent persistent cursors. Restarts resume both;
+failed pages are retried without skipping data. An upgrade from an unfinished v1
+block replay builds a fresh generation while preserving the readable index and
+v1's partial index until publication. An already completed v1 index is reused.
 
 This one-time schema repair runs automatically whenever metrics is enabled,
 independently of the shared startup backfill gate and its legacy
-`metrics.backfill_on_startup` flag. Keep the shard block history available until
-the repair finishes. Logs report `generation`, `shard_id`, `next_block`, `tip` and
-`percent` every five seconds; the `metrics.backfill_complete` field in
-`GET /v2/farcaster/_status/backfill` becomes true after publication.
+`metrics.backfill_on_startup` flag. Keep blocks from the saved live boundary until
+the repair finishes. The status endpoint `GET /v2/farcaster/_status/backfill` includes
+`metrics_backfill` with `phase`, generations, and per-shard `rows_scanned`,
+`messages_indexed`, `last_fid`, `scan_complete`, `next_block` and `blocks_remaining`.
+The scan phase is `scanning`, then `catching_up`, then `ready`. Row counts and FIDs
+are scan progress; the tail's block percentage does not measure the historical scan.
+Logs report scan and tail progress every five seconds. The generic
+`metrics.backfill_complete` becomes true after publication; its legacy
+`items_indexed` and `last_event_id` fields are not rebuild progress counters.
 
 ### Live daily stats
 

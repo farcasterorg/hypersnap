@@ -38,6 +38,7 @@ pub mod http;
 pub mod index_gaps;
 pub mod indexer;
 pub mod metrics;
+mod metrics_scan;
 mod metrics_worker;
 pub mod notifications;
 pub mod search;
