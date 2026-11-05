@@ -34,6 +34,7 @@ pub mod daily_stats;
 pub mod events;
 pub mod feeds;
 pub mod http;
+pub mod index_gaps;
 pub mod indexer;
 pub mod metrics;
 pub mod notifications;
@@ -75,7 +76,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, watch};
 
 /// Default channel capacity for index events.
-/// If indexers can't keep up, events are dropped and caught up via backfill.
+/// If indexers can't keep up, events are dropped; see `index_gaps` for how they're caught up.
 pub const DEFAULT_CHANNEL_CAPACITY: usize = 10_000;
 
 /// Create an index event channel pair.
@@ -523,6 +524,24 @@ pub fn initialize(
         };
 
     let shutdown_tx = worker_pool.shutdown_sender();
+    // Blocks whose live events a bridge lost get replayed from the shard
+    // store into the indexers that can take a message twice in any order
+    // (put-only, keyed by the message), so a cast doesn't stay unfindable by
+    // hash until the next restart. The rest still catch up at startup.
+    let index_gaps = Arc::new(index_gaps::IndexGaps::default());
+    let tips: HashMap<u32, u64> = shard_stores
+        .iter()
+        .map(|(&id, stores)| (id, stores.shard_store.max_block_number().unwrap_or(0)))
+        .collect();
+    index_gaps::spawn_repair(
+        index_gaps.clone(),
+        shard_stores.clone(),
+        vec![
+            cast_hash_indexer.clone() as Arc<dyn Indexer>,
+            cast_quotes_indexer.clone() as Arc<dyn Indexer>,
+        ],
+        shutdown_tx.subscribe(),
+    );
     let social_graph_handle = social_graph_indexer.as_ref().map(|indexer| {
         social_graph_worker::spawn(
             indexer.clone(),
@@ -606,7 +625,11 @@ pub fn initialize(
     // Create bridges for each shard, gated on backfill completion
     let mut bridge_handles = Vec::new();
     for (shard_id, hub_event_tx) in hub_event_senders {
-        let bridge = HubEventBridge::from_sender(&hub_event_tx, index_tx.clone(), shard_id);
+        let bridge = HubEventBridge::from_sender(&hub_event_tx, index_tx.clone(), shard_id)
+            .with_gaps(
+                index_gaps.clone(),
+                tips.get(&shard_id).copied().unwrap_or(0),
+            );
         let mut rx = backfill_done_tx.subscribe();
         let handle = tokio::spawn(async move {
             // Wait until backfill is done (checks current value first, no race)

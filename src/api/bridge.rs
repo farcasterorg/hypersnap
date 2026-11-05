@@ -5,7 +5,9 @@
 //! This approach keeps the integration non-invasive - no changes to the engine.
 
 use crate::api::events::{IndexEvent, IndexEventSender, IndexEventSenderExt};
+use crate::api::index_gaps::IndexGaps;
 use crate::proto::{hub_event, HubEvent, HubEventType};
+use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
@@ -17,6 +19,9 @@ pub struct HubEventBridge {
     event_rx: broadcast::Receiver<HubEvent>,
     index_tx: IndexEventSender,
     shard_id: u32,
+    /// Where lost blocks are recorded for replay, and the last block height
+    /// seen (the shard tip when the bridge subscribed, before any event).
+    gaps: Option<(Arc<IndexGaps>, u64)>,
 }
 
 impl HubEventBridge {
@@ -35,7 +40,15 @@ impl HubEventBridge {
             event_rx,
             index_tx,
             shard_id,
+            gaps: None,
         }
+    }
+
+    /// Record the blocks whose events this bridge loses in `gaps`, so they're
+    /// replayed (index_gaps.rs). `tip` is the shard's height at subscription.
+    pub fn with_gaps(mut self, gaps: Arc<IndexGaps>, tip: u64) -> Self {
+        self.gaps = Some((gaps, tip));
+        self
     }
 
     /// Create a bridge from a broadcast sender (subscribes automatically).
@@ -55,14 +68,27 @@ impl HubEventBridge {
 
         let mut events_forwarded: u64 = 0;
         let mut events_dropped: u64 = 0;
+        // After a lag: the last height seen before it, so the missed blocks are
+        // known once the next event says where the stream picked up again.
+        let mut lagged_after: Option<u64> = None;
 
         loop {
             match self.event_rx.recv().await {
                 Ok(hub_event) => {
+                    let height = self.extract_block_height(&hub_event);
+                    if let Some((gaps, last)) = &mut self.gaps {
+                        if let Some(from) = lagged_after.take() {
+                            gaps.lost(self.shard_id, from, height);
+                        }
+                        *last = height;
+                    }
                     if let Some(index_event) = self.convert_event(&hub_event) {
                         if self.index_tx.try_send_event(index_event) {
                             events_forwarded += 1;
                         } else {
+                            if let Some((gaps, _)) = &self.gaps {
+                                gaps.lost(self.shard_id, height, height);
+                            }
                             events_dropped += 1;
                             if events_dropped % 1000 == 1 {
                                 warn!(
@@ -74,10 +100,13 @@ impl HubEventBridge {
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(count)) => {
+                    if let Some((_, last)) = &self.gaps {
+                        lagged_after = Some(lagged_after.unwrap_or(*last));
+                    }
                     warn!(
                         shard_id = self.shard_id,
                         lagged = count,
-                        "HubEvent bridge lagged behind, missed events (will backfill)"
+                        "HubEvent bridge lagged behind, missed events"
                     );
                 }
                 Err(broadcast::error::RecvError::Closed) => {
