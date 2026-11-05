@@ -69,19 +69,24 @@ The backfill status endpoint is `GET /v2/farcaster/_status/backfill`.
 
 ### Social graph rebuilds
 
-Social graph schema upgrades clear and rebuild follower/following indexes in a
-dedicated background worker. The node, HTTP server, and other API indexers can
-start while this runs. Follower lists, counts, and feeds that depend on them can
-be incomplete until `social_graph.backfill_complete` is true in the backfill
-status response's `indexers` array.
+Social graph schema upgrades rebuild follower/following indexes in a dedicated
+background worker. The node, HTTP server, and other API indexers start as
+usual, and the rebuild has no API downtime: the index stays in two
+generations, and readers keep the one they have, which the worker keeps current
+with every new block, while it rebuilds the other generation a batch at a time
+in between. Once the rebuilt generation reaches the tip, readers switch to it
+in one write and the old generation is deleted, also a batch at a time.
+`social_graph.backfill_complete` in the backfill status response's `indexers`
+array is false until the switch.
 
-The worker finishes deleting old index entries before indexing any new ones,
-then replays stored shard blocks and continues following new committed blocks.
-Those blocks serve as the durable queue during the rebuild; per-shard cursors
-resume replay after a restart. Keep block retention long enough to cover the
-rebuild. Logs report deletion and replay progress every five seconds while
-batches complete, and storage failures are logged and retried without skipping
-the failed batch.
+A node with no social graph index yet (or with `backfill_on_startup = false`)
+builds in place instead, so its follower lists, counts and the feeds that
+depend on them fill in as the replay runs.
+
+Shard blocks are the durable queue during a rebuild, and per-generation,
+per-shard cursors resume replay after a restart, so keep block retention long
+enough to cover the rebuild. Logs report replay progress every five seconds,
+and storage failures are logged and retried without skipping the failed batch.
 
 ## Contributing 
 
