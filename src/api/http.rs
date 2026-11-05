@@ -3807,7 +3807,7 @@ impl ApiHttpHandler {
                         "actions": "cast = top-level cast, reply = cast with a parent cast, like, recast, link = any LinkAdd, delete = cast/reaction/link remove, profile = UserDataAdd, verification = verification add or remove",
                         "active_fids": "fids with at least one of those actions; unlike casts.unique_authors, not limited to casts",
                         "retention": "per client, against exactly N days earlier: retained = used the client both days; retained_exclusive = used only that client both days; gained_from_other_clients = uses it now but N days earlier was active only elsewhere; lost_to_other_clients = the reverse. Windows reaching before tracked_from are null",
-                        "partial": "true on tracked_from, which is only counted from when the node started attributing",
+                        "partial": "true on tracked_from until a retained-block repair recovers coverage from the start of that UTC day",
                     });
                 }
                 Ok(Self::json_response(StatusCode::OK, &body))
@@ -3914,7 +3914,7 @@ impl ApiHttpHandler {
                 indexers.push(collect("search", s.as_ref()));
             }
         }
-        let daily_stats_progress = {
+        let (daily_stats_progress, daily_stats_repair) = {
             let ds = self.daily_stats.read().unwrap().clone();
             match ds {
                 Some(d) => {
@@ -3922,15 +3922,19 @@ impl ApiHttpHandler {
                     // The generic IndexerStats shape cannot express a fid-major
                     // store walk, so daily_stats gets its own block with the
                     // per-shard cursors and the day coverage.
-                    Some(d.backfill_progress())
+                    (Some(d.backfill_progress()), d.repair_progress())
                 }
-                None => None,
+                None => (None, None),
             }
         };
 
         let mut body = serde_json::json!({ "indexers": indexers });
         if let Some(progress) = daily_stats_progress {
             body["daily_stats_backfill"] =
+                serde_json::to_value(progress).unwrap_or(serde_json::Value::Null);
+        }
+        if let Some(progress) = daily_stats_repair {
+            body["daily_stats_repair"] =
                 serde_json::to_value(progress).unwrap_or(serde_json::Value::Null);
         }
         Ok(Self::json_response(StatusCode::OK, &body))

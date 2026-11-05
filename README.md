@@ -97,6 +97,42 @@ per-shard cursors resume replay after a restart, so keep block retention long
 enough to cover the rebuild. Logs report replay progress every five seconds,
 and storage failures are logged and retried without skipping the failed batch.
 
+### Live daily stats
+
+Daily stats and client attribution consume live events through their own queue
+and worker, starting immediately without waiting for search or other startup
+backfills. Slow search commits do not share this worker. The historical daily
+stats walk continues in the background with its existing date boundary.
+
+After upgrading, new activity appears in `/v2/farcaster/stats/daily?clients=10`;
+include `to=YYYY-MM-DD` for today in UTC to see the current partial day. The
+`daily_stats` entry at `/v2/farcaster/_status/backfill` reports messages processed
+since startup as `items_indexed`.
+
+With daily stats enabled, a one-time repair automatically replays retained
+shard blocks from the first client-attribution day (`notes.clients.tracked_from`)
+through the UTC day the repair starts. It rebuilds both totals and client data
+in a persistent staging database while live collection continues, then replaces
+the affected days atomically. Buffered events already included by that repair
+are skipped. Older days are kept intact, and an interrupted repair resumes from
+its committed per-shard cursors. Keys that cannot be resolved are attributed to
+`unresolved`.
+
+Monitor it with:
+
+```bash
+curl -s http://localhost:3381/v2/farcaster/_status/backfill | jq '.daily_stats_repair'
+```
+
+The object reports `phase`, `complete`, `from`, `to`, `messages_replayed`, shard
+cursors and any `error`. Progress is also logged about every five seconds.
+Insufficient block retention or a missing source block leaves existing rows
+intact and reports a failure. The staging directory lives beside the API DB
+(`.rocks/shard-0.daily-stats-repair-*`) and is removed after success. To defer
+the repair, set `[api.daily_stats] repair_on_startup = false`; it defaults to
+true. The regular historical store-walk backfill has its own checkpoints and
+does not need to be reset for this repair.
+
 ## Contributing 
 
 We welcome contributions from developers of all skill levels. Please look for issues labeled with "help wanted" to find good tickets to work on. If you are working on something that is not explicitly a ticket, we may or may not accept it. We encourage checking with someone on the team before spending a lot of time on something. 

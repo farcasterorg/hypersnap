@@ -31,6 +31,7 @@ pub mod config;
 pub mod conversations;
 pub mod custody_index;
 pub mod daily_stats;
+mod daily_stats_worker;
 pub mod events;
 pub mod feeds;
 pub mod http;
@@ -90,6 +91,10 @@ pub struct ApiSystem {
     pub worker_handle: tokio::task::JoinHandle<()>,
     /// Ordered social graph migration/replay/tailing task.
     pub social_graph_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Live daily stats run independently of search and startup backfill.
+    pub daily_stats_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Resumable replacement of days missed during startup backfill.
+    pub daily_stats_repair_handle: Option<tokio::task::JoinHandle<()>>,
     /// Bridge task handles (one per shard).
     pub bridge_handles: Vec<tokio::task::JoinHandle<()>>,
     /// Webhook delivery worker task handle.
@@ -121,6 +126,12 @@ impl ApiSystem {
         tracing::info!("Shutting down Farcaster indexing system");
         let _ = self.shutdown_tx.send(());
         if let Some(handle) = self.social_graph_handle {
+            let _ = handle.await;
+        }
+        if let Some(handle) = self.daily_stats_handle {
+            let _ = handle.await;
+        }
+        if let Some(handle) = self.daily_stats_repair_handle {
             let _ = handle.await;
         }
 
@@ -419,10 +430,6 @@ pub fn initialize(
         worker_pool.register_arc(indexer.clone());
     }
 
-    if let Some(ref indexer) = daily_stats_indexer {
-        worker_pool.register_arc(indexer.clone());
-    }
-
     if let Some(ref indexer) = search_indexer {
         worker_pool.register_arc(indexer.clone());
     }
@@ -527,6 +534,25 @@ pub fn initialize(
         };
 
     let shutdown_tx = worker_pool.shutdown_sender();
+    let (daily_stats_handle, mut bridge_handles) = if let Some(indexer) = &daily_stats_indexer {
+        let (worker, bridges) = daily_stats_worker::spawn(
+            config,
+            indexer.clone(),
+            db.clone(),
+            &hub_event_senders,
+            &shutdown_tx,
+        );
+        (Some(worker), bridges)
+    } else {
+        (None, Vec::new())
+    };
+    let daily_stats_repair_handle = if config.daily_stats.repair_on_startup {
+        daily_stats_indexer
+            .as_ref()
+            .map(|indexer| indexer.spawn_gap_repair(shard_stores.clone(), shutdown_tx.subscribe()))
+    } else {
+        None
+    };
     // Blocks whose live events a bridge lost get replayed from the shard
     // store into the indexers that can take a message twice in any order
     // (put-only, keyed by the message), so a cast doesn't stay unfindable by
@@ -592,7 +618,7 @@ pub fn initialize(
         let _ = backfill_done_tx.send(true);
     }
 
-    // Daily-stats backfill runs CONCURRENTLY with the bridges, not ahead of them.
+    // Daily-stats backfill runs concurrently with its dedicated live worker.
     //
     // Gating the bridges on this walk was what left a hole at the backfill/live
     // seam: the walk takes hours, nothing else indexes while it runs, and the
@@ -632,7 +658,6 @@ pub fn initialize(
     }
 
     // Create bridges for each shard, gated on backfill completion
-    let mut bridge_handles = Vec::new();
     for (shard_id, hub_event_tx) in hub_event_senders {
         let bridge = HubEventBridge::from_sender(&hub_event_tx, index_tx.clone(), shard_id)
             .with_gaps(
@@ -732,6 +757,8 @@ pub fn initialize(
     Some(ApiSystem {
         worker_handle,
         social_graph_handle,
+        daily_stats_handle,
+        daily_stats_repair_handle,
         bridge_handles,
         delivery_handle,
         retry_pump_handle,

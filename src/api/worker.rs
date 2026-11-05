@@ -62,6 +62,13 @@ impl IndexWorkerPool {
         self.shutdown_tx.clone()
     }
 
+    /// Join the API system's shutdown signal when running a dedicated pool.
+    pub(crate) fn with_shutdown(mut self, shutdown_tx: broadcast::Sender<()>) -> Self {
+        self.shutdown_rx = shutdown_tx.subscribe();
+        self.shutdown_tx = shutdown_tx;
+        self
+    }
+
     /// Get the list of registered indexers.
     pub fn indexers(&self) -> &[Arc<dyn Indexer>] {
         &self.indexers

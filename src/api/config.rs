@@ -75,6 +75,11 @@ pub struct DailyStatsConfig {
     #[serde(default)]
     pub enabled: bool,
 
+    /// Once per data directory, repair missed live days from retained blocks,
+    /// starting at the first day client attribution was enabled.
+    #[serde(default = "default_daily_stats_repair_on_startup")]
+    pub repair_on_startup: bool,
+
     /// Whether to run backfill on startup. Required for the series to cover
     /// history that predates enabling the indexer — without it the chart
     /// starts on the day the node was upgraded.
@@ -124,6 +129,10 @@ fn default_flush_every_events() -> usize {
     50_000
 }
 
+fn default_daily_stats_repair_on_startup() -> bool {
+    true
+}
+
 fn default_flush_interval_secs() -> u64 {
     30
 }
@@ -140,6 +149,7 @@ impl Default for DailyStatsConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            repair_on_startup: true,
             backfill_on_startup: false,
             backfill_batch_size: default_backfill_batch_size(),
             flush_every_events: default_flush_every_events(),

@@ -71,6 +71,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+mod repair;
+pub use repair::{RepairProgress, RepairShardProgress};
+
 const SECONDS_PER_DAY: u64 = 86_400;
 
 /// Upper bound on the span a single query may ask for. Each day in the span
@@ -893,6 +896,11 @@ pub struct DailyStatsIndexer {
     config: DailyStatsConfig,
     db: Arc<RocksDB>,
     pending: Mutex<BTreeMap<u32, DayAccumulator>>,
+    /// Orders live folding/flushes with publication of repaired day rows.
+    mutation_gate: Mutex<()>,
+    repair_fence: Mutex<Option<repair::RepairFence>>,
+    repair_boundary_error: Mutex<Option<String>>,
+    live_heights: Mutex<BTreeMap<u32, u64>>,
     /// Serializes `write_days`.
     ///
     /// Every stored value is folded in with a read-modify-write (counters sum,
@@ -942,10 +950,21 @@ impl DailyStatsIndexer {
         let checkpoint = Self::load_checkpoint(&db).unwrap_or(0);
         let live_from = Self::load_live_from(&db).unwrap_or(0);
         let clients_from = Self::load_day(&db, &Self::clients_from_key()).unwrap_or(0);
+        let (repair_fence, repair_boundary_error) = match repair::load_fence(&db) {
+            Ok(fence) => (fence, None),
+            Err(error) => {
+                tracing::error!(%error, "Daily stats repair boundary is unreadable; pausing writes");
+                (None, Some(error.to_string()))
+            }
+        };
         Self {
             config,
             db,
             pending: Mutex::new(BTreeMap::new()),
+            mutation_gate: Mutex::new(()),
+            repair_fence: Mutex::new(repair_fence),
+            repair_boundary_error: Mutex::new(repair_boundary_error),
+            live_heights: Mutex::new(BTreeMap::new()),
             write_lock: Mutex::new(()),
             pending_events: AtomicU64::new(0),
             pending_fids: AtomicU64::new(0),
@@ -1466,13 +1485,22 @@ impl DailyStatsIndexer {
     /// note the plain counters *are* additive, so a replayed range does inflate
     /// them. Backfill is checkpointed to avoid that.
     fn write_days(&self, days: Vec<(u32, DayAccumulator)>) -> Result<(), IndexerError> {
-        if days.is_empty() {
+        self.write_days_with_extra(days, RocksDbTransactionBatch::new())
+    }
+
+    /// Repair staging writes its next-block cursor in the same commit as the
+    /// additive counters. A retry can never count a committed batch twice.
+    fn write_days_with_extra(
+        &self,
+        days: Vec<(u32, DayAccumulator)>,
+        mut txn: RocksDbTransactionBatch,
+    ) -> Result<(), IndexerError> {
+        if days.is_empty() && txn.len() == 0 {
             return Ok(());
         }
         // Held across the whole read-merge-write cycle, not just the commit:
         // the read is the half that has to be protected.
         let _guard = self.write_lock.lock().unwrap();
-        let mut txn = RocksDbTransactionBatch::new();
         let n = days.len() as u64;
 
         for (day, acc) in days {
@@ -1705,7 +1733,7 @@ impl DailyStatsIndexer {
                     d20: retained(20),
                     d30: retained(30),
                 },
-                reconstructed: live_from != 0 && day < live_from,
+                reconstructed: live_from != 0 && day < live_from && !self.repaired_day(day),
                 clients: None,
             });
         }
@@ -1777,7 +1805,7 @@ impl DailyStatsIndexer {
                     past,
                     &counters[&day],
                     &labels,
-                    day == tracked_from,
+                    day == tracked_from && !self.repaired_day(day),
                 ),
             );
         }
@@ -2013,6 +2041,13 @@ impl Indexer for DailyStatsIndexer {
     }
 
     async fn process_event(&self, event: &IndexEvent) -> Result<(), IndexerError> {
+        let _gate = self.mutation_gate.lock().unwrap();
+        self.check_repair_boundary()?;
+        if let Some(height) = event.block_height() {
+            let mut live = self.live_heights.lock().unwrap();
+            let seen = live.entry(event.shard_id()).or_default();
+            *seen = (*seen).max(height);
+        }
         match event {
             // Merges only. Prune and revoke redeliver a message that was already
             // counted, with its original timestamp, so folding them would inflate
@@ -2020,9 +2055,13 @@ impl Indexer for DailyStatsIndexer {
             IndexEvent::MessageCommitted {
                 message,
                 shard_id,
+                block_height,
                 kind: MessageEventKind::Merge,
                 ..
             } => {
+                if !self.accept_message(message, *shard_id, *block_height) {
+                    return Ok(());
+                }
                 let attribution = self.attribute(*shard_id, message);
                 let new_fids = {
                     let mut pending = self.pending.lock().unwrap();
@@ -2037,9 +2076,15 @@ impl Indexer for DailyStatsIndexer {
             IndexEvent::MessagesCommitted {
                 messages,
                 shard_id,
+                block_height,
                 kind: MessageEventKind::Merge,
                 ..
             } => {
+                let messages: Vec<_> = messages
+                    .iter()
+                    .filter(|m| self.accept_message(m, *shard_id, *block_height))
+                    .cloned()
+                    .collect();
                 let attributions: Vec<_> = messages
                     .iter()
                     .map(|m| self.attribute(*shard_id, m))
@@ -2057,7 +2102,7 @@ impl Indexer for DailyStatsIndexer {
                     .fetch_add(messages.len() as u64, Ordering::Relaxed);
                 self.messages_folded
                     .fetch_add(messages.len() as u64, Ordering::Relaxed);
-                self.mark_live(messages);
+                self.mark_live(&messages);
                 self.maybe_flush()?;
             }
             IndexEvent::BlockCommitted { .. } => {
@@ -2069,6 +2114,8 @@ impl Indexer for DailyStatsIndexer {
     }
 
     async fn process_batch(&self, events: &[IndexEvent]) -> Result<(), IndexerError> {
+        let _gate = self.mutation_gate.lock().unwrap();
+        self.check_repair_boundary()?;
         // Resolve signers before taking the accumulator lock: a cache miss is a
         // RocksDB read, and the live path folds under the same lock.
         let mut merged: Vec<(&Message, Option<(u64, u16)>)> = Vec::new();
@@ -2077,15 +2124,26 @@ impl Indexer for DailyStatsIndexer {
                 IndexEvent::MessageCommitted {
                     message,
                     shard_id,
+                    block_height,
                     kind: MessageEventKind::Merge,
                     ..
-                } => merged.push((message, self.attribute(*shard_id, message))),
+                } => {
+                    if self.accept_message(message, *shard_id, *block_height) {
+                        merged.push((message, self.attribute(*shard_id, message)));
+                    }
+                }
                 IndexEvent::MessagesCommitted {
                     messages,
                     shard_id,
+                    block_height,
                     kind: MessageEventKind::Merge,
                     ..
-                } => merged.extend(messages.iter().map(|m| (m, self.attribute(*shard_id, m)))),
+                } => merged.extend(
+                    messages
+                        .iter()
+                        .filter(|m| self.accept_message(m, *shard_id, *block_height))
+                        .map(|m| (m, self.attribute(*shard_id, m))),
+                ),
                 _ => {}
             }
         }
@@ -2108,6 +2166,8 @@ impl Indexer for DailyStatsIndexer {
     }
 
     async fn save_checkpoint(&self, event_id: u64) -> Result<(), IndexerError> {
+        let _gate = self.mutation_gate.lock().unwrap();
+        self.check_repair_boundary()?;
         // Flush first: a checkpoint that outruns the data it stands for would
         // make a restart skip events that were only ever in memory.
         self.flush_all()?;
@@ -2135,6 +2195,8 @@ impl Indexer for DailyStatsIndexer {
     }
 
     async fn flush(&self) -> Result<(), IndexerError> {
+        let _gate = self.mutation_gate.lock().unwrap();
+        self.check_repair_boundary()?;
         self.flush_all()
     }
 }

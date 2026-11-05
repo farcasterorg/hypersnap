@@ -38,7 +38,7 @@ static GEO_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^geo:(-?\d{1,2}\.\d{2}),(-?\d{1,3}\.\d{2})$").unwrap());
 
 /** Number of seconds (10 minutes) that is appropriate for clock skew */
-const ALLOWED_CLOCK_SKEW_SECONDS: u64 = 10 * 60;
+pub(crate) const ALLOWED_CLOCK_SKEW_SECONDS: u64 = 10 * 60;
 
 pub fn validate_message_type(message_type: i32) -> Result<(), ValidationError> {
     MessageType::try_from(message_type)

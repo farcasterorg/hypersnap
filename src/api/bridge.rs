@@ -22,6 +22,8 @@ pub struct HubEventBridge {
     /// Where lost blocks are recorded for replay, and the last block height
     /// seen (the shard tip when the bridge subscribed, before any event).
     gaps: Option<(Arc<IndexGaps>, u64)>,
+    /// Dedicated consumers wait for their own queue instead of dropping events.
+    backpressure: bool,
 }
 
 impl HubEventBridge {
@@ -41,6 +43,7 @@ impl HubEventBridge {
             index_tx,
             shard_id,
             gaps: None,
+            backpressure: false,
         }
     }
 
@@ -48,6 +51,11 @@ impl HubEventBridge {
     /// replayed (index_gaps.rs). `tip` is the shard's height at subscription.
     pub fn with_gaps(mut self, gaps: Arc<IndexGaps>, tip: u64) -> Self {
         self.gaps = Some((gaps, tip));
+        self
+    }
+
+    pub(crate) fn with_backpressure(mut self) -> Self {
+        self.backpressure = true;
         self
     }
 
@@ -83,7 +91,15 @@ impl HubEventBridge {
                         *last = height;
                     }
                     if let Some(index_event) = self.convert_event(&hub_event) {
-                        if self.index_tx.try_send_event(index_event) {
+                        let sent = if self.backpressure {
+                            if self.index_tx.send(index_event).await.is_err() {
+                                break;
+                            }
+                            true
+                        } else {
+                            self.index_tx.try_send_event(index_event)
+                        };
+                        if sent {
                             events_forwarded += 1;
                         } else {
                             if let Some((gaps, _)) = &self.gaps {
@@ -210,9 +226,7 @@ impl HubEventBridge {
     /// Extract block height from hub event ID.
     /// Event IDs encode the block height in the upper bits.
     fn extract_block_height(&self, hub_event: &HubEvent) -> u64 {
-        // Event ID format: (block_number << 24) | sequence
-        // See: src/storage/store/event_handler.rs
-        hub_event.id >> 24
+        crate::storage::store::account::HubEventIdGenerator::extract_height_and_seq(hub_event.id).0
     }
 }
 
@@ -243,6 +257,47 @@ mod tests {
             })),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn message_height_uses_the_persisted_event_id_layout() {
+        let (hub_tx, _) = broadcast::channel(1);
+        let (index_tx, _) = mpsc::channel(1);
+        let bridge = HubEventBridge::from_sender(&hub_tx, index_tx, 1);
+        let mut event = make_merge_event(make_test_message(10));
+        event.id =
+            crate::storage::store::account::HubEventIdGenerator::make_event_id_for_block_number(
+                50_000_000,
+            ) | 123;
+        assert_eq!(
+            bridge.convert_event(&event).unwrap().block_height(),
+            Some(50_000_000)
+        );
+    }
+
+    #[tokio::test]
+    async fn backpressure_waits_for_capacity_instead_of_dropping_events() {
+        let (hub_tx, _) = broadcast::channel(8);
+        let (index_tx, mut index_rx) = mpsc::channel(1);
+        let bridge = HubEventBridge::from_sender(&hub_tx, index_tx, 1).with_backpressure();
+        let task = tokio::spawn(bridge.run());
+        for fid in 1..=3 {
+            hub_tx
+                .send(make_merge_event(make_test_message(fid)))
+                .unwrap();
+        }
+        for fid in 1..=3 {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(1), index_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let IndexEvent::MessageCommitted { message, .. } = event else {
+                panic!("expected merge message");
+            };
+            assert_eq!(message.data.unwrap().fid, fid);
+        }
+        drop(hub_tx);
+        task.await.unwrap();
     }
 
     #[tokio::test]

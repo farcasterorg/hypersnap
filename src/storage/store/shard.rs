@@ -316,6 +316,40 @@ impl ShardStore {
             .transpose()
     }
 
+    /// Earliest retained height whose block timestamp meets the cutoff.
+    /// Header clocks need not be monotonic across leaders, so a height binary
+    /// search (or just the first timestamp-index entry) can skip eligible blocks.
+    pub(crate) fn min_height_since_timestamp(
+        &self,
+        timestamp: u64,
+        min_height: u64,
+        max_height: u64,
+    ) -> Result<Option<u64>, ShardStorageError> {
+        let mut prefix = vec![RootPrefix::BlockIndex as u8];
+        prefix.extend_from_slice(&self.shard_id.to_be_bytes());
+        let mut earliest: Option<u64> = None;
+        self.db.for_each_iterator_by_prefix(
+            Some(make_block_timestamp_index(self.shard_id, timestamp)),
+            Some(crate::storage::util::increment_vec_u8(&prefix)),
+            &PageOptions::default(),
+            |_, value| {
+                if value.len() != 9 || value[0] != RootPrefix::Shard as u8 {
+                    return Err(HubError {
+                        code: "internal_error".into(),
+                        message: "Invalid shard timestamp index".into(),
+                    });
+                }
+                let height = u64::from_be_bytes(value[1..].try_into().unwrap());
+                // Old timestamp keys may outlive pruning of the primary block.
+                if (min_height..=max_height).contains(&height) {
+                    earliest = Some(earliest.map_or(height, |old| old.min(height)));
+                }
+                Ok(false)
+            },
+        )?;
+        Ok(earliest)
+    }
+
     // Prune blocks with height less than stop_height. Returns the total number
     // of blocks pruned. Sleeps after each page for the throttle duration and
     // will stop if a shutdown is requested.
