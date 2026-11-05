@@ -38,6 +38,7 @@ pub mod http;
 pub mod index_gaps;
 pub mod indexer;
 pub mod metrics;
+mod metrics_worker;
 pub mod notifications;
 pub mod search;
 pub mod social_graph;
@@ -91,6 +92,8 @@ pub struct ApiSystem {
     pub worker_handle: tokio::task::JoinHandle<()>,
     /// Ordered social graph migration/replay/tailing task.
     pub social_graph_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Metrics replacement and durable block replay.
+    pub metrics_rebuild_handle: Option<tokio::task::JoinHandle<()>>,
     /// Live daily stats run independently of search and startup backfill.
     pub daily_stats_handle: Option<tokio::task::JoinHandle<()>>,
     /// Resumable replacement of days missed during startup backfill.
@@ -126,6 +129,9 @@ impl ApiSystem {
         tracing::info!("Shutting down Farcaster indexing system");
         let _ = self.shutdown_tx.send(());
         if let Some(handle) = self.social_graph_handle {
+            let _ = handle.await;
+        }
+        if let Some(handle) = self.metrics_rebuild_handle {
             let _ = handle.await;
         }
         if let Some(handle) = self.daily_stats_handle {
@@ -365,22 +371,6 @@ pub fn initialize(
         });
     }
 
-    // Trending windows read hourly engagement buckets that live events only
-    // fill from the first start of this version; fill the buckets for the
-    // engagement before it once, from the hyper stores.
-    if let (Some(metrics), Some(hyper)) = (metrics_indexer.clone(), hyper_shard_stores.clone()) {
-        tokio::task::spawn_blocking(move || {
-            let started = std::time::Instant::now();
-            match metrics.backfill_window(&hyper) {
-                Ok(()) => tracing::info!(
-                    elapsed_secs = started.elapsed().as_secs(),
-                    "Trending window backfill complete"
-                ),
-                Err(e) => tracing::warn!(error = %e, "Trending window backfill failed"),
-            }
-        });
-    }
-
     // Collect indexers that need backfill
     let mut backfill_indexers: Vec<Arc<dyn Indexer>> = Vec::new();
     backfill_indexers.push(cast_hash_indexer.clone());
@@ -390,11 +380,6 @@ pub fn initialize(
     // replay must never gate the other indexers or compete with live writes.
     if config.channels.backfill_on_startup {
         if let Some(ref idx) = channels_indexer {
-            backfill_indexers.push(idx.clone());
-        }
-    }
-    if config.metrics.backfill_on_startup {
-        if let Some(ref idx) = metrics_indexer {
             backfill_indexers.push(idx.clone());
         }
     }
@@ -423,10 +408,6 @@ pub fn initialize(
     worker_pool.register_arc(user_search_indexer.clone());
 
     if let Some(ref indexer) = channels_indexer {
-        worker_pool.register_arc(indexer.clone());
-    }
-
-    if let Some(ref indexer) = metrics_indexer {
         worker_pool.register_arc(indexer.clone());
     }
 
@@ -579,6 +560,21 @@ pub fn initialize(
             config.social_graph.backfill_on_startup,
             shutdown_tx.subscribe(),
         )
+    });
+
+    let metrics_rebuild_handle = metrics_indexer.as_ref().map(|indexer| {
+        let (worker, handles) = metrics_worker::spawn(
+            indexer.clone(),
+            db.clone(),
+            shard_stores.clone(),
+            hyper_shard_stores
+                .clone()
+                .unwrap_or_else(|| shard_stores.clone()),
+            &hub_event_senders,
+            &shutdown_tx,
+        );
+        bridge_handles.extend(handles);
+        worker
     });
 
     // Spawn worker pool
@@ -757,6 +753,7 @@ pub fn initialize(
     Some(ApiSystem {
         worker_handle,
         social_graph_handle,
+        metrics_rebuild_handle,
         daily_stats_handle,
         daily_stats_repair_handle,
         bridge_handles,

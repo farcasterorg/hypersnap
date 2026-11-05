@@ -17,6 +17,11 @@
 //!   from the stores for engagement before `[prefix][0x03]`
 //! - `[prefix][0xFF]` -> checkpoint:8
 //!
+//! Subkeys 0x01/02/05/06/07 are also stored with bit 0x10 set for
+//! the replacement generation. 0x06 records reaction membership and 0x07
+//! records replies (including deletion tombstones); 0xF0..F3 track publication.
+//! The old generation is retained until replacement replay completes.
+//!
 //! # Processing
 //!
 //! - ReactionAdd (type=Like): increment like count
@@ -34,18 +39,18 @@
 use crate::api::config::MetricsConfig;
 use crate::api::events::{IndexEvent, MessageEventKind};
 use crate::api::indexer::{Indexer, IndexerError, IndexerStats};
-use crate::mempool::routing::{MessageRouter, ShardRouter};
 use crate::proto::message_data::Body;
 use crate::proto::{Message, MessageType, ReactionType};
-use crate::storage::constants::{RootPrefix, UserPostfix};
 use crate::storage::db::{PageOptions, RocksDB, RocksDbTransactionBatch};
-use crate::storage::store::account::{make_user_key_with_prefix, message_decode};
-use crate::storage::store::stores::Stores;
 use async_trait::async_trait;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+mod replacement;
 
 /// Key prefixes for metrics data.
 mod keys {
@@ -61,11 +66,15 @@ mod keys {
     /// Farcaster time from which live events fill hour buckets: <prefix><0x03> -> u64
     pub const WINDOW_LIVE_SINCE: u8 = 0x03;
 
-    /// Present once the store backfill of hour buckets has finished: <prefix><0x04>
-    pub const WINDOW_BACKFILL_DONE: u8 = 0x04;
-
     /// Hourly engagement backfilled from the stores: same layout as WINDOW_LIVE
     pub const WINDOW_BACKFILL: u8 = 0x05;
+
+    pub const MEMBERSHIP: u8 = 0x06;
+    pub const REPLIES: u8 = 0x07;
+    pub const ACTIVE: u8 = 0xF0;
+    pub const BUILDING: u8 = 0xF1;
+    pub const SCHEMA: u8 = 0xF2;
+    pub const DELETING: u8 = 0xF3;
 
     /// Checkpoint: <prefix><0xFF> -> event_id:8
     pub const CHECKPOINT: u8 = 0xFF;
@@ -90,11 +99,14 @@ const REPLY_WEIGHT: i64 = 3;
 /// Metrics indexer for tracking engagement on casts.
 pub struct MetricsIndexer {
     config: MetricsConfig,
+    generation: AtomicU8,
+    writer: Arc<Mutex<()>>,
+    readers: Arc<RwLock<()>>,
+    fixed_generation: bool,
     db: Arc<RocksDB>,
     checkpoint: AtomicU64,
     casts_tracked: AtomicU64,
-    /// Live events with a timestamp at or after this fill hour buckets;
-    /// [`Self::backfill_window`] covers the engagement before it.
+    /// Legacy live-hour boundary. Replacement views replay all retained hours.
     window_live_since: u64,
     /// Last hour whose expired buckets were deleted.
     window_pruned_hour: AtomicU64,
@@ -108,6 +120,14 @@ impl MetricsIndexer {
 
         Self {
             config,
+            generation: AtomicU8::new(
+                Self::read_generation(&db, keys::ACTIVE)
+                    .expect("Invalid metrics generation")
+                    .unwrap_or(0),
+            ),
+            writer: Arc::new(Mutex::new(())),
+            readers: Arc::new(RwLock::new(())),
+            fixed_generation: false,
             db,
             checkpoint: AtomicU64::new(checkpoint),
             casts_tracked: AtomicU64::new(0),
@@ -134,7 +154,8 @@ impl MetricsIndexer {
 
     /// Get metrics for a cast.
     pub fn get_cast_metrics(&self, fid: u64, hash: &[u8]) -> Result<CastMetrics, IndexerError> {
-        let key = Self::make_cast_key(fid, hash);
+        let _guard = self.readers.read();
+        let key = self.cast_key(fid, hash);
         match self.db.get(&key) {
             Ok(Some(data)) => {
                 let metrics: CastMetrics = serde_json::from_slice(&data).map_err(|e| {
@@ -155,9 +176,13 @@ impl MetricsIndexer {
         window_secs: u64,
         now: u64,
     ) -> Result<Vec<(u64, Vec<u8>, f64)>, IndexerError> {
+        let _guard = self.readers.read();
         let from_hour = (now.saturating_sub(window_secs) / 3600) as u32;
         let mut scores: HashMap<(u64, Vec<u8>), i64> = HashMap::new();
-        for source in [keys::WINDOW_LIVE, keys::WINDOW_BACKFILL] {
+        for source in [
+            keys::WINDOW_LIVE | self.generation(),
+            keys::WINDOW_BACKFILL | self.generation(),
+        ] {
             let start = [
                 &[keys::METRICS_PREFIX, source][..],
                 &from_hour.to_be_bytes(),
@@ -195,105 +220,6 @@ impl MetricsIndexer {
         Ok(ranked)
     }
 
-    /// Fill hour buckets for the engagement that predates live bucket
-    /// tracking, from every cast and reaction in `hyper_stores` timestamped
-    /// within [`WINDOW_RETENTION_SECS`] before it. Runs once. Blocking.
-    pub fn backfill_window(&self, hyper_stores: &HashMap<u32, Stores>) -> Result<(), IndexerError> {
-        let done_key = [keys::METRICS_PREFIX, keys::WINDOW_BACKFILL_DONE];
-        if matches!(self.db.get(&done_key), Ok(Some(_))) {
-            return Ok(());
-        }
-        let until = self.window_live_since;
-        let from = until.saturating_sub(WINDOW_RETENTION_SECS);
-        let num_shards = hyper_stores.len() as u32;
-        let router = ShardRouter {};
-
-        for (&shard_id, stores) in hyper_stores {
-            let Some(max_fid) = crate::hyper::reconcile::max_registered_fid(stores) else {
-                continue;
-            };
-            let mut txn = RocksDbTransactionBatch::new();
-            for fid in 1..=max_fid {
-                if router.route_fid(fid, num_shards) != shard_id {
-                    continue;
-                }
-                let user = make_user_key_with_prefix(RootPrefix::HyperUser as u8, fid);
-                for postfix in [UserPostfix::ReactionMessage, UserPostfix::CastMessage] {
-                    let set = [&user[..], &[postfix as u8]].concat();
-                    let start = [&set[..], &(from as u32).to_be_bytes()].concat();
-                    let stop = [&set[..], &(until as u32).to_be_bytes()].concat();
-                    stores
-                        .db
-                        .for_each_iterator_by_prefix(
-                            Some(start),
-                            Some(stop),
-                            &PageOptions::default(),
-                            |_key, value| {
-                                if let Ok(message) = message_decode(value) {
-                                    self.backfill_message(&message, &mut txn)?;
-                                }
-                                Ok(false)
-                            },
-                        )
-                        .map_err(|e| IndexerError::Storage(format!("{:?}", e)))?;
-                }
-                if txn.len() >= 1000 {
-                    self.commit(std::mem::replace(&mut txn, RocksDbTransactionBatch::new()))?;
-                }
-            }
-            self.commit(txn)?;
-        }
-
-        self.db
-            .put(&done_key, &[1])
-            .map_err(|e| IndexerError::Storage(e.to_string()))
-    }
-
-    /// Add a stored message's engagement to the backfilled hour buckets.
-    fn backfill_message(
-        &self,
-        message: &Message,
-        txn: &mut RocksDbTransactionBatch,
-    ) -> Result<(), crate::core::error::HubError> {
-        let Some(data) = &message.data else {
-            return Ok(());
-        };
-        let target = match (MessageType::try_from(data.r#type), &data.body) {
-            (Ok(MessageType::ReactionAdd), Some(Body::ReactionBody(body))) => {
-                match (&body.target, ReactionType::try_from(body.r#type)) {
-                    (
-                        Some(crate::proto::reaction_body::Target::TargetCastId(cast)),
-                        Ok(ReactionType::Like),
-                    ) => Some((cast, LIKE_WEIGHT)),
-                    (
-                        Some(crate::proto::reaction_body::Target::TargetCastId(cast)),
-                        Ok(ReactionType::Recast),
-                    ) => Some((cast, RECAST_WEIGHT)),
-                    _ => None,
-                }
-            }
-            (Ok(MessageType::CastAdd), Some(Body::CastAddBody(body))) => match &body.parent {
-                Some(crate::proto::cast_add_body::Parent::ParentCastId(cast)) => {
-                    Some((cast, REPLY_WEIGHT))
-                }
-                _ => None,
-            },
-            _ => None,
-        };
-        if let Some((cast, weight)) = target {
-            let key = Self::make_window_key(
-                keys::WINDOW_BACKFILL,
-                data.timestamp as u64 / 3600,
-                cast.fid,
-                &cast.hash,
-            );
-            Self::add_to_window_key(&self.db, key, weight, txn).map_err(|e| {
-                crate::core::error::HubError::invalid_internal_state(&e.to_string())
-            })?;
-        }
-        Ok(())
-    }
-
     /// Get number of casts being tracked.
     pub fn casts_tracked(&self) -> u64 {
         self.casts_tracked.load(Ordering::Relaxed)
@@ -311,100 +237,10 @@ impl MetricsIndexer {
             None => return Ok(()),
         };
 
-        let msg_type = MessageType::try_from(data.r#type).unwrap_or(MessageType::None);
-        // +1 counts the message, -1 takes it back.
-        let delta = match (kind, msg_type) {
-            (MessageEventKind::Prune, _) => return Ok(()),
-            (MessageEventKind::Merge, MessageType::ReactionRemove) => -1,
-            (MessageEventKind::Merge, _) => 1,
-            (MessageEventKind::Revoke, MessageType::ReactionAdd | MessageType::CastAdd) => -1,
-            (MessageEventKind::Revoke, _) => return Ok(()),
-        };
-
-        match msg_type {
-            MessageType::ReactionAdd | MessageType::ReactionRemove => {
-                self.process_reaction_message(data, delta, txn)?;
-            }
-            MessageType::CastAdd => {
-                self.process_cast_add(data, delta, txn)?;
-            }
-            _ => {}
-        }
-
-        Ok(())
-    }
-
-    /// Process a reaction message (add or remove).
-    fn process_reaction_message(
-        &self,
-        data: &crate::proto::MessageData,
-        delta: i64,
-        txn: &mut RocksDbTransactionBatch,
-    ) -> Result<(), IndexerError> {
-        let reaction_body = match &data.body {
-            Some(Body::ReactionBody(body)) => body,
-            _ => return Ok(()),
-        };
-
-        // Get the target cast
-        let target_cast = match &reaction_body.target {
-            Some(crate::proto::reaction_body::Target::TargetCastId(cast_id)) => cast_id,
-            _ => return Ok(()), // URL reactions not tracked
-        };
-
-        let reaction_type =
-            ReactionType::try_from(reaction_body.r#type).unwrap_or(ReactionType::None);
-        if reaction_type == ReactionType::None {
+        if kind == MessageEventKind::Prune {
             return Ok(());
         }
-
-        let weight = if reaction_type == ReactionType::Recast {
-            RECAST_WEIGHT
-        } else {
-            LIKE_WEIGHT
-        };
-        self.add_window_score(
-            target_cast.fid,
-            &target_cast.hash,
-            data.timestamp,
-            weight * delta,
-            txn,
-        )?;
-        self.update_cast_metrics(
-            target_cast.fid,
-            &target_cast.hash,
-            reaction_type,
-            delta > 0,
-            txn,
-        )
-    }
-
-    /// Process a cast add message to track replies.
-    fn process_cast_add(
-        &self,
-        data: &crate::proto::MessageData,
-        delta: i64,
-        txn: &mut RocksDbTransactionBatch,
-    ) -> Result<(), IndexerError> {
-        let cast_body = match &data.body {
-            Some(Body::CastAddBody(body)) => body,
-            _ => return Ok(()),
-        };
-
-        // Check if this is a reply (has a parent cast)
-        let parent_cast = match &cast_body.parent {
-            Some(crate::proto::cast_add_body::Parent::ParentCastId(cast_id)) => cast_id,
-            _ => return Ok(()), // Not a reply
-        };
-
-        self.add_window_score(
-            parent_cast.fid,
-            &parent_cast.hash,
-            data.timestamp,
-            REPLY_WEIGHT * delta,
-            txn,
-        )?;
-        self.adjust_reply_count(parent_cast.fid, &parent_cast.hash, delta, txn)
+        self.apply_engagement(message, data, kind, txn)
     }
 
     /// Add `delta` to the cast's live bucket for the hour of `timestamp`.
@@ -420,13 +256,23 @@ impl MetricsIndexer {
     ) -> Result<(), IndexerError> {
         let timestamp = timestamp as u64;
         let now = crate::core::util::get_farcaster_time().unwrap_or(0);
-        if timestamp < self.window_live_since
+        if timestamp
+            < if self.generation() == 0 {
+                self.window_live_since
+            } else {
+                0
+            }
             || timestamp + WINDOW_RETENTION_SECS < now
             || delta == 0
         {
             return Ok(());
         }
-        let key = Self::make_window_key(keys::WINDOW_LIVE, timestamp / 3600, fid, hash);
+        let key = Self::make_window_key(
+            keys::WINDOW_LIVE | self.generation(),
+            timestamp / 3600,
+            fid,
+            hash,
+        );
         Self::add_to_window_key(&self.db, key, delta, txn)
     }
 
@@ -460,7 +306,10 @@ impl MetricsIndexer {
             return Ok(());
         }
         let cutoff = (now.saturating_sub(WINDOW_RETENTION_SECS) / 3600) as u32;
-        for source in [keys::WINDOW_LIVE, keys::WINDOW_BACKFILL] {
+        for source in [
+            keys::WINDOW_LIVE | self.generation(),
+            keys::WINDOW_BACKFILL | self.generation(),
+        ] {
             let start = vec![keys::METRICS_PREFIX, source];
             let stop = [&start[..], &cutoff.to_be_bytes()].concat();
             self.db
@@ -539,7 +388,7 @@ impl MetricsIndexer {
         is_add: bool,
         txn: &mut RocksDbTransactionBatch,
     ) -> Result<(), IndexerError> {
-        let key = Self::make_cast_key(fid, hash);
+        let key = self.cast_key(fid, hash);
 
         // Get existing metrics from txn or DB
         let mut metrics = match self.get_metrics_from_txn(&key, txn)? {
@@ -587,7 +436,7 @@ impl MetricsIndexer {
         delta: i64,
         txn: &mut RocksDbTransactionBatch,
     ) -> Result<(), IndexerError> {
-        let key = Self::make_cast_key(fid, hash);
+        let key = self.cast_key(fid, hash);
 
         // Get existing metrics from txn or DB
         let mut metrics = match self.get_metrics_from_txn(&key, txn)? {
@@ -617,6 +466,31 @@ impl MetricsIndexer {
         key.push(hash.len() as u8);
         key.extend_from_slice(hash);
         key
+    }
+
+    fn cast_key(&self, fid: u64, hash: &[u8]) -> Vec<u8> {
+        let mut key = Self::make_cast_key(fid, hash);
+        key[1] |= self.generation();
+        key
+    }
+
+    fn write_events(&self, events: &[IndexEvent]) -> Result<(), IndexerError> {
+        let mut txn = RocksDbTransactionBatch::new();
+        for event in events {
+            match event {
+                IndexEvent::MessageCommitted { message, kind, .. } => {
+                    self.process_message(message, *kind, &mut txn)?
+                }
+                IndexEvent::MessagesCommitted { messages, kind, .. } => {
+                    for message in messages {
+                        self.process_message(message, *kind, &mut txn)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.prune_window(&mut txn)?;
+        self.commit(txn)
     }
 
     fn make_checkpoint_key() -> Vec<u8> {
@@ -658,23 +532,16 @@ impl Indexer for MetricsIndexer {
     }
 
     async fn process_batch(&self, events: &[IndexEvent]) -> Result<(), IndexerError> {
-        let mut txn = RocksDbTransactionBatch::new();
-
-        for event in events {
-            match event {
-                IndexEvent::MessageCommitted { message, kind, .. } => {
-                    self.process_message(message, *kind, &mut txn)?;
-                }
-                IndexEvent::MessagesCommitted { messages, kind, .. } => {
-                    for message in messages {
-                        self.process_message(message, *kind, &mut txn)?;
-                    }
-                }
-                _ => {}
+        let _guard = self.writer.lock();
+        self.write_events(events)?;
+        // Live updates also reach the replacement; historical replay uses a
+        // fixed view and never writes back into the generation being served.
+        if !self.fixed_generation {
+            if let Some(generation) = self.building_generation()? {
+                self.view(generation).write_events(events)?;
             }
         }
-        self.prune_window(&mut txn)?;
-        self.commit(txn)
+        Ok(())
     }
 
     fn last_checkpoint(&self) -> u64 {
@@ -700,7 +567,8 @@ impl Indexer for MetricsIndexer {
             items_indexed: self.casts_tracked.load(Ordering::Relaxed),
             last_event_id: self.checkpoint.load(Ordering::SeqCst),
             last_block_height: 0,
-            backfill_complete: true,
+            backfill_complete: matches!(self.building_generation(), Ok(None))
+                && matches!(self.db.get(&[keys::METRICS_PREFIX, keys::SCHEMA]), Ok(Some(version)) if version == replacement::SCHEMA.to_be_bytes()),
             size_bytes: 0,
         }
     }
@@ -907,58 +775,6 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(indexer.get_cast_metrics(9, &[9; 20]).unwrap().likes, 1);
-    }
-
-    #[tokio::test]
-    async fn test_backfill_window_counts_stored_engagement() {
-        use crate::storage::store::test_helper;
-        use crate::utils::factory::messages_factory;
-
-        let (mut engine, _dir) = test_helper::new_engine().await;
-        let fid = test_helper::FID_FOR_TEST;
-        test_helper::register_user(
-            fid,
-            test_helper::default_signer(),
-            test_helper::default_custody_address(),
-            &mut engine,
-        )
-        .await;
-        let cast = messages_factory::casts::create_cast_add(fid, "popular", None, None);
-        let like = messages_factory::reactions::create_reaction_add(
-            fid,
-            ReactionType::Like,
-            crate::proto::reaction_body::Target::TargetCastId(CastId {
-                fid,
-                hash: cast.hash.clone(),
-            }),
-            None,
-            None,
-        );
-        test_helper::commit_message(&mut engine, &cast).await;
-        test_helper::commit_message(&mut engine, &like).await;
-
-        // Live tracking starts after the stored engagement.
-        let now = crate::core::util::get_farcaster_time().unwrap();
-        let db = make_test_db();
-        db.put(
-            &[keys::METRICS_PREFIX, keys::WINDOW_LIVE_SINCE],
-            &(now + 60).to_be_bytes(),
-        )
-        .unwrap();
-        let indexer = create_indexer(db);
-        let hyper = HashMap::from([(1u32, engine.get_hyper_stores().unwrap())]);
-        indexer.backfill_window(&hyper).unwrap();
-
-        assert_eq!(
-            indexer.get_trending_window(3600, now + 60).unwrap(),
-            vec![(fid, cast.hash.clone(), 1.0)]
-        );
-        // Runs once.
-        indexer.backfill_window(&hyper).unwrap();
-        assert_eq!(
-            indexer.get_trending_window(3600, now + 60).unwrap()[0].2,
-            1.0
-        );
     }
 
     #[tokio::test]
@@ -1228,5 +1044,227 @@ mod tests {
         let db = make_test_db();
         let indexer = create_indexer(db);
         assert!(indexer.is_enabled());
+    }
+    #[tokio::test]
+    async fn duplicate_batches_and_restart_do_not_recount_engagement() {
+        let db = make_test_db();
+        let indexer = create_indexer(db.clone());
+        let now = crate::core::util::get_farcaster_time().unwrap();
+        let mut reply = at(create_reply_message(789, 123, vec![1; 20]), now);
+        reply.hash = vec![3; 20];
+        let messages = vec![
+            at(
+                create_reaction_message(456, 123, vec![1; 20], ReactionType::Like, true),
+                now,
+            ),
+            at(
+                create_reaction_message(456, 123, vec![1; 20], ReactionType::Recast, true),
+                now,
+            ),
+            reply,
+        ];
+        let event = IndexEvent::messages(messages, 1, 1);
+        indexer
+            .process_batch(&[event.clone(), event.clone()])
+            .await
+            .unwrap();
+        let score = indexer.get_trending_window(3600, now).unwrap();
+        let restarted = create_indexer(db);
+        restarted.process_event(&event).await.unwrap();
+        let m = restarted.get_cast_metrics(123, &[1; 20]).unwrap();
+        assert_eq!((m.likes, m.recasts, m.replies), (1, 1, 1));
+        assert_eq!(restarted.get_trending_window(3600, now).unwrap(), score);
+    }
+
+    #[tokio::test]
+    async fn reaction_membership_tracks_latest_state_and_ignores_stale_events() {
+        let indexer = create_indexer(make_test_db());
+        let like = at(
+            create_reaction_message(456, 123, vec![1; 20], ReactionType::Like, true),
+            100,
+        );
+        let unlike = at(
+            create_reaction_message(456, 123, vec![1; 20], ReactionType::Like, false),
+            200,
+        );
+        let relike = at(like.clone(), 300);
+        for message in [unlike.clone(), like.clone(), unlike.clone()] {
+            indexer
+                .process_event(&IndexEvent::message(message, 1, 1))
+                .await
+                .unwrap();
+        }
+        assert_eq!(indexer.get_cast_metrics(123, &[1; 20]).unwrap().likes, 0);
+        for message in [relike.clone(), relike, unlike, like] {
+            indexer
+                .process_event(&IndexEvent::message(message, 1, 1))
+                .await
+                .unwrap();
+        }
+        assert_eq!(indexer.get_cast_metrics(123, &[1; 20]).unwrap().likes, 1);
+    }
+
+    #[tokio::test]
+    async fn deleted_and_revoked_replies_never_reappear_during_replay() {
+        let indexer = create_indexer(make_test_db());
+        let mut reply = create_reply_message(789, 123, vec![1; 20]);
+        reply.hash = vec![3; 20];
+        let remove = Message {
+            hash: vec![4; 20],
+            data: Some(MessageData {
+                fid: 789,
+                timestamp: 2000,
+                r#type: MessageType::CastRemove as i32,
+                body: Some(Body::CastRemoveBody(crate::proto::CastRemoveBody {
+                    target_hash: reply.hash.clone(),
+                })),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for message in [reply.clone(), remove.clone(), remove, reply.clone()] {
+            indexer
+                .process_event(&IndexEvent::message(message, 1, 1))
+                .await
+                .unwrap();
+        }
+        assert_eq!(indexer.get_cast_metrics(123, &[1; 20]).unwrap().replies, 0);
+        // A delete delivered before the add also leaves a tombstone.
+        let mut other = reply.clone();
+        other.hash = vec![5; 20];
+        indexer
+            .process_event(&IndexEvent::message_of_kind(
+                other.clone(),
+                1,
+                1,
+                MessageEventKind::Revoke,
+            ))
+            .await
+            .unwrap();
+        indexer
+            .process_event(&IndexEvent::message(other, 1, 1))
+            .await
+            .unwrap();
+        assert_eq!(indexer.get_cast_metrics(123, &[1; 20]).unwrap().replies, 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_duplicate_updates_are_serialized() {
+        let indexer = Arc::new(create_indexer(make_test_db()));
+        let event = IndexEvent::message(
+            create_reaction_message(456, 123, vec![1; 20], ReactionType::Like, true),
+            1,
+            1,
+        );
+        let mut tasks = vec![];
+        for _ in 0..20 {
+            let indexer = indexer.clone();
+            let event = event.clone();
+            tasks.push(tokio::spawn(async move {
+                indexer.process_event(&event).await.unwrap();
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert_eq!(indexer.get_cast_metrics(123, &[1; 20]).unwrap().likes, 1);
+    }
+
+    #[tokio::test]
+    async fn replacement_keeps_old_counts_until_publish_and_resumes_after_restart() {
+        let db = make_test_db();
+        let indexer = create_indexer(db.clone());
+        let legacy_key = MetricsIndexer::make_cast_key(123, &[1; 20]);
+        let legacy_value = serde_json::to_vec(&CastMetrics {
+            likes: 7,
+            recasts: 2,
+            replies: 4,
+        })
+        .unwrap();
+        db.put(&legacy_key, &legacy_value).unwrap();
+        indexer.prepare().unwrap();
+        let generation = indexer.building_generation().unwrap().unwrap();
+        let replacement = indexer.view(generation);
+        let old_like = create_reaction_message(456, 123, vec![1; 20], ReactionType::Like, true);
+        replacement
+            .process_event(&IndexEvent::message(old_like.clone(), 1, 1))
+            .await
+            .unwrap();
+        assert_eq!(indexer.get_cast_metrics(123, &[1; 20]).unwrap().likes, 7);
+        assert_eq!(db.get(&legacy_key).unwrap(), Some(legacy_value.clone()));
+        assert!(indexer.delete_retired(1).unwrap()); // no retired generation yet
+        assert_eq!(db.get(&legacy_key).unwrap(), Some(legacy_value.clone()));
+        let restarted = create_indexer(db.clone());
+        restarted.prepare().unwrap();
+        assert_eq!(restarted.building_generation().unwrap(), Some(generation));
+        assert_eq!(restarted.get_cast_metrics(123, &[1; 20]).unwrap().likes, 7);
+        restarted
+            .view(generation)
+            .process_event(&IndexEvent::message(old_like, 1, 1))
+            .await
+            .unwrap();
+        // Live activity updates both generations while the replacement builds.
+        let live = create_reaction_message(999, 123, vec![1; 20], ReactionType::Like, true);
+        restarted
+            .process_event(&IndexEvent::message(live.clone(), 1, 2))
+            .await
+            .unwrap();
+        assert_eq!(restarted.get_cast_metrics(123, &[1; 20]).unwrap().likes, 8);
+        restarted
+            .view(generation)
+            .process_event(&IndexEvent::message(live, 1, 2))
+            .await
+            .unwrap();
+        restarted.switch_to(generation).unwrap();
+        assert_eq!(restarted.get_cast_metrics(123, &[1; 20]).unwrap().likes, 2);
+        assert!(db.get(&legacy_key).unwrap().is_some()); // publish did not clear it
+        let published = create_indexer(db.clone());
+        published.prepare().unwrap();
+        assert_eq!(published.building_generation().unwrap(), None);
+        assert_eq!(published.get_cast_metrics(123, &[1; 20]).unwrap().likes, 2);
+        while !published.delete_retired(1).unwrap() {}
+        assert!(db.get(&legacy_key).unwrap().is_none());
+        assert_eq!(published.get_cast_metrics(123, &[1; 20]).unwrap().likes, 2);
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocked_replacement_write_does_not_block_existing_metrics_reads() {
+        let db = make_test_db();
+        let reader = create_indexer(db.clone());
+        db.put(
+            &MetricsIndexer::make_cast_key(123, &[1; 20]),
+            br#"{"likes":7,"recasts":0,"replies":0}"#,
+        )
+        .unwrap();
+        reader.prepare().unwrap();
+        let generation = reader.building_generation().unwrap().unwrap();
+        let replacement = reader.view(generation);
+        let replacement_key = replacement.cast_key(123, &[1; 20]);
+        let db_guard = db.db();
+        let crate::storage::db::DBProvider::Transaction(raw) = db_guard.as_ref().unwrap() else {
+            panic!("expected TransactionDB");
+        };
+        let lock = raw.transaction();
+        lock.get_for_update(&replacement_key, true).unwrap();
+        let task = tokio::spawn(async move {
+            replacement
+                .process_event(&IndexEvent::message(
+                    create_reaction_message(456, 123, vec![1; 20], ReactionType::Like, true),
+                    1,
+                    1,
+                ))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while reader.writer.try_lock().is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(reader.get_cast_metrics(123, &[1; 20]).unwrap().likes, 7);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        drop(lock);
+        task.await.unwrap().unwrap();
     }
 }

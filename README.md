@@ -97,6 +97,28 @@ per-shard cursors resume replay after a restart, so keep block retention long
 enough to cover the rebuild. Logs report replay progress every five seconds,
 and storage failures are logged and retried without skipping the failed batch.
 
+### Engagement metrics replacement
+
+The metrics schema upgrade repairs inflated likes, recasts and reply counts in
+an independent background worker. Existing counts and trending data keep serving
+and receiving live updates while a separate generation is rebuilt. The rebuild
+never clears the readable generation first. Only after every shard catches up
+does one atomic database write publish the replacement. Retired data is reclaimed
+in bounded batches afterward.
+
+Reaction membership and reply identities make repeated events and replay safe;
+reply deletions and signer revocations remove their contributions. Replay checks
+canonical hyper stores (legacy stores if hyper is unavailable) so superseded or
+revoked historical adds are not resurrected. Per-generation shard cursors survive
+restarts, and failed batches are retried without advancing their cursor.
+
+This one-time schema repair runs automatically whenever metrics is enabled,
+independently of the shared startup backfill gate and its legacy
+`metrics.backfill_on_startup` flag. Keep the shard block history available until
+the repair finishes. Logs report `generation`, `shard_id`, `next_block`, `tip` and
+`percent` every five seconds; the `metrics.backfill_complete` field in
+`GET /v2/farcaster/_status/backfill` becomes true after publication.
+
 ### Live daily stats
 
 Daily stats and client attribution consume live events through their own queue
