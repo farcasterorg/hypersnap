@@ -1193,7 +1193,8 @@ impl ApiHttpHandler {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(2)
                     .min(5);
-                self.handle_conversation(&identifier, &id_type, reply_depth, viewer_fid)
+                let fid: Option<u64> = params.get("fid").and_then(|s| s.parse().ok());
+                self.handle_conversation(&identifier, &id_type, fid, reply_depth, viewer_fid)
                     .await
             }
 
@@ -1773,11 +1774,16 @@ impl ApiHttpHandler {
         }
     }
 
-    /// Handle GET /v2/farcaster/cast/conversation/?identifier=X&type=hash|url
+    /// Handle GET /v2/farcaster/cast/conversation/?identifier=X&type=hash|url[&fid=N]
+    ///
+    /// `fid`, the author's, is a hint like on /v2/farcaster/cast: the cast is
+    /// read at its one key, without a full FID probe whose miss is remembered
+    /// in `missing_casts` (a client polling for a cast it just submitted).
     async fn handle_conversation(
         &self,
         identifier: &str,
         id_type: &str,
+        fid_hint: Option<u64>,
         reply_depth: u32,
         viewer_fid: Option<u64>,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
@@ -1809,7 +1815,7 @@ impl ApiHttpHandler {
                 }
             };
             let resolved_fid = self
-                .resolve_cast(&hash, None, true)
+                .resolve_cast(&hash, fid_hint, true)
                 .await
                 .and_then(|msg| msg.data.map(|d| d.fid))
                 .unwrap_or(0);
@@ -5724,6 +5730,49 @@ mod tests {
             .await
             .is_none());
         assert_eq!(probes(), 1, "no probe when probing is not allowed");
+    }
+
+    /// Records the FID each conversation was asked for.
+    #[derive(Default)]
+    struct RecordingConversations(std::sync::Mutex<Vec<u64>>);
+
+    #[async_trait]
+    impl ConversationHandler for RecordingConversations {
+        fn is_enabled(&self) -> bool {
+            true
+        }
+
+        async fn get_conversation(
+            &self,
+            fid: u64,
+            hash: &[u8],
+            _depth: Option<u32>,
+        ) -> Result<ConversationData, ConversationError> {
+            self.0.lock().unwrap().push(fid);
+            Err(ConversationError::CastNotFound(hex::encode(hash)))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_conversation_fid_hint_skips_the_probe() {
+        let handler = ApiHttpHandler::new(None, None, None, None, None, None);
+        let hash = vec![6u8; 20];
+        let mock = Arc::new(MockHubQuery {
+            cast_lookup: Some(mock_cast(42, hash.clone())),
+            ..Default::default()
+        });
+        handler.set_hub_query(mock.clone());
+        let conversations = Arc::new(RecordingConversations::default());
+        handler.set_conversations(conversations.clone());
+        let id = hex::encode(&hash);
+
+        handler
+            .handle_conversation(&id, "hash", Some(42), 2, None)
+            .await
+            .unwrap();
+        assert_eq!(*conversations.0.lock().unwrap(), vec![42]);
+        assert_eq!(mock.probes.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(!handler.missing_casts.contains_key(&hash));
     }
 
     #[tokio::test]
