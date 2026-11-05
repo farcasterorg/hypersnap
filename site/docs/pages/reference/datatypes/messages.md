@@ -115,9 +115,12 @@ Type of UserData message
 | USER_DATA_PRIMARY_ADDRESS_SOLANA   | 12     | Primary Solana address                |
 | USER_DATA_TYPE_PROFILE_TOKEN       | 13     | Profile token in CAIP-19 format       |
 | USER_DATA_TYPE_LIVE_AT             | 14     | Live activity URL for the user        |
+| USER_DATA_TYPE_PINNED_CAST         | 15     | Hash of the cast pinned to the profile |
 
 See [FIP-196](https://github.com/farcasterxyz/protocol/discussions/196) for more information on Location.
 See [FIP-19](https://github.com/farcasterxyz/protocol/discussions/199) for more information on Twitter/X and Github usernames.
+
+`USER_DATA_TYPE_PINNED_CAST` pins one cast to the top of the user's profile. Its value is the cast hash as a lowercase `0x`-prefixed 20-byte hex string (`0x` plus 40 characters from `0-9a-f`), or the empty string to unpin. Like every user data type it is last-write-wins. The node does not check that the cast exists or that the user authored it: clients should ignore a pin whose cast is missing or was authored by a different fid.
 
 ## 3. Cast
 
