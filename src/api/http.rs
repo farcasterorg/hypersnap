@@ -11,7 +11,7 @@ use crate::api::metrics::MetricsIndexer;
 use crate::api::notifications::{
     NotificationAppHandler, NotificationSendHandler, NotificationWebhookHandler,
 };
-use crate::api::search::SearchIndexer;
+use crate::api::search::{SearchIndexer, SearchSort};
 use crate::api::social_graph::SocialGraphIndexer;
 use crate::api::types::{
     self, BlockListResponse, BulkCastsResponse, BulkUsersResponse, Cast, CastReactions,
@@ -1161,7 +1161,11 @@ impl ApiHttpHandler {
             }
             "/v2/farcaster/cast/search" => {
                 let q = require_param!(params, "q");
-                self.handle_cast_search(&q, cursor.as_deref(), limit).await
+                let sort = params
+                    .get("sort_type")
+                    .map_or(SearchSort::Relevance, |s| SearchSort::parse(s));
+                self.handle_cast_search(&q, sort, cursor.as_deref(), limit)
+                    .await
             }
             "/v2/farcaster/cast/quotes" => {
                 let identifier = require_param!(params, "identifier");
@@ -1723,13 +1727,29 @@ impl ApiHttpHandler {
         }
     }
 
-    /// Handle GET /v2/farcaster/cast/search/?q=X
+    /// Handle GET /v2/farcaster/cast/search/?q=X[&sort_type=desc_chronological|chron|algorithmic]
+    ///
+    /// `#tag` in `q` matches the hashtag exactly. The cursor is the number of
+    /// results already returned.
     async fn handle_cast_search(
         &self,
         query: &str,
-        _cursor: Option<&str>,
+        sort: SearchSort,
+        cursor: Option<&str>,
         limit: usize,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        // Deep pages cost O(offset); nobody scrolls 10k results.
+        const MAX_OFFSET: usize = 10_000;
+        let offset = match cursor.filter(|c| !c.is_empty()).map(str::parse::<usize>) {
+            None => 0,
+            Some(Ok(offset)) if offset <= MAX_OFFSET => offset,
+            Some(_) => {
+                return Ok(Self::error_response(
+                    StatusCode::BAD_REQUEST,
+                    "Invalid cursor",
+                ))
+            }
+        };
         let indexer = self.search.read().unwrap().clone();
         let Some(indexer) = indexer else {
             return Ok(Self::error_response(
@@ -1745,8 +1765,10 @@ impl ApiHttpHandler {
             ));
         }
 
-        match indexer.search_casts(query, limit) {
+        match indexer.search_casts(query, sort, offset, limit) {
             Ok(results) => {
+                let next = (results.len() == limit && offset + limit <= MAX_OFFSET)
+                    .then(|| (offset + limit).to_string());
                 let mut casts = Vec::with_capacity(results.len());
                 for result in results {
                     let author = self.get_user(result.fid).await;
@@ -1762,7 +1784,7 @@ impl ApiHttpHandler {
                 let response = CastsSearchResponse {
                     result: CastsSearchResult {
                         casts,
-                        next: NextCursor { cursor: None },
+                        next: NextCursor { cursor: next },
                     },
                 };
                 Ok(Self::json_response(StatusCode::OK, &response))

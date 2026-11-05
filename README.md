@@ -67,6 +67,15 @@ To retain an existing index, stop the old node and copy the entire old index
 directory to `<rocksdb_dir>/search_index` before starting the updated node.
 The backfill status endpoint is `GET /v2/farcaster/_status/backfill`.
 
+Cast search matches `#hashtag` exactly and takes Neynar's `sort_type`
+(`desc_chronological`, `chron`, `algorithmic`) and `cursor`. An index built
+before hashtags is moved to `<index_path>.legacy` on startup and keeps
+answering searches, and receiving new casts, while a new index is backfilled
+next to it. The backfill runs alongside live indexing, so the node keeps
+serving and indexing throughout. When it completes, the legacy directory is
+deleted. Plan for disk space for both indexes during the rebuild. With
+`backfill_on_startup = false`, the legacy index keeps serving until a backfill runs.
+
 ### Social graph rebuilds
 
 Social graph schema upgrades rebuild follower/following indexes in a dedicated
