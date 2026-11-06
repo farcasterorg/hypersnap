@@ -6990,6 +6990,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trending_uses_writer_generation_after_replacement_and_retirement() {
+        use crate::api::config::{FeedConfig, MetricsConfig};
+        use crate::api::events::IndexEvent;
+        use crate::api::feeds::{FeedService, TrendingFeedOptions};
+        use crate::api::http::ApiHttpHandler;
+        use crate::api::indexer::Indexer;
+        use crate::api::metrics::MetricsIndexer;
+
+        let (_, _, [mut engine, _engine2], _block_engine, service, _shard_tx, _block_tx) =
+            make_server(None, None).await;
+        let fid = SHARD1_FID;
+        register_user(
+            fid,
+            test_helper::default_signer(),
+            test_helper::default_custody_address(),
+            &mut engine,
+        )
+        .await;
+        let old_cast =
+            messages_factory::casts::create_cast_add(fid, "before metrics replacement", None, None);
+        let new_cast =
+            messages_factory::casts::create_cast_add(fid, "after metrics replacement", None, None);
+        test_helper::commit_message(&mut engine, &old_cast).await;
+        test_helper::commit_message(&mut engine, &new_cast).await;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(RocksDB::new(dir.path().to_str().unwrap()));
+        db.open().unwrap();
+        let writer = Arc::new(MetricsIndexer::new(
+            MetricsConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            db,
+        ));
+        let handler = ApiHttpHandler::new(None, None, Some(writer.clone()), None, None, None);
+        let reader = handler.metrics_indexer().unwrap();
+        assert!(Arc::ptr_eq(&reader, &writer));
+        let like = |actor, cast: &proto::Message| {
+            messages_factory::reactions::create_reaction_add(
+                actor,
+                proto::ReactionType::Like,
+                proto::reaction_body::Target::TargetCastId(proto::CastId {
+                    fid,
+                    hash: cast.hash.clone(),
+                }),
+                None,
+                None,
+            )
+        };
+        writer
+            .process_event(&IndexEvent::message(like(1000, &old_cast), 1, 1))
+            .await
+            .unwrap();
+        let feeds = FeedService::new(
+            FeedConfig {
+                enabled: true,
+                trending_cache_ttl_secs: 3600,
+                ..Default::default()
+            },
+            None,
+            Some(reader),
+            Arc::new(service),
+        );
+        let options = TrendingFeedOptions::default();
+        let first = feeds.get_trending_feed(None, 10, &options).await.unwrap();
+        assert_eq!(first.items.len(), 1);
+        assert_eq!(first.items[0].cast.hash, old_cast.hash);
+
+        // Build and publish a different ranking while the feed already exists.
+        writer.prepare().unwrap();
+        let generation = writer.building_generation().unwrap().unwrap();
+        writer
+            .view(generation)
+            .process_event(&IndexEvent::message(like(2000, &new_cast), 1, 2))
+            .await
+            .unwrap();
+        writer.switch_to(generation).unwrap();
+        while !writer.delete_retired(100).unwrap() {}
+        // A fresh opener would see the same persisted generation; no rebuild is needed.
+        // The existing feed must also see it, without waiting for its one-hour TTL.
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let page = feeds.get_trending_feed(None, 10, &options).await.unwrap();
+                if page.items.len() == 1 && page.items[0].cast.hash == new_cast.hash {
+                    assert_eq!(page.items[0].likes, 1);
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("feed did not follow metrics publication");
+    }
+
+    #[tokio::test]
     async fn trending_signer_filters_fill_pages_and_preserve_ranking() {
         use crate::api::config::{FeedConfig, MetricsConfig};
         use crate::api::events::IndexEvent;

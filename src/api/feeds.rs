@@ -421,6 +421,7 @@ impl RankedCasts {
 /// and looks up each candidate cast, so requests share one snapshot per window.
 struct TrendingSnapshot {
     computed_at: Instant,
+    metrics_generation: u8,
     ranking: TrendingRanking,
 }
 
@@ -488,7 +489,16 @@ where
             .read()
             .unwrap()
             .as_ref()
-            .map(|snap| (snap.ranking.clone(), snap.computed_at.elapsed() < ttl))
+            .map(|snap| {
+                (
+                    snap.ranking.clone(),
+                    snap.computed_at.elapsed() < ttl
+                        && self
+                            .metrics
+                            .as_ref()
+                            .is_some_and(|metrics| metrics.generation() == snap.metrics_generation),
+                )
+            })
     }
 
     /// Recompute the window's ranking in the background, unless a refresh is
@@ -509,20 +519,24 @@ where
             let started = Instant::now();
             let now = crate::core::util::get_farcaster_time().unwrap_or(0);
             let secs = window.secs();
-            let candidates =
-                match tokio::task::spawn_blocking(move || metrics.get_trending_window(secs, now))
-                    .await
-                {
-                    Ok(Ok(candidates)) => candidates,
-                    Ok(Err(e)) => {
-                        warn!(error = ?e, ?window, "Failed to compute trending ranking");
-                        return;
-                    }
-                    Err(e) => {
-                        warn!(error = %e, ?window, "Trending ranking task failed");
-                        return;
-                    }
-                };
+            let (metrics_generation, candidates) = match tokio::task::spawn_blocking(move || {
+                let generation = metrics.generation();
+                metrics
+                    .get_trending_window(secs, now)
+                    .map(|candidates| (generation, candidates))
+            })
+            .await
+            {
+                Ok(Ok(candidates)) => candidates,
+                Ok(Err(e)) => {
+                    warn!(error = ?e, ?window, "Failed to compute trending ranking");
+                    return;
+                }
+                Err(e) => {
+                    warn!(error = %e, ?window, "Trending ranking task failed");
+                    return;
+                }
+            };
 
             let cutoff = now.saturating_sub(secs);
             let considered = candidates.len();
@@ -560,6 +574,7 @@ where
             );
             *snapshot.write().unwrap() = Some(TrendingSnapshot {
                 computed_at: Instant::now(),
+                metrics_generation,
                 ranking: Arc::new(RankedCasts::new(ranking)),
             });
         });

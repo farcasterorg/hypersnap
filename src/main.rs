@@ -201,14 +201,7 @@ async fn start_servers(
         }
         if app_config.api.feeds.enabled {
             let social_graph = handler.social_graph_indexer();
-            let metrics = if app_config.api.metrics.enabled {
-                Some(Arc::new(snapchain::api::MetricsIndexer::new(
-                    app_config.api.metrics.clone(),
-                    block_stores.db.clone(),
-                )))
-            } else {
-                None
-            };
+            let metrics = handler.metrics_indexer();
             let feeds = Arc::new(snapchain::api::FeedService::new(
                 app_config.api.feeds.clone(),
                 social_graph,

@@ -312,6 +312,12 @@ impl ApiHttpHandler {
         self.social_graph.clone()
     }
 
+    /// Share the writer's generation-aware handle with feed ranking. A second
+    /// MetricsIndexer would retain the generation active when it was opened.
+    pub fn metrics_indexer(&self) -> Option<Arc<MetricsIndexer>> {
+        self.metrics.clone()
+    }
+
     /// Create a new handler with optional indexers.
     pub fn new(
         social_graph: Option<Arc<SocialGraphIndexer>>,
