@@ -217,9 +217,8 @@ fn member_slot_suffix(message: &Message) -> Result<Vec<u8>, HubError> {
     match message.data.as_ref().and_then(|data| data.body.as_ref()) {
         Some(Body::ChannelMemberBody(body)) => {
             let mut suffix = body.channel_id.clone();
-            let target_fid = u32::try_from(body.fid)
-                .map_err(|_| HubError::invalid_parameter("channel member fid exceeds u32"))?;
-            suffix.extend_from_slice(&target_fid.to_be_bytes());
+            let target_fid = super::make_fid_key(body.fid);
+            suffix.extend_from_slice(&target_fid);
             Ok(suffix)
         }
         _ => Err(invalid_body("ChannelMember")),
@@ -277,10 +276,9 @@ fn encode_slot_pointer(
     message: &Message,
     ts_hash: &[u8; TS_HASH_LENGTH],
 ) -> Result<Vec<u8>, HubError> {
-    let fid = u32::try_from(message.fid())
-        .map_err(|_| HubError::invalid_parameter("channel message fid exceeds u32"))?;
+    let fid = super::make_fid_key(message.fid());
     let mut pointer = Vec::with_capacity(4 + TS_HASH_LENGTH);
-    pointer.extend_from_slice(&fid.to_be_bytes());
+    pointer.extend_from_slice(&fid);
     pointer.extend_from_slice(ts_hash);
     Ok(pointer)
 }
@@ -308,7 +306,7 @@ fn message_for_slot_pointer<T: ChannelSlotStoreDef + Clone>(
     txn: &RocksDbTransactionBatch,
     pointer: &[u8],
 ) -> Result<Message, HubError> {
-    if pointer.len() != 4 + TS_HASH_LENGTH {
+    if super::encoded_fid_len(pointer, 0).is_none_or(|n| pointer.len() != n + TS_HASH_LENGTH) {
         warn!(
             actual_length = pointer.len(),
             expected_length = 4 + TS_HASH_LENGTH,
@@ -319,7 +317,9 @@ fn message_for_slot_pointer<T: ChannelSlotStoreDef + Clone>(
         ));
     }
     let fid = read_fid_key(pointer, 0);
-    let ts_hash: [u8; TS_HASH_LENGTH] = pointer[4..].try_into().unwrap();
+    let ts_hash: [u8; TS_HASH_LENGTH] = pointer[super::encoded_fid_len(pointer, 0).unwrap()..]
+        .try_into()
+        .unwrap();
     match get_message(&store.db(), txn, fid, store.store_def().postfix(), &ts_hash)? {
         Some(message) => Ok(message),
         None => {
@@ -716,12 +716,11 @@ impl ChannelSlotStoreDef for ChannelMemberStoreDef {
             Some(Body::ChannelMemberBody(body)) => body,
             _ => return Err(invalid_body("ChannelMember")),
         };
-        let target_fid = u32::try_from(body.fid)
-            .map_err(|_| HubError::invalid_parameter("channel member fid exceeds u32"))?;
+        let target_fid = super::make_fid_key(body.fid);
         Ok(channel_index_key(
             ChannelIndex::MemberSlot,
             &body.channel_id,
-            &target_fid.to_be_bytes(),
+            &target_fid,
         ))
     }
 
@@ -770,12 +769,11 @@ impl ChannelSlotStoreDef for ChannelMemberStoreDef {
 
 impl ChannelMemberStoreDef {
     pub fn make_member_by_fid_key(target_fid: u64, channel_id: &[u8]) -> Result<Vec<u8>, HubError> {
-        let target_fid = u32::try_from(target_fid)
-            .map_err(|_| HubError::invalid_parameter("channel member fid exceeds u32"))?;
+        let target_fid = super::make_fid_key(target_fid);
         let mut key = Vec::with_capacity(2 + 4 + channel_id.len());
         key.push(RootPrefix::Channel as u8);
         key.push(ChannelIndex::MemberByFid as u8);
-        key.extend_from_slice(&target_fid.to_be_bytes());
+        key.extend_from_slice(&target_fid);
         key.extend_from_slice(channel_id);
         Ok(key)
     }
@@ -996,12 +994,11 @@ impl ChannelMemberStore {
     }
 
     pub fn slot_key(channel_id: &[u8], target_fid: u64) -> Result<Vec<u8>, HubError> {
-        let target_fid = u32::try_from(target_fid)
-            .map_err(|_| HubError::invalid_parameter("channel member fid exceeds u32"))?;
+        let target_fid = super::make_fid_key(target_fid);
         Ok(channel_index_key(
             ChannelIndex::MemberSlot,
             channel_id,
-            &target_fid.to_be_bytes(),
+            &target_fid,
         ))
     }
 
@@ -1055,7 +1052,9 @@ impl ChannelMemberStore {
             Some(increment_vec_u8(&prefix)),
             page_options,
             |key, pointer| {
-                if key.len() != prefix.len() + 4 {
+                if super::encoded_fid_len(key, prefix.len())
+                    .is_none_or(|n| key.len() != prefix.len() + n)
+                {
                     return Err(HubError::invalid_internal_state(
                         "channel member slot key has invalid length",
                     ));

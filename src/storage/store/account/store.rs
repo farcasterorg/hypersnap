@@ -405,6 +405,7 @@ pub trait StoreDef: Send + Sync {
         HubEvent::new_event(
             HubEventType::MergeMessage,
             hub_event::Body::MergeMessageBody(MergeMessageBody {
+                native_registration: None,
                 message: Some(message.clone()),
                 deleted_messages: merge_conflicts,
             }),

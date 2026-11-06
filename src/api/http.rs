@@ -121,6 +121,11 @@ pub trait HubQueryHandler: Send + Sync {
     /// `include_custody` is set, to the FID it is the custody address of.
     async fn get_fids_by_address(&self, address: &[u8], include_custody: bool) -> Vec<u64>;
 
+    /// Native registry lookup, without scanning legacy IdRegistry events.
+    async fn get_native_fid_by_custody(&self, _address: &[u8]) -> Option<u64> {
+        None
+    }
+
     /// Get username proof.
     async fn get_username_proof(&self, name: &[u8]) -> Option<(u64, String, u64, Vec<u8>)>;
 
@@ -385,6 +390,9 @@ impl ApiHttpHandler {
         let mut fids = hub.get_fids_by_address(address, false).await;
         if fids.is_empty() {
             fids.extend(custody.get_fid_by_custody_address(address));
+        }
+        if fids.is_empty() {
+            fids.extend(hub.get_native_fid_by_custody(address).await);
         }
         fids
     }
@@ -6162,6 +6170,7 @@ mod tests {
         // Build a reply (CastAdd) message
         let reply_msg = crate::proto::Message {
             data: Some(crate::proto::MessageData {
+                native_onboard_body: None,
                 fid: mentioner_fid,
                 r#type: crate::proto::MessageType::CastAdd as i32,
                 timestamp: 1000,
@@ -6197,6 +6206,7 @@ mod tests {
         let target_cast_hash: Vec<u8> = vec![5, 6, 7];
         let reaction_msg = crate::proto::Message {
             data: Some(crate::proto::MessageData {
+                native_onboard_body: None,
                 fid: reactor_fid,
                 r#type: crate::proto::MessageType::ReactionAdd as i32,
                 timestamp: 2000,
@@ -6224,6 +6234,7 @@ mod tests {
         // Build a follow message
         let follow_msg = crate::proto::Message {
             data: Some(crate::proto::MessageData {
+                native_onboard_body: None,
                 fid: follower_fid,
                 r#type: crate::proto::MessageType::LinkAdd as i32,
                 timestamp: 3000,
@@ -6247,6 +6258,7 @@ mod tests {
         // The cast being reacted to (needs text for hydration)
         let target_cast_msg = crate::proto::Message {
             data: Some(crate::proto::MessageData {
+                native_onboard_body: None,
                 fid: target_fid,
                 r#type: crate::proto::MessageType::CastAdd as i32,
                 timestamp: 500,

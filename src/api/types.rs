@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
     pub object: String,
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub fid: u64,
     pub username: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -214,6 +215,7 @@ impl Default for Cast {
 /// Parent author reference (just FID).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ParentAuthor {
+    #[serde(default, with = "crate::native_registration::serde_fid::option")]
     pub fid: Option<u64>,
 }
 
@@ -252,6 +254,7 @@ pub enum Embed {
 /// Cast ID reference.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CastId {
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub fid: u64,
     pub hash: String,
 }
@@ -270,6 +273,7 @@ pub struct CastReactions {
 /// User who reacted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReactionUser {
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub fid: u64,
     pub fname: String,
 }
@@ -451,6 +455,7 @@ pub struct Reaction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReactionCastRef {
     pub hash: String,
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub fid: u64,
 }
 
@@ -488,6 +493,7 @@ pub struct FnameAvailabilityResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsernameProofResponse {
     pub r#type: String,
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub fid: u64,
     pub username: String,
     pub timestamp: u64,
@@ -540,6 +546,7 @@ pub struct SignerResponse {
     pub object: String,
     pub signer_uuid: String,
     pub public_key: String,
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub fid: u64,
     pub status: String,
 }
@@ -555,6 +562,7 @@ pub struct OnChainEventsResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OnChainEventEntry {
     pub object: String,
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub fid: u64,
     pub event_type: String,
     pub block_number: u32,

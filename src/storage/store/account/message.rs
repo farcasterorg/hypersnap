@@ -1,6 +1,5 @@
 use super::PAGE_SIZE_MAX;
 use crate::core::error::HubError;
-use crate::core::types::FidOnDisk;
 use crate::storage::constants::{RootPrefix, UserPostfix};
 use crate::storage::db::{PageOptions, RocksdbError};
 use crate::storage::util::increment_vec_u8;
@@ -130,16 +129,48 @@ pub fn unpack_ts_hash(ts_hash: &[u8; TS_HASH_LENGTH]) -> (u32, [u8; HASH_LENGTH]
 
 #[inline]
 pub fn make_fid_key(fid: u64) -> Vec<u8> {
-    // Downcast to u32, since on disk, we only assume 4 bytes for the fid to save space
-    (fid as FidOnDisk).to_be_bytes().to_vec()
+    // FID zero is never an account. Its four zero bytes escape a full native
+    // FID, preserving every existing 32-bit account key and its trie hash.
+    if crate::native_registration::is_native_fid(fid)
+        && crate::native_registration::native_fid_encoding()
+    {
+        [0u32.to_be_bytes().as_slice(), &fid.to_be_bytes()].concat()
+    } else {
+        (fid as u32).to_be_bytes().to_vec()
+    }
+}
+
+pub fn fid_key_len(fid: u64) -> usize {
+    if crate::native_registration::is_native_fid(fid)
+        && crate::native_registration::native_fid_encoding()
+    {
+        12
+    } else {
+        FID_BYTES
+    }
+}
+
+/// Length of a complete encoded FID at `offset`, or None for a truncated key.
+pub fn encoded_fid_len(key: &[u8], offset: usize) -> Option<usize> {
+    let head = key.get(offset..offset.checked_add(FID_BYTES)?)?;
+    if crate::native_registration::native_fid_encoding()
+        && head == [0; FID_BYTES]
+        && key
+            .get(offset + FID_BYTES..offset + 2 * FID_BYTES)
+            .is_some_and(|upper| upper != [0; FID_BYTES])
+    {
+        key.get(offset..offset + 12).map(|_| 12)
+    } else {
+        Some(FID_BYTES)
+    }
 }
 
 #[inline]
 pub fn read_fid_key(key: &[u8], offset: usize) -> u64 {
-    let mut fid_bytes = [0u8; FID_BYTES];
-    fid_bytes.copy_from_slice(&key[offset..offset + FID_BYTES]);
-    // Upcast to u64 so we are always dealing with the same type everywhere
-    u32::from_be_bytes(fid_bytes) as u64
+    match encoded_fid_len(key, offset).expect("complete FID key") {
+        12 => u64::from_be_bytes(key[offset + 4..offset + 12].try_into().unwrap()),
+        _ => u32::from_be_bytes(key[offset..offset + 4].try_into().unwrap()) as u64,
+    }
 }
 
 #[inline]
@@ -431,10 +462,41 @@ pub fn decode_message_data(
     bytes: &[u8],
     version: Option<EngineVersion>,
 ) -> Result<MessageData, DecodeError> {
-    MessageData::decode(bytes).or_else(|err| match drop_unknown_fields(bytes, version) {
-        Some(stripped) => MessageData::decode(stripped.as_slice()),
-        None => Err(err),
-    })
+    let decode = |bytes: &[u8]| {
+        MessageData::decode(bytes).or_else(|err| match drop_unknown_fields(bytes, version) {
+            Some(stripped) => MessageData::decode(stripped.as_slice()),
+            None => Err(err),
+        })
+    };
+    decode(bytes)
+        .or_else(|original| {
+            // Rare fallback: an old client may send any protobuf wire type in
+            // this previously unknown field. Preserve that pre-fork interpretation.
+            let fields = protobuf_fields(bytes, 100).ok_or(original.clone())?;
+            let mut kind = 0;
+            for (tag, wire, field) in &fields {
+                if *tag == 1 && *wire == WireType::Varint {
+                    let mut value = *field;
+                    decode_key(&mut value).map_err(|_| original.clone())?;
+                    kind = decode_varint(&mut value).map_err(|_| original.clone())?;
+                }
+            }
+            if kind == crate::proto::MessageType::NativeOnboard as u64
+                || !fields.iter().any(|(tag, _, _)| *tag == 1160)
+            {
+                return Err(original);
+            }
+            let stripped: Vec<u8> = fields
+                .into_iter()
+                .filter(|(tag, _, _)| *tag != 1160)
+                .flat_map(|(_, _, field)| field.iter().copied())
+                .collect();
+            decode(&stripped)
+        })
+        .map(|mut data| {
+            crate::native_registration::normalize_data(&mut data, true);
+            data
+        })
 }
 
 /// `MessageData` bytes without the added fields that `version` does not know and that do not
@@ -478,6 +540,7 @@ fn drop_unknown_fields(bytes: &[u8], version: Option<EngineVersion>) -> Option<V
 /// The same drop for a decoded `MessageData`, using the same arms: for `data` sent without
 /// `data_bytes`, and for the `data` of a block's messages.
 pub fn drop_unknown_data_fields(data: &mut MessageData, version: EngineVersion) {
+    crate::native_registration::normalize_data(data, true);
     if let Some(Body::CastAddBody(body)) = &mut data.body {
         if is_unknown_field(5, 9, Some(version)) {
             body.format_version = 0;

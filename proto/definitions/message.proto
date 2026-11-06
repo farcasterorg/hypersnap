@@ -50,6 +50,10 @@ message MessageData {
     ChannelPinBody channel_pin_body = 23;
     ChannelModerateBody channel_moderate_body = 24;
   } // Properties specific to the MessageType
+  // Encoded HyperNativeOnboardBody (wire-compatible with pow's field 1160).
+  // Kept outside the legacy oneof so unknown registration data cannot replace
+  // a legacy cast/link body during pre-fork decoding.
+  optional bytes native_onboard_body = 1160;
 }
 
 /** Type of hashing scheme used to produce a digest of MessageData */
@@ -90,6 +94,7 @@ enum MessageType {
   MESSAGE_TYPE_CHANNEL_MEMBER = 19;
   MESSAGE_TYPE_CHANNEL_PIN = 20;
   MESSAGE_TYPE_CHANNEL_MODERATE = 21;
+  MESSAGE_TYPE_NATIVE_ONBOARD = 160;
 }
 
 /** Farcaster network the message is intended for */
@@ -367,4 +372,24 @@ message ChannelModerateBody {
   bytes channel_id = 1;
   bytes cast_hash = 2;
   ChannelModerateAction action = 3;
+}
+
+// Native registration only. Stake and Falcon fields from pow are reserved;
+// those protocols are deliberately not enabled by this port.
+message PowSolution {
+  bytes nonce = 1;
+  uint32 difficulty_bits = 2;
+}
+message HyperNativeOnboardBody {
+  bytes custody_address = 1;
+  bytes custody_signature = 2;
+  uint64 anchor_block_height = 3;
+  bytes anchor_block_hash = 4;
+  oneof gate_proof { PowSolution pow = 5; }
+  reserved 6, 7, 8;
+}
+message NativeRegistrationRecord {
+  uint64 fid = 1;
+  Message registration = 2;
+  uint64 block_number = 3;
 }

@@ -20,7 +20,7 @@ use crate::core::error::HubError;
 use crate::core::validations;
 use crate::mempool::routing::MessageRouter;
 use crate::proto::{
-    self, on_chain_event, FarcasterNetwork, UserNameProof, UserNameType, VerificationAddAddressBody,
+    self, FarcasterNetwork, UserNameProof, UserNameType, VerificationAddAddressBody,
 };
 use crate::storage::db::RocksDbTransactionBatch;
 use crate::storage::store::account::{UsernameProofStore, VerificationStore};
@@ -226,13 +226,10 @@ impl L1Validator {
 
         let id_register = stores
             .onchain_event_store
-            .get_id_register_event_by_fid(fid, None)
+            .get_custody_address(fid, None)
             .map_err(|_| HubError::internal_db_error("Could not fetch id registration"))?;
 
-        let custody_address = match id_register.and_then(|event| event.body) {
-            Some(on_chain_event::Body::IdRegisterEventBody(id_register)) => id_register.to,
-            _ => return Err(rejected("missing fid registration")),
-        };
+        let custody_address = id_register.ok_or_else(|| rejected("missing fid registration"))?;
 
         // Check verified addresses if the resolved address doesn't match the custody address
         if custody_address != resolved_ens_address {

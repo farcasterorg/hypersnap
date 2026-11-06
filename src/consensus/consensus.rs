@@ -47,6 +47,8 @@ pub struct ValidatorSetConfig {
 pub struct Config {
     pub private_key: String,
     pub num_shards: u32,
+    #[serde(default)]
+    pub native_registration: crate::native_registration::Config,
     pub shard_ids: Vec<u32>,
 
     #[serde(with = "humantime_serde")]
@@ -82,6 +84,7 @@ impl Config {
         Self {
             private_key: self.private_key.clone(),
             num_shards: shard_ids.len() as u32,
+            native_registration: self.native_registration.clone(),
             shard_ids,
             block_time: self.block_time,
             propose_time: self.propose_time,
@@ -159,6 +162,7 @@ impl Default for Config {
             private_key: hex::encode(SecretKey::generate()),
             shard_ids: vec![1],
             num_shards: 1,
+            native_registration: Default::default(),
             propose_time: Duration::from_millis(1000),
             prevote_time: Duration::from_millis(500),
             precommit_time: Duration::from_millis(500),

@@ -304,6 +304,20 @@ impl ShardEngine {
         self.shard_id
     }
 
+    pub fn with_native_registration(
+        mut self,
+        config: crate::native_registration::Config,
+        authority: Arc<RocksDB>,
+    ) -> Self {
+        self.stores.native_registration = config.clone();
+        self.stores.native_authority = Some(authority.clone());
+        if let Some(hyper) = &mut self.hyper_stores {
+            hyper.native_registration = config;
+            hyper.native_authority = Some(authority);
+        }
+        self
+    }
+
     pub fn get_stores(&self) -> Stores {
         self.stores.clone()
     }
@@ -339,6 +353,12 @@ impl ShardEngine {
         messages: Vec<MempoolMessage>,
         timestamp: &FarcasterTime,
     ) -> Result<ShardStateChange, EngineError> {
+        let _fid_encoding = crate::native_registration::FidEncodingScope::enter(
+            self.stores.native_registration.active(
+                shard_id,
+                self.get_confirmed_height().block_number.saturating_add(1),
+            ),
+        );
         self.metrics.count(
             "prepare_proposal.recv_messages",
             messages.len() as u64,
@@ -547,7 +567,13 @@ impl ShardEngine {
         source: ProposalSource,
         version: EngineVersion,
         timestamp: &FarcasterTime,
+        height: Height,
     ) -> Result<(Vec<HubEvent>, u64), EngineError> {
+        let _fid_encoding = crate::native_registration::FidEncodingScope::enter(
+            self.stores
+                .native_registration
+                .active(self.shard_id, height.block_number),
+        );
         let now = std::time::Instant::now();
         let mut events = vec![];
         let mut max_block_event_seqnum = self.stores.block_event_store.max_seqnum()?;
@@ -632,7 +658,49 @@ impl ShardEngine {
         trie_message: &ShardTrieEntryWithMessage,
         channel_messages_enabled: bool,
     ) -> Result<MergedReplicatorMessage, EngineError> {
+        let native_key =
+            crate::storage::store::account::encoded_fid_len(&trie_message.trie_key, 1) == Some(12);
+        let raw_fid = match &trie_message.trie_message {
+            Some(TrieMessage::UserMessage(message)) => message.fid(),
+            Some(TrieMessage::OnChainEvent(event)) => event.fid,
+            Some(TrieMessage::FnameTransfer(transfer)) => {
+                transfer.proof.as_ref().map_or(0, |p| p.fid)
+            }
+            Some(TrieMessage::NativeRegistration(record)) => record.fid,
+            None => 0,
+        };
+        let _fid_encoding = crate::native_registration::FidEncodingScope::enter(
+            native_key || !crate::native_registration::is_native_fid(raw_fid),
+        );
         let (hub_event, fid) = match &trie_message.trie_message {
+            Some(TrieMessage::NativeRegistration(record)) => {
+                if !native_key {
+                    return Err(HubError::validation_failure(
+                        "native receipt requires a full-width trie key",
+                    )
+                    .into());
+                }
+                crate::native_registration::validate_record_proof(
+                    &self.stores.native_registration,
+                    record,
+                    self.network,
+                )?;
+                if trie_message.trie_key != crate::native_registration::trie_key(record) {
+                    return Err(HubError::validation_failure(
+                        "native receipt does not match trie key",
+                    )
+                    .into());
+                }
+                crate::native_registration::apply_record(&self.db, txn_batch, record)?;
+                (
+                    crate::native_registration::event(
+                        &self.stores.event_handler,
+                        txn_batch,
+                        record,
+                    )?,
+                    record.fid,
+                )
+            }
             Some(TrieMessage::UserMessage(m)) => {
                 let events = self.merge_message(m, txn_batch, channel_messages_enabled)?;
                 self.merge_message_hyper(m, txn_batch);
@@ -781,6 +849,54 @@ impl ShardEngine {
                     .as_ref()
                     .ok_or(MessageValidationError::BlockEventMissingBody)?;
                 let msg_type = message.msg_type();
+                if msg_type == MessageType::NativeOnboard {
+                    let record = merge_message_event
+                        .native_registration
+                        .as_ref()
+                        .ok_or_else(|| {
+                            HubError::validation_failure(
+                                "native registration event missing receipt",
+                            )
+                        })?;
+                    if !self
+                        .stores
+                        .native_registration
+                        .active(0, block_event.block_number())
+                        || record.block_number != block_event.block_number()
+                        || record.registration.as_ref() != Some(*message)
+                    {
+                        return Err(HubError::validation_failure(
+                            "invalid native registration receipt or fork height",
+                        )
+                        .into());
+                    }
+                    let authority = self.stores.native_authority.as_ref().ok_or_else(|| {
+                        HubError::invalid_internal_state(
+                            "native registration authority unavailable",
+                        )
+                    })?;
+                    if crate::native_registration::account(
+                        authority,
+                        &RocksDbTransactionBatch::new(),
+                        record.fid,
+                    )?
+                    .as_ref()
+                        != Some(record)
+                    {
+                        return Err(HubError::validation_failure(
+                            "native receipt is not committed on shard zero yet",
+                        )
+                        .into());
+                    }
+                    crate::native_registration::apply_record(&self.db, txn_batch, record)?;
+                    let event = crate::native_registration::event(
+                        &self.stores.event_handler,
+                        txn_batch,
+                        record,
+                    )?;
+                    self.update_trie(trie_ctx, &event, txn_batch)?;
+                    return Ok(vec![event]);
+                }
                 // Per-msg-type feature gating and merge strategy for shard-0-hosted user
                 // messages, decided together so the two can never disagree about a type. Any
                 // future shard-0 feature whose merges propagate via a `MergeMessage` BlockEvent
@@ -1270,6 +1386,11 @@ impl ShardEngine {
         timestamp: &FarcasterTime,
         mut last_block_event_seqnum: u64,
     ) -> Result<(Vec<u8>, Vec<HubEvent>, Vec<MessageValidationError>, u64), EngineError> {
+        let _fid_encoding = crate::native_registration::FidEncodingScope::or_next(
+            &self.stores.native_registration,
+            self.shard_id,
+            self.get_confirmed_height().block_number.saturating_add(1),
+        );
         let now = std::time::Instant::now();
         let total_user_messages = snapchain_txn.user_messages.len();
         let total_system_messages = snapchain_txn.system_messages.len();
@@ -1292,6 +1413,13 @@ impl ShardEngine {
         // followed by FnameTransfers sorted by timestamp.
         let mut sorted_system_messages = snapchain_txn.system_messages.clone();
         sorted_system_messages.sort_by(|a, b| {
+            if let (Some(a), Some(b)) = (&a.block_event, &b.block_event) {
+                if a.seqnum() > crate::native_registration::FORK_EVENT_BASE
+                    || b.seqnum() > crate::native_registration::FORK_EVENT_BASE
+                {
+                    return a.seqnum().cmp(&b.seqnum());
+                }
+            }
             match (&a.on_chain_event, &b.on_chain_event) {
                 (Some(event_a), Some(event_b)) => {
                     // Both are OnChainEvents, sort by block_number then log_index.
@@ -1454,9 +1582,72 @@ impl ShardEngine {
             }
 
             if let Some(block_event) = &msg.block_event {
+                if block_event.seqnum() > crate::native_registration::FORK_EVENT_BASE
+                    && !self.stores.native_registration.active(
+                        self.shard_id,
+                        self.stores
+                            .shard_store
+                            .max_block_number()
+                            .map_err(|e| HubError::internal_db_error(&e.to_string()))?
+                            .saturating_add(1),
+                    )
+                {
+                    return Err(HubError::validation_failure(
+                        "post-fork block event before data-shard fork",
+                    )
+                    .into());
+                }
                 // TODO(aditi): Validate hash and insert into any other relevant stores and trie if the message is relevant
                 if version.is_enabled(ProtocolFeature::ReadDataFromShardZero) {
+                    // Switch streams only on the first authenticated post-fork event,
+                    // so replaying earlier data-shard blocks still consumes legacy events.
+                    if block_event.seqnum() > crate::native_registration::FORK_EVENT_BASE {
+                        let authority = self.stores.native_authority.as_ref().ok_or_else(|| {
+                            HubError::invalid_internal_state("fork event authority unavailable")
+                        })?;
+                        let committed =
+                            crate::storage::store::account::BlockEventStore::new(authority.clone())
+                                .get_block_event_by_seqnum(block_event.seqnum())?;
+                        if committed.as_ref() != Some(block_event) {
+                            return Err(HubError::validation_failure(
+                                "fork block event is not committed on shard zero yet",
+                            )
+                            .into());
+                        }
+                        last_block_event_seqnum = last_block_event_seqnum
+                            .max(crate::native_registration::FORK_EVENT_BASE);
+                    }
+                    if block_event.seqnum() > crate::native_registration::FORK_EVENT_BASE
+                        && block_event.seqnum() != last_block_event_seqnum + 1
+                    {
+                        return Err(HubError::validation_failure(
+                            "post-fork block events must be consecutive",
+                        )
+                        .into());
+                    }
                     if block_event.seqnum() == last_block_event_seqnum + 1 {
+                        if block_event.seqnum() > crate::native_registration::FORK_EVENT_BASE {
+                            let next = self
+                                .stores
+                                .shard_store
+                                .max_block_number()
+                                .map_err(|e| HubError::internal_db_error(&e.to_string()))?
+                                .saturating_add(1);
+                            if !self.stores.native_registration.active(self.shard_id, next) {
+                                return Err(HubError::validation_failure(
+                                    "native account event before data-shard fork",
+                                )
+                                .into());
+                            }
+                            let merged =
+                                self.handle_block_event(trie_ctx, block_event, txn_batch, version)?;
+                            self.stores
+                                .block_event_store
+                                .put_block_event(block_event, txn_batch)?;
+                            last_block_event_seqnum += 1;
+                            events.extend(merged);
+                            continue;
+                        }
                         if let Err(err) = self
                             .stores
                             .block_event_store
@@ -2193,6 +2384,11 @@ impl ShardEngine {
         version: EngineVersion,
         txn_batch: &mut RocksDbTransactionBatch,
     ) -> Result<(), MessageValidationError> {
+        let _fid_encoding = crate::native_registration::FidEncodingScope::or_next(
+            &self.stores.native_registration,
+            self.shard_id,
+            self.get_confirmed_height().block_number.saturating_add(1),
+        );
         let now = std::time::Instant::now();
 
         // Read-view of the transaction batch. When `DependentMessagesInBulkSubmit` is enabled,
@@ -2231,7 +2427,7 @@ impl ShardEngine {
         // If not in the temp cache, fall back to the DB
         self.stores
             .onchain_event_store
-            .get_id_register_event_by_fid(message_data.fid, Some(read_txn))
+            .get_custody_address(message_data.fid, Some(read_txn))
             .map_err(|_| MessageValidationError::MissingFid)?
             .ok_or(MessageValidationError::MissingFid)?;
 
@@ -2502,7 +2698,18 @@ impl ShardEngine {
             return false;
         };
         let version = self.version_for(&FarcasterTime::new(header.timestamp));
-        header.transactions_root == expected_transactions_root(&shard_chunk.transactions, version)
+        header.transactions_root
+            == expected_transactions_root(
+                &crate::native_registration::transactions_for_root(
+                    &shard_chunk.transactions,
+                    header.height.is_some_and(|h| {
+                        self.stores
+                            .native_registration
+                            .active(self.shard_id, h.block_number)
+                    }),
+                ),
+                version,
+            )
     }
 
     pub fn validate_shard_chunk(&mut self, shard_chunk: &ShardChunk) -> bool {
@@ -2568,6 +2775,7 @@ impl ShardEngine {
             ProposalSource::Validate,
             shard_state_change.version,
             &shard_state_change.timestamp,
+            height,
         );
 
         match proposal_result {
@@ -2931,6 +3139,7 @@ impl ShardEngine {
                 ProposalSource::Commit,
                 version,
                 &FarcasterTime::new(header.timestamp),
+                header.height.unwrap(),
             ) {
                 Err(err) => {
                     // Persist before panicking. The panic below is caught by

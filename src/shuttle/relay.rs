@@ -332,6 +332,11 @@ fn compatible(raw: &Message, config: &Config, side: Side) -> Option<Message> {
         Some(bytes) => MessageData::decode(bytes.as_slice()).ok()?,
         None => message.data.clone()?,
     };
+    if crate::native_registration::is_native_fid(data.fid)
+        || data.r#type == proto::MessageType::NativeOnboard as i32
+    {
+        return None;
+    }
     if data.network != config.network
         || data.fid == 0
         || !config.side(side).message_types.contains(&data.r#type)
