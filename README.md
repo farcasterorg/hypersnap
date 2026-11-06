@@ -166,6 +166,14 @@ the repair, set `[api.daily_stats] repair_on_startup = false`; it defaults to
 true. The regular historical store-walk backfill has its own checkpoints and
 does not need to be reset for this repair.
 
+### Hypersnap ↔ Snapchain shuttle
+
+The standalone `shuttle` binary relays compatible signed user messages from each
+network's committed blocks to the opposite mempool, with persistent cursors and
+loop suppression. Gossip switches to Hypersnap topics at each shard's configured
+fork height. See [shuttle setup and fork routing](docs/shuttle.md) and
+[`shuttle.example.toml`](shuttle.example.toml).
+
 ## Contributing 
 
 We welcome contributions from developers of all skill levels. Please look for issues labeled with "help wanted" to find good tickets to work on. If you are working on something that is not explicitly a ticket, we may or may not accept it. We encourage checking with someone on the team before spending a lot of time on something. 

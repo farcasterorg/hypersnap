@@ -20,8 +20,8 @@ use bytes::Bytes;
 use futures::StreamExt;
 use informalsystems_malachitebft_codec::Codec;
 use informalsystems_malachitebft_core_types::{SignedProposal, SignedVote};
+use informalsystems_malachitebft_network::PeerId as MalachitePeerId;
 use informalsystems_malachitebft_network::{Channel, PeerIdExt};
-use informalsystems_malachitebft_network::{MessageId, PeerId as MalachitePeerId};
 use informalsystems_malachitebft_sync::{self as sync};
 use libp2p::identity::ed25519::Keypair;
 use libp2p::request_response::{self, InboundRequestId, OutboundRequestId};
@@ -36,7 +36,6 @@ use prost::Message;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -44,31 +43,20 @@ use std::time::{Duration, Instant};
 use tokio::io;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 const DEFAULT_GOSSIP_HOST: &str = "127.0.0.1";
 /// How long a shutdown waits for peer connections to close.
 pub const SHUTDOWN_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_GOSSIP_MESSAGE_SIZE: usize = 1024 * 1024 * 10; // 10 mb
 
-pub(crate) const CONSENSUS_TOPIC: &str = "consensus";
-pub(crate) const MEMPOOL_TOPIC: &str = "mempool";
-const DECIDED_VALUES: &str = "decided-values";
-const READ_NODE_PEER_STATUSES: &str = "read-node-peers";
-const CONTACT_INFO: &str = "contact-info";
-const HYPER_TOPIC: &str = "hyper";
-
-/// All gossip topics this node may participate in. The single source of truth
-/// for valid topic names — used to bound the per-peer gossip-metrics
-/// sampler/eviction and to validate the mesh view's `?topics=` selection.
-pub(crate) const ALL_TOPICS: [&str; 6] = [
-    CONSENSUS_TOPIC,
-    MEMPOOL_TOPIC,
-    DECIDED_VALUES,
-    READ_NODE_PEER_STATUSES,
-    CONTACT_INFO,
-    HYPER_TOPIC,
-];
+pub(crate) const CONSENSUS_TOPIC: &str = snapchain_proto::topics::CONSENSUS;
+pub(crate) const MEMPOOL_TOPIC: &str = snapchain_proto::topics::MEMPOOL;
+const DECIDED_VALUES: &str = snapchain_proto::topics::DECIDED_VALUES;
+const READ_NODE_PEER_STATUSES: &str = snapchain_proto::topics::READ_NODE_PEERS;
+const CONTACT_INFO: &str = snapchain_proto::topics::CONTACT_INFO;
+const HYPER_TOPIC: &str = snapchain_proto::topics::HYPER;
+pub(crate) const ALL_TOPICS: [&str; 12] = snapchain_proto::topics::TRANSITION_TOPICS;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -93,6 +81,9 @@ pub struct Config {
     pub enable_autodiscovery: bool,
     // Comma-separated list of peer IDs to always connect to directly.
     pub direct_peers: String,
+    /// First Hypersnap consensus height for each shard. Configured in validators.toml.
+    #[serde(default)]
+    pub topic_cutovers: BTreeMap<String, u64>,
 }
 
 impl Default for Config {
@@ -110,6 +101,7 @@ impl Default for Config {
             bootstrap_reconnect_interval: Duration::from_secs(30),
             enable_autodiscovery: false,
             direct_peers: "".to_string(),
+            topic_cutovers: BTreeMap::new(),
         }
     }
 }
@@ -289,6 +281,7 @@ pub(crate) fn peers_to_bounce(
 }
 
 pub struct SnapchainGossip {
+    topic_schedule: super::topic_schedule::Schedule,
     pub swarm: Swarm<SnapchainBehavior>,
     pub tx: mpsc::Sender<GossipEvent<SnapchainValidatorContext>>,
     rx: mpsc::Receiver<GossipEvent<SnapchainValidatorContext>>,
@@ -406,6 +399,9 @@ impl SnapchainGossip {
         statsd_client: StatsdClientWrapper,
         capabilities: Vec<String>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let topic_schedule =
+            super::topic_schedule::Schedule::new(&config.topic_cutovers, fc_network)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair.clone().into())
             .with_tokio()
             .with_tcp(
@@ -415,34 +411,27 @@ impl SnapchainGossip {
             )?
             .with_quic()
             .with_behaviour(|key| {
-                let message_id_fn = |message: &gossipsub::Message| {
-                    // This is the default implementation inside libp2p
-                    let default_message_id_fn = |message: &gossipsub::Message| {
-                        let mut source_string = if let Some(peer_id) = message.source.as_ref() {
-                            peer_id.to_base58()
-                        } else {
-                            PeerId::from_bytes(&[0, 1, 0])
-                                .expect("Valid peer id")
-                                .to_base58()
-                        };
-                        source_string
-                            .push_str(&message.sequence_number.unwrap_or_default().to_string());
-                        MessageId::from(source_string)
-                    };
-
-                    match message.topic.as_str() {
-                        MEMPOOL_TOPIC | CONTACT_INFO => {
-                            let mut s = DefaultHasher::new();
-                            message.data.hash(&mut s);
-                            gossipsub::MessageId::from(s.finish().to_string())
-                        }
-                        _ => default_message_id_fn(message),
+                let message_id_fn = |message: &gossipsub::Message| match message.topic.as_str() {
+                    MEMPOOL_TOPIC | CONTACT_INFO | "mempool" | "contact-info" => {
+                        gossipsub::MessageId::from(snapchain_proto::topics::message_id(
+                            message.topic.as_str(),
+                            &message.data,
+                        ))
+                    }
+                    _ => {
+                        let source = message.source.map(|p| p.to_base58()).unwrap_or_default();
+                        gossipsub::MessageId::from(format!(
+                            "{}{}",
+                            source,
+                            message.sequence_number.unwrap_or_default()
+                        ))
                     }
                 };
 
                 // Set a custom gossipsub configuration
                 let gossipsub_config = gossipsub::ConfigBuilder::default()
                     .heartbeat_interval(Duration::from_millis(500)) // This might need to be lowered to 1/3 of the block time
+                    .validate_messages()
                     .validation_mode(gossipsub::ValidationMode::Strict) // This sets the kind of message validation. The default is Strict (enforce message signing)
                     .message_id_fn(message_id_fn) // content-address mempool messages
                     .max_transmit_size(MAX_GOSSIP_MESSAGE_SIZE) // maximum message size that can be transmitted
@@ -574,9 +563,20 @@ impl SnapchainGossip {
             local_topics.push(topic);
         }
 
+        let templates = local_topics;
+        let mut local_topics = Vec::new();
+        for topic in templates {
+            let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&topic);
+            for name in topic_schedule.subscriptions(topic.hash().as_str()) {
+                let topic = gossipsub::IdentTopic::new(name);
+                swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
+                local_topics.push(topic);
+            }
+        }
         let direct_peers: HashSet<PeerId> = config.direct_peers().into_iter().collect();
 
         Ok(SnapchainGossip {
+            topic_schedule,
             swarm,
             tx,
             rx,
@@ -802,13 +802,20 @@ impl SnapchainGossip {
                     // SUBSCRIBE delivery, comfortably above any reasonable settle.
                     let connection_settle_threshold = Duration::from_secs(30);
 
-                    let peer_topics_snapshot: HashMap<PeerId, Vec<gossipsub::TopicHash>> = self
+                    let mut peer_topics_snapshot: HashMap<PeerId, Vec<gossipsub::TopicHash>> = self
                         .swarm
                         .behaviour()
                         .gossipsub
                         .all_peers()
                         .map(|(p, ts)| (*p, ts.into_iter().cloned().collect()))
                         .collect();
+
+                    let legacy_contact = gossipsub::IdentTopic::new("contact-info").hash();
+                    for topics in peer_topics_snapshot.values_mut() {
+                        if topics.contains(&legacy_contact) && !topics.contains(&contact_info_hash) {
+                            topics.push(contact_info_hash.clone());
+                        }
+                    }
 
                     // Reconcile `peer_connected_at` against the current snapshot. Two
                     // directions of cleanup, both defensive against missed events:
@@ -904,8 +911,9 @@ impl SnapchainGossip {
                     // Validators only: surface consensus mesh size so we can
                     // alert if grafts to N-1 peers don't establish.
                     if !self.read_node {
-                        let consensus_hash = gossipsub::IdentTopic::new(CONSENSUS_TOPIC).hash();
-                        let mesh_size = self.swarm.behaviour().gossipsub.mesh_peers(&consensus_hash).count() as u64;
+                        let mesh_size = ["consensus", CONSENSUS_TOPIC].into_iter()
+                            .flat_map(|name| self.swarm.behaviour().gossipsub.mesh_peers(&gossipsub::IdentTopic::new(name).hash()).copied().collect::<Vec<_>>())
+                            .collect::<HashSet<_>>().len() as u64;
                         self.statsd_client.gauge("gossip.consensus_mesh_size", mesh_size, vec![]);
                     }
 
@@ -1060,9 +1068,11 @@ impl SnapchainGossip {
                             // leaves the set empty so this is a HashSet contains check
                             // under an uncontended `parking_lot::Mutex` (no poisoning,
                             // no thread parking, won't block the tokio executor).
-                            if self.peer_blocklist.lock().contains(&peer_id) {
-                                continue;
-                            }
+                            let blocked = self.peer_blocklist.lock().contains(&peer_id);
+                            let accepted = !blocked && self.topic_schedule.accepts(message.topic.as_str(), &message.data);
+                            let acceptance = if accepted { gossipsub::MessageAcceptance::Accept } else { gossipsub::MessageAcceptance::Ignore };
+                            self.swarm.behaviour_mut().gossipsub.report_message_validation_result(&_id, &peer_id, acceptance);
+                            if !accepted { continue; }
                             // Per-peer/per-topic gossip volume. `IdentTopic` uses
                             // identity hashing, so `topic.as_str()` is the human
                             // topic name (e.g. "consensus"). Cumulative — rates are
@@ -1261,19 +1271,56 @@ impl SnapchainGossip {
         self.direct_peers.contains(peer_id) || self.bootstrap_peer_addrs.contains_key(peer_id)
     }
 
+    pub fn set_topic_routing_shards(&mut self, num_shards: u32) -> Result<(), String> {
+        self.topic_schedule.set_num_shards(num_shards)
+    }
+
+    fn refresh_topic_subscriptions(&mut self) {
+        let templates: std::collections::BTreeSet<_> = self
+            .local_topics
+            .iter()
+            .filter_map(|t| snapchain_proto::topics::canonical(t.hash().as_str()))
+            .collect();
+        let desired: std::collections::BTreeSet<_> = templates
+            .iter()
+            .flat_map(|topic| self.topic_schedule.subscriptions(topic))
+            .collect();
+        for topic in &self.local_topics {
+            if !desired.contains(topic.hash().as_str()) {
+                let _ = self.swarm.behaviour_mut().gossipsub.unsubscribe(topic);
+            }
+        }
+        self.local_topics = desired
+            .into_iter()
+            .map(|name| {
+                let topic = gossipsub::IdentTopic::new(name);
+                if let Err(error) = self.swarm.behaviour_mut().gossipsub.subscribe(&topic) {
+                    warn!(%error, name, "Topic subscription failed");
+                }
+                topic
+            })
+            .collect();
+    }
+
     fn publish(&mut self, message: Vec<u8>, topic: &str) {
-        let publish_topic = gossipsub::IdentTopic::new(topic);
-        if let Err(e) = self
-            .swarm
-            .behaviour_mut()
-            .gossipsub
-            .publish(publish_topic, message)
-        {
-            warn!("Failed to publish gossip message: {} ({:?})", e, topic);
-            // Without this a dropped publish is visible only in logs: a mempool message
-            // the RPC layer already reported as submitted never leaves the node.
-            self.statsd_client
-                .count("gossip.publish_failed", 1, vec![("topic", topic)]);
+        let previous = self.topic_schedule.phases();
+        self.topic_schedule.observe_outbound(&message);
+        if previous != self.topic_schedule.phases() {
+            info!(phases = ?self.topic_schedule.phases(), "Gossip topic fork phase advanced");
+            self.refresh_topic_subscriptions();
+        }
+        for topic in self.topic_schedule.publications(topic, &message) {
+            let publish_topic = gossipsub::IdentTopic::new(topic);
+            if let Err(e) = self
+                .swarm
+                .behaviour_mut()
+                .gossipsub
+                .publish(publish_topic, message.clone())
+            {
+                warn!("Failed to publish gossip message: {} ({:?})", e, topic);
+                self.statsd_client
+                    .count("gossip.publish_failed", 1, vec![("topic", topic)]);
+            }
         }
     }
 
@@ -1532,11 +1579,9 @@ impl SnapchainGossip {
         let snapchain_codec = SnapchainCodec {};
         match event {
             Some(GossipEvent::SubscribeToDecidedValuesTopic()) => {
-                let topic = gossipsub::IdentTopic::new(DECIDED_VALUES);
-                let result = self.swarm.behaviour_mut().gossipsub.subscribe(&topic);
-                if let Err(e) = result {
-                    error!("Failed to subscribe to {} topic: {}", DECIDED_VALUES, e);
-                }
+                self.local_topics
+                    .push(gossipsub::IdentTopic::new(DECIDED_VALUES));
+                self.refresh_topic_subscriptions();
                 None
             }
             Some(GossipEvent::BroadcastDecidedValue(decided_value)) => {
@@ -1805,10 +1850,13 @@ impl SnapchainGossip {
             })
             .collect();
 
-        let consensus_mesh_size = topic_mesh
-            .get(CONSENSUS_TOPIC)
-            .map(|m| m.len() as u32)
-            .unwrap_or(0);
+        let consensus_mesh_size = ["consensus", CONSENSUS_TOPIC]
+            .into_iter()
+            .filter_map(|name| topic_mesh.get(name))
+            .flatten()
+            .copied()
+            .collect::<HashSet<_>>()
+            .len() as u32;
         let current_version = EngineVersion::current(self.fc_network).protocol_version();
         let local = proto::MeshSelf {
             peer_id: self.swarm.local_peer_id().to_bytes(),

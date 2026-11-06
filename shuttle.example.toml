@@ -1,0 +1,31 @@
+# Copy to shuttle.toml. Use gRPC RPC addresses, not REST API addresses.
+state_dir = ".shuttle"
+network = 1 # Farcaster Mainnet message signatures on both networks
+num_shards = 2
+shards = [0, 1, 2]
+poll_ms = 500
+batch_blocks = 16
+rpc_timeout_secs = 15
+
+# Must match validators.toml on the Hypersnap nodes.
+[topic_cutovers]
+"0" = 50_178_325
+"1" = 50_862_269
+"2" = 50_697_335
+
+[hypersnap]
+rpc = "http://127.0.0.1:3383"
+peers = ["/ip4/127.0.0.1/udp/3382/quic-v1"]
+# listen = "/ip4/0.0.0.0/udp/0/quic-v1"
+# Omit start_blocks to start at the observed tip + 1 on FIRST launch.
+# To replay retained history instead, set inclusive starting blocks per shard:
+# [hypersnap.start_blocks]
+# "0" = 50178325
+# "1" = 50862269
+# "2" = 50697335
+
+[snapchain]
+rpc = "http://127.0.0.1:4383"
+peers = ["/ip4/127.0.0.1/udp/4382/quic-v1"]
+# Optional allowlist on either side: only the intersection is relayed.
+# message_types = [1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 13, 14, 15]
