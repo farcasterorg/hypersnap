@@ -15,7 +15,7 @@ use std::fmt::Write;
 /// Topics shown in the ASCII view when `?topics=` is omitted. Derived from the
 /// canonical topic constants — consensus is the consensus-partition signal,
 /// mempool the next most operationally important (transaction propagation).
-pub const DEFAULT_TOPICS: [&str; 2] = [CONSENSUS_TOPIC, MEMPOOL_TOPIC];
+pub const DEFAULT_TOPICS: [&str; 4] = ["consensus", "mempool", CONSENSUS_TOPIC, MEMPOOL_TOPIC];
 
 /// Parse a comma-separated `?topics=` value into a topic list. The sentinel
 /// `all` selects every known topic. Otherwise entries are trimmed and validated
@@ -101,7 +101,14 @@ pub fn render_mesh_view(view: &proto::MeshView, topics: &[String]) -> String {
         for t in topics {
             row.push_str(&format!("{:<11}", mesh_cell(link_state(p, t))));
         }
-        let rate = rate_for_topic(p, &rate_topic)
+        let rate = topics
+            .iter()
+            .filter(|t| {
+                snapchain_proto::topics::canonical(t)
+                    == snapchain_proto::topics::canonical(&rate_topic)
+            })
+            .filter_map(|t| rate_for_topic(p, t))
+            .reduce(|a, b| a + b)
             .map(|r| format!("{:.1}", r))
             .unwrap_or_else(|| "—".to_string());
         row.push_str(&format!(
@@ -114,7 +121,10 @@ pub fn render_mesh_view(view: &proto::MeshView, topics: &[String]) -> String {
 
     // Consensus partition graph — only when consensus is among the shown topics
     // (it is the partition-critical signal).
-    if topics.iter().any(|t| t == CONSENSUS_TOPIC) {
+    if topics
+        .iter()
+        .any(|t| snapchain_proto::topics::canonical(t) == Some(CONSENSUS_TOPIC))
+    {
         let _ = writeln!(out, "GRAPH (consensus mesh)");
         let mut any_validator = false;
         for p in &view.peers {
@@ -123,7 +133,13 @@ pub fn render_mesh_view(view: &proto::MeshView, topics: &[String]) -> String {
             }
             any_validator = true;
             let peer = short_peer(&p.peer_id);
-            match link_state(p, CONSENSUS_TOPIC) {
+            match topics
+                .iter()
+                .filter(|t| snapchain_proto::topics::canonical(t) == Some(CONSENSUS_TOPIC))
+                .map(|t| link_state(p, t))
+                .min()
+                .unwrap_or(LinkState::None)
+            {
                 LinkState::Mesh => {
                     let _ = writeln!(out, "  {self_id} ── {peer}");
                 }
@@ -338,7 +354,7 @@ fn network_name(network: i32) -> &'static str {
 /// peer reports `in_mesh = false`. We treat a subscribed direct peer as a
 /// first-class link (`Direct`) so it is never mistaken for a partition or for a
 /// merely-subscribed peer.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum LinkState {
     Mesh,    // in our emergent gossipsub mesh
     Direct,  // explicit/direct peer, subscribed (excluded from the mesh by design)
@@ -368,7 +384,7 @@ fn has_link(state: LinkState) -> bool {
 
 /// Does the peer have an effective consensus link (meshed or explicit/direct)?
 fn has_consensus_link(peer: &proto::MeshPeer) -> bool {
-    has_link(link_state(peer, CONSENSUS_TOPIC))
+    has_link(link_state(peer, CONSENSUS_TOPIC)) || has_link(link_state(peer, "consensus"))
 }
 
 /// `(subscribed, in_mesh)` for a peer on a given topic. Absent membership entry
@@ -882,7 +898,7 @@ mod tests {
             // Meshed on consensus, subscribed-but-not-meshed on mempool.
             peers: vec![peer_with_topics(
                 &b,
-                &[("consensus", true), ("mempool", false)],
+                &[(CONSENSUS_TOPIC, true), (MEMPOOL_TOPIC, false)],
             )],
             generated_at: 0,
         };
@@ -918,18 +934,18 @@ mod tests {
             nodes: vec![
                 mk(
                     &a,
-                    peer_with_topics(&b, &[("consensus", true), ("mempool", true)]),
+                    peer_with_topics(&b, &[(CONSENSUS_TOPIC, true), (MEMPOOL_TOPIC, true)]),
                 ),
                 mk(
                     &b,
-                    peer_with_topics(&a, &[("consensus", true), ("mempool", false)]),
+                    peer_with_topics(&a, &[(CONSENSUS_TOPIC, true), (MEMPOOL_TOPIC, false)]),
                 ),
             ],
             unreachable: vec![],
             generated_at: 0,
         };
 
-        let topics = vec!["consensus".to_string(), "mempool".to_string()];
+        let topics = vec![CONSENSUS_TOPIC.to_string(), MEMPOOL_TOPIC.to_string()];
         let out = render_topology(&topo, &topics);
         // One matrix per topic.
         assert!(out.contains("CONSENSUS LINKS"));

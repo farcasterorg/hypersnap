@@ -192,3 +192,63 @@ validator_public_keys = [
   "bd465c947fe1acfac219fec2fb2ae1e8a13e2acd0498c413f2e54c946ea95095",
   "be846f1454da8fee9ab3e0e3d77f24e408639f97d70124c47679e791eae53cd2",
 ]
+
+# Initial Hypersnap fork: eight validators collected in issue #51.
+# Source: https://github.com/farcasterorg/hypersnap/issues/51
+# Includes haatz/cassie from the issue body and all seven comment submissions.
+# Grafana: http://85.237.203.140:3000/d/c158c14a-0b7f-4228-aefa-d913cae8db02/snapchain
+# Height snapshot: 2026-11-06 09:25:20 UTC; projected activation: 2026-11-09 09:25:20 UTC.
+# Rates measured over available history: 2026-11-06 04:27:00 UTC to 2026-11-06 09:08:00 UTC.
+# Projection per shard: ceil(snapshot_height + observed_blocks_per_second * 259200).
+# Activation time is an estimate; consensus activates at the exact heights below.
+
+# Shard 0: snapshot 49_923_111; observed rate 0.984618426255 blocks/second.
+[[consensus.validator_sets]]
+effective_at = 50_178_325
+shard_ids = [ 0 ]
+validator_public_keys = [
+  "ae46d4ae50bee1a9cf6d798ddddd1d7f54c8314eaf85ac0efa3bf685c9506119", # cassie (haatz.quilibrium.com)
+  "3f9335279a61dc06eb2f097333bf9b7f1aac8760fa44c9fe38c68052d163b143", # kmacb.eth
+  "c37026ce39c58c55d11265bd4e348717dfe008f4da888bc67f0feb9a38fa87c3", # derekhoiem
+  "0149adb8c10672b17a86fb0b9247433d12b7e22c1b888499d3be5cde5171c463", # infinitehomie
+  "7882148cc2608d13d096ea6d68891deb99000612a9f136e55af440d49173ce0d", # arfonzo
+  "1929bcf9fba23418b0a15cc7a6ffb658f7cd7688ab6eb061bac680de8d3ca3ca", # ivy
+  "7b0e914a8bca87888dd9297a8defc71802ba261c399527263713a2caa8b3967a", # mvr
+  "22e82d8886c9c73fe8dd5b6c1df474100f5d9289e7352ea590361d23837074d0", # wake
+]
+
+# Shard 2: snapshot 50_440_548; observed rate 0.990688018980 blocks/second.
+[[consensus.validator_sets]]
+effective_at = 50_697_335
+shard_ids = [ 2 ]
+validator_public_keys = [
+  "ae46d4ae50bee1a9cf6d798ddddd1d7f54c8314eaf85ac0efa3bf685c9506119", # cassie (haatz.quilibrium.com)
+  "3f9335279a61dc06eb2f097333bf9b7f1aac8760fa44c9fe38c68052d163b143", # kmacb.eth
+  "c37026ce39c58c55d11265bd4e348717dfe008f4da888bc67f0feb9a38fa87c3", # derekhoiem
+  "0149adb8c10672b17a86fb0b9247433d12b7e22c1b888499d3be5cde5171c463", # infinitehomie
+  "7882148cc2608d13d096ea6d68891deb99000612a9f136e55af440d49173ce0d", # arfonzo
+  "1929bcf9fba23418b0a15cc7a6ffb658f7cd7688ab6eb061bac680de8d3ca3ca", # ivy
+  "7b0e914a8bca87888dd9297a8defc71802ba261c399527263713a2caa8b3967a", # mvr
+  "22e82d8886c9c73fe8dd5b6c1df474100f5d9289e7352ea590361d23837074d0", # wake
+]
+
+# Shard 1: snapshot 50_605_339; observed rate 0.991241597470 blocks/second.
+[[consensus.validator_sets]]
+effective_at = 50_862_269
+shard_ids = [ 1 ]
+validator_public_keys = [
+  "ae46d4ae50bee1a9cf6d798ddddd1d7f54c8314eaf85ac0efa3bf685c9506119", # cassie (haatz.quilibrium.com)
+  "3f9335279a61dc06eb2f097333bf9b7f1aac8760fa44c9fe38c68052d163b143", # kmacb.eth
+  "c37026ce39c58c55d11265bd4e348717dfe008f4da888bc67f0feb9a38fa87c3", # derekhoiem
+  "0149adb8c10672b17a86fb0b9247433d12b7e22c1b888499d3be5cde5171c463", # infinitehomie
+  "7882148cc2608d13d096ea6d68891deb99000612a9f136e55af440d49173ce0d", # arfonzo
+  "1929bcf9fba23418b0a15cc7a6ffb658f7cd7688ab6eb061bac680de8d3ca3ca", # ivy
+  "7b0e914a8bca87888dd9297a8defc71802ba261c399527263713a2caa8b3967a", # mvr
+  "22e82d8886c9c73fe8dd5b6c1df474100f5d9289e7352ea590361d23837074d0", # wake
+]
+
+# Gossip follows the same per-shard fork boundary; pre-fork traffic stays on Snapchain topics.
+[gossip.topic_cutovers]
+"0" = 50_178_325
+"1" = 50_862_269
+"2" = 50_697_335

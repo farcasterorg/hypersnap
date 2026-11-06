@@ -288,8 +288,8 @@
         return chip;
       }
       function rateFor(peer, topic) {
-        const r = (peer.gossip_rates || []).find((x) => x.topic === topic);
-        return r ? r.msgs_per_sec.toFixed(1) : "—";
+        const rates = (peer.gossip_rates || []).filter((x) => x.topic === topic || x.topic === "hypersnap/" + topic);
+        return rates.length ? rates.reduce((sum, r) => sum + r.msgs_per_sec, 0).toFixed(1) : "—";
       }
 
       // ---- /v1/info fan-out (browser-side, best effort) ------------------
@@ -503,9 +503,9 @@
       // gossipsub excludes it from the emergent mesh (in_mesh=false).
       // Returns "mesh" | "direct" | null (sub-only / no link => null).
       function peerLink(p, topic) {
-        const t = (p.topics || []).find((x) => x.topic === topic);
-        if (t && t.in_mesh) return "mesh";
-        if (p.direct_peer && t && t.subscribed) return "direct";
+        const topics = (p.topics || []).filter((x) => x.topic === topic || x.topic === "hypersnap/" + topic);
+        if (topics.some((t) => t.in_mesh)) return "mesh";
+        if (p.direct_peer && topics.some((t) => t.subscribed)) return "direct";
         return null;
       }
       // Same, but resolved from a node's peer list by peer id.
