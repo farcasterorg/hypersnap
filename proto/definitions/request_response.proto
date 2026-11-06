@@ -764,3 +764,14 @@ message MeshTopology {
   repeated UnreachableNode unreachable = 2;
   uint64 generated_at = 3; // unix millis
 }
+
+message NativeAccountRequest { uint64 fid = 1; bytes custody_address = 2; }
+message NativeRegistrationInfo {
+  bool active = 1;
+  uint64 next_block = 2;
+  uint64 anchor_block_height = 3;
+  bytes anchor_block_hash = 4;
+  uint32 min_difficulty_bits = 5;
+  uint64 anchor_window = 6;
+  uint64 first_native_fid = 7;
+}

@@ -47,7 +47,7 @@ RUN <<EOF
 set -eu
 cargo build --release --bins
 mkdir -p /out
-cp target/release/hypersnap target/release/follow_blocks target/release/setup_local_testnet \
+cp target/release/hypersnap target/release/shuttle target/release/native_register target/release/follow_blocks target/release/setup_local_testnet \
   target/release/submit_message target/release/perftest target/release/repair_block_event \
   target/release/inspect_block_event /out/
 ## Pre-generate some configurations we can use

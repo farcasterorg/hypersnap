@@ -580,6 +580,16 @@ async fn run() -> Result<(), Box<dyn Error>> {
         }
     };
 
+    app_config
+        .consensus
+        .native_registration
+        .validate(
+            app_config.consensus.num_shards,
+            &app_config.gossip.topic_cutovers,
+            &app_config.consensus.get_validator_set_config(0),
+        )
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"))
         .add_directive("tantivy=warn".parse().unwrap());
@@ -788,6 +798,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
     }
 
     let mut gossip = gossip_result?;
+    gossip
+        .set_topic_routing_shards(app_config.consensus.num_shards)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     // Validator PeerIds permitted to query the mesh-diagnostics behaviour;
     // the gossip responder answers only these peers (fail-closed otherwise).
     let validator_peers: HashSet<_> = snapchain::network::mesh::view::build_validator_peer_ids(

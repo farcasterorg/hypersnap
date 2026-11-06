@@ -1,7 +1,7 @@
 use super::{
     index_read::{get_union_index_value, index_roots},
     make_fid_key, make_user_key_with_prefix,
-    message::{read_fid_key, read_ts_hash, FID_BYTES},
+    message::{read_fid_key, read_ts_hash},
     store::{Store, StoreDef},
     MessagesPage, StoreEventHandler, TS_HASH_LENGTH,
 };
@@ -467,7 +467,10 @@ impl VerificationStore {
                 // (address ++ fid_key -> ts_hash) entry rather than failing the whole read. During
                 // the background migration a legacy address-only slot can still live under this
                 // prefix; tolerating it keeps reads available through the transitional state.
-                if key.len() != prefix_len + FID_BYTES || value.len() != TS_HASH_LENGTH {
+                if super::encoded_fid_len(&key, prefix_len)
+                    .is_none_or(|n| key.len() != prefix_len + n)
+                    || value.len() != TS_HASH_LENGTH
+                {
                     continue;
                 }
                 let fid = read_fid_key(&key, prefix_len);
@@ -520,7 +523,7 @@ impl VerificationStore {
         )?;
 
         if let Some(value) = result {
-            if value.len() == FID_BYTES {
+            if super::encoded_fid_len(&value, 0).is_some_and(|n| value.len() == n) {
                 return Ok(Some(read_fid_key(&value, 0)));
             }
         }

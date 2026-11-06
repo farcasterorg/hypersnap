@@ -49,6 +49,8 @@ pub enum StoresError {
 
 #[derive(Clone)]
 pub struct Stores {
+    pub native_registration: crate::native_registration::Config,
+    pub native_authority: Option<Arc<RocksDB>>,
     pub block_event_store: BlockEventStore,
     pub shard_store: ShardStore,
     pub cast_store: Store<CastStoreDef>,
@@ -170,7 +172,7 @@ impl Limits {
             | MessageType::ChannelMember
             | MessageType::ChannelPin
             | MessageType::ChannelModerate => StoreType::None,
-            MessageType::None => StoreType::None,
+            MessageType::NativeOnboard | MessageType::None => StoreType::None,
         }
     }
 
@@ -257,6 +259,8 @@ impl Stores {
         };
 
         Self {
+            native_registration: self.native_registration.clone(),
+            native_authority: self.native_authority.clone(),
             block_event_store: self.block_event_store.clone(),
             shard_store: self.shard_store.clone(),
             cast_store: self
@@ -417,6 +421,8 @@ impl Stores {
         );
 
         Stores {
+            native_registration: Default::default(),
+            native_authority: None,
             shard_id,
             trie,
             shard_store,

@@ -591,6 +591,7 @@ mod tests {
 
     fn data(fid: u64, body: Body, msg_type: MessageType) -> MessageData {
         MessageData {
+            native_onboard_body: None,
             r#type: msg_type as i32,
             fid,
             timestamp: 0,

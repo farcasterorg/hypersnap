@@ -97,6 +97,7 @@ pub mod events_factory {
             block_timestamp,
             body: Some(message::block_event_data::Body::MergeMessageEventBody(
                 MergeMessageEventBody {
+                    native_registration: None,
                     message: Some(message),
                 },
             )),
@@ -388,6 +389,7 @@ pub mod messages_factory {
         let timestamp = timestamp.unwrap_or_else(|| farcaster_time());
 
         let msg_data = MessageData {
+            native_onboard_body: None,
             fid,
             r#type: msg_type as i32,
             timestamp,
@@ -1203,6 +1205,7 @@ pub mod hub_events_factory {
             r#type: proto::HubEventType::MergeMessage as i32,
             body: Some(proto::hub_event::Body::MergeMessageBody(
                 proto::MergeMessageBody {
+                    native_registration: None,
                     message: Some(message.clone()),
                     deleted_messages: vec![],
                 },

@@ -4,8 +4,7 @@ use super::{
     make_cast_id_key, make_fid_key, make_message_primary_key, make_user_key_with_prefix,
     read_fid_key, read_ts_hash,
     store::{Store, StoreDef},
-    MessagesPage, StoreEventHandler, FID_BYTES, HASH_LENGTH, PAGE_SIZE_MAX, TRUE_VALUE,
-    TS_HASH_LENGTH,
+    MessagesPage, StoreEventHandler, HASH_LENGTH, PAGE_SIZE_MAX, TRUE_VALUE, TS_HASH_LENGTH,
 };
 use crate::hyper::StateContext;
 use crate::storage::constants::{RootPrefix, UserPostfix};
@@ -550,7 +549,9 @@ impl CastStore {
                 let ts_hash_offset = prefix.len();
                 let fid_offset = ts_hash_offset + TS_HASH_LENGTH;
                 // a longer parent URL that starts with this one (see index_read)
-                if key.len() != fid_offset + FID_BYTES {
+                if super::encoded_fid_len(key, fid_offset)
+                    .is_none_or(|n| key.len() != fid_offset + n)
+                {
                     return Ok(false);
                 }
 

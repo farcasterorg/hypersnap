@@ -1,4 +1,3 @@
-use crate::core::types::FidOnDisk;
 use crate::proto::{self, MessageType};
 use crate::version::version::{EngineVersion, ProtocolFeature};
 use sha2::{Digest, Sha256};
@@ -14,7 +13,7 @@ impl MessageRouter for ShardRouter {
         // DO NOT CHANGE THE HASHING FUNCTION
         // This is being used to determine the merkle trie key for messages. Changing this will
         // break merkle trie hashes
-        let hash = Sha256::digest((fid as FidOnDisk).to_be_bytes());
+        let hash = Sha256::digest(crate::storage::store::account::make_fid_key(fid));
         let hash_u32 = u32::from_be_bytes(hash[..4].try_into().unwrap());
         (hash_u32 % num_shards) + 1
     }
@@ -53,7 +52,8 @@ pub fn route_message(
     // traffic exists; the feature gate lives at admission (mempool, wall-clock; engines,
     // block-ts), not here.
     match message.msg_type() {
-        MessageType::LendStorage
+        MessageType::NativeOnboard
+        | MessageType::LendStorage
         | MessageType::KeyAdd
         | MessageType::KeyRemove
         | MessageType::ChannelUpdate

@@ -177,6 +177,7 @@ mod tests {
         GaslessKeyRecord {
             message: Some(proto::Message {
                 data: Some(MessageData {
+                    native_onboard_body: None,
                     r#type: MessageType::KeyAdd as i32,
                     fid: 0,
                     timestamp: 0,

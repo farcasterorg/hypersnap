@@ -80,6 +80,7 @@ mod tests {
             r#type: proto::HubEventType::MergeMessage as i32,
             body: Some(proto::hub_event::Body::MergeMessageBody(
                 proto::MergeMessageBody {
+                    native_registration: None,
                     message: Some(message),
                     ..Default::default()
                 },

@@ -167,12 +167,19 @@ pub fn validate_message(
     }
 
     validate_message_hash(message.hash_scheme, &data_bytes, &message.hash)?;
-    validate_signature(
-        message.signature_scheme,
-        &message.hash,
-        &message.signature,
-        &message.signer,
-    )?;
+    if message_data.r#type == MessageType::NativeOnboard as i32 {
+        let mut normalized = message.clone();
+        normalized.data = Some(message_data.clone());
+        crate::native_registration::precheck(&normalized)
+            .map_err(|_| ValidationError::InvalidData)?;
+    } else {
+        validate_signature(
+            message.signature_scheme,
+            &message.hash,
+            &message.signature,
+            &message.signer,
+        )?;
+    }
     validate_timestamp(message_data.timestamp, block_timestamp, version)?;
 
     match &message_data.body {
@@ -311,7 +318,11 @@ fn validate_channel_update_body(body: &proto::ChannelUpdateBody) -> Result<(), V
 
 fn validate_channel_member_body(body: &proto::ChannelMemberBody) -> Result<(), ValidationError> {
     validate_channel_id(&body.channel_id)?;
-    if body.fid == 0 || u32::try_from(body.fid).is_err() {
+    if body.fid == 0
+        || (u32::try_from(body.fid).is_err()
+            && !(crate::native_registration::native_fid_encoding()
+                && crate::native_registration::is_native_fid(body.fid)))
+    {
         return Err(invalid_channel(
             "channel member fid must fit in a non-zero u32",
         ));

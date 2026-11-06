@@ -87,6 +87,19 @@ impl BlockReceiver {
     /// store directly is what prevents a lagged or dropped broadcast message from
     /// being mistaken for a real failure — the bug that silently dropped a seqnum and
     /// later wedged the shard.
+    async fn wait_for_fork(&self) {
+        while !self.stores.native_registration.active(
+            self.shard_id,
+            self.stores
+                .shard_store
+                .max_block_number()
+                .unwrap_or(0)
+                .saturating_add(1),
+        ) {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
     fn confirmed_in_store(&self, seqnum: u64) -> bool {
         match self.stores.block_event_store.max_seqnum() {
             Ok(max_seqnum) => max_seqnum >= seqnum,
@@ -167,6 +180,12 @@ impl BlockReceiver {
     ) -> Result<(), BlockReceiverError> {
         info!(start_seqnum, stop_seqnum, "Syncing missing blocks",);
         let mut currrent_seqnum = start_seqnum;
+        if start_seqnum <= crate::native_registration::FORK_EVENT_BASE
+            && stop_seqnum >= crate::native_registration::FORK_EVENT_BASE
+        {
+            self.wait_for_fork().await;
+            currrent_seqnum = crate::native_registration::FORK_EVENT_BASE + 1;
+        }
         while currrent_seqnum <= stop_seqnum {
             let (block_tx, block_rx) = oneshot::channel::<Option<Block>>();
             self.system_tx
@@ -216,8 +235,23 @@ impl BlockReceiver {
             if block.events.is_empty() {
                 continue;
             }
+            if block
+                .events
+                .first()
+                .is_some_and(|e| e.seqnum() > crate::native_registration::FORK_EVENT_BASE)
+            {
+                self.wait_for_fork().await;
+            }
             // The db is the source of truth, it's possible to read this out of the events_rx channel but delivery over that channel is not reliable (it's a broadcast channel) we may not have the most up to date state.
-            let last_stored_event_seqnum = self.stores.block_event_store.max_seqnum().unwrap();
+            let mut last_stored_event_seqnum = self.stores.block_event_store.max_seqnum().unwrap();
+            if block
+                .events
+                .first()
+                .is_some_and(|e| e.seqnum() > crate::native_registration::FORK_EVENT_BASE)
+            {
+                last_stored_event_seqnum =
+                    last_stored_event_seqnum.max(crate::native_registration::FORK_EVENT_BASE);
+            }
             let last_event_in_block = block.events.last().unwrap();
             if last_event_in_block.seqnum() < last_stored_event_seqnum {
                 continue;
