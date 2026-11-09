@@ -35,6 +35,7 @@ pub struct NetworkConnectorState {
     gossip_tx: mpsc::Sender<GossipEvent<SnapchainValidatorContext>>,
     statsd: StatsdClientWrapper,
     sync_peers: Option<HashSet<MalachitePeerId>>,
+    connected_peers: HashSet<MalachitePeerId>,
     participation: Option<Arc<Participation>>,
 }
 
@@ -43,7 +44,7 @@ pub struct NetworkConnectorArgs {
     pub peer_id: MalachitePeerId,
     pub statsd: StatsdClientWrapper,
     /// Peers whose statuses are passed to sync, which only requests values from peers it has a
-    /// status for. `None` passes every peer's status.
+    /// status for. `None` passes every directly connected peer's status.
     pub sync_peers: Option<HashSet<MalachitePeerId>>,
     pub participation: Option<Arc<Participation>>,
 }
@@ -87,6 +88,7 @@ where
             peer_id: args.peer_id,
             statsd: args.statsd,
             sync_peers: args.sync_peers,
+            connected_peers: HashSet::new(),
             participation: args.participation,
         })
     }
@@ -113,6 +115,7 @@ where
             statsd,
             peer_id: _,
             sync_peers,
+            connected_peers,
             participation,
         } = state;
 
@@ -193,12 +196,12 @@ where
             }
 
             Msg::NewEvent(Event::PeerConnected(peer_id)) => {
-                // peers.insert(peer_id);
+                connected_peers.insert(peer_id);
                 output_port.send(NetworkEvent::PeerConnected(peer_id));
             }
 
             Msg::NewEvent(Event::PeerDisconnected(peer_id)) => {
-                // peers.remove(&peer_id);
+                connected_peers.remove(&peer_id);
                 output_port.send(NetworkEvent::PeerDisconnected(peer_id));
             }
 
@@ -285,6 +288,21 @@ where
                 // }
 
                 trace!(%from, height = %status.height, "Received status");
+
+                // Status gossip is relayed: the advertised validator may not
+                // have a direct RPC connection to us. Re-adding it after a
+                // disconnect makes sync repeatedly dial an unreachable peer
+                // and wait for a request timeout before trying another.
+                if !connected_peers.contains(&status.peer_id) {
+                    debug!(peer_id = %status.peer_id, "Ignoring relayed status from a disconnected sync peer");
+                    statsd.count_with_shard(
+                        status.height.shard_index,
+                        "sync.status_disconnected",
+                        1,
+                        vec![],
+                    );
+                    return Ok(());
+                }
 
                 // `status.peer_id` can claim any peer, but sync requests go over a direct
                 // connection to that peer, so a forged status cannot redirect them.

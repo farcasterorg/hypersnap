@@ -1026,10 +1026,14 @@ impl SnapchainGossip {
                                 self.observed_addrs.remove(&peer_id);
                             }
                             info!(direct = is_direct, "Connection closed with peer: {:?} due to: {:?}", peer_id, cause);
-                            if let Some(system_tx) = &self.system_tx {
-                                let event = MalachiteNetworkEvent::PeerDisconnected(MalachitePeerId::from_libp2p(&peer_id));
-                                if let Err(e) = system_tx.send(SystemMessage::MalachiteNetwork(MalachiteEventShard::None, event)).await {
-                                    warn!("Failed to send connection closed message: {}", e);
+                            // Sync can keep using this peer while another connection
+                            // remains open (for example during a QUIC reconnect).
+                            if !self.swarm.is_connected(&peer_id) {
+                                if let Some(system_tx) = &self.system_tx {
+                                    let event = MalachiteNetworkEvent::PeerDisconnected(MalachitePeerId::from_libp2p(&peer_id));
+                                    if let Err(e) = system_tx.send(SystemMessage::MalachiteNetwork(MalachiteEventShard::None, event)).await {
+                                        warn!("Failed to send connection closed message: {}", e);
+                                    }
                                 }
                             }
                             match endpoint {
