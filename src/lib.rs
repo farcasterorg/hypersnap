@@ -20,6 +20,7 @@ pub mod mempool;
 pub mod network;
 pub mod node;
 pub mod perf;
+pub mod shuttle;
 pub mod storage;
 pub mod utils;
 pub mod version;

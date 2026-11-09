@@ -5,6 +5,7 @@ pub mod mesh;
 pub mod replication;
 pub mod rpc_extensions;
 pub mod server;
+pub mod topic_schedule;
 
 #[cfg(test)]
 mod gossip_test;

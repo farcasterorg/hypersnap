@@ -527,7 +527,10 @@ async fn mesh_view_tags_meshed_peers_as_in_mesh() {
             .expect("mesh view timed out")
             .expect("oneshot dropped");
         if let Some(p) = view.peers.iter().find(|p| p.peer_id == pid2.to_bytes()) {
-            if p.topics.iter().any(|t| t.topic == "consensus" && t.in_mesh) {
+            if p.topics
+                .iter()
+                .any(|t| t.topic == crate::network::gossip::CONSENSUS_TOPIC && t.in_mesh)
+            {
                 found = Some((view.clone(), p.clone()));
                 break;
             }
@@ -543,7 +546,7 @@ async fn mesh_view_tags_meshed_peers_as_in_mesh() {
     let consensus = peer
         .topics
         .iter()
-        .find(|t| t.topic == "consensus")
+        .find(|t| t.topic == crate::network::gossip::CONSENSUS_TOPIC)
         .expect("consensus membership");
     assert!(consensus.in_mesh, "a meshed peer should report in_mesh");
 
@@ -942,7 +945,7 @@ mod self_heal_bounce {
     const COOLDOWN: Duration = Duration::from_secs(60);
 
     fn contact_info() -> TopicHash {
-        IdentTopic::new("contact-info").hash()
+        IdentTopic::new(snapchain_proto::topics::CONTACT_INFO).hash()
     }
 
     fn bounce(
@@ -1333,4 +1336,113 @@ async fn test_malformed_gossip_messages_are_dropped() {
         )),
     );
     assert!(contact_info.is_none());
+}
+
+/// Scheduled nodes must retain legacy interoperability until their own cutoff,
+/// then accept only the new mempool domain, even with legacy peers connected.
+#[tokio::test]
+#[serial]
+async fn test_gossip_topics_switch_at_cutoff_without_pre_fork_partition() {
+    let base = BASE_PORT_FOR_TEST + 150;
+    let addresses: Vec<_> = (0..3)
+        .map(|i| format!("/ip4/{HOST_FOR_TEST}/udp/{}/quic-v1", base + i))
+        .collect();
+    let mut configs: Vec<_> = (0..3)
+        .map(|i| {
+            Config::new(addresses[i].clone(), addresses[1 - i.min(1)].clone())
+                .with_announce_address(addresses[i].clone())
+                .with_announce_rpc_address(format!("http://127.0.0.1:{}", base + i as u32))
+                .with_contact_info_interval(Duration::from_secs(60))
+        })
+        .collect();
+    // Node 0 uses legacy topics; node 1 crosses at height 100; node 2 is post-fork.
+    configs[1].topic_cutovers = (0..=2).map(|s| (s.to_string(), 100)).collect();
+    configs[2].topic_cutovers = (0..=2).map(|s| (s.to_string(), 0)).collect();
+    configs[2].bootstrap_peers = addresses[1].clone();
+    let mut senders = vec![];
+    let mut tasks = vec![];
+    let mut receiving = None;
+    let mut scheduled_peer = None;
+    for (index, config) in configs.iter().enumerate() {
+        let (tx, rx) = mpsc::channel(100);
+        let mut node = SnapchainGossip::create(
+            Keypair::generate(),
+            config,
+            Some(tx),
+            true,
+            FarcasterNetwork::Mainnet,
+            statsd_client(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        node.set_topic_routing_shards(2).unwrap();
+        if index == 1 {
+            receiving = Some(rx);
+            scheduled_peer = Some(*node.swarm.local_peer_id());
+        }
+        senders.push(node.tx.clone());
+        tasks.push(tokio::spawn(async move { node.start().await }));
+    }
+    let mut receiver = receiving.unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        publish_until_received(
+            senders[0].clone(),
+            &mut receiver,
+            messages_factory::casts::create_cast_add(42, "legacy before fork", None, None),
+            Duration::from_secs(8)
+        )
+        .await
+    );
+    assert!(
+        !publish_until_received(
+            senders[2].clone(),
+            &mut receiver,
+            messages_factory::casts::create_cast_add(42, "new before fork", None, None),
+            Duration::from_secs(2)
+        )
+        .await
+    );
+    for shard_index in 0..=2 {
+        senders[1]
+            .send(GossipEvent::BroadcastStatus(
+                informalsystems_malachitebft_sync::Status {
+                    peer_id: MalachitePeerId::from_libp2p(&scheduled_peer.unwrap()),
+                    height: Height {
+                        shard_index,
+                        block_number: 99,
+                    },
+                    history_min_height: Height {
+                        shard_index,
+                        block_number: 1,
+                    },
+                },
+            ))
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert!(
+        publish_until_received(
+            senders[2].clone(),
+            &mut receiver,
+            messages_factory::casts::create_cast_add(42, "new after fork", None, None),
+            Duration::from_secs(8)
+        )
+        .await
+    );
+    assert!(
+        !publish_until_received(
+            senders[0].clone(),
+            &mut receiver,
+            messages_factory::casts::create_cast_add(42, "legacy after fork", None, None),
+            Duration::from_secs(2)
+        )
+        .await
+    );
+    for task in tasks {
+        task.abort();
+        let _ = task.await;
+    }
 }

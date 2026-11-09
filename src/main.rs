@@ -788,6 +788,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
     }
 
     let mut gossip = gossip_result?;
+    gossip
+        .set_topic_routing_shards(app_config.consensus.num_shards)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     // Validator PeerIds permitted to query the mesh-diagnostics behaviour;
     // the gossip responder answers only these peers (fail-closed otherwise).
     let validator_peers: HashSet<_> = snapchain::network::mesh::view::build_validator_peer_ids(

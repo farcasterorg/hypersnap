@@ -246,3 +246,9 @@ validator_public_keys = [
   "7b0e914a8bca87888dd9297a8defc71802ba261c399527263713a2caa8b3967a", # mvr
   "22e82d8886c9c73fe8dd5b6c1df474100f5d9289e7352ea590361d23837074d0", # wake
 ]
+
+# Gossip follows the same per-shard fork boundary; pre-fork traffic stays on Snapchain topics.
+[gossip.topic_cutovers]
+"0" = 50_178_325
+"1" = 50_862_269
+"2" = 50_697_335
