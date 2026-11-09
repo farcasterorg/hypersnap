@@ -38,8 +38,8 @@ shuttle never silently jumps past a gap.
 ## Fork boundary
 
 Hypersnap's `[gossip.topic_cutovers]` in `validators.toml` sets the same per-shard
-boundaries as the new validator sets: shard 0 at 50,178,325; shard 1 at 50,862,269;
-shard 2 at 50,697,335. Copy those values into the shuttle's `[topic_cutovers]`.
+boundaries as the new validator sets: shard 0 at 50,433,538; shard 1 at 51,119,199;
+shard 2 at 50,954,121. Copy those values into the shuttle's `[topic_cutovers]`.
 
 Votes and proposals use their block height. Decided values use their committed
 height. Status messages announce the next height after their committed tip.

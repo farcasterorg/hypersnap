@@ -9,9 +9,9 @@ rpc_timeout_secs = 15
 
 # Must match validators.toml on the Hypersnap nodes.
 [topic_cutovers]
-"0" = 50_178_325
-"1" = 50_862_269
-"2" = 50_697_335
+"0" = 50_433_538
+"1" = 51_119_199
+"2" = 50_954_121
 
 [hypersnap]
 rpc = "http://127.0.0.1:3383"
@@ -20,9 +20,9 @@ peers = ["/ip4/127.0.0.1/udp/3382/quic-v1"]
 # Omit start_blocks to start at the observed tip + 1 on FIRST launch.
 # To replay retained history instead, set inclusive starting blocks per shard:
 # [hypersnap.start_blocks]
-# "0" = 50178325
-# "1" = 50862269
-# "2" = 50697335
+# "0" = 50433538
+# "1" = 51119199
+# "2" = 50954121
 
 [snapchain]
 rpc = "http://127.0.0.1:4383"
