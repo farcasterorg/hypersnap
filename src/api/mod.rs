@@ -206,18 +206,16 @@ pub fn initialize(
         .map(|(id, s)| (*id, s.db.clone()))
         .collect();
 
-    // Take a clone of one shard's on-chain event store for the JFS
-    // signer lookup before `shard_stores` is moved into the backfill
-    // task below. All shards see the same on-chain events so any one is
-    // sufficient.
-    let jfs_signer_store: Option<crate::storage::store::account::OnchainEventStore> =
+    // Gasless signers and legacy custody are shard-local. JFS must consult
+    // the account's owning shard, including its expiry/revocation state.
+    let jfs_signer_stores: HashMap<u32, crate::storage::store::account::OnchainEventStore> =
         if config.notifications.enabled {
             shard_stores
-                .values()
-                .next()
-                .map(|s| s.onchain_event_store.clone())
+                .iter()
+                .map(|(id, s)| (*id, s.onchain_event_store.clone()))
+                .collect()
         } else {
-            None
+            HashMap::new()
         };
     if !config.enabled {
         tracing::info!("Farcaster indexing disabled");
@@ -705,9 +703,9 @@ pub fn initialize(
     // records). The registration management handler is set later
     // from main.rs once the custody-address lookup is available.
     let (notification_app_store, notification_token_store) = if config.notifications.enabled {
-        if let Some(onchain_store) = jfs_signer_store {
+        if !jfs_signer_stores.is_empty() {
             let lookup: Arc<dyn crate::api::notifications::ActiveSignerLookup> = Arc::new(
-                crate::api::notifications::OnchainSignerLookup::new(onchain_store),
+                crate::api::notifications::OnchainSignerLookup::for_shards(jfs_signer_stores),
             );
             let token_store = Arc::new(crate::api::notifications::NotificationStore::new(
                 db.clone(),

@@ -464,6 +464,20 @@ impl Stores {
             .put(&Self::make_schema_version_key(), &version.to_be_bytes())
     }
 
+    pub fn storage_limits_disabled(&self) -> bool {
+        if self.native_registration.activation_heights.is_empty() {
+            return false;
+        }
+        crate::native_registration::fork_active(
+            &self.native_registration,
+            self.shard_id,
+            self.shard_store
+                .max_block_number()
+                .unwrap_or(0)
+                .saturating_add(1),
+        )
+    }
+
     pub fn get_storage_slot_for_fid(
         &self,
         fid: u64,
@@ -471,6 +485,9 @@ impl Stores {
         count_borrowed_storage: bool,
         pending_events: &[OnChainEvent],
     ) -> Result<StorageSlot, StoresError> {
+        if self.storage_limits_disabled() {
+            return Ok(StorageSlot::new(0, 0, 0, u32::MAX));
+        }
         let lent_storage = StorageLendStore::get_lent_storage(&self.storage_lend_store, fid)
             .map_err(|err| StoresError::StoreError {
                 inner: err,
@@ -509,6 +526,9 @@ impl Stores {
     ) -> Result<(u32, u32), StoresError> {
         let store_type = Limits::message_type_to_store_type(message_type);
         let message_count = self.get_usage_by_store_type(fid, store_type, txn_batch)?;
+        if self.storage_limits_disabled() {
+            return Ok((message_count, u32::MAX));
+        }
         let count_borrowed_storage = store_type != StoreType::StorageLends;
         // RPC/limit-enforcement path: max_messages is independent of invalidate_at, so the
         // expiry-extension version gate does not affect the result here. Use the current version.
@@ -561,6 +581,43 @@ impl Stores {
     }
 
     pub fn get_storage_limits(&self, fid: u64) -> Result<StorageLimitsResponse, StoresError> {
+        if self.storage_limits_disabled() {
+            let mut txn = RocksDbTransactionBatch::new();
+            let limits = [
+                (StoreType::Casts, "CASTS"),
+                (StoreType::Links, "LINKS"),
+                (StoreType::Reactions, "REACTIONS"),
+                (StoreType::UserData, "USER_DATA"),
+                (StoreType::Verifications, "VERIFICATIONS"),
+                (StoreType::UsernameProofs, "USERNAME_PROOFS"),
+                (StoreType::StorageLends, "STORAGE_LENDS"),
+            ]
+            .into_iter()
+            .map(|(kind, name)| {
+                Ok(StorageLimit {
+                    store_type: kind.try_into().unwrap(),
+                    name: name.into(),
+                    limit: u64::MAX,
+                    used: self.get_usage_by_store_type(fid, kind, &mut txn)? as u64,
+                    earliest_timestamp: 0,
+                    earliest_hash: vec![],
+                })
+            })
+            .collect::<Result<Vec<_>, StoresError>>()?;
+            return Ok(StorageLimitsResponse {
+                limits,
+                units: 0,
+                unit_details: vec![],
+                tier_subscriptions: vec![TierDetails {
+                    tier_type: TierType::Pro as i32,
+                    expires_at: self.onchain_event_store.tier_subscription_exires_at(
+                        proto::TierType::Pro,
+                        fid,
+                        None,
+                    )?,
+                }],
+            });
+        }
         let txn_batch = &mut RocksDbTransactionBatch::new();
         let mut limits = vec![];
         let purchased_slot = self

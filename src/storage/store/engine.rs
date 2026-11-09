@@ -389,7 +389,7 @@ impl ShardEngine {
                     .ok()?;
 
                 // Drop events if storage slot is inactive
-                if !storage_slot.is_active() {
+                if !self.stores.storage_limits_disabled() && !storage_slot.is_active() {
                     transaction.user_messages = vec![];
                 }
 
@@ -896,6 +896,32 @@ impl ShardEngine {
                     )?;
                     self.update_trie(trie_ctx, &event, txn_batch)?;
                     return Ok(vec![event]);
+                }
+                // Fork events are authenticated against shard 0 before this
+                // replay. Legacy custody exists only on the account's owning
+                // data shard, so other shards consume the event without trying
+                // to merge a legacy key against a nonexistent local identity.
+                // Native registry records are replicated everywhere, and their
+                // key events continue to merge on every shard.
+                if block_event.seqnum() > crate::native_registration::FORK_EVENT_BASE
+                    && matches!(msg_type, MessageType::KeyAdd | MessageType::KeyRemove)
+                    && !crate::native_registration::is_native_fid(message.fid())
+                {
+                    let num_shards = self
+                        .stores
+                        .native_registration
+                        .activation_heights
+                        .len()
+                        .saturating_sub(1) as u32;
+                    if num_shards > 0 {
+                        use crate::mempool::routing::MessageRouter;
+                        if (crate::mempool::routing::ShardRouter {})
+                            .route_fid(message.fid(), num_shards)
+                            != self.shard_id
+                        {
+                            return Ok(vec![]);
+                        }
+                    }
                 }
                 // Per-msg-type feature gating and merge strategy for shard-0-hosted user
                 // messages, decided together so the two can never disagree about a type. Any
@@ -2289,6 +2315,9 @@ impl ShardEngine {
         txn_batch: &mut RocksDbTransactionBatch,
         version: &EngineVersion,
     ) -> Result<Vec<HubEvent>, EngineError> {
+        if self.stores.storage_limits_disabled() {
+            return Ok(vec![]);
+        }
         let (current_count, max_count) = self
             .stores
             .get_usage(fid, msg_type, txn_batch)

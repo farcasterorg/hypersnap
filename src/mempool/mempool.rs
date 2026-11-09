@@ -112,6 +112,14 @@ impl RateLimits {
     }
 
     pub fn consume_for_fid(&mut self, fid: u64) -> bool {
+        let shard = self.message_router.route_fid(fid, self.num_shards);
+        if self
+            .shard_stores
+            .get(&shard)
+            .is_some_and(|s| s.storage_limits_disabled())
+        {
+            return true;
+        }
         let rate_limiter = self.get_rate_limiter_for_fid(fid);
         self.statsd_client.gauge(
             "mempool.rate_limiter_entries",
@@ -208,6 +216,14 @@ impl LiveAtRateLimits {
     }
 
     pub fn consume_for_fid(&self, fid: u64) -> bool {
+        let shard = self.message_router.route_fid(fid, self.num_shards);
+        if self
+            .shard_stores
+            .get(&shard)
+            .is_some_and(|s| s.storage_limits_disabled())
+        {
+            return true;
+        }
         let rate_limiter = self.rate_limits_by_fid.optionally_get_with(fid, || {
             let shard_id = self.message_router.route_fid(fid, self.num_shards);
             let stores = self.shard_stores.get(&shard_id).unwrap();
@@ -741,6 +757,26 @@ impl Mempool {
                             .count("mempool.key_add_rate_limit_hit", 1, vec![]);
                         return true;
                     }
+                }
+
+                let storage_disabled = self
+                    .read_node_mempool
+                    .route_mempool_message(message)
+                    .iter()
+                    .all(|shard| {
+                        if *shard == 0 {
+                            self.read_node_mempool
+                                .block_stores
+                                .storage_limits_disabled()
+                        } else {
+                            self.read_node_mempool
+                                .shard_stores
+                                .get(shard)
+                                .is_some_and(|stores| stores.storage_limits_disabled())
+                        }
+                    });
+                if storage_disabled {
+                    return false;
                 }
 
                 if is_live_at(user_msg) {

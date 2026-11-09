@@ -480,6 +480,20 @@ impl BlockStores {
         Ok(select_verification_address_winner(authoritative))
     }
 
+    pub fn storage_limits_disabled(&self) -> bool {
+        if self.native_registration.activation_heights.is_empty() {
+            return false;
+        }
+        crate::native_registration::fork_active(
+            &self.native_registration,
+            0,
+            self.block_store
+                .max_block_number()
+                .unwrap_or(0)
+                .saturating_add(1),
+        )
+    }
+
     pub fn get_storage_slot_for_fid(
         &self,
         fid: u64,
@@ -488,6 +502,9 @@ impl BlockStores {
         count_lent_storage: bool,
         count_borrowed_storage: bool,
     ) -> Option<StorageSlot> {
+        if self.storage_limits_disabled() {
+            return Some(StorageSlot::new(0, 0, 0, u32::MAX));
+        }
         let lent_storage = if count_lent_storage {
             StorageLendStore::get_lent_storage(&self.storage_lend_store, fid).ok()?
         } else {
@@ -661,7 +678,11 @@ impl BlockEngine {
         version: EngineVersion,
         txn_batch: &mut RocksDbTransactionBatch,
     ) -> Result<(), MessageValidationError> {
-        let verification_counts = self.verification_message_counts(message.fid(), txn_batch)?;
+        let verification_counts = if self.stores.storage_limits_disabled() {
+            VerificationMessageCounts::default()
+        } else {
+            self.verification_message_counts(message.fid(), txn_batch)?
+        };
         self.validate_user_message_with_verification_counts(
             message,
             storage_slot,
@@ -1094,7 +1115,9 @@ impl BlockEngine {
                 // the verification activation floor has no channel analogue.
                 channel_dispatch = Some(self.validate_channel_message(message_data, txn_batch)?);
             }
-            crate::proto::message_data::Body::LendStorageBody(lend_storage) => {
+            crate::proto::message_data::Body::LendStorageBody(lend_storage)
+                if !self.stores.storage_limits_disabled() =>
+            {
                 let total_storage_purchased = self
                     .stores
                     .get_storage_slot_for_fid(message_data.fid, version, &vec![], false, false)
@@ -1119,6 +1142,7 @@ impl BlockEngine {
                     return Err(MessageValidationError::InsufficientStorage);
                 }
             }
+            crate::proto::message_data::Body::LendStorageBody(_) => {}
             // KEY_ADD / KEY_REMOVE have no per-body pre-merge validation to do at the block-
             // engine level: static body validation (key length, scopes, ttl bound, etc.) ran
             // upstream in `validate_message`, and state-dependent checks (nonce CAS, custody
@@ -1179,61 +1203,66 @@ impl BlockEngine {
                 // so the live-add limit matches the data shard's limit exactly. If store limits
                 // ever become configurable, this must read the same injected value the data-shard
                 // prune uses or the two sides will enforce different caps on the same message.
-                let max_messages =
-                    StoreLimits::default().max_messages(storage_slot, StoreType::Verifications);
-                // With no active storage, adds are never admitted, including replacements. This
-                // is the spam gate for shard 0's otherwise gasless verification write path.
-                if max_messages == 0 && is_add {
-                    return Err(MessageValidationError::InsufficientStorage);
-                }
-                // Admission is decided per TRANSITION, against the quantity each one actually
-                // grows. Two rules a reader may be tempted to collapse back into one, both of
-                // which are unsound — each was a live hole caught in review:
-                //
-                //   1. A type-blind "any existing row supersedes, so admit" carve-out lets an add
-                //      land on a tombstone, skipping the live-add cap while refunding a tombstone
-                //      slot. `remove addr; add addr` then cycles forever.
-                //   2. Gating only the counter a transition grows is still not enough, because
-                //      rows are PERMANENT while the counters are not. `add addr_i; remove addr_i`
-                //      returns `live_adds` to 0 every cycle and leaves a tombstone behind, so any
-                //      rule written purely over current counter state never engages.
-                //
-                // Rows appear ONLY in the two `None` arms, and both check `total_rows`. That makes
-                // the bound locally provable here: no fid can ever exceed
-                // `max_messages + tombstone_cap` permanent replica rows, for any message sequence.
-                let tombstone_cap = verification_tombstone_cap(max_messages);
-                let row_cap = verification_row_cap(max_messages);
-                let total_rows = verification_counts
-                    .live_adds
-                    .saturating_add(verification_counts.tombstones);
-                let existing =
-                    self.verification_logical_key_type(message_data.fid, address, txn_batch)?;
-                match (is_add, existing) {
-                    // Replacing an add with an add: net-zero on both counters, always admitted.
-                    (true, Some(MessageType::VerificationAddEthAddress)) => {}
-                    // Re-adding a tombstoned address. Row-neutral, but it grows `live_adds`.
-                    (true, Some(_)) => {
-                        if verification_counts.live_adds >= max_messages {
-                            return Err(MessageValidationError::InsufficientStorage);
-                        }
+                if !self.stores.storage_limits_disabled() {
+                    let max_messages =
+                        StoreLimits::default().max_messages(storage_slot, StoreType::Verifications);
+                    // With no active storage, adds are never admitted, including replacements. This
+                    // is the spam gate for shard 0's otherwise gasless verification write path.
+                    if max_messages == 0 && is_add {
+                        return Err(MessageValidationError::InsufficientStorage);
                     }
-                    // Mints a new add row.
-                    (true, None) => {
-                        if verification_counts.live_adds >= max_messages || total_rows >= row_cap {
-                            return Err(MessageValidationError::InsufficientStorage);
+                    // Admission is decided per TRANSITION, against the quantity each one actually
+                    // grows. Two rules a reader may be tempted to collapse back into one, both of
+                    // which are unsound — each was a live hole caught in review:
+                    //
+                    //   1. A type-blind "any existing row supersedes, so admit" carve-out lets an add
+                    //      land on a tombstone, skipping the live-add cap while refunding a tombstone
+                    //      slot. `remove addr; add addr` then cycles forever.
+                    //   2. Gating only the counter a transition grows is still not enough, because
+                    //      rows are PERMANENT while the counters are not. `add addr_i; remove addr_i`
+                    //      returns `live_adds` to 0 every cycle and leaves a tombstone behind, so any
+                    //      rule written purely over current counter state never engages.
+                    //
+                    // Rows appear ONLY in the two `None` arms, and both check `total_rows`. That makes
+                    // the bound locally provable here: no fid can ever exceed
+                    // `max_messages + tombstone_cap` permanent replica rows, for any message sequence.
+                    let tombstone_cap = verification_tombstone_cap(max_messages);
+                    let row_cap = verification_row_cap(max_messages);
+                    let total_rows = verification_counts
+                        .live_adds
+                        .saturating_add(verification_counts.tombstones);
+                    let existing =
+                        self.verification_logical_key_type(message_data.fid, address, txn_batch)?;
+                    match (is_add, existing) {
+                        // Replacing an add with an add: net-zero on both counters, always admitted.
+                        (true, Some(MessageType::VerificationAddEthAddress)) => {}
+                        // Re-adding a tombstoned address. Row-neutral, but it grows `live_adds`.
+                        (true, Some(_)) => {
+                            if verification_counts.live_adds >= max_messages {
+                                return Err(MessageValidationError::InsufficientStorage);
+                            }
                         }
-                    }
-                    // A remove over any existing row turns an add row into a tombstone row, or
-                    // replaces a tombstone with a newer one. Row-neutral either way, and
-                    // deliberately admitted even past `tombstone_cap`: a fid at cap, or one whose
-                    // storage lapsed, must always be able to shed live state.
-                    (false, Some(_)) => {}
-                    // Mints a new tombstone row. This is the pre-V24-address remove case: the
-                    // replica has never seen the address, so the row is new.
-                    (false, None) => {
-                        if verification_counts.tombstones >= tombstone_cap || total_rows >= row_cap
-                        {
-                            return Err(MessageValidationError::InsufficientStorage);
+                        // Mints a new add row.
+                        (true, None) => {
+                            if verification_counts.live_adds >= max_messages
+                                || total_rows >= row_cap
+                            {
+                                return Err(MessageValidationError::InsufficientStorage);
+                            }
+                        }
+                        // A remove over any existing row turns an add row into a tombstone row, or
+                        // replaces a tombstone with a newer one. Row-neutral either way, and
+                        // deliberately admitted even past `tombstone_cap`: a fid at cap, or one whose
+                        // storage lapsed, must always be able to shed live state.
+                        (false, Some(_)) => {}
+                        // Mints a new tombstone row. This is the pre-V24-address remove case: the
+                        // replica has never seen the address, so the row is new.
+                        (false, None) => {
+                            if verification_counts.tombstones >= tombstone_cap
+                                || total_rows >= row_cap
+                            {
+                                return Err(MessageValidationError::InsufficientStorage);
+                            }
                         }
                     }
                 }
@@ -1452,6 +1481,9 @@ impl BlockEngine {
         storage_slot: &mut StorageSlot,
         merge_message_body: &MergeMessageBody,
     ) -> Result<(), BlockEngineError> {
+        if self.stores.storage_limits_disabled() {
+            return Ok(());
+        }
         if let Some(added_message) = &merge_message_body.message {
             match added_message.data.as_ref().unwrap().body.as_ref().unwrap() {
                 proto::message_data::Body::LendStorageBody(lend_storage_body) => {
@@ -1579,7 +1611,8 @@ impl BlockEngine {
         } else {
             storage_slot.clone()
         };
-        let mut verification_counts = if has_verification {
+        let mut verification_counts = if has_verification && !self.stores.storage_limits_disabled()
+        {
             self.verification_message_counts(snapchain_txn.fid, txn_batch)
                 .map_err(BlockEngineError::HubError)?
         } else {
@@ -1700,16 +1733,18 @@ impl BlockEngine {
                         if version.is_enabled(ProtocolFeature::VerificationsOnShardZero) {
                             match self.merge_message(message, txn_batch, version) {
                                 Ok(events) => {
-                                    for event in &events {
-                                        if let Some(proto::hub_event::Body::MergeMessageBody(
-                                            body,
-                                        )) = event.body.as_ref()
-                                        {
-                                            verification_counts =
-                                                Self::apply_verification_count_delta(
-                                                    verification_counts,
-                                                    body,
-                                                )?;
+                                    if !self.stores.storage_limits_disabled() {
+                                        for event in &events {
+                                            if let Some(proto::hub_event::Body::MergeMessageBody(
+                                                body,
+                                            )) = event.body.as_ref()
+                                            {
+                                                verification_counts =
+                                                    Self::apply_verification_count_delta(
+                                                        verification_counts,
+                                                        body,
+                                                    )?;
+                                            }
                                         }
                                     }
                                     hub_events.extend(events)
@@ -2093,7 +2128,7 @@ impl BlockEngine {
                     self.storage_slot_for_transaction(&transaction, version, true, true)?;
 
                 // Drop events if storage slot is inactive
-                if !storage_slot.is_active() {
+                if !self.stores.storage_limits_disabled() && !storage_slot.is_active() {
                     transaction.user_messages.retain(|m| {
                         m.msg_type() == MessageType::NativeOnboard
                             || (crate::native_registration::is_native_fid(m.fid())
@@ -2203,7 +2238,7 @@ impl BlockEngine {
             .filter_map(|mut transaction| {
                 let storage_slot =
                     self.storage_slot_for_transaction(&transaction, version, true, true)?;
-                if !storage_slot.is_active() {
+                if !self.stores.storage_limits_disabled() && !storage_slot.is_active() {
                     transaction.user_messages.clear();
                 }
                 (!transaction.system_messages.is_empty() || !transaction.user_messages.is_empty())

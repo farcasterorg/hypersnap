@@ -102,6 +102,17 @@ pub(crate) fn native_fid_encoding() -> bool {
     NATIVE_FID_ENCODING.with(|mode| mode.get().unwrap_or(true))
 }
 
+/// Consensus uses its exact execution height; admission and APIs use the next
+/// local height. Keep storage policy on the same per-shard fork boundary.
+pub(crate) fn fork_active(config: &Config, shard: u32, next_height: u64) -> bool {
+    if !config.activation_heights.contains_key(&shard.to_string()) {
+        return false;
+    }
+    NATIVE_FID_ENCODING
+        .with(|mode| mode.get())
+        .unwrap_or_else(|| config.active(shard, next_height))
+}
+
 /// A synchronous execution scope: never retain this guard across an await.
 /// The !Send marker prevents moving a scope to another executor thread.
 pub(crate) struct FidEncodingScope {
@@ -707,6 +718,58 @@ mod tests {
         assert!(pow_target_met(&hash, 30));
         assert!(!pow_target_met(&hash, 31));
     }
+
+    #[tokio::test]
+    async fn legacy_users_ignore_storage_only_at_their_shard_fork() {
+        use crate::storage::store::test_helper as shards;
+        use crate::utils::factory::{events_factory, messages_factory, signers::generate_signer};
+        let (source, _source_dir) = blocks::setup();
+        let (engine, _dir) = shards::new_engine().await;
+        let mut schedule = config();
+        schedule.activation_heights.insert("1".into(), 4);
+        let mut engine = engine.with_native_registration(schedule, source.stores().db.clone());
+        let fid = 42;
+        let key = generate_signer();
+        let id = events_factory::create_id_register_event(
+            fid,
+            proto::IdRegisterEventType::Register,
+            vec![42; 20],
+            None,
+        );
+        let signer = events_factory::create_signer_event(
+            fid,
+            key.clone(),
+            proto::SignerEventType::Add,
+            None,
+            None,
+        );
+        shards::commit_event(&mut engine, &id).await;
+        shards::commit_event(&mut engine, &signer).await;
+        let cast =
+            messages_factory::casts::create_cast_add(fid, "zero storage at fork", None, Some(&key));
+        let old =
+            engine.propose_state_change(1, vec![MempoolMessage::UserMessage(cast.clone())], None);
+        assert!(old.transactions.is_empty());
+        shards::validate_and_commit_state_change(&mut engine, &old).await;
+        assert_eq!(engine.get_confirmed_height().block_number, 3);
+        shards::commit_message(&mut engine, &cast).await;
+        assert_eq!(engine.get_casts_by_fid(fid).unwrap().messages, vec![cast]);
+        // A replay scope must still use historical policy even when the DB
+        // has advanced across the fork, and other shards have independent gates.
+        let stores = engine.get_stores();
+        assert!(stores.storage_limits_disabled());
+        {
+            let _historical = FidEncodingScope::enter(false);
+            assert!(!stores.storage_limits_disabled());
+            assert_eq!(stores.get_storage_limits(fid).unwrap().limits[0].limit, 0);
+        }
+        assert!(stores
+            .get_storage_limits(fid)
+            .unwrap()
+            .limits
+            .iter()
+            .all(|l| l.limit == u64::MAX));
+    }
     #[test]
     fn fork_boundary_pow_signature_anchor_and_replay_checks() {
         let (engine, _dir, anchor) = setup();
@@ -834,8 +897,8 @@ mod tests {
         )
         .unwrap()
         .is_none());
-        // Existing gasless keys and storage lending make the new identity usable,
-        // without inventing an IdRegistry event or changing the storage policy.
+        // Native identity uses ordinary gasless keys without an IdRegistry event
+        // or a purchased/borrowed storage allocation after the fork.
         use crate::storage::store::account::{get_gasless_key_owner_fid, list_gasless_keys_by_fid};
         use crate::utils::factory::{messages_factory as messages, signers::generate_signer};
         let app_custody = PrivateKeySigner::random();
@@ -844,33 +907,52 @@ mod tests {
             1,
             app_signer.clone(),
             app_custody.address().to_vec(),
-            1000,
+            0,
             &mut engine,
         );
+        // This legacy account belongs to shard 1. Mirror its IdRegistry event
+        // there as the L1 connector does; native accounts need no such event.
+        let legacy_id = engine
+            .stores()
+            .onchain_event_store
+            .get_id_register_event_by_fid(1, None)
+            .unwrap()
+            .unwrap();
+        crate::storage::store::test_helper::commit_event(&mut shard, &legacy_id).await;
         let signer = generate_signer();
         let now = FarcasterTime::current().to_u64() as u32;
-        let key = messages::keys::create_key_add(
-            FIRST_NATIVE_FID,
-            &custody,
+        let legacy_gasless = generate_signer();
+        let legacy_key = messages::keys::create_key_add(
             1,
             &app_custody,
-            &signer,
+            1,
+            &app_custody,
+            &legacy_gasless,
             vec![proto::MessageType::CastAdd],
             3600,
             1,
             now + 86_400,
             Some(now),
         );
-        blocks::commit_message(&mut engine, &key, blocks::Validity::Valid);
-        let lend = messages::storage_lend::create_storage_lend(
-            1,
+        blocks::commit_message(&mut engine, &legacy_key, blocks::Validity::Valid);
+        let key = messages::keys::create_key_add(
             FIRST_NATIVE_FID,
+            &custody,
             1,
-            proto::StorageUnitType::UnitType2025,
-            None,
-            Some(&app_signer),
+            &app_custody,
+            &signer,
+            vec![
+                proto::MessageType::CastAdd,
+                proto::MessageType::ReactionAdd,
+                proto::MessageType::LinkAdd,
+                proto::MessageType::UserDataAdd,
+            ],
+            3600,
+            1,
+            now + 86_400,
+            Some(now),
         );
-        blocks::commit_message(&mut engine, &lend, blocks::Validity::Valid);
+        blocks::commit_message(&mut engine, &key, blocks::Validity::Valid);
         // Several cross-shard events from different authors arrive in one batch.
         let from = shard.get_stores().block_event_store.max_seqnum().unwrap() + 1;
         let to = engine.stores().block_event_store.max_seqnum().unwrap();
@@ -890,6 +972,53 @@ mod tests {
             pending.iter().collect(),
         )
         .await;
+        // The same ordered stream must also advance a non-owning shard that
+        // intentionally has no IdRegistry record for legacy fid 1.
+        let (other, _other_dir) = crate::storage::store::test_helper::new_engine_with_options(
+            crate::storage::store::test_helper::EngineOptions {
+                shard_id: 2,
+                ..Default::default()
+            },
+        )
+        .await;
+        let mut other = other.with_native_registration(config(), engine.stores().db.clone());
+        let events: Vec<_> = (FORK_EVENT_BASE + 1..=to)
+            .map(|seq| {
+                engine
+                    .stores()
+                    .block_event_store
+                    .get_block_event_by_seqnum(seq)
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect();
+        crate::storage::store::test_helper::commit_block_events(
+            &mut other,
+            events.iter().collect(),
+        )
+        .await;
+        assert_eq!(
+            other.get_stores().block_event_store.max_seqnum().unwrap(),
+            to
+        );
+        assert_eq!(
+            get_gasless_key_owner_fid(
+                &other.db,
+                &RocksDbTransactionBatch::new(),
+                &legacy_gasless.verifying_key().to_bytes()
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            get_gasless_key_owner_fid(
+                &other.db,
+                &RocksDbTransactionBatch::new(),
+                &signer.verifying_key().to_bytes()
+            )
+            .unwrap(),
+            Some(FIRST_NATIVE_FID)
+        );
         assert_eq!(
             get_gasless_key_owner_fid(
                 &shard.db,
@@ -909,6 +1038,66 @@ mod tests {
             Some(&signer),
         );
         crate::storage::store::test_helper::commit_message(&mut shard, &cast).await;
+        let stores = shard.get_stores();
+        assert_eq!(
+            stores
+                .get_storage_slot_for_fid(
+                    FIRST_NATIVE_FID,
+                    crate::version::version::EngineVersion::latest(),
+                    true,
+                    &[]
+                )
+                .unwrap()
+                .units_for(proto::StorageUnitType::UnitType2025),
+            0
+        );
+        let limits = stores.get_storage_limits(FIRST_NATIVE_FID).unwrap();
+        assert_eq!(limits.units, 0);
+        assert!(limits.limits.iter().all(|l| l.limit == u64::MAX));
+        for message in [
+            messages::reactions::create_reaction_add(
+                FIRST_NATIVE_FID,
+                proto::ReactionType::Like,
+                proto::reaction_body::Target::TargetCastId(proto::CastId {
+                    fid: FIRST_NATIVE_FID,
+                    hash: cast.hash.clone(),
+                }),
+                None,
+                Some(&signer),
+            ),
+            messages::links::create_link_add(FIRST_NATIVE_FID, "follow", 1, None, Some(&signer)),
+            messages::create_message_with_data(
+                FIRST_NATIVE_FID,
+                proto::MessageType::UserDataAdd,
+                proto::message_data::Body::UserDataBody(proto::UserDataBody {
+                    r#type: proto::UserDataType::Display as i32,
+                    value: "Native user".into(),
+                }),
+                None,
+                Some(&signer),
+            ),
+        ] {
+            crate::storage::store::test_helper::commit_message(&mut shard, &message).await;
+        }
+        // Posting beyond this engine's small pre-fork cast quota must retain all
+        // casts instead of pruning them for zero storage.
+        for index in 0..8 {
+            let message = messages::casts::create_cast_add(
+                FIRST_NATIVE_FID,
+                &format!("unmetered cast {index}"),
+                None,
+                Some(&signer),
+            );
+            crate::storage::store::test_helper::commit_message(&mut shard, &message).await;
+        }
+        assert_eq!(
+            shard
+                .get_casts_by_fid(FIRST_NATIVE_FID)
+                .unwrap()
+                .messages
+                .len(),
+            9
+        );
         assert!(shard
             .get_stores()
             .onchain_event_store
