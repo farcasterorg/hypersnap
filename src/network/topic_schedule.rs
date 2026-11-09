@@ -181,7 +181,24 @@ impl Schedule {
                 vec![self.is_hypersnap(height.shard_index, height.block_number)]
             }
             Some(Scope::Shard(shard)) => {
-                vec![self.is_hypersnap(shard, self.next.get(&shard).copied().unwrap_or(0))]
+                let hypersnap =
+                    self.is_hypersnap(shard, self.next.get(&shard).copied().unwrap_or(0));
+                if !hypersnap {
+                    if let Payload::MempoolMessage(m) = &payload {
+                        if let Some(proto::mempool_message::MempoolMessage::UserMessage(raw)) =
+                            &m.mempool_message
+                        {
+                            let mut message = raw.clone();
+                            crate::storage::store::account::message_bytes_decode(&mut message);
+                            if message.msg_type() == proto::MessageType::NativeOnboard
+                                || crate::native_registration::is_native_fid(message.fid())
+                            {
+                                return vec![];
+                            }
+                        }
+                    }
+                }
+                vec![hypersnap]
             }
             Some(Scope::Control) => self.phases(),
             None => return vec![],
@@ -324,5 +341,41 @@ mod tests {
         )
         .unwrap();
         assert!(s.set_num_shards(2).is_err());
+    }
+    #[test]
+    fn native_messages_never_enter_legacy_topics() {
+        let mut s = schedule();
+        let bytes = |fid, kind| {
+            proto::GossipMessage {
+                gossip_message: Some(Payload::MempoolMessage(proto::MempoolMessage {
+                    mempool_message: Some(proto::mempool_message::MempoolMessage::UserMessage(
+                        proto::Message {
+                            data: Some(proto::MessageData {
+                                fid,
+                                r#type: kind,
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                    )),
+                })),
+            }
+            .encode_to_vec()
+        };
+        let registration = bytes(0, proto::MessageType::NativeOnboard as i32);
+        let cast = bytes(
+            crate::native_registration::FIRST_NATIVE_FID,
+            proto::MessageType::CastAdd as i32,
+        );
+        assert!(s.publications(t::MEMPOOL, &registration).is_empty());
+        assert!(s.publications(t::MEMPOOL, &cast).is_empty());
+        for (shard_index, block_number) in [(0, 100), (1, 200), (2, 300)] {
+            s.observe_next(proto::Height {
+                shard_index,
+                block_number,
+            });
+        }
+        assert_eq!(s.publications(t::MEMPOOL, &registration), vec![t::MEMPOOL]);
+        assert_eq!(s.publications(t::MEMPOOL, &cast), vec![t::MEMPOOL]);
     }
 }

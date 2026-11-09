@@ -128,6 +128,7 @@ pub struct Message {
 pub struct MessageData {
     #[serde(rename = "type")]
     pub message_type: String,
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub fid: u64,
     pub timestamp: u32,
     pub network: String,
@@ -177,6 +178,8 @@ pub struct MessageData {
         skip_serializing_if = "Option::is_none"
     )]
     pub channel_moderate_body: Option<ChannelModerateBody>,
+    #[serde(rename = "nativeOnboardBody", skip_serializing_if = "Option::is_none")]
+    pub native_onboard_body: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -201,6 +204,7 @@ pub struct EmbedCastId {
 pub struct CastAddBody {
     #[serde(rename = "embedsDeprecated")]
     pub embeds_deprecated: Vec<String>,
+    #[serde(with = "crate::native_registration::serde_fid::vec")]
     pub mentions: Vec<u64>,
     #[serde(rename = "parentCastId")]
     pub parent_cast_id: Option<CastId>,
@@ -276,6 +280,7 @@ pub struct LinkBody {
     #[serde(rename = "displayTimestamp")]
     pub display_timestamp: Option<u32>,
     #[serde(rename = "targetFid")]
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub target_fid: u64,
 }
 
@@ -286,6 +291,7 @@ pub struct UsernameProofBody {
     pub owner: String,
     #[serde(with = "serdebase64")]
     pub signature: Vec<u8>,
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub fid: u64,
     #[serde(rename = "type")]
     pub username_proof_type: String,
@@ -315,12 +321,14 @@ pub struct LinkCompactStateBody {
     #[serde(rename = "type")]
     pub link_compact_type: String,
     #[serde(rename = "targetFids")]
+    #[serde(with = "crate::native_registration::serde_fid::vec")]
     pub target_fids: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LendStorageBody {
     #[serde(rename = "toFid")]
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub to_fid: u64,
     #[serde(rename = "numUnits")]
     pub num_units: u64,
@@ -421,6 +429,7 @@ pub struct ChannelUpdateBody {
 pub struct ChannelMemberBody {
     #[serde(with = "serdehex", rename = "channelId")]
     pub channel_id: Vec<u8>,
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub fid: u64,
     pub action: ChannelMemberAction,
 }
@@ -444,6 +453,7 @@ pub struct ChannelModerateBody {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CastId {
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub fid: u64,
     pub hash: String,
 }
@@ -546,6 +556,7 @@ impl GetFidsRequest {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GetFidsResponse {
+    #[serde(with = "crate::native_registration::serde_fid::vec")]
     pub fids: Vec<u64>,
     #[serde(rename = "nextPageToken", skip_serializing_if = "Option::is_none")]
     pub next_page_token: Option<String>,
@@ -554,6 +565,7 @@ pub struct GetFidsResponse {
 #[allow(non_snake_case)]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FidRequest {
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub fid: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page_size: Option<u32>,
@@ -591,6 +603,7 @@ impl FidRequest {
 #[allow(non_snake_case)]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FidTimestampRequest {
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub fid: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page_size: Option<u32>,
@@ -639,6 +652,7 @@ impl FidTimestampRequest {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CastsByParentRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(with = "crate::native_registration::serde_fid::option")]
     pub fid: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
@@ -734,6 +748,7 @@ impl ReactionsByFidRequest {
 #[allow(non_snake_case)]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ReactionsByCastRequest {
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub target_fid: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_hash: Option<String>,
@@ -977,6 +992,7 @@ pub struct UserNameProof {
     pub owner: String,
     #[serde(with = "serdebase64")]
     pub signature: Vec<u8>,
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub fid: u64,
     pub r#type: String,
 }
@@ -988,6 +1004,7 @@ pub struct UsernameProofsResponse {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FidResponse {
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub fid: u64,
 }
 
@@ -1033,6 +1050,7 @@ impl NameLookupRequest {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NameToAddressResponse {
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub fid: u64,
     #[serde(rename = "custodyAddress", skip_serializing_if = "Option::is_none")]
     pub custody_address: Option<String>,
@@ -1080,6 +1098,7 @@ impl AddressLookupRequest {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AddressMatch {
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub fid: u64,
     #[serde(rename = "isCustody")]
     pub is_custody: bool,
@@ -1257,6 +1276,7 @@ pub struct OnChainEvent {
     pub transaction_hash: Vec<u8>,
     #[serde(rename = "logIndex")]
     pub log_index: u32,
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub fid: u64,
     #[serde(rename = "signerEventBody", skip_serializing_if = "Option::is_none")]
     pub signer_event_body: Option<SignerEventBody>,
@@ -1309,6 +1329,7 @@ pub struct HttpSigner {
     pub key: Vec<u8>,
     #[serde(rename = "keyType")]
     pub key_type: u32,
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub fid: u64,
 
     #[serde(rename = "addedAt", skip_serializing_if = "Option::is_none")]
@@ -1323,6 +1344,7 @@ pub struct HttpSigner {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub scopes: Vec<String>,
     #[serde(rename = "requestFid", skip_serializing_if = "Option::is_none")]
+    #[serde(default, with = "crate::native_registration::serde_fid::option")]
     pub request_fid: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nonce: Option<u32>,
@@ -1357,6 +1379,7 @@ pub struct HttpSignersByFidResponse {
 #[allow(non_snake_case)]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SignersByFidHttpRequest {
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub fid: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page_size: Option<u32>,
@@ -1369,6 +1392,7 @@ pub struct SignersByFidHttpRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reverse: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(with = "crate::native_registration::serde_fid::vec")]
     pub requester_fids: Vec<u64>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1403,6 +1427,7 @@ impl SignersByFidHttpRequest {
 #[allow(non_snake_case)]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SignerHttpRequest {
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub fid: u64,
     #[serde(with = "serdehex")]
     pub signer: Vec<u8>,
@@ -1420,6 +1445,7 @@ impl SignerHttpRequest {
 #[allow(non_snake_case)]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FidAddressTypeRequest {
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub fid: u64,
     #[serde(with = "serdehex")]
     pub address: Vec<u8>,
@@ -1498,6 +1524,7 @@ impl ChannelOwnerRequest {
 pub struct ChannelOwnerResponse {
     /// 0 = registered but no verified owner in shard-0 consensus state
     /// ("parked"). Parking is computed at read time, never stored.
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub fid: u64,
     /// Raw 20-byte EVM address from the channel registry fold, hex-encoded.
     #[serde(with = "serdehex", rename = "ownerAddress")]
@@ -1547,6 +1574,7 @@ impl ChannelsByAddressRequest {
 #[allow(non_snake_case)]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChannelsByFidRequest {
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub fid: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page_size: Option<u32>,
@@ -1583,6 +1611,7 @@ pub struct ChannelInfo {
     #[serde(rename = "channelKey")]
     pub channel_key: String,
     /// Resolved winner; 0 = parked.
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub fid: u64,
     #[serde(with = "serdehex", rename = "ownerAddress")]
     pub owner_address: Vec<u8>,
@@ -1667,6 +1696,7 @@ impl ChannelIdRequest {
 pub struct ChannelMemberRequest {
     #[serde(with = "serdehex", rename = "channelId")]
     pub channel_id: Vec<u8>,
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub fid: u64,
 }
 
@@ -1732,6 +1762,7 @@ impl ChannelMembersRequest {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChannelMember {
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub fid: u64,
     pub state: ChannelMemberState,
 }
@@ -1748,6 +1779,7 @@ pub struct ChannelPin {
     #[serde(with = "serdehex", rename = "castHash")]
     pub cast_hash: Vec<u8>,
     #[serde(rename = "authorFid")]
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub author_fid: u64,
 }
 
@@ -1803,6 +1835,7 @@ impl ChannelFollowersRequest {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChannelFollower {
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub fid: u64,
     #[serde(rename = "followedAt")]
     pub followed_at: u32,
@@ -1837,6 +1870,7 @@ pub struct ChannelFollowerCountResponse {
 #[allow(non_snake_case)]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChannelFollowsRequest {
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub fid: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page_size: Option<u32>,
@@ -1886,6 +1920,7 @@ pub struct ChannelFollowsResponse {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct IsFollowingChannelRequest {
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub fid: u64,
     #[serde(with = "serdehex", rename = "channelId")]
     pub channel_id: Vec<u8>,
@@ -1950,6 +1985,7 @@ pub struct ChannelModeration {
     pub cast_hash: Vec<u8>,
     pub action: ChannelModerateAction,
     #[serde(rename = "authorFid")]
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub author_fid: u64,
 }
 
@@ -1983,6 +2019,7 @@ pub struct ChannelMetadataResponse {
 #[allow(non_snake_case)]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChannelMembershipsByFidRequest {
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub fid: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page_size: Option<u32>,
@@ -2045,6 +2082,8 @@ pub enum HubEventType {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MergeMessageBody {
+    #[serde(rename = "nativeRegistration", skip_serializing_if = "Option::is_none")]
+    pub native_registration: Option<serde_json::Value>,
     pub message: Message,
     #[serde(rename = "deletedMessages")]
     pub deleted_messages: Vec<Message>,
@@ -3006,12 +3045,40 @@ fn map_proto_message_data_without_body(
         channel_member_body: None,
         channel_pin_body: None,
         channel_moderate_body: None,
+        native_onboard_body: None,
     })
 }
 
 fn map_proto_message_data_to_json_message_data(
     message_data: proto::MessageData,
 ) -> Result<MessageData, ErrorResponse> {
+    if message_data.r#type == proto::MessageType::NativeOnboard as i32 {
+        let message = proto::Message {
+            data: Some(message_data.clone()),
+            ..Default::default()
+        };
+        let body = crate::native_registration::body(&message).map_err(|e| ErrorResponse {
+            error: e.to_string(),
+            error_detail: None,
+            status: None,
+        })?;
+        let mut result = map_proto_message_data_without_body(
+            message_data.r#type,
+            message_data.fid,
+            message_data.timestamp,
+            message_data.network,
+        )?;
+        let pow = match body.gate_proof {
+            Some(proto::hyper_native_onboard_body::GateProof::Pow(pow)) => Some(
+                serde_json::json!({"nonce":format!("0x{}",hex::encode(pow.nonce)),"difficultyBits":pow.difficulty_bits}),
+            ),
+            None => None,
+        };
+        result.native_onboard_body = Some(
+            serde_json::json!({"custodyAddress":format!("0x{}",hex::encode(body.custody_address)),"custodySignature":format!("0x{}",hex::encode(body.custody_signature)),"anchorBlockHeight":body.anchor_block_height,"anchorBlockHash":format!("0x{}",hex::encode(body.anchor_block_hash)),"pow":pow}),
+        );
+        return Ok(result);
+    }
     match message_data.body {
         Some(Body::CastAddBody(cast_add_body)) => {
             let result = map_proto_cast_add_body_to_json_cast_add_body(cast_add_body)?;
@@ -3051,6 +3118,7 @@ fn map_proto_message_data_to_json_message_data(
                 channel_member_body: None,
                 channel_pin_body: None,
                 channel_moderate_body: None,
+                native_onboard_body: None,
             })
         }
         Some(Body::CastRemoveBody(cast_remove_body)) => Ok(MessageData {
@@ -3091,6 +3159,7 @@ fn map_proto_message_data_to_json_message_data(
             channel_member_body: None,
             channel_pin_body: None,
             channel_moderate_body: None,
+            native_onboard_body: None,
         }),
         Some(Body::FrameActionBody(frame_action_body)) => {
             return Ok(MessageData {
@@ -3140,6 +3209,7 @@ fn map_proto_message_data_to_json_message_data(
                 channel_member_body: None,
                 channel_pin_body: None,
                 channel_moderate_body: None,
+                native_onboard_body: None,
             });
         }
         Some(Body::LinkBody(link_body)) => {
@@ -3180,6 +3250,7 @@ fn map_proto_message_data_to_json_message_data(
                 channel_member_body: None,
                 channel_pin_body: None,
                 channel_moderate_body: None,
+                native_onboard_body: None,
             });
         }
         Some(Body::LinkCompactStateBody(link_compact_state_body)) => {
@@ -3221,6 +3292,7 @@ fn map_proto_message_data_to_json_message_data(
                 channel_member_body: None,
                 channel_pin_body: None,
                 channel_moderate_body: None,
+                native_onboard_body: None,
             });
         }
         Some(Body::ReactionBody(reaction_body)) => {
@@ -3261,6 +3333,7 @@ fn map_proto_message_data_to_json_message_data(
                 channel_member_body: None,
                 channel_pin_body: None,
                 channel_moderate_body: None,
+                native_onboard_body: None,
             });
         }
         Some(Body::UserDataBody(user_data_body)) => {
@@ -3301,6 +3374,7 @@ fn map_proto_message_data_to_json_message_data(
                 channel_member_body: None,
                 channel_pin_body: None,
                 channel_moderate_body: None,
+                native_onboard_body: None,
             });
         }
         Some(Body::UsernameProofBody(username_proof_body)) => {
@@ -3342,6 +3416,7 @@ fn map_proto_message_data_to_json_message_data(
                 channel_member_body: None,
                 channel_pin_body: None,
                 channel_moderate_body: None,
+                native_onboard_body: None,
             });
         }
         Some(Body::VerificationAddAddressBody(verification_add_address_body)) => {
@@ -3384,6 +3459,7 @@ fn map_proto_message_data_to_json_message_data(
                 channel_member_body: None,
                 channel_pin_body: None,
                 channel_moderate_body: None,
+                native_onboard_body: None,
             });
         }
         Some(Body::VerificationRemoveBody(verification_remove_body)) => {
@@ -3426,6 +3502,7 @@ fn map_proto_message_data_to_json_message_data(
                 channel_member_body: None,
                 channel_pin_body: None,
                 channel_moderate_body: None,
+                native_onboard_body: None,
             });
         }
         Some(Body::LendStorageBody(lend_storage_body)) => {
@@ -3466,6 +3543,7 @@ fn map_proto_message_data_to_json_message_data(
                 channel_member_body: None,
                 channel_pin_body: None,
                 channel_moderate_body: None,
+                native_onboard_body: None,
             });
         }
         Some(Body::KeyAddBody(key_add_body)) => {
@@ -3506,6 +3584,7 @@ fn map_proto_message_data_to_json_message_data(
                 channel_member_body: None,
                 channel_pin_body: None,
                 channel_moderate_body: None,
+                native_onboard_body: None,
             });
         }
         Some(Body::KeyRemoveBody(key_remove_body)) => {
@@ -3546,6 +3625,7 @@ fn map_proto_message_data_to_json_message_data(
                 channel_member_body: None,
                 channel_pin_body: None,
                 channel_moderate_body: None,
+                native_onboard_body: None,
             });
         }
         Some(Body::ChannelUpdateBody(body)) => {
@@ -3779,6 +3859,9 @@ pub fn map_proto_hub_event_to_json_hub_event(
         None => {}
         Some(hub_event::Body::MergeMessageBody(body)) => {
             merge_message_body = body.message.clone().map(|msg| MergeMessageBody {
+                native_registration: body.native_registration.as_ref().map(
+                    |r| serde_json::json!({"fid":r.fid.to_string(),"blockNumber":r.block_number}),
+                ),
                 message: map_proto_message_to_json_message(msg).unwrap(),
                 deleted_messages: body
                     .deleted_messages
@@ -3900,6 +3983,14 @@ pub fn map_proto_hub_event_to_json_hub_event(
 // Service trait for type-safe request handling
 #[async_trait]
 pub trait HubHttpService {
+    async fn get_native_account(
+        &self,
+        req: NativeAccountLookup,
+    ) -> Result<serde_json::Value, ErrorResponse>;
+    async fn get_native_registration_info(
+        &self,
+        req: InfoRequest,
+    ) -> Result<serde_json::Value, ErrorResponse>;
     async fn get_info(&self, req: InfoRequest) -> Result<InfoResponse, ErrorResponse>;
     async fn get_fids(&self, req: GetFidsRequest) -> Result<GetFidsResponse, ErrorResponse>;
     async fn get_cast_by_id(&self, req: IdRequest) -> Result<Message, ErrorResponse>;
@@ -4061,6 +4152,60 @@ impl<T> HubHttpService for HubHttpServiceImpl<T>
 where
     T: HubService,
 {
+    async fn get_native_account(
+        &self,
+        req: NativeAccountLookup,
+    ) -> Result<serde_json::Value, ErrorResponse> {
+        let custody_address = req
+            .custody
+            .map(|s| hex::decode(s.strip_prefix("0x").unwrap_or(&s)))
+            .transpose()
+            .map_err(|e| ErrorResponse {
+                error: e.to_string(),
+                error_detail: None,
+                status: Some(StatusCode::BAD_REQUEST),
+            })?
+            .unwrap_or_default();
+        let record = self
+            .service
+            .get_native_account(tonic::Request::new(proto::NativeAccountRequest {
+                fid: req.fid.unwrap_or(0),
+                custody_address,
+            }))
+            .await
+            .map_err(|e| ErrorResponse::from_status(&e, "Native registration lookup failed"))?
+            .into_inner();
+        let message = record.registration.ok_or_else(|| ErrorResponse {
+            error: "native registration missing message".into(),
+            error_detail: None,
+            status: None,
+        })?;
+        let custody = crate::native_registration::body(&message)
+            .map_err(|e| ErrorResponse {
+                error: e.to_string(),
+                error_detail: None,
+                status: None,
+            })?
+            .custody_address
+            .clone();
+        Ok(
+            serde_json::json!({"fid":record.fid.to_string(),"custodyAddress":format!("0x{}",hex::encode(custody)),"blockNumber":record.block_number,"message":map_proto_message_to_json_message(message)?}),
+        )
+    }
+    async fn get_native_registration_info(
+        &self,
+        _: InfoRequest,
+    ) -> Result<serde_json::Value, ErrorResponse> {
+        let info = self
+            .service
+            .get_native_registration_info(tonic::Request::new(proto::GetInfoRequest {}))
+            .await
+            .map_err(|e| ErrorResponse::from_status(&e, "Native registration lookup failed"))?
+            .into_inner();
+        Ok(
+            serde_json::json!({"active":info.active,"nextBlock":info.next_block,"anchorBlockHeight":info.anchor_block_height,"anchorBlockHash":format!("0x{}",hex::encode(info.anchor_block_hash)),"minDifficultyBits":info.min_difficulty_bits,"anchorWindow":info.anchor_window,"firstNativeFid":info.first_native_fid.to_string()}),
+        )
+    }
     async fn get_info(&self, _request: InfoRequest) -> Result<InfoResponse, ErrorResponse> {
         let response = self
             .service
@@ -5351,6 +5496,19 @@ where
         }
 
         let mut response = match (req.method(), req.uri().path()) {
+            (&Method::GET, "/v1/nativeAccount") => {
+                self.handle_request::<NativeAccountLookup, serde_json::Value, _>(
+                    req,
+                    |service, req| Box::pin(async move { service.get_native_account(req).await }),
+                )
+                .await
+            }
+            (&Method::GET, "/v1/nativeRegistration") => {
+                self.handle_request::<InfoRequest, serde_json::Value, _>(req, |service, req| {
+                    Box::pin(async move { service.get_native_registration_info(req).await })
+                })
+                .await
+            }
             (&Method::GET, "/v1/info") => {
                 self.handle_request::<InfoRequest, InfoResponse, _>(req, |service, req| {
                     Box::pin(async move { service.get_info(req).await })
@@ -6091,6 +6249,7 @@ mod tests {
             _ => MessageType::None as i32,
         };
         proto::MessageData {
+            native_onboard_body: None,
             r#type,
             fid: 1108653,
             timestamp: 100_000,
@@ -6674,4 +6833,11 @@ mod tests {
         let scopes = json.key_add_body.unwrap().scopes;
         assert_eq!(scopes, vec!["MESSAGE_TYPE_CAST_ADD".to_string()]);
     }
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct NativeAccountLookup {
+    #[serde(default, with = "crate::native_registration::serde_fid::option")]
+    pub fid: Option<u64>,
+    pub custody: Option<String>,
 }

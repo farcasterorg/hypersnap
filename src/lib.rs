@@ -17,6 +17,7 @@ pub mod core;
 pub mod hyper;
 pub mod jobs;
 pub mod mempool;
+pub mod native_registration;
 pub mod network;
 pub mod node;
 pub mod perf;

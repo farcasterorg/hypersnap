@@ -3,7 +3,9 @@ use super::errors::TrieError;
 use super::trie_node::{TrieNode, UNCOMPACTED_LENGTH};
 use crate::mempool::routing::{MessageRouter, ShardRouter};
 use crate::proto;
-use crate::storage::store::account::{make_fid_key, read_fid_key, IntoU8, FID_BYTES};
+use crate::storage::store::account::{
+    encoded_fid_len, make_fid_key, read_fid_key, IntoU8, FID_BYTES,
+};
 use crate::storage::trie::util::{combine_nibbles, expand_nibbles};
 use crate::storage::trie::{trie_node, util};
 use std::collections::HashMap;
@@ -56,7 +58,12 @@ impl TrieKey {
         key.extend_from_slice(&fid_bytes);
         // Left shift msg_ype by 3 bits so we don't collide with onchain event types.
         // Supports 8 reserved types (onchain events, fnames etc) and 32 message types
-        key.push(msg_type << 3);
+        if msg_type >= 31 {
+            key.push(31 << 3);
+            key.push(msg_type);
+        } else {
+            key.push(msg_type << 3);
+        }
         key
     }
 
@@ -110,7 +117,10 @@ impl TrieKey {
             return Err(TrieError::KeyLengthTooShort);
         }
 
-        let message_type_pos = 1 + FID_BYTES;
+        let message_type_pos = 1 + encoded_fid_len(key, 1).ok_or(TrieError::KeyLengthTooShort)?;
+        if key.len() <= message_type_pos {
+            return Err(TrieError::KeyLengthTooShort);
+        }
 
         let virtual_shard = key[0];
         let fid = read_fid_key(&key, 1);
@@ -123,7 +133,18 @@ impl TrieKey {
             (None, Some(key[message_type_pos] >> 3))
         };
 
-        let rest = key[(message_type_pos + 1)..].to_vec();
+        let (message_type, rest_start) = if key[message_type_pos] == 31 << 3 {
+            (
+                Some(
+                    *key.get(message_type_pos + 1)
+                        .ok_or(TrieError::KeyLengthTooShort)?,
+                ),
+                message_type_pos + 2,
+            )
+        } else {
+            (message_type, message_type_pos + 1)
+        };
+        let rest = key[rest_start..].to_vec();
 
         Ok(DecodedTrieKey {
             virtual_shard,
@@ -142,7 +163,11 @@ impl TrieKey {
         match &event.body {
             Some(proto::hub_event::Body::MergeMessageBody(merge)) => {
                 if let Some(msg) = &merge.message {
-                    inserts.extend(TrieKey::for_message(&msg));
+                    if let Some(record) = &merge.native_registration {
+                        inserts.push(crate::native_registration::trie_key(record));
+                    } else {
+                        inserts.extend(TrieKey::for_message(&msg));
+                    }
                 }
                 for deleted_message in &merge.deleted_messages {
                     deletes.extend(TrieKey::for_message(&deleted_message));
@@ -880,6 +905,12 @@ mod tests {
         assert_eq!(TrieKey::fid_shard(1), 168);
         assert_eq!(TrieKey::fid_shard(100), 89);
         assert_eq!(TrieKey::fid_shard(42), 141);
-        assert_eq!(TrieKey::fid_shard(918648237462), 153);
+        {
+            let _legacy = crate::native_registration::FidEncodingScope::enter(false);
+            assert_eq!(TrieKey::fid_shard(918648237462), 153);
+        }
+        // Native FIDs use their full width after activation; historical replay
+        // above retains the original truncation and shard assignment.
+        assert_eq!(TrieKey::fid_shard(918648237462), 91);
     }
 }

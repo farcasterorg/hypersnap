@@ -61,6 +61,7 @@ impl SnapchainReadNode {
             None,
             farcaster_network,
         );
+        let engine = engine.with_native_registration(config.native_registration.clone());
         let block_stores = engine.stores();
         info!(
             "Block db height {}",
@@ -111,6 +112,10 @@ impl SnapchainReadNode {
                 }
             };
 
+            let engine = engine.with_native_registration(
+                config.native_registration.clone(),
+                block_stores.db.clone(),
+            );
             shard_senders.insert(shard_id, engine.get_senders());
             shard_stores.insert(shard_id, engine.get_stores());
 

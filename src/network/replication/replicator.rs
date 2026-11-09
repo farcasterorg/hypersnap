@@ -10,7 +10,6 @@ use crate::{
         store::{
             account::{
                 LinkStore, StorageLendStore, UserDataStore, UsernameProofStore, VerificationStore,
-                FID_BYTES,
             },
             engine::PostCommitMessage,
             stores::Stores,
@@ -320,7 +319,9 @@ impl Replicator {
                 .into_iter()
                 .map(|m| {
                     // tx_hash + log_index is the key
-                    let hash = TrieKey::for_onchain_event(&m)[(1 + FID_BYTES + 1)..].to_vec();
+                    let hash = TrieKey::for_onchain_event(&m)
+                        [(1 + crate::storage::store::account::fid_key_len(m.fid) + 1)..]
+                        .to_vec();
 
                     (hash, CacheMessageEntry::OnChainEvent(m))
                 })
@@ -360,7 +361,8 @@ impl Replicator {
 
         // Handle each store type directly
         let messages = match user_message_type {
-            proto::MessageType::FrameAction
+            proto::MessageType::NativeOnboard
+            | proto::MessageType::FrameAction
             | proto::MessageType::None
             | proto::MessageType::KeyAdd
             | proto::MessageType::KeyRemove => {
@@ -654,6 +656,26 @@ impl Replicator {
                     }
                 }
                 (None, Some(message_type)) => {
+                    if message_type == proto::MessageType::NativeOnboard as u8 {
+                        let record = crate::native_registration::account(
+                            &stores.db,
+                            &RocksDbTransactionBatch::new(),
+                            fid,
+                        )?
+                        .ok_or_else(|| {
+                            ReplicationError::InvalidMessage("native account not found".into())
+                        })?;
+                        if crate::native_registration::trie_key(&record) != trie_key {
+                            return Err(ReplicationError::InvalidMessage(
+                                "native account receipt hash mismatch".into(),
+                            ));
+                        }
+                        trie_messages.push(proto::ShardTrieEntryWithMessage {
+                            trie_key,
+                            trie_message: Some(TrieMessage::NativeRegistration(record)),
+                        });
+                        continue;
+                    }
                     // User message
                     let hash = rest;
                     let cache = self.build_fid_user_message_type_cache(

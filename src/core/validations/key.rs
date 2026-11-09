@@ -391,7 +391,8 @@ fn validate_key_add_scopes(scopes: &[i32]) -> Result<(), ValidationError> {
             | Ok(MessageType::LendStorage) => true,
             // Custody-level operations a signer must never authorize, plus message types with no
             // merge path on any network.
-            Ok(MessageType::None)
+            Ok(MessageType::NativeOnboard)
+            | Ok(MessageType::None)
             | Ok(MessageType::KeyAdd)
             | Ok(MessageType::KeyRemove)
             | Ok(MessageType::ChannelUpdate)
@@ -933,6 +934,7 @@ mod tests {
             MessageType::LendStorage,
         ];
         let denied = [
+            MessageType::NativeOnboard,
             MessageType::None,
             MessageType::KeyAdd,
             MessageType::KeyRemove,

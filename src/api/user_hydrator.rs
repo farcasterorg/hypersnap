@@ -220,11 +220,29 @@ where
         out
     }
 
-    /// Fetch the FID's current custody address along with the on-chain
-    /// block timestamp of the registration event. Returns `None` when
-    /// the FID has no `IdRegistry` event yet, or when the event body
-    /// is malformed.
+    /// Resolve custody through the native registry or the legacy IdRegistry.
     async fn fetch_custody_info(&self, fid: u64) -> Option<CustodyInfo> {
+        if crate::native_registration::is_native_fid(fid) {
+            let record = self
+                .hub_service
+                .get_native_account(Request::new(proto::NativeAccountRequest {
+                    fid,
+                    custody_address: vec![],
+                }))
+                .await
+                .ok()?
+                .into_inner();
+            let message = record.registration.as_ref()?;
+            let body = crate::native_registration::body(message).ok()?;
+            let address: [u8; 20] = body.custody_address.as_slice().try_into().ok()?;
+            return Some(CustodyInfo {
+                address: Address::from(address),
+                block_timestamp: crate::core::util::FarcasterTime::new(
+                    message.data.as_ref()?.timestamp as u64,
+                )
+                .to_unix_seconds(),
+            });
+        }
         let request = Request::new(proto::FidRequest {
             fid,
             page_size: None,
@@ -254,8 +272,7 @@ where
     }
 }
 
-/// Snapshot of the data the hydrator extracts from a single
-/// `IdRegistry` on-chain event.
+/// Custody and registration time from either account registry.
 struct CustodyInfo {
     address: Address,
     block_timestamp: u64,

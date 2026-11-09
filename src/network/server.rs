@@ -802,7 +802,7 @@ impl MyHubService {
         message: proto::Message,
     ) -> Result<proto::Message, HubError> {
         let fid = message.fid();
-        if fid == 0 {
+        if fid == 0 && message.msg_type() != proto::MessageType::NativeOnboard {
             return Err(HubError::invalid_parameter("fid cannot be 0"));
         }
 
@@ -1500,6 +1500,65 @@ impl MyHubService {
 
 #[tonic::async_trait]
 impl HubService for MyHubService {
+    async fn get_native_account(
+        &self,
+        request: Request<proto::NativeAccountRequest>,
+    ) -> Result<Response<proto::NativeRegistrationRecord>, Status> {
+        let request = request.into_inner();
+        if !request.custody_address.is_empty() && request.custody_address.len() != 20 {
+            return Err(Status::invalid_argument("custody must be 20 bytes"));
+        }
+        let fid = match (request.fid, request.custody_address.is_empty()) {
+            (0, false) => crate::native_registration::fid_by_custody(
+                &self.block_stores.db,
+                &request.custody_address,
+            )
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("native account not found"))?,
+            (fid, true) if crate::native_registration::is_native_fid(fid) => fid,
+            _ => {
+                return Err(Status::invalid_argument(
+                    "specify one native fid or custody address",
+                ))
+            }
+        };
+        let record = crate::native_registration::account(
+            &self.block_stores.db,
+            &crate::storage::db::RocksDbTransactionBatch::new(),
+            fid,
+        )
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found("native account not found"))?;
+        Ok(Response::new(record))
+    }
+    async fn get_native_registration_info(
+        &self,
+        _: Request<proto::GetInfoRequest>,
+    ) -> Result<Response<proto::NativeRegistrationInfo>, Status> {
+        let height = self
+            .block_stores
+            .block_store
+            .max_block_number()
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let anchor = self
+            .block_stores
+            .block_store
+            .get_block_by_height(height)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(proto::NativeRegistrationInfo {
+            active: self
+                .block_stores
+                .native_registration
+                .active(0, height.saturating_add(1)),
+            next_block: height.saturating_add(1),
+            anchor_block_height: height,
+            anchor_block_hash: anchor.map(|b| b.hash).unwrap_or_default(),
+            min_difficulty_bits: self.block_stores.native_registration.min_difficulty_bits,
+            anchor_window: crate::native_registration::ANCHOR_WINDOW,
+            first_native_fid: crate::native_registration::FIRST_NATIVE_FID,
+        }))
+    }
+
     async fn submit_message(
         &self,
         request: Request<proto::Message>,
@@ -2928,15 +2987,10 @@ impl HubService for MyHubService {
 
         let stores = self.get_stores_for(fid)?;
 
-        let mut custody_address: Option<Vec<u8>> = None;
-        if let Ok(Some(event)) = stores
+        let custody_address = stores
             .onchain_event_store
-            .get_id_register_event_by_fid(fid, None)
-        {
-            if let Some(Body::IdRegisterEventBody(body)) = &event.body {
-                custody_address = Some(body.to.clone());
-            }
-        }
+            .get_custody_address(fid, None)
+            .map_err(|e| Status::internal(e.to_string()))?;
 
         let mut connected_addresses: Vec<Vec<u8>> = Vec::new();
         let mut page_token: Option<Vec<u8>> = None;
@@ -3336,8 +3390,13 @@ impl HubService for MyHubService {
     ) -> Result<Response<ChannelMemberResponse>, Status> {
         let req = request.into_inner();
         let channel_id = self.require_registered_channel(&req.channel_id)?;
-        if req.fid == 0 || u32::try_from(req.fid).is_err() {
-            return Err(Status::invalid_argument("fid must fit in a non-zero u32"));
+        if req.fid == 0
+            || (u32::try_from(req.fid).is_err()
+                && !crate::native_registration::is_native_fid(req.fid))
+        {
+            return Err(Status::invalid_argument(
+                "fid must be a non-zero legacy or native FID",
+            ));
         }
         let member = ChannelMemberStore::member(
             &self.block_stores.channel_member_store,
@@ -3488,8 +3547,13 @@ impl HubService for MyHubService {
         request: Request<ChannelMembershipsByFidRequest>,
     ) -> Result<Response<ChannelMembershipsResponse>, Status> {
         let req = request.into_inner();
-        if req.fid == 0 || u32::try_from(req.fid).is_err() {
-            return Err(Status::invalid_argument("fid must fit in a non-zero u32"));
+        if req.fid == 0
+            || (u32::try_from(req.fid).is_err()
+                && !crate::native_registration::is_native_fid(req.fid))
+        {
+            return Err(Status::invalid_argument(
+                "fid must be a non-zero legacy or native FID",
+            ));
         }
         require_nonzero_page_size(req.page_size)?;
         let page = ChannelMemberStore::memberships_by_fid(
@@ -3595,8 +3659,13 @@ impl HubService for MyHubService {
         request: Request<ChannelFollowsRequest>,
     ) -> Result<Response<ChannelFollowsResponse>, Status> {
         let req = request.into_inner();
-        if req.fid == 0 || u32::try_from(req.fid).is_err() {
-            return Err(Status::invalid_argument("fid must fit in a non-zero u32"));
+        if req.fid == 0
+            || (u32::try_from(req.fid).is_err()
+                && !crate::native_registration::is_native_fid(req.fid))
+        {
+            return Err(Status::invalid_argument(
+                "fid must be a non-zero legacy or native FID",
+            ));
         }
         require_nonzero_page_size(req.page_size)?;
         // Keyed by fid, so this is a single-shard read with none of the fan-out
@@ -3626,8 +3695,13 @@ impl HubService for MyHubService {
         request: Request<IsFollowingChannelRequest>,
     ) -> Result<Response<IsFollowingChannelResponse>, Status> {
         let req = request.into_inner();
-        if req.fid == 0 || u32::try_from(req.fid).is_err() {
-            return Err(Status::invalid_argument("fid must fit in a non-zero u32"));
+        if req.fid == 0
+            || (u32::try_from(req.fid).is_err()
+                && !crate::native_registration::is_native_fid(req.fid))
+        {
+            return Err(Status::invalid_argument(
+                "fid must be a non-zero legacy or native FID",
+            ));
         }
         let channel_id = require_channel_id_width(&req.channel_id)?;
         let stores = self.get_stores_for(req.fid)?;
@@ -3715,15 +3789,14 @@ impl HubService for MyHubService {
         // Check if the address is a custody address (from IdRegistry)
         for store in self.shard_stores.values() {
             // Check IdRegistry for custody address
-            if let Ok(Some(id_event)) = store
+            if store
                 .onchain_event_store
-                .get_id_register_event_by_fid(fid, None)
+                .get_custody_address(fid, None)
+                .ok()
+                .flatten()
+                .is_some_and(|custody| custody == address)
             {
-                if let Some(Body::IdRegisterEventBody(body)) = &id_event.body {
-                    if body.to == address {
-                        is_custody = true;
-                    }
-                }
+                is_custody = true;
             }
 
             // Check KeyRegistry for auth address (keyType=2)
@@ -4166,6 +4239,12 @@ impl crate::api::HubQueryHandler for MyHubService {
         None
     }
 
+    async fn get_native_fid_by_custody(&self, address: &[u8]) -> Option<u64> {
+        crate::native_registration::fid_by_custody(&self.block_stores.db, address)
+            .ok()
+            .flatten()
+    }
+
     async fn get_fids_by_address(&self, address: &[u8], include_custody: bool) -> Vec<u64> {
         let mut fids = Vec::new();
 
@@ -4183,6 +4262,15 @@ impl crate::api::HubQueryHandler for MyHubService {
         // Check ID registry for custody address (uses a cache, but the
         // initial population scans all id register events and can be slow).
         // Skip if we already found matches via verifications.
+        if include_custody {
+            if let Ok(Some(fid)) =
+                crate::native_registration::fid_by_custody(&self.block_stores.db, address)
+            {
+                if !fids.contains(&fid) {
+                    fids.push(fid);
+                }
+            }
+        }
         if include_custody && fids.is_empty() {
             if let Ok(Some(event)) = self.find_id_registry_event_by_address(address) {
                 if let Some(Body::IdRegisterEventBody(body)) = &event.body {

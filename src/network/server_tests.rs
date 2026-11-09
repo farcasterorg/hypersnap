@@ -597,6 +597,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_account_lookup_and_profile_hydration_use_native_custody() {
+        use crate::api::webhooks::CustodyAddressLookup;
+        use crate::api::{http::UserHydrator, HubQueryHandler};
+        let (_stores, _senders, _engines, block_engine, service, _shards, _blocks) =
+            make_server(None, None).await;
+        let fid = crate::native_registration::FIRST_NATIVE_FID;
+        let custody = vec![42; 20];
+        let message = proto::Message {
+            data: Some(proto::MessageData {
+                r#type: proto::MessageType::NativeOnboard as i32,
+                timestamp: 100,
+                native_onboard_body: Some(
+                    proto::HyperNativeOnboardBody {
+                        custody_address: custody.clone(),
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // Seed a committed receipt; consensus/proof validation is exercised by
+        // native_registration's end-to-end registration tests.
+        let record = proto::NativeRegistrationRecord {
+            fid,
+            registration: Some(message),
+            block_number: 2,
+        };
+        let db = block_engine.stores().db;
+        let mut txn = RocksDbTransactionBatch::new();
+        crate::native_registration::apply_record(&db, &mut txn, &record).unwrap();
+        db.commit(txn).unwrap();
+        let by_address = service
+            .get_native_account(Request::new(proto::NativeAccountRequest {
+                fid: 0,
+                custody_address: custody.clone(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(by_address, record);
+        assert_eq!(service.get_native_fid_by_custody(&custody).await, Some(fid));
+        assert_eq!(service.get_fids_by_address(&custody, true).await, vec![fid]);
+        let hydrator = crate::api::user_hydrator::HubUserHydrator::new(Arc::new(service), None);
+        let user = hydrator.hydrate_user(fid).await.unwrap();
+        assert_eq!(user.custody_address, format!("0x{}", hex::encode(&custody)));
+        assert!(!user.registered_at.is_empty());
+        assert_eq!(
+            hydrator.get_custody_address(fid).await.unwrap().as_slice(),
+            custody
+        );
+    }
+
+    #[tokio::test]
     async fn test_get_channel_owner_unknown_channel_key_returns_not_found() {
         let (
             _stores,
@@ -1672,10 +1727,8 @@ mod tests {
             now_unix_seconds() + 3600,
         );
 
-        // A fid outside a non-zero u32 cannot key a member slot. Without the explicit
-        // guard, `make_member_by_fid_key`'s own `try_from` failure would surface as
-        // `internal` — a server fault for what is caller input.
-        for fid in [0u64, u32::MAX as u64 + 1, u64::MAX] {
+        // Zero is not an account. All higher values are legacy or native FIDs.
+        for fid in [0u64] {
             assert_eq!(
                 service
                     .get_channel_member(Request::new(ChannelMemberRequest {
@@ -1702,6 +1755,19 @@ mod tests {
                 tonic::Code::InvalidArgument,
                 "get_channel_memberships_by_fid must reject fid {fid}"
             );
+        }
+
+        for fid in [crate::native_registration::FIRST_NATIVE_FID, u64::MAX] {
+            let member = service
+                .get_channel_member(Request::new(ChannelMemberRequest {
+                    channel_id: channel_id.clone(),
+                    fid,
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(member.state, proto::ChannelMemberState::None as i32);
+            assert!(member.last_action_ts.is_none());
         }
 
         // An i32 outside ChannelMemberState is caller input, not a store fault.
@@ -9152,6 +9218,7 @@ mod tests {
         };
         let message = proto::Message {
             data: Some(MessageData {
+                native_onboard_body: None,
                 r#type: MessageType::KeyAdd as i32,
                 fid,
                 timestamp: 100_000,
@@ -9410,6 +9477,7 @@ mod tests {
         let record = GaslessKeyRecord {
             message: Some(proto::Message {
                 data: Some(MessageData {
+                    native_onboard_body: None,
                     r#type: MessageType::KeyAdd as i32,
                     fid,
                     timestamp: 50_000,

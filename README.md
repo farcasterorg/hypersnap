@@ -166,6 +166,12 @@ the repair, set `[api.daily_stats] repair_on_startup = false`; it defaults to
 true. The regular historical store-walk backfill has its own checkpoints and
 does not need to be reset for this repair.
 
+### Native account registration
+
+Native accounts can register with a custody signature and proof of work from the
+new validator fork heights, without an IdRegistry transaction. See
+[native registration, activation and client usage](docs/native-registration.md).
+
 ### Hypersnap ↔ Snapchain shuttle
 
 The standalone `shuttle` binary relays compatible signed user messages from each

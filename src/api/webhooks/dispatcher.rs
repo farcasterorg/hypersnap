@@ -292,6 +292,7 @@ mod tests {
     fn cast_msg(fid: u64, text: &str) -> Message {
         Message {
             data: Some(MessageData {
+                native_onboard_body: None,
                 r#type: MessageType::CastAdd as i32,
                 fid,
                 timestamp: 0,
@@ -313,6 +314,7 @@ mod tests {
     fn follow_msg(fid: u64, target: u64) -> Message {
         Message {
             data: Some(MessageData {
+                native_onboard_body: None,
                 r#type: MessageType::LinkAdd as i32,
                 fid,
                 timestamp: 0,

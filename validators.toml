@@ -252,3 +252,10 @@ validator_public_keys = [
 "0" = 50_178_325
 "1" = 50_862_269
 "2" = 50_697_335
+
+# Native account registration activates with the new validator set on each shard.
+[consensus.native_registration.activation_heights]
+"0" = 50_178_325
+"1" = 50_862_269
+"2" = 50_697_335
+

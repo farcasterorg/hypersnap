@@ -334,6 +334,7 @@ impl From<crate::storage::store::engine::MessageValidationError> for MessageVali
 
 #[derive(Clone)]
 pub struct BlockStores {
+    pub native_registration: crate::native_registration::Config,
     pub block_store: BlockStore,
     pub block_event_store: BlockEventStore,
     pub onchain_event_store: OnchainEventStore,
@@ -367,6 +368,7 @@ impl BlockStores {
     ) -> Self {
         let store_event_handler = StoreEventHandler::new();
         BlockStores {
+            native_registration: Default::default(),
             block_store: BlockStore::new(db.clone()),
             block_event_store: BlockEventStore { db: db.clone() },
             onchain_event_store: OnchainEventStore::new(db.clone(), store_event_handler.clone()),
@@ -409,6 +411,7 @@ impl BlockStores {
 
     pub fn with_state_context(&self, ctx: StateContext) -> Self {
         BlockStores {
+            native_registration: self.native_registration.clone(),
             block_store: self.block_store.clone(),
             block_event_store: self.block_event_store.clone(),
             onchain_event_store: self.onchain_event_store.with_state_context(ctx),
@@ -477,6 +480,20 @@ impl BlockStores {
         Ok(select_verification_address_winner(authoritative))
     }
 
+    pub fn storage_limits_disabled(&self) -> bool {
+        if self.native_registration.activation_heights.is_empty() {
+            return false;
+        }
+        crate::native_registration::fork_active(
+            &self.native_registration,
+            0,
+            self.block_store
+                .max_block_number()
+                .unwrap_or(0)
+                .saturating_add(1),
+        )
+    }
+
     pub fn get_storage_slot_for_fid(
         &self,
         fid: u64,
@@ -485,6 +502,9 @@ impl BlockStores {
         count_lent_storage: bool,
         count_borrowed_storage: bool,
     ) -> Option<StorageSlot> {
+        if self.storage_limits_disabled() {
+            return Some(StorageSlot::new(0, 0, 0, u32::MAX));
+        }
         let lent_storage = if count_lent_storage {
             StorageLendStore::get_lent_storage(&self.storage_lend_store, fid).ok()?
         } else {
@@ -608,6 +628,11 @@ impl BlockEngine {
         }
     }
 
+    pub fn with_native_registration(mut self, config: crate::native_registration::Config) -> Self {
+        self.stores.native_registration = config;
+        self
+    }
+
     pub fn stores(&self) -> BlockStores {
         self.stores.clone()
     }
@@ -653,7 +678,11 @@ impl BlockEngine {
         version: EngineVersion,
         txn_batch: &mut RocksDbTransactionBatch,
     ) -> Result<(), MessageValidationError> {
-        let verification_counts = self.verification_message_counts(message.fid(), txn_batch)?;
+        let verification_counts = if self.stores.storage_limits_disabled() {
+            VerificationMessageCounts::default()
+        } else {
+            self.verification_message_counts(message.fid(), txn_batch)?
+        };
         self.validate_user_message_with_verification_counts(
             message,
             storage_slot,
@@ -954,6 +983,11 @@ impl BlockEngine {
         txn_batch: &mut RocksDbTransactionBatch,
         verification_counts: VerificationMessageCounts,
     ) -> Result<Option<ChannelMergeDispatch>, MessageValidationError> {
+        let _fid_encoding = crate::native_registration::FidEncodingScope::or_next(
+            &self.stores.native_registration,
+            0,
+            self.get_confirmed_height().block_number.saturating_add(1),
+        );
         // Ensure message data is present
         let message_data = message
             .data
@@ -974,10 +1008,26 @@ impl BlockEngine {
             version,
         )?;
 
+        if message.msg_type() == MessageType::NativeOnboard {
+            let height = self
+                .stores
+                .block_store
+                .max_block_number()
+                .map_err(|e| HubError::internal_db_error(&e.to_string()))?
+                .saturating_add(1);
+            crate::native_registration::validate(
+                &self.stores.native_registration,
+                &self.stores,
+                txn_batch,
+                message,
+                height,
+            )?;
+            return Ok(None);
+        }
         // 1. Check that the user has a custody address
         self.stores
             .onchain_event_store
-            .get_id_register_event_by_fid(message_data.fid, Some(txn_batch))
+            .get_custody_address(message_data.fid, Some(txn_batch))
             .map_err(|_| MessageValidationError::MissingFid)?
             .ok_or(MessageValidationError::MissingFid)?;
 
@@ -1065,7 +1115,9 @@ impl BlockEngine {
                 // the verification activation floor has no channel analogue.
                 channel_dispatch = Some(self.validate_channel_message(message_data, txn_batch)?);
             }
-            crate::proto::message_data::Body::LendStorageBody(lend_storage) => {
+            crate::proto::message_data::Body::LendStorageBody(lend_storage)
+                if !self.stores.storage_limits_disabled() =>
+            {
                 let total_storage_purchased = self
                     .stores
                     .get_storage_slot_for_fid(message_data.fid, version, &vec![], false, false)
@@ -1090,6 +1142,7 @@ impl BlockEngine {
                     return Err(MessageValidationError::InsufficientStorage);
                 }
             }
+            crate::proto::message_data::Body::LendStorageBody(_) => {}
             // KEY_ADD / KEY_REMOVE have no per-body pre-merge validation to do at the block-
             // engine level: static body validation (key length, scopes, ttl bound, etc.) ran
             // upstream in `validate_message`, and state-dependent checks (nonce CAS, custody
@@ -1150,61 +1203,66 @@ impl BlockEngine {
                 // so the live-add limit matches the data shard's limit exactly. If store limits
                 // ever become configurable, this must read the same injected value the data-shard
                 // prune uses or the two sides will enforce different caps on the same message.
-                let max_messages =
-                    StoreLimits::default().max_messages(storage_slot, StoreType::Verifications);
-                // With no active storage, adds are never admitted, including replacements. This
-                // is the spam gate for shard 0's otherwise gasless verification write path.
-                if max_messages == 0 && is_add {
-                    return Err(MessageValidationError::InsufficientStorage);
-                }
-                // Admission is decided per TRANSITION, against the quantity each one actually
-                // grows. Two rules a reader may be tempted to collapse back into one, both of
-                // which are unsound — each was a live hole caught in review:
-                //
-                //   1. A type-blind "any existing row supersedes, so admit" carve-out lets an add
-                //      land on a tombstone, skipping the live-add cap while refunding a tombstone
-                //      slot. `remove addr; add addr` then cycles forever.
-                //   2. Gating only the counter a transition grows is still not enough, because
-                //      rows are PERMANENT while the counters are not. `add addr_i; remove addr_i`
-                //      returns `live_adds` to 0 every cycle and leaves a tombstone behind, so any
-                //      rule written purely over current counter state never engages.
-                //
-                // Rows appear ONLY in the two `None` arms, and both check `total_rows`. That makes
-                // the bound locally provable here: no fid can ever exceed
-                // `max_messages + tombstone_cap` permanent replica rows, for any message sequence.
-                let tombstone_cap = verification_tombstone_cap(max_messages);
-                let row_cap = verification_row_cap(max_messages);
-                let total_rows = verification_counts
-                    .live_adds
-                    .saturating_add(verification_counts.tombstones);
-                let existing =
-                    self.verification_logical_key_type(message_data.fid, address, txn_batch)?;
-                match (is_add, existing) {
-                    // Replacing an add with an add: net-zero on both counters, always admitted.
-                    (true, Some(MessageType::VerificationAddEthAddress)) => {}
-                    // Re-adding a tombstoned address. Row-neutral, but it grows `live_adds`.
-                    (true, Some(_)) => {
-                        if verification_counts.live_adds >= max_messages {
-                            return Err(MessageValidationError::InsufficientStorage);
-                        }
+                if !self.stores.storage_limits_disabled() {
+                    let max_messages =
+                        StoreLimits::default().max_messages(storage_slot, StoreType::Verifications);
+                    // With no active storage, adds are never admitted, including replacements. This
+                    // is the spam gate for shard 0's otherwise gasless verification write path.
+                    if max_messages == 0 && is_add {
+                        return Err(MessageValidationError::InsufficientStorage);
                     }
-                    // Mints a new add row.
-                    (true, None) => {
-                        if verification_counts.live_adds >= max_messages || total_rows >= row_cap {
-                            return Err(MessageValidationError::InsufficientStorage);
+                    // Admission is decided per TRANSITION, against the quantity each one actually
+                    // grows. Two rules a reader may be tempted to collapse back into one, both of
+                    // which are unsound — each was a live hole caught in review:
+                    //
+                    //   1. A type-blind "any existing row supersedes, so admit" carve-out lets an add
+                    //      land on a tombstone, skipping the live-add cap while refunding a tombstone
+                    //      slot. `remove addr; add addr` then cycles forever.
+                    //   2. Gating only the counter a transition grows is still not enough, because
+                    //      rows are PERMANENT while the counters are not. `add addr_i; remove addr_i`
+                    //      returns `live_adds` to 0 every cycle and leaves a tombstone behind, so any
+                    //      rule written purely over current counter state never engages.
+                    //
+                    // Rows appear ONLY in the two `None` arms, and both check `total_rows`. That makes
+                    // the bound locally provable here: no fid can ever exceed
+                    // `max_messages + tombstone_cap` permanent replica rows, for any message sequence.
+                    let tombstone_cap = verification_tombstone_cap(max_messages);
+                    let row_cap = verification_row_cap(max_messages);
+                    let total_rows = verification_counts
+                        .live_adds
+                        .saturating_add(verification_counts.tombstones);
+                    let existing =
+                        self.verification_logical_key_type(message_data.fid, address, txn_batch)?;
+                    match (is_add, existing) {
+                        // Replacing an add with an add: net-zero on both counters, always admitted.
+                        (true, Some(MessageType::VerificationAddEthAddress)) => {}
+                        // Re-adding a tombstoned address. Row-neutral, but it grows `live_adds`.
+                        (true, Some(_)) => {
+                            if verification_counts.live_adds >= max_messages {
+                                return Err(MessageValidationError::InsufficientStorage);
+                            }
                         }
-                    }
-                    // A remove over any existing row turns an add row into a tombstone row, or
-                    // replaces a tombstone with a newer one. Row-neutral either way, and
-                    // deliberately admitted even past `tombstone_cap`: a fid at cap, or one whose
-                    // storage lapsed, must always be able to shed live state.
-                    (false, Some(_)) => {}
-                    // Mints a new tombstone row. This is the pre-V24-address remove case: the
-                    // replica has never seen the address, so the row is new.
-                    (false, None) => {
-                        if verification_counts.tombstones >= tombstone_cap || total_rows >= row_cap
-                        {
-                            return Err(MessageValidationError::InsufficientStorage);
+                        // Mints a new add row.
+                        (true, None) => {
+                            if verification_counts.live_adds >= max_messages
+                                || total_rows >= row_cap
+                            {
+                                return Err(MessageValidationError::InsufficientStorage);
+                            }
+                        }
+                        // A remove over any existing row turns an add row into a tombstone row, or
+                        // replaces a tombstone with a newer one. Row-neutral either way, and
+                        // deliberately admitted even past `tombstone_cap`: a fid at cap, or one whose
+                        // storage lapsed, must always be able to shed live state.
+                        (false, Some(_)) => {}
+                        // Mints a new tombstone row. This is the pre-V24-address remove case: the
+                        // replica has never seen the address, so the row is new.
+                        (false, None) => {
+                            if verification_counts.tombstones >= tombstone_cap
+                                || total_rows >= row_cap
+                            {
+                                return Err(MessageValidationError::InsufficientStorage);
+                            }
                         }
                     }
                 }
@@ -1423,6 +1481,9 @@ impl BlockEngine {
         storage_slot: &mut StorageSlot,
         merge_message_body: &MergeMessageBody,
     ) -> Result<(), BlockEngineError> {
+        if self.stores.storage_limits_disabled() {
+            return Ok(());
+        }
         if let Some(added_message) = &merge_message_body.message {
             match added_message.data.as_ref().unwrap().body.as_ref().unwrap() {
                 proto::message_data::Body::LendStorageBody(lend_storage_body) => {
@@ -1459,6 +1520,11 @@ impl BlockEngine {
         timestamp: &FarcasterTime,
         version: EngineVersion,
     ) -> Result<(Vec<u8>, Vec<HubEvent>, Vec<MessageValidationError>), BlockEngineError> {
+        let _fid_encoding = crate::native_registration::FidEncodingScope::or_next(
+            &self.stores.native_registration,
+            0,
+            self.get_confirmed_height().block_number.saturating_add(1),
+        );
         let mut hub_events = vec![];
         let mut validation_errors = vec![];
         let system_messages =
@@ -1545,14 +1611,56 @@ impl BlockEngine {
         } else {
             storage_slot.clone()
         };
-        let mut verification_counts = if has_verification {
+        let mut verification_counts = if has_verification && !self.stores.storage_limits_disabled()
+        {
             self.verification_message_counts(snapchain_txn.fid, txn_batch)
                 .map_err(BlockEngineError::HubError)?
         } else {
             VerificationMessageCounts::default()
         };
 
-        for message in &snapchain_txn.user_messages {
+        let mut native_order;
+        let user_messages = if snapchain_txn.user_messages.iter().any(|m| {
+            m.msg_type() == MessageType::NativeOnboard
+                || m.data
+                    .as_ref()
+                    .is_some_and(|d| d.native_onboard_body.is_some())
+        }) {
+            native_order = snapchain_txn.user_messages.clone();
+            for data in native_order.iter_mut().filter_map(|m| m.data.as_mut()) {
+                crate::native_registration::normalize_data(
+                    data,
+                    self.stores.native_registration.active(
+                        0,
+                        self.stores
+                            .block_store
+                            .max_block_number()
+                            .unwrap_or(0)
+                            .saturating_add(1),
+                    ),
+                );
+            }
+            if self.stores.native_registration.active(
+                0,
+                self.stores
+                    .block_store
+                    .max_block_number()
+                    .unwrap_or(0)
+                    .saturating_add(1),
+            ) {
+                native_order.sort_by(|a, b| {
+                    a.data
+                        .as_ref()
+                        .map(|d| d.timestamp)
+                        .cmp(&b.data.as_ref().map(|d| d.timestamp))
+                        .then_with(|| a.hash.cmp(&b.hash))
+                });
+            }
+            &native_order
+        } else {
+            &snapchain_txn.user_messages
+        };
+        for message in user_messages {
             let validation_storage_slot = match message.msg_type() {
                 MessageType::VerificationAddEthAddress | MessageType::VerificationRemove => {
                     &verification_storage_slot
@@ -1568,6 +1676,23 @@ impl BlockEngine {
                 verification_counts,
             ) {
                 Ok(channel_dispatch) => match message.msg_type() {
+                    MessageType::NativeOnboard => {
+                        let height = self
+                            .stores
+                            .block_store
+                            .max_block_number()
+                            .map_err(|e| HubError::internal_db_error(&e.to_string()))?
+                            .saturating_add(1);
+                        match crate::native_registration::merge(
+                            &self.stores,
+                            txn_batch,
+                            message,
+                            height,
+                        ) {
+                            Ok(event) => hub_events.push(event),
+                            Err(error) => validation_errors.push(error.into()),
+                        }
+                    }
                     MessageType::LendStorage => {
                         if version.is_enabled(ProtocolFeature::StorageLending) {
                             if let Ok(events) = self.merge_message(message, txn_batch, version) {
@@ -1608,16 +1733,18 @@ impl BlockEngine {
                         if version.is_enabled(ProtocolFeature::VerificationsOnShardZero) {
                             match self.merge_message(message, txn_batch, version) {
                                 Ok(events) => {
-                                    for event in &events {
-                                        if let Some(proto::hub_event::Body::MergeMessageBody(
-                                            body,
-                                        )) = event.body.as_ref()
-                                        {
-                                            verification_counts =
-                                                Self::apply_verification_count_delta(
-                                                    verification_counts,
-                                                    body,
-                                                )?;
+                                    if !self.stores.storage_limits_disabled() {
+                                        for event in &events {
+                                            if let Some(proto::hub_event::Body::MergeMessageBody(
+                                                body,
+                                            )) = event.body.as_ref()
+                                            {
+                                                verification_counts =
+                                                    Self::apply_verification_count_delta(
+                                                        verification_counts,
+                                                        body,
+                                                    )?;
+                                            }
                                         }
                                     }
                                     hub_events.extend(events)
@@ -1776,7 +1903,13 @@ impl BlockEngine {
         let gasless_enabled = version.is_enabled(ProtocolFeature::GaslessSigners);
         let channel_messages_enabled = version.is_enabled(ProtocolFeature::ChannelMessages);
         let mut events = vec![];
-        let mut max_block_event_seqnum = self.stores.block_event_store.max_seqnum().unwrap();
+        let persisted = self.stores.block_event_store.max_seqnum().unwrap();
+        let mut max_block_event_seqnum =
+            self.stores
+                .native_registration
+                .event_watermark(0, height.block_number, persisted);
+        let first_fork_block = persisted < crate::native_registration::FORK_EVENT_BASE
+            && max_block_event_seqnum == crate::native_registration::FORK_EVENT_BASE;
         for hub_event in hub_events {
             match hub_event.body.unwrap() {
                 proto::hub_event::Body::MergeMessageBody(merge_message_body) => {
@@ -1788,6 +1921,28 @@ impl BlockEngine {
                             continue;
                         }
                         match msg_type {
+                            MessageType::NativeOnboard
+                                if self
+                                    .stores
+                                    .native_registration
+                                    .active(0, height.block_number) =>
+                            {
+                                max_block_event_seqnum += 1;
+                                events.push(Self::build_block_event(BlockEventData {
+                                    seqnum: max_block_event_seqnum,
+                                    r#type: BlockEventType::MergeMessage as i32,
+                                    block_number: height.block_number,
+                                    event_index: events.len() as u64,
+                                    block_timestamp: timestamp.to_u64(),
+                                    body: Some(block_event_data::Body::MergeMessageEventBody(
+                                        proto::MergeMessageEventBody {
+                                            message: Some(message),
+                                            native_registration: merge_message_body
+                                                .native_registration,
+                                        },
+                                    )),
+                                }));
+                            }
                             MessageType::LendStorage
                             | MessageType::KeyAdd
                             | MessageType::KeyRemove
@@ -1807,6 +1962,7 @@ impl BlockEngine {
                                     block_timestamp: timestamp.to_u64(),
                                     body: Some(block_event_data::Body::MergeMessageEventBody(
                                         proto::MergeMessageEventBody {
+                                            native_registration: None,
                                             message: Some(message),
                                         },
                                     )),
@@ -1832,6 +1988,7 @@ impl BlockEngine {
                                     block_timestamp: timestamp.to_u64(),
                                     body: Some(block_event_data::Body::MergeMessageEventBody(
                                         proto::MergeMessageEventBody {
+                                            native_registration: None,
                                             message: Some(message),
                                         },
                                     )),
@@ -1877,7 +2034,9 @@ impl BlockEngine {
             }
         }
 
-        if height.block_number % self.heartbeat_block_interval() == 0 {
+        if height.block_number % self.heartbeat_block_interval() == 0
+            || (first_fork_block && events.is_empty())
+        {
             max_block_event_seqnum += 1;
             let data = BlockEventData {
                 seqnum: max_block_event_seqnum,
@@ -1938,6 +2097,11 @@ impl BlockEngine {
         timestamp: &FarcasterTime,
         version: EngineVersion,
     ) -> Result<BlockStateChange, BlockEngineError> {
+        let _fid_encoding = crate::native_registration::FidEncodingScope::enter(
+            self.stores
+                .native_registration
+                .active(0, height.block_number),
+        );
         self.metrics.count(
             "recv_messages",
             messages.len() as u64,
@@ -1947,13 +2111,32 @@ impl BlockEngine {
         let mut snapchain_txns = MempoolPoller::create_transactions_from_mempool(messages)?
             .into_iter()
             .filter_map(|mut transaction| {
+                for data in transaction
+                    .user_messages
+                    .iter_mut()
+                    .filter_map(|m| m.data.as_mut())
+                {
+                    crate::native_registration::normalize_data(
+                        data,
+                        self.stores
+                            .native_registration
+                            .active(0, height.block_number),
+                    );
+                }
                 // TODO(aditi): We could share this code with the shard engine but there may be other things we want to add here. For example, it may make sense to exclude validator messages and user messages that aren't intended for shard 0 here so a bug in the mempool won't impact the protocol in a significant way.
                 let storage_slot =
                     self.storage_slot_for_transaction(&transaction, version, true, true)?;
 
                 // Drop events if storage slot is inactive
-                if !storage_slot.is_active() {
-                    transaction.user_messages = vec![];
+                if !self.stores.storage_limits_disabled() && !storage_slot.is_active() {
+                    transaction.user_messages.retain(|m| {
+                        m.msg_type() == MessageType::NativeOnboard
+                            || (crate::native_registration::is_native_fid(m.fid())
+                                && matches!(
+                                    m.msg_type(),
+                                    MessageType::KeyAdd | MessageType::KeyRemove
+                                ))
+                    });
                 }
 
                 if transaction.system_messages.is_empty() && transaction.user_messages.is_empty() {
@@ -2055,7 +2238,7 @@ impl BlockEngine {
             .filter_map(|mut transaction| {
                 let storage_slot =
                     self.storage_slot_for_transaction(&transaction, version, true, true)?;
-                if !storage_slot.is_active() {
+                if !self.stores.storage_limits_disabled() && !storage_slot.is_active() {
                     transaction.user_messages.clear();
                 }
                 (!transaction.system_messages.is_empty() || !transaction.user_messages.is_empty())
@@ -2116,6 +2299,11 @@ impl BlockEngine {
         timestamp: &FarcasterTime,
         version: EngineVersion,
     ) -> Result<(), BlockEngineError> {
+        let _fid_encoding = crate::native_registration::FidEncodingScope::enter(
+            self.stores
+                .native_registration
+                .active(0, height.block_number),
+        );
         let now = std::time::Instant::now();
         // TODO(aditi): We probably only want to check this if we're in a test env (maybe only if the network is Devnet)
         // Validate that the trie is in a good place to start with
@@ -2216,7 +2404,17 @@ impl BlockEngine {
         };
         let version =
             EngineVersion::version_for(&FarcasterTime::new(header.timestamp), self.network);
-        if header.transactions_root != expected_transactions_root(&block.transactions, version) {
+        if header.transactions_root
+            != expected_transactions_root(
+                &crate::native_registration::transactions_for_root(
+                    &block.transactions,
+                    self.stores
+                        .native_registration
+                        .active(0, height.block_number),
+                ),
+                version,
+            )
+        {
             error!(
                 height = height.block_number,
                 "Block transactions do not match its header"

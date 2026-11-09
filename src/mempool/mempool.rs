@@ -112,6 +112,14 @@ impl RateLimits {
     }
 
     pub fn consume_for_fid(&mut self, fid: u64) -> bool {
+        let shard = self.message_router.route_fid(fid, self.num_shards);
+        if self
+            .shard_stores
+            .get(&shard)
+            .is_some_and(|s| s.storage_limits_disabled())
+        {
+            return true;
+        }
         let rate_limiter = self.get_rate_limiter_for_fid(fid);
         self.statsd_client.gauge(
             "mempool.rate_limiter_entries",
@@ -208,6 +216,14 @@ impl LiveAtRateLimits {
     }
 
     pub fn consume_for_fid(&self, fid: u64) -> bool {
+        let shard = self.message_router.route_fid(fid, self.num_shards);
+        if self
+            .shard_stores
+            .get(&shard)
+            .is_some_and(|s| s.storage_limits_disabled())
+        {
+            return true;
+        }
         let rate_limiter = self.rate_limits_by_fid.optionally_get_with(fid, || {
             let shard_id = self.message_router.route_fid(fid, self.num_shards);
             let stores = self.shard_stores.get(&shard_id).unwrap();
@@ -294,6 +310,15 @@ pub trait MessageMempoolExt {
 
 impl MessageMempoolExt for proto::Message {
     fn mempool_key(&self) -> MempoolKey {
+        if self.msg_type() == MessageType::NativeOnboard {
+            if let Ok(body) = crate::native_registration::body(self) {
+                return MempoolKey::new(
+                    MempoolMessageKind::UserMessage,
+                    0,
+                    format!("native:{}", hex::encode(&body.custody_address)),
+                );
+            }
+        }
         // TODO: Consider revisiting choice of timestamp here as backdated messages currently are prioritized.
         let timestamp = self.data.as_ref().map_or(0, |data| {
             FarcasterTime::new(data.timestamp as u64).to_unix_seconds()
@@ -324,7 +349,11 @@ impl ValidatorMessageMempoolExt for proto::ValidatorMessage {
             MempoolKey::new(
                 MempoolMessageKind::ValidatorMessage,
                 block_event.block_timestamp(),
-                block_event.seqnum().to_string(),
+                if block_event.seqnum() > crate::native_registration::FORK_EVENT_BASE {
+                    format!("{:020}", block_event.seqnum())
+                } else {
+                    block_event.seqnum().to_string()
+                },
             )
         } else {
             MempoolKey::new(
@@ -730,6 +759,26 @@ impl Mempool {
                     }
                 }
 
+                let storage_disabled = self
+                    .read_node_mempool
+                    .route_mempool_message(message)
+                    .iter()
+                    .all(|shard| {
+                        if *shard == 0 {
+                            self.read_node_mempool
+                                .block_stores
+                                .storage_limits_disabled()
+                        } else {
+                            self.read_node_mempool
+                                .shard_stores
+                                .get(shard)
+                                .is_some_and(|stores| stores.storage_limits_disabled())
+                        }
+                    });
+                if storage_disabled {
+                    return false;
+                }
+
                 if is_live_at(user_msg) {
                     if !self.live_at_rate_limits.consume_for_fid(fid) {
                         self.statsd_client
@@ -767,6 +816,23 @@ impl Mempool {
                     match shard_messages.pop_first() {
                         None => break,
                         Some((key, next_message)) => {
+                            if let MempoolMessage::BlockEvent { message, for_shard } = &next_message
+                            {
+                                let stores = &self.read_node_mempool.shard_stores[for_shard];
+                                if message.seqnum() > crate::native_registration::FORK_EVENT_BASE
+                                    && !stores.native_registration.active(
+                                        *for_shard,
+                                        stores
+                                            .shard_store
+                                            .max_block_number()
+                                            .unwrap_or(0)
+                                            .saturating_add(1),
+                                    )
+                                {
+                                    shard_messages.insert(key, next_message);
+                                    break;
+                                }
+                            }
                             self.remove_live_at_index_for_message(
                                 request.shard_id,
                                 &key,
@@ -798,6 +864,32 @@ impl Mempool {
         message: &MempoolMessage,
         at_admission: bool,
     ) -> Result<(), HubError> {
+        if let MempoolMessage::UserMessage(message) = message {
+            if message.msg_type() == MessageType::NativeOnboard {
+                let stores = &self.read_node_mempool.block_stores;
+                let height = stores
+                    .block_store
+                    .max_block_number()
+                    .map_err(|e| HubError::internal_db_error(&e.to_string()))?
+                    .saturating_add(1);
+                let now = crate::core::util::FarcasterTime::current();
+                crate::core::validations::message::validate_message(
+                    message,
+                    self.read_node_mempool.network,
+                    false,
+                    &now,
+                    EngineVersion::current(self.read_node_mempool.network),
+                )
+                .map_err(|e| HubError::validation_failure(&e.to_string()))?;
+                crate::native_registration::validate(
+                    &stores.native_registration,
+                    stores,
+                    &RocksDbTransactionBatch::new(),
+                    message,
+                    height,
+                )?;
+            }
+        }
         // Pre-feature admission gate for KEY_ADD / KEY_REMOVE. Provisional until
         // NEYN-10619 consolidates feature-gating into a single validate_user_message
         // hook at mempool admission.

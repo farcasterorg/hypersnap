@@ -1528,6 +1528,50 @@ mod tests {
     }
 
     #[test]
+    fn verification_storage_quota_ends_at_the_fork() {
+        let (mut engine, _dir) = setup();
+        register_user(
+            VERIFICATION_FID,
+            default_signer(),
+            default_custody_address(),
+            0,
+            &mut engine,
+        );
+        let cutoff = engine.get_confirmed_height().block_number + 2;
+        let mut config = crate::native_registration::Config::default();
+        config.activation_heights.insert("0".into(), cutoff);
+        engine = engine.with_native_registration(config);
+        let timestamp = messages_factory::farcaster_time();
+        let zero = StorageSlot::new(0, 0, 0, u32::MAX);
+        assert!(matches!(
+            engine.validate_user_message(
+                &verification_contract_add(quota_test_address(3000), timestamp),
+                &zero,
+                &FarcasterTime::new(timestamp as u64),
+                EngineVersion::V24,
+                &mut RocksDbTransactionBatch::new(),
+            ),
+            Err(MessageValidationError::InsufficientStorage)
+        ));
+        let height = engine.get_confirmed_height().increment();
+        let change = engine.propose_state_change(vec![], height, None);
+        validate_and_commit_state_change(&mut engine, &change);
+        let adds: Vec<_> = (3000..3010)
+            .map(|id| verification_contract_add(quota_test_address(id), timestamp))
+            .collect();
+        commit_messages(
+            &mut engine,
+            adds.iter()
+                .map(|message| (message, Validity::Valid))
+                .collect(),
+        );
+        let remove = verification_remove(quota_test_address(3000), timestamp + 1);
+        commit_message(&mut engine, &remove, Validity::Valid);
+        let readd = verification_contract_add(quota_test_address(3000), timestamp + 2);
+        commit_message(&mut engine, &readd, Validity::Valid);
+    }
+
+    #[test]
     fn test_shard_zero_verification_validation_gate_and_signatures() {
         let (mut block_engine, _temp_dir) = setup();
         register_user(
