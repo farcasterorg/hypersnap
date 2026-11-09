@@ -817,6 +817,9 @@ mod tests {
 
     #[test]
     fn test_pinned_cast_user_data_validation() {
+        // Store keys hold the user data type as one byte.
+        assert!((proto::UserDataType::PinnedCast as i32) < 256);
+
         // Empty unpins; otherwise a lowercase 0x-prefixed 20-byte hash.
         for value in [
             "",

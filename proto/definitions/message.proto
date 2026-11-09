@@ -126,7 +126,9 @@ enum UserDataType {
   // 20-byte hex string, or empty to unpin. The node does not check that the cast exists or
   // that the user authored it; clients ignore a pin whose cast is missing or authored by
   // someone else.
-  USER_DATA_TYPE_PINNED_CAST = 15;
+  // Hypersnap-only type: numbered far from upstream Snapchain (1-14 so far) so a type added
+  // there later cannot collide. Must stay below 256: store keys hold the type as one byte.
+  USER_DATA_TYPE_PINNED_CAST = 200;
 }
 
 message Embed {

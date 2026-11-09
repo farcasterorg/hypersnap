@@ -17,7 +17,7 @@ The UserData API will accept the following values for the `user_data_type` field
 | USER_DATA_PRIMARY_ADDRESS_SOLANA   | 12              | Primary Solana address         |
 | USER_DATA_TYPE_PROFILE_TOKEN       | 13              | Profile token in CAIP-19 format |
 | USER_DATA_TYPE_LIVE_AT             | 14              | Live activity URL for the user |
-| USER_DATA_TYPE_PINNED_CAST         | 15              | Hash of the cast pinned to the profile |
+| USER_DATA_TYPE_PINNED_CAST         | 200             | Hash of the cast pinned to the profile |
 
 See [FIP-196](https://github.com/farcasterxyz/protocol/discussions/196) for more information on Location.
 See [FIP-19](https://github.com/farcasterxyz/protocol/discussions/199) for more information on Twitter/X and Github usernames.
