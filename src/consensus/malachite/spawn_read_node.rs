@@ -110,6 +110,7 @@ impl MalachiteReadNodeActors {
             local_peer_id,
             statsd_client.clone(),
             None,
+            None,
         )
         .await?;
         let host_actor =

@@ -17,8 +17,11 @@ use informalsystems_malachitebft_engine::util::streaming::{
 use informalsystems_malachitebft_sync::RawDecidedValue;
 use prost::Message;
 use ractor::{async_trait, Actor, ActorProcessingErr, ActorRef, SpawnErr};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
+
+use super::participation::Participation;
 
 /// Actor for bridging consensus and the application via a set of channels.
 ///
@@ -33,6 +36,7 @@ pub struct HostState {
     pub gossip_tx: mpsc::Sender<GossipEvent<SnapchainValidatorContext>>,
     pub statsd: StatsdClientWrapper,
     pub consensus_block_time: u64, // in ms
+    pub participation: Arc<Participation>,
 }
 
 impl Host {
@@ -60,6 +64,12 @@ impl Host {
                 // Start height
                 state.shard_validator.start(); // Call each time?
                 let height = state.shard_validator.get_current_height().increment();
+                state.participation.advance_to(height.as_u64());
+                state.statsd.gauge_with_shard(
+                    height.shard_index,
+                    "consensus.participating",
+                    u64::from(state.participation.is_active()),
+                );
                 let validator_set = state.shard_validator.get_validator_set(height.as_u64());
                 // Wait a few seconds before starting
                 tokio::time::sleep(tokio::time::Duration::from_secs(
@@ -189,6 +199,10 @@ impl Host {
                     .ok_or_else(|| "not a data part".to_string())
                     .and_then(|proposal| WellFormedProposal::try_from(proposal.clone()));
                 match proposal {
+                    Ok(proposal)
+                        if !state
+                            .participation
+                            .accepts_height(proposal.height().as_u64()) => {}
                     Ok(proposal) if !state.shard_validator.is_expected_proposer(&proposal) => {
                         // No reply, so consensus never sees this proposal: it keeps the first
                         // validity recorded for a value id.
@@ -275,6 +289,14 @@ impl Host {
                 let commits = Commits::from_commit_certificate(&certificate);
                 //commit
                 state.shard_validator.decide(commits.clone()).await;
+                state
+                    .participation
+                    .advance_to(certificate.height.increment().as_u64());
+                state.statsd.gauge_with_shard(
+                    certificate.height.shard_index,
+                    "consensus.participating",
+                    u64::from(state.participation.is_active()),
+                );
 
                 let proposal = proposed_value.proposal();
                 let decided_value = if let Some(block) = proposal.block(commits.clone()) {

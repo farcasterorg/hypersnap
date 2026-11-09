@@ -14,8 +14,11 @@ use informalsystems_malachitebft_sync::{self as sync, RawMessage};
 use libp2p::request_response;
 use ractor::{Actor, ActorProcessingErr, ActorRef};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, trace};
+
+use super::participation::Participation;
 
 pub type MalachiteNetworkActorMsg = Msg<SnapchainValidatorContext>;
 pub type MalachiteNetworkEvent = Event;
@@ -32,6 +35,7 @@ pub struct NetworkConnectorState {
     gossip_tx: mpsc::Sender<GossipEvent<SnapchainValidatorContext>>,
     statsd: StatsdClientWrapper,
     sync_peers: Option<HashSet<MalachitePeerId>>,
+    participation: Option<Arc<Participation>>,
 }
 
 pub struct NetworkConnectorArgs {
@@ -41,6 +45,7 @@ pub struct NetworkConnectorArgs {
     /// Peers whose statuses are passed to sync, which only requests values from peers it has a
     /// status for. `None` passes every peer's status.
     pub sync_peers: Option<HashSet<MalachitePeerId>>,
+    pub participation: Option<Arc<Participation>>,
 }
 
 impl<Codec> MalachiteNetworkConnector<Codec>
@@ -82,6 +87,7 @@ where
             peer_id: args.peer_id,
             statsd: args.statsd,
             sync_peers: args.sync_peers,
+            participation: args.participation,
         })
     }
 
@@ -107,6 +113,7 @@ where
             statsd,
             peer_id: _,
             sync_peers,
+            participation,
         } = state;
 
         match msg {
@@ -196,6 +203,9 @@ where
             }
 
             Msg::NewEvent(Event::Message(Channel::Consensus, from, data)) => {
+                if participation.as_ref().is_some_and(|p| !p.is_active()) {
+                    return Ok(());
+                }
                 let msg = match self.codec.decode(data) {
                     Ok(msg) => msg,
                     Err(e) => {
@@ -203,6 +213,17 @@ where
                         return Ok(());
                     }
                 };
+
+                let height = match &msg {
+                    SignedConsensusMsg::Vote(vote) => vote.message.height,
+                    SignedConsensusMsg::Proposal(proposal) => proposal.message.height,
+                };
+                if participation
+                    .as_ref()
+                    .is_some_and(|p| !p.accepts_height(height.block_number))
+                {
+                    return Ok(());
+                }
 
                 let event = match msg {
                     SignedConsensusMsg::Vote(vote) => NetworkEvent::Vote(from, vote),
@@ -216,6 +237,9 @@ where
             }
 
             Msg::NewEvent(Event::Message(Channel::ProposalParts, from, data)) => {
+                if participation.as_ref().is_some_and(|p| !p.is_active()) {
+                    return Ok(());
+                }
                 debug!("Received proposal parts from network");
                 let msg: StreamMessage<<SnapchainValidatorContext as informalsystems_malachitebft_core_types::Context>::ProposalPart> = match self.codec.decode(data) {
                     Ok(stream_msg) => stream_msg,
@@ -224,6 +248,15 @@ where
                         return Ok(());
                     }
                 };
+
+                if participation.as_ref().is_some_and(|p| {
+                    !msg.content
+                        .as_data()
+                        .and_then(|proposal| proposal.height)
+                        .is_some_and(|height| p.accepts_height(height.block_number))
+                }) {
+                    return Ok(());
+                }
 
                 trace!(
                     %from,

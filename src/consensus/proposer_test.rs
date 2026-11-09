@@ -108,4 +108,68 @@ mod tests {
         assert_eq!(proposer.get_proposed_value(proposal.shard_hash()), None);
         assert_eq!(proposer.add_proposed_value(&proposal), Validity::Valid);
     }
+
+    #[tokio::test]
+    async fn test_rejected_live_proposal_does_not_throttle_synced_commit() {
+        use crate::consensus::consensus::ValidatorSetConfig;
+        use crate::consensus::validator::{ProposalSource, ShardValidator};
+        use crate::storage::db::RocksDB;
+        use crate::storage::store::node_local_state::LocalStateStore;
+        use informalsystems_malachitebft_core_types::Round;
+        use libp2p::identity::ed25519::Keypair;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let (proposer, synced, dir) = new_shard_proposer().await;
+        let key = Keypair::generate();
+        let address = Address(key.public().to_bytes());
+        let db = RocksDB::new(dir.path().join("local.db").to_str().unwrap());
+        db.open().unwrap();
+        let mut validator = ShardValidator::new(
+            address.clone(),
+            SnapchainShard::new(1),
+            vec![ValidatorSetConfig {
+                effective_at: 0,
+                validator_public_keys: vec![address.to_hex()],
+                shard_ids: vec![1],
+            }],
+            None,
+            Some(proposer),
+            LocalStateStore::new(Arc::new(db)),
+            test_helper::statsd_client(),
+        );
+        validator.start_round(Height::new(1, 1), Round::new(0), address);
+        assert!(validator
+            .add_proposed_value(&synced, ProposalSource::Sync)
+            .validity
+            .is_valid());
+
+        let mut ahead = synced.proposal().clone();
+        ahead.height = Some(Height::new(1, 100));
+        let Some(full_proposal::ProposedValue::Shard(chunk)) = &mut ahead.proposed_value else {
+            panic!("expected shard chunk");
+        };
+        let header = chunk.header.as_mut().unwrap();
+        header.height = ahead.height;
+        chunk.hash = shard_chunk_hash(header);
+        let ahead = WellFormedProposal::try_from(ahead).unwrap();
+        assert!(!validator
+            .add_proposed_value(&ahead, ProposalSource::Consensus)
+            .validity
+            .is_valid());
+
+        assert_eq!(
+            validator.next_height_delay(60_000),
+            Duration::ZERO,
+            "rejected live traffic must not add the normal block-time sleep to sync"
+        );
+        validator
+            .decide(Commits {
+                height: Some(Height::new(1, 1)),
+                value: Some(synced.shard_hash().clone()),
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(validator.get_current_height(), Height::new(1, 1));
+    }
 }

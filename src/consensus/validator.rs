@@ -287,7 +287,6 @@ impl ShardValidator {
         proposal_source: ProposalSource,
     ) -> ProposedValue<SnapchainValidatorContext> {
         let value = full_proposal.shard_hash().clone();
-        self.proposal_source = proposal_source;
         let proposal_shard = full_proposal.height().shard_index;
         let validity = if self.shard_id.shard_id() != proposal_shard {
             warn!(
@@ -303,6 +302,11 @@ impl ShardValidator {
         } else {
             panic!("No proposer set");
         };
+        // Rejected or ahead-of-tip gossip must not turn a synced commit into a
+        // live commit: that would add the normal block-time sleep during catch-up.
+        if validity.is_valid() {
+            self.proposal_source = proposal_source;
+        }
 
         ProposedValue {
             height: full_proposal.height(),

@@ -2764,6 +2764,54 @@ async fn test_validator_set_rotation() {
     );
 }
 
+/// A future validator catches up through certified sync while the old set is
+/// active, then produces the first block of its own set without restarting.
+#[tokio::test]
+#[serial]
+async fn test_future_validator_syncs_then_activates_without_restart() {
+    let rotation_height = 20;
+    let mut network = TestNetwork::create_with_validator_sets(
+        4,
+        1,
+        vec![
+            ValidatorSetConfig {
+                effective_at: 0,
+                validator_public_keys: vec!["idx:0".into(), "idx:1".into(), "idx:2".into()],
+                shard_ids: vec![1],
+            },
+            ValidatorSetConfig {
+                effective_at: rotation_height,
+                validator_public_keys: vec!["idx:3".into()],
+                shard_ids: vec![1],
+            },
+        ],
+    )
+    .await;
+    network.enable_all_to_all_direct_peers();
+    network.start_validators().await;
+    network
+        .wait_for_shard_chunk(1, (rotation_height + 5) as usize)
+        .await
+        .expect("future validator failed to sync or activate");
+
+    let future_key = network.keypairs[3].public().to_bytes().to_vec();
+    let stores = &network
+        .first_live_node()
+        .shard_stores()
+        .get(&1)
+        .unwrap()
+        .shard_store;
+    for height in 1..=rotation_height + 5 {
+        let chunk = stores.get_chunk_by_height(height).unwrap().unwrap();
+        let signatures = &chunk.commits.as_ref().unwrap().signatures;
+        assert_eq!(
+            signatures.iter().any(|s| s.signer == future_key),
+            height >= rotation_height,
+            "incorrect participation at height {height}"
+        );
+    }
+}
+
 /// HTTP server end-to-end: stand up the production HTTP layer (axum/hyper +
 /// `start_http_server` helper) on top of a small validator network, then drive
 /// it with `reqwest`. Exercises the Tokio `TcpListener` path that the in-process

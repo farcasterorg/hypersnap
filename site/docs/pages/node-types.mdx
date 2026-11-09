@@ -7,6 +7,9 @@ its configured message shards:
 - A **validator** has a key listed in a scheduled validator set. It starts consensus
   actors immediately, including when its membership begins at a future fork height.
   It proposes and votes only at heights where its key is in the active set.
+  Before that, it catches up through certified block sync and ignores live votes
+  and proposals. Live consensus processing starts when its next local block is
+  covered by its membership; remote heights cannot activate it early.
 - A **read node** has no scheduled validator membership. It follows the chain,
   stores the full state and serves the HTTP and gRPC APIs. Anyone can run one.
 

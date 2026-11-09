@@ -1,5 +1,6 @@
 mod host;
 pub mod network_connector;
+pub mod participation;
 pub mod read_host;
 pub mod read_sync;
 pub mod snapchain_codec;
