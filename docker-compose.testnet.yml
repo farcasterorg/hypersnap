@@ -20,7 +20,7 @@ services:
         http_address="0.0.0.0:3381"
         rocksdb_dir=".rocks.testnet"
         fc_network="Testnet"
-        read_node = true
+        # Role is inferred from the consensus key and validator schedule.
 
         [statsd]
         prefix="snapchain"

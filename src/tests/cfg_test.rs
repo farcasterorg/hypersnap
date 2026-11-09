@@ -315,40 +315,95 @@ mod tests {
         })
     }
 
-    /// Contract test for `fc config pull`'s read_node handling
-    /// (`cli/src/config_pull.rs::effective_read_node` mirrors these exact
-    /// semantics): the env overlay wins over the file, and figment parses the
-    /// value strictly — exactly "true"/"false", anything else aborts config
-    /// loading. If a figment upgrade loosens or changes this, fc's mirror
-    /// must follow.
+    fn scheduled_validator_config(scheduled: bool) -> String {
+        let consensus = crate::consensus::consensus::Config::default();
+        let public_key = if scheduled {
+            consensus.keypair().public().to_bytes()
+        } else {
+            crate::consensus::consensus::Config::default()
+                .keypair()
+                .public()
+                .to_bytes()
+        };
+        format!(
+            r#"
+            [consensus]
+            private_key = "{}"
+            shard_ids = [1, 2]
+            [[consensus.validator_sets]]
+            effective_at = 50_000_000
+            shard_ids = [2]
+            validator_public_keys = ["{}"]
+            "#,
+            consensus.private_key,
+            hex::encode(public_key),
+        )
+    }
+
     #[test]
     #[serial]
-    fn read_node_env_overlay_is_strict() {
+    fn role_is_inferred_even_with_legacy_read_node_settings() {
+        for scheduled in [false, true] {
+            for file_setting in ["", "read_node = true", "read_node = false"] {
+                for env_setting in [None, Some("true"), Some("false")] {
+                    run_test(
+                        vec![
+                            match env_setting {
+                                Some(value) => set("SNAPCHAIN_READ_NODE", value),
+                                None => clr("SNAPCHAIN_READ_NODE"),
+                            },
+                            clr("SNAPCHAIN_FORCE_READ_NODE"),
+                        ],
+                        || {
+                            let (_tmpdir, file_path) = write_config_file(&format!(
+                                "{file_setting}\n{}",
+                                scheduled_validator_config(scheduled)
+                            ));
+                            let config = load_and_merge_config(vec![
+                                "test_binary".to_string(),
+                                "--config-path".to_string(),
+                                file_path,
+                            ])
+                            .unwrap();
+                            assert_eq!(config.is_read_node(), !scheduled);
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn force_read_node_env_overlay_is_strict() {
         let load = |env_val: Option<&str>| {
             let envs = match env_val {
-                Some(v) => vec![set("SNAPCHAIN_READ_NODE", v)],
-                None => vec![clr("SNAPCHAIN_READ_NODE")],
+                Some(v) => vec![set("SNAPCHAIN_FORCE_READ_NODE", v)],
+                None => vec![clr("SNAPCHAIN_FORCE_READ_NODE")],
             };
             let mut result = None;
             run_test(envs, || {
-                let (_tmpdir, file_path) = write_config_file(r#"read_node = true"#);
+                let (_tmpdir, file_path) = write_config_file(&format!(
+                    "force_read_node = true\n{}",
+                    scheduled_validator_config(true)
+                ));
                 let args = vec![
                     "test_binary".to_string(),
                     "--config-path".to_string(),
                     file_path,
                 ];
-                result = Some(load_and_merge_config(args).map(|c| c.read_node));
+                result = Some(load_and_merge_config(args).map(|c| c.is_read_node()));
             });
             result.unwrap()
         };
 
-        assert_eq!(load(None).unwrap(), true); // file alone decides
+        assert_eq!(load(None).unwrap(), true); // explicit opt-out in the file
         assert_eq!(load(Some("true")).unwrap(), true);
         assert_eq!(load(Some("false")).unwrap(), false); // env beats file
         for bad in ["TRUE", "True", "1", "0", "yes", ""] {
             assert!(
                 load(Some(bad)).is_err(),
-                "loader unexpectedly accepted SNAPCHAIN_READ_NODE={bad:?}"
+                "loader unexpectedly accepted SNAPCHAIN_FORCE_READ_NODE={bad:?}"
             );
         }
     }

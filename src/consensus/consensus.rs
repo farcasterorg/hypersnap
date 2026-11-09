@@ -119,6 +119,28 @@ impl Config {
         panic!("No validator configuration provided")
     }
 
+    /// Start consensus actors for keys with any scheduled membership on a shard
+    /// this node serves. Shard 0 is always served. Include future sets so the
+    /// actors are ready at activation, and history so replay works across a
+    /// validator's removal. Consensus still gates votes by membership at each height.
+    pub fn is_scheduled_validator(&self) -> bool {
+        let public_key = self.keypair().public().to_bytes();
+        let matches_key =
+            |encoded: &String| hex::decode(encoded).is_ok_and(|key| key.as_slice() == public_key);
+        if let Some(sets) = &self.validator_sets {
+            sets.iter().any(|set| {
+                set.shard_ids
+                    .iter()
+                    .any(|shard| *shard == 0 || self.shard_ids.contains(shard))
+                    && set.validator_public_keys.iter().any(matches_key)
+            })
+        } else {
+            self.validator_addresses
+                .as_ref()
+                .is_some_and(|keys| keys.iter().any(matches_key))
+        }
+    }
+
     /// Public keys (hex) of the most recent validator set for every shard the
     /// config governs, unioned. This is the "current + about-to-be" validator
     /// set across all shards — used to classify validator peers in the mesh view
@@ -190,6 +212,59 @@ mod tests {
             validator_public_keys: keys.iter().map(|k| k.to_string()).collect(),
             shard_ids,
         }
+    }
+
+    #[test]
+    fn scheduled_validator_role_includes_current_future_and_historical_membership() {
+        let config = Config::default();
+        let local_key = hex::encode(config.keypair().public().to_bytes());
+        let other_key = hex::encode(Config::default().keypair().public().to_bytes());
+        for height in [0, 100, 50_000_000] {
+            let config = config.with(
+                vec![1, 2],
+                vec![
+                    vset(0, vec![0, 1, 2], &[&other_key]),
+                    vset(height, vec![2], &[&local_key]),
+                    vset(height + 100, vec![2], &[&other_key]),
+                ],
+            );
+            assert!(config.is_scheduled_validator());
+        }
+    }
+
+    #[test]
+    fn scheduled_validator_role_requires_local_key_on_a_served_shard() {
+        let config = Config::default();
+        let local_key = hex::encode(config.keypair().public().to_bytes());
+        let other_key = hex::encode(Config::default().keypair().public().to_bytes());
+        assert!(!config
+            .with(vec![1], vec![vset(0, vec![0, 1], &[&other_key])])
+            .is_scheduled_validator());
+        assert!(!config
+            .with(vec![1], vec![vset(100, vec![2], &[&local_key])])
+            .is_scheduled_validator());
+        // Both node types create shard 0 even though it is absent from shard_ids.
+        assert!(config
+            .with(vec![1], vec![vset(100, vec![0], &[&local_key])])
+            .is_scheduled_validator());
+        assert!(config
+            .with(
+                vec![1],
+                vec![vset(100, vec![1], &[&local_key.to_uppercase()])]
+            )
+            .is_scheduled_validator());
+    }
+
+    #[test]
+    fn scheduled_validator_role_supports_legacy_addresses() {
+        let mut config = Config::default();
+        assert!(!config.is_scheduled_validator());
+        let local_key = hex::encode(config.keypair().public().to_bytes());
+        config.validator_addresses = Some(vec![local_key]);
+        assert!(config.is_scheduled_validator());
+        // As with get_validator_set_config, explicit sets take precedence.
+        config.validator_sets = Some(vec![vset(0, vec![0, 1], &[])]);
+        assert!(!config.is_scheduled_validator());
     }
 
     #[test]

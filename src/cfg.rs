@@ -110,7 +110,9 @@ pub struct Config {
     pub statsd: StatsdConfig,
     pub l1_rpc_url: String,
     pub fc_network: FarcasterNetwork,
-    pub read_node: bool,
+    /// Keep a scheduled validator passive. Otherwise the role is inferred from
+    /// the local consensus key and validator schedules, including future sets.
+    pub force_read_node: bool,
     pub pruning: PruningConfig,
     pub http_server: http_server::Config,
     pub mesh: network::mesh::config::Config,
@@ -143,7 +145,7 @@ impl Default for Config {
             l1_rpc_url: "".to_string(),
             fc_network: FarcasterNetwork::Devnet,
             snapshot: storage::db::snapshot::Config::default(),
-            read_node: false,
+            force_read_node: false,
             pruning: PruningConfig::default(),
             http_server: http_server::Config::default(),
             mesh: network::mesh::config::Config::default(),
@@ -151,6 +153,12 @@ impl Default for Config {
             block_receiver: block_receiver::Config::default(),
             api: api::ApiConfig::default(),
         }
+    }
+}
+
+impl Config {
+    pub fn is_read_node(&self) -> bool {
+        self.force_read_node || !self.consensus.is_scheduled_validator()
     }
 }
 

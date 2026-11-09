@@ -1,9 +1,25 @@
 # Validators vs. read nodes
 
-Every Snapchain node runs the same binary. The `read_node` config flag decides which role it plays:
+Every Hypersnap node runs the same binary. At startup it infers its role from
+`consensus.private_key` and the configured validator schedules for shard 0 and
+its configured message shards:
 
-- A **validator** (`read_node = false`) proposes blocks and votes on them. Only nodes whose keys are in the validator set can do this.
-- A **read node** (`read_node = true`) follows the chain, stores the full state and serves the HTTP and gRPC APIs. Anyone can run one, and it is what [`snapchain.sh`](/guides/managing-a-node) installs.
+- A **validator** has a key listed in a scheduled validator set. It starts consensus
+  actors immediately, including when its membership begins at a future fork height.
+  It proposes and votes only at heights where its key is in the active set.
+- A **read node** has no scheduled validator membership. It follows the chain,
+  stores the full state and serves the HTTP and gRPC APIs. Anyone can run one.
+
+The schedule includes historical sets so a validator can replay blocks from before
+its removal. To deliberately keep a scheduled validator passive, set the top-level
+`force_read_node = true` (or `SNAPCHAIN_FORCE_READ_NODE=true`). Otherwise no role flag
+is needed. Legacy `read_node` and `SNAPCHAIN_READ_NODE` settings are ignored, so old
+read-node configs cannot prevent a scheduled validator from activating.
+
+Load the complete validator schedule and the matching consensus private key before
+cutover. Role selection happens at startup; restart after changing the key,
+schedule, served shards, or override. A node already started with consensus actors
+begins voting at each shard's activation height without another restart.
 
 Most of the differences below come from that split. They matter when you move a node between roles, when you read metrics or logs from both kinds side by side, or when you debug why a message submitted to one node never shows up on another.
 

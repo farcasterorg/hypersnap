@@ -373,7 +373,7 @@ async fn schedule_background_jobs(
 ) {
     let sched = JobScheduler::new().await.unwrap();
     let mut jobs = vec![];
-    if app_config.read_node {
+    if app_config.is_read_node() {
         if let Some(block_retention) = app_config.pruning.block_retention {
             let schedule = "0 0 10 * * *"; // 10am UTC every day
             let job = snapchain::jobs::block_pruning::block_pruning_job(
@@ -771,6 +771,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     };
 
     let keypair = app_config.consensus.keypair().clone();
+    let read_node = app_config.is_read_node();
 
     let (system_tx, mut system_rx) = mpsc::channel::<SystemMessage>(16384);
     let (mempool_tx, mempool_rx) = mpsc::channel(app_config.mempool.queue_size as usize);
@@ -785,7 +786,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         keypair.clone(),
         &app_config.gossip,
         Some(system_tx.clone()),
-        app_config.read_node,
+        read_node,
         app_config.fc_network,
         statsd_client.clone(),
         node_capabilities,
@@ -810,11 +811,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     .collect();
     gossip.set_validator_peers(validator_peers);
     let local_peer_id = gossip.swarm.local_peer_id().clone();
-    let read_or_validator = if app_config.read_node {
-        "read"
-    } else {
-        "validator"
-    };
+    let read_or_validator = if read_node { "read" } else { "validator" };
     info!(
         "Starting Snapchain {} node with public key: {} ({})",
         read_or_validator,
@@ -864,7 +861,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     );
     let local_state_store = LocalStateStore::new(global_db);
 
-    if app_config.read_node {
+    if read_node {
         // Setup post-commit channel if replication is enabled
         let (engine_post_commit_tx, engine_post_commit_rx) = if app_config.replication.enable {
             // TODO: consider increasing the buffer size to prevent blocking across multiple shards
