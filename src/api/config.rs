@@ -332,6 +332,8 @@ pub struct FeedConfig {
     pub enabled: bool,
 
     /// Maximum number of users to fetch casts from for following feed.
+    /// Follows are read in FID order, so anyone followed past this cap
+    /// (the newest accounts) never shows up in the feed.
     #[serde(default = "default_max_following_fetch")]
     pub max_following_fetch: usize,
 
@@ -360,7 +362,7 @@ fn default_trending_cache_ttl_secs() -> u64 {
 }
 
 fn default_max_following_fetch() -> usize {
-    1000
+    10_000
 }
 
 fn default_feed_page_size() -> usize {

@@ -354,31 +354,46 @@ pub fn get_messages_page_by_prefix<F>(
 where
     F: Fn(&MessageProto) -> bool,
 {
+    get_messages_page_by_range(
+        db,
+        prefix.to_vec(),
+        increment_vec_u8(&prefix.to_vec()),
+        page_options,
+        filter,
+    )
+}
+
+/// Like `get_messages_page_by_prefix`, over the keys in `[start, stop)`.
+pub fn get_messages_page_by_range<F>(
+    db: &RocksDB,
+    start: Vec<u8>,
+    stop: Vec<u8>,
+    page_options: &PageOptions,
+    filter: F,
+) -> Result<MessagesPage, HubError>
+where
+    F: Fn(&MessageProto) -> bool,
+{
     let mut messages = Vec::new();
     let mut last_key = vec![];
 
-    db.for_each_iterator_by_prefix(
-        Some(prefix.to_vec()),
-        Some(increment_vec_u8(&prefix.to_vec())),
-        page_options,
-        |key, value| {
-            match message_decode(value) {
-                Ok(message) => {
-                    if filter(&message) {
-                        messages.push(message);
+    db.for_each_iterator_by_prefix(Some(start), Some(stop), page_options, |key, value| {
+        match message_decode(value) {
+            Ok(message) => {
+                if filter(&message) {
+                    messages.push(message);
 
-                        if messages.len() >= page_options.page_size.unwrap_or(PAGE_SIZE_MAX) {
-                            last_key = key.to_vec();
-                            return Ok(true); // Stop iterating
-                        }
+                    if messages.len() >= page_options.page_size.unwrap_or(PAGE_SIZE_MAX) {
+                        last_key = key.to_vec();
+                        return Ok(true); // Stop iterating
                     }
-
-                    Ok(false) // Continue iterating
                 }
-                Err(e) => Err(HubError::from(e)),
+
+                Ok(false) // Continue iterating
             }
-        },
-    )?;
+            Err(e) => Err(HubError::from(e)),
+        }
+    })?;
 
     let next_page_token = if !last_key.is_empty() {
         Some(last_key.to_vec())
