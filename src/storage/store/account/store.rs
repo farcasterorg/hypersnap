@@ -1,9 +1,9 @@
 use super::{
     super::super::util::{bytes_compare, vec_to_u8_24},
     delete_message_transaction_with_prefix, get_from_db_or_txn, get_message_with_prefix,
-    get_messages_page_by_prefix, is_message_in_time_range, make_message_primary_key_with_prefix,
-    make_ts_hash, message_decode, message_encode, put_message_transaction_with_prefix,
-    MessagesPage, StoreEventHandler, TS_HASH_LENGTH,
+    get_messages_page_by_prefix, get_messages_page_by_range, is_message_in_time_range,
+    make_message_primary_key_with_prefix, make_ts_hash, message_decode, message_encode,
+    put_message_transaction_with_prefix, MessagesPage, StoreEventHandler, TS_HASH_LENGTH,
 };
 use crate::core::error::HubError;
 use crate::core::message::HubEventExt;
@@ -1453,12 +1453,29 @@ impl<T: StoreDef + Clone> Store<T> {
             self.store_def.postfix(),
             None,
         );
-        let messages = get_messages_page_by_prefix(&self.db, &prefix, &page_options, |message| {
-            is_message_in_time_range(start_time, stop_time, message)
-                && (self.store_def.is_add_type(&message)
-                    || (self.store_def.remove_type_supported()
-                        && self.store_def.is_remove_type(&message)))
-        })?;
+        // Keys end in the big-endian timestamp and hash, so the time range is
+        // a key range: seek to it instead of decoding the whole history.
+        let start = match start_time {
+            Some(t) => [prefix.as_slice(), &t.to_be_bytes()].concat(),
+            None => prefix.clone(),
+        };
+        let stop = match stop_time {
+            Some(t) if t < u32::MAX => [prefix.as_slice(), &(t + 1).to_be_bytes()].concat(),
+            _ => increment_vec_u8(&prefix),
+        };
+        if start >= stop {
+            return Ok(MessagesPage {
+                messages: vec![],
+                next_page_token: None,
+            });
+        }
+        let messages =
+            get_messages_page_by_range(&self.db, start, stop, &page_options, |message| {
+                is_message_in_time_range(start_time, stop_time, message)
+                    && (self.store_def.is_add_type(&message)
+                        || (self.store_def.remove_type_supported()
+                            && self.store_def.is_remove_type(&message)))
+            })?;
 
         Ok(messages)
     }

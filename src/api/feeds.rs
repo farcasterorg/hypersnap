@@ -21,7 +21,7 @@ use crate::api::social_graph::SocialGraphIndexer;
 use crate::proto::{self, Message};
 use async_trait::async_trait;
 use serde::Serialize;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -238,7 +238,8 @@ impl TimestampedCast {
                 recaster: None,
             }),
             Some(proto::message_data::Body::ReactionBody(body))
-                if body.r#type == proto::ReactionType::Recast as i32 =>
+                if data.r#type == proto::MessageType::ReactionAdd as i32
+                    && body.r#type == proto::ReactionType::Recast as i32 =>
             {
                 let Some(proto::reaction_body::Target::TargetCastId(target)) = &body.target else {
                     return None;
@@ -269,6 +270,181 @@ fn take_newest(heap: &mut BinaryHeap<TimestampedCast>, limit: usize) -> Vec<Time
         }
     }
     entries
+}
+
+/// What a following feed read returns for one followed account.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum FollowedKind {
+    Casts,
+    Recasts,
+}
+
+/// Followed accounts one task reads one after another.
+const FOLLOWED_PER_TASK: usize = 64;
+
+/// The newest `n` casts or recasts each of `fids` made between `start` and
+/// `stop` (inclusive), read in parallel tasks.
+async fn read_followed<R, Fut>(
+    fids: &[u64],
+    read: &R,
+    kind: FollowedKind,
+    start: Option<u32>,
+    stop: u32,
+    n: usize,
+) -> Vec<Vec<TimestampedCast>>
+where
+    R: Fn(u64, FollowedKind, Option<u32>, u32, usize) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = Vec<TimestampedCast>> + Send,
+{
+    let tasks: Vec<_> = fids
+        .chunks(FOLLOWED_PER_TASK)
+        .map(|chunk| {
+            let (chunk, read) = (chunk.to_vec(), read.clone());
+            tokio::spawn(async move {
+                let mut out = Vec::with_capacity(chunk.len());
+                for fid in chunk {
+                    out.push(read(fid, kind, start, stop, n).await);
+                }
+                out
+            })
+        })
+        .collect();
+    let mut out = Vec::with_capacity(fids.len());
+    for task in tasks {
+        out.extend(task.await.unwrap_or_default());
+    }
+    out
+}
+
+/// The newest `limit` casts `following` made at or before `stop`.
+///
+/// A k-way merge: it reads each account's newest cast, then reads further
+/// into an account only when its casts reach the top, doubling the read each
+/// time. That is about one read per account plus two per page entry, however
+/// many casts each account has.
+async fn newest_casts<R, Fut>(
+    following: &[u64],
+    stop: u32,
+    limit: usize,
+    read: &R,
+) -> Vec<TimestampedCast>
+where
+    R: Fn(u64, FollowedKind, Option<u32>, u32, usize) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = Vec<TimestampedCast>> + Send,
+{
+    // Per account: casts read so far, those not merged yet, and whether
+    // it has no more
+    let mut sources: HashMap<u64, (usize, VecDeque<TimestampedCast>, bool)> = HashMap::new();
+    let mut heap = BinaryHeap::new();
+    let heads = read_followed(following, read, FollowedKind::Casts, None, stop, 1).await;
+    for (&fid, head) in following.iter().zip(heads) {
+        if let Some(cast) = head.into_iter().next() {
+            sources.insert(fid, (1, VecDeque::new(), false));
+            heap.push(cast);
+        }
+    }
+    let mut casts = Vec::with_capacity(limit);
+    while casts.len() < limit {
+        let Some(cast) = heap.pop() else { break };
+        let fid = cast.fid;
+        casts.push(cast);
+        let Some((read_so_far, unmerged, done)) = sources.get_mut(&fid) else {
+            continue;
+        };
+        if unmerged.is_empty() && !*done && casts.len() < limit {
+            let n = *read_so_far + (*read_so_far).min(limit - casts.len());
+            let more = read(fid, FollowedKind::Casts, None, stop, n).await;
+            *done = more.len() < n;
+            unmerged.extend(more.into_iter().skip(*read_so_far));
+            *read_so_far += unmerged.len();
+        }
+        if let Some(next) = unmerged.pop_front() {
+            heap.push(next);
+        }
+    }
+    casts
+}
+
+/// The newest `limit` following feed entries made at or before `stop`, and
+/// whether older ones may exist.
+///
+/// Casts come from `newest_casts`. When there is a full page of them, a
+/// recast older than the last one can't make the page, so recasts are read
+/// back only to it instead of through every like before it.
+async fn newest_followed<R, Fut>(
+    following: &[u64],
+    stop: u32,
+    limit: usize,
+    with_recasts: bool,
+    read: R,
+) -> (Vec<TimestampedCast>, bool)
+where
+    R: Fn(u64, FollowedKind, Option<u32>, u32, usize) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = Vec<TimestampedCast>> + Send,
+{
+    let mut entries = newest_casts(following, stop, limit, &read).await;
+    let full = entries.len() == limit;
+    if with_recasts {
+        let floor = match entries.last() {
+            Some(last) if entries.len() == limit => Some(last.timestamp),
+            _ => None,
+        };
+        let recasts = read_followed(following, &read, FollowedKind::Recasts, floor, stop, limit);
+        entries.extend(recasts.await.into_iter().flatten());
+    }
+    let mut heap = BinaryHeap::from(entries);
+    let newest = take_newest(&mut heap, limit);
+    let more = full || newest.len() == limit;
+    (newest, more)
+}
+
+/// The newest `n` casts or recasts `fid` made between `start` and `stop`
+/// (inclusive), read from the hub.
+async fn read_followed_newest<S>(
+    hub: Arc<S>,
+    fid: u64,
+    kind: FollowedKind,
+    start: Option<u32>,
+    stop: u32,
+    n: usize,
+) -> Vec<TimestampedCast>
+where
+    S: proto::hub_service_server::HubService,
+{
+    let mut out = Vec::with_capacity(n);
+    let mut page_token = None;
+    while out.len() < n {
+        let request = Request::new(proto::FidTimestampRequest {
+            fid,
+            // Removes and likes are read too; a recast is one reaction of many
+            page_size: Some(match kind {
+                FollowedKind::Casts => n.max(1) as u32,
+                FollowedKind::Recasts => 100,
+            }),
+            page_token,
+            reverse: Some(true),
+            start_timestamp: start.map(u64::from),
+            stop_timestamp: Some(u64::from(stop)),
+        });
+        let response = match kind {
+            FollowedKind::Casts => hub.get_all_cast_messages_by_fid(request).await,
+            FollowedKind::Recasts => hub.get_all_reaction_messages_by_fid(request).await,
+        };
+        let Ok(response) = response else { break };
+        let response = response.into_inner();
+        out.extend(
+            response
+                .messages
+                .into_iter()
+                .filter_map(TimestampedCast::from_message),
+        );
+        page_token = response.next_page_token;
+        if page_token.is_none() {
+            break;
+        }
+    }
+    out.truncate(n);
+    out
 }
 
 impl PartialEq for TimestampedCast {
@@ -636,9 +812,7 @@ where
             });
         }
 
-        // Fetch recent casts from followed users in parallel batches
         let limit = limit.min(100);
-        let mut heap: BinaryHeap<TimestampedCast> = BinaryHeap::new();
 
         // Cap timestamp to prevent forward-dated casts from dominating
         // Farcaster epoch = 2021-01-01, so max reasonable timestamp is ~10 years out
@@ -649,71 +823,27 @@ where
             - 1609459200) as u32;
         let max_timestamp = now_farcaster + 60; // Allow 60s clock skew, no more
 
-        let following_fids: Vec<u64> = following
-            .into_iter()
-            .take(self.config.max_following_fetch)
-            .collect();
-
-        // Fetch casts concurrently in chunks
-        let chunk_size = 50;
-        for chunk in following_fids.chunks(chunk_size) {
-            let mut handles = Vec::with_capacity(chunk.len());
-            for &followed_fid in chunk {
+        // The cursor is exclusive
+        let stop = match start_timestamp {
+            Some(0) => None,
+            Some(before) => Some((before - 1).min(max_timestamp)),
+            None => Some(max_timestamp),
+        };
+        let (newest, more) = match stop {
+            Some(stop) => {
                 let hub = self.hub_service.clone();
-                let ts = start_timestamp;
-                let lim = limit;
-                handles.push(tokio::spawn(async move {
-                    let request = proto::FidRequest {
-                        fid: followed_fid,
-                        page_size: Some(lim as u32),
-                        page_token: None,
-                        reverse: Some(true),
-                    };
-                    let mut messages = match hub.get_casts_by_fid(Request::new(request)).await {
-                        Ok(resp) => resp.into_inner().messages,
-                        Err(_) => vec![],
-                    };
-                    if with_recasts {
-                        let request = proto::ReactionsByFidRequest {
-                            fid: followed_fid,
-                            reaction_type: Some(proto::ReactionType::Recast as i32),
-                            page_size: Some(lim as u32),
-                            page_token: None,
-                            reverse: Some(true),
-                        };
-                        if let Ok(resp) = hub.get_reactions_by_fid(Request::new(request)).await {
-                            messages.extend(resp.into_inner().messages);
-                        }
-                    }
-                    if let Some(before) = ts {
-                        messages.retain(|m| {
-                            m.data
-                                .as_ref()
-                                .map(|d| d.timestamp < before)
-                                .unwrap_or(false)
-                        });
-                    }
-                    messages
-                }));
+                let read = move |fid, kind, start, stop, n| {
+                    read_followed_newest(hub.clone(), fid, kind, start, stop, n)
+                };
+                newest_followed(&following, stop, limit, with_recasts, read).await
             }
-            for handle in handles {
-                if let Ok(messages) = handle.await {
-                    heap.extend(
-                        messages
-                            .into_iter()
-                            .filter_map(TimestampedCast::from_message)
-                            // Skip forward-dated casts
-                            .filter(|tc| tc.timestamp <= max_timestamp),
-                    );
-                }
-            }
-        }
+            None => (vec![], false),
+        };
 
-        // Extract top N items
         let mut items = Vec::with_capacity(limit);
         let mut last_timestamp = None;
 
-        for tc in take_newest(&mut heap, limit) {
+        for tc in newest {
             last_timestamp = Some(tc.timestamp);
 
             // A recast carries the reaction; show the cast it points at
@@ -739,11 +869,10 @@ where
             });
         }
 
-        // Generate next cursor if there are more items
-        let next_cursor = if heap.is_empty() {
-            None
-        } else {
+        let next_cursor = if more {
             last_timestamp.map(|ts| ts.to_string())
+        } else {
+            None
         };
 
         Ok(FeedResponse {
@@ -965,7 +1094,167 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn feed_message(
+        fid: u64,
+        timestamp: u32,
+        r#type: proto::MessageType,
+        body: proto::message_data::Body,
+        hash: Vec<u8>,
+    ) -> Message {
+        Message {
+            data: Some(proto::MessageData {
+                fid,
+                timestamp,
+                r#type: r#type as i32,
+                body: Some(body),
+                ..Default::default()
+            }),
+            hash,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn following_feed_pages_match_a_full_merge() {
+        use proto::message_data::Body;
+        use proto::MessageType::{CastAdd, CastRemove, ReactionAdd, ReactionRemove};
+        let mut rng = StdRng::seed_from_u64(7);
+        let following: Vec<u64> = (1..=40).collect();
+        // Unique timestamps, so the expected order has no ties
+        let mut times: Vec<u32> = (1..=6000).collect();
+        times.shuffle(&mut rng);
+        let mut times = times.into_iter();
+        let mut casts: HashMap<u64, Vec<Message>> = HashMap::new();
+        let mut reactions: HashMap<u64, Vec<Message>> = HashMap::new();
+        let mut targets = vec![];
+        for (i, &fid) in following.iter().enumerate() {
+            // A few prolific accounts, many quiet ones, some silent
+            let n = [0, 1, 3, 8, 120][i % 5];
+            for _ in 0..n {
+                let hash = rng.gen::<[u8; 20]>().to_vec();
+                targets.push(proto::CastId {
+                    fid,
+                    hash: hash.clone(),
+                });
+                let body = Body::CastAddBody(Default::default());
+                let cast = feed_message(fid, times.next().unwrap(), CastAdd, body, hash);
+                casts.entry(fid).or_default().push(cast);
+            }
+            let body = Body::CastRemoveBody(Default::default());
+            let remove = feed_message(fid, times.next().unwrap(), CastRemove, body, vec![0; 20]);
+            casts.entry(fid).or_default().push(remove);
+        }
+        for &fid in &following {
+            for _ in 0..rng.gen_range(0..150) {
+                let (r#type, kind) = match rng.gen_range(0..10) {
+                    0 => (ReactionAdd, proto::ReactionType::Recast),
+                    1 => (ReactionRemove, proto::ReactionType::Recast),
+                    _ => (ReactionAdd, proto::ReactionType::Like),
+                };
+                let body = Body::ReactionBody(proto::ReactionBody {
+                    r#type: kind as i32,
+                    target: Some(proto::reaction_body::Target::TargetCastId(
+                        targets.choose(&mut rng).unwrap().clone(),
+                    )),
+                });
+                let hash = rng.gen::<[u8; 20]>().to_vec();
+                let reaction = feed_message(fid, times.next().unwrap(), r#type, body, hash);
+                reactions.entry(fid).or_default().push(reaction);
+            }
+        }
+        let data = Arc::new((casts, reactions));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let entries = |messages: Option<&Vec<Message>>, start: Option<u32>, stop: u32| {
+            let mut entries: Vec<TimestampedCast> = messages
+                .into_iter()
+                .flatten()
+                .filter(|m| {
+                    let ts = m.data.as_ref().unwrap().timestamp;
+                    start.map_or(true, |s| ts >= s) && ts <= stop
+                })
+                .cloned()
+                .filter_map(TimestampedCast::from_message)
+                .collect();
+            entries.sort_by(|a, b| b.cmp(a));
+            entries
+        };
+        let read = {
+            let (data, reads) = (data.clone(), reads.clone());
+            move |fid, kind, start, stop, n| {
+                let (data, reads) = (data.clone(), reads.clone());
+                async move {
+                    let (casts, reactions) = &*data;
+                    let messages = match kind {
+                        FollowedKind::Casts => casts.get(&fid),
+                        FollowedKind::Recasts => reactions.get(&fid),
+                    };
+                    let mut out = entries(messages, start, stop);
+                    out.truncate(n);
+                    reads.fetch_add(out.len(), Ordering::Relaxed);
+                    out
+                }
+            }
+        };
+        let key = |e: &TimestampedCast| (e.timestamp, e.hash.clone(), e.recaster);
+        for with_recasts in [false, true] {
+            for limit in [1, 7, 25] {
+                let (casts, reactions) = &*data;
+                let mut stop = u32::MAX;
+                let mut pages = 0;
+                loop {
+                    let (page, more) =
+                        newest_followed(&following, stop, limit, with_recasts, read.clone()).await;
+                    let mut all: BinaryHeap<_> = following
+                        .iter()
+                        .flat_map(|fid| {
+                            let mut all = entries(casts.get(fid), None, stop);
+                            if with_recasts {
+                                all.extend(entries(reactions.get(fid), None, stop));
+                            }
+                            all
+                        })
+                        .collect();
+                    let expected = take_newest(&mut all, limit);
+                    assert_eq!(
+                        page.iter().map(key).collect::<Vec<_>>(),
+                        expected.iter().map(key).collect::<Vec<_>>(),
+                        "with_recasts {with_recasts}, limit {limit}, stop {stop}"
+                    );
+                    pages += 1;
+                    if !more {
+                        // Only older entries of casts already shown are left
+                        assert!(all.iter().all(|e| page.iter().any(|p| p.hash == e.hash)));
+                        break;
+                    }
+                    stop = page.last().unwrap().timestamp - 1;
+                }
+                assert!(pages > 3);
+            }
+        }
+        // Casts alone: one read per account, then a few per page entry
+        reads.store(0, Ordering::Relaxed);
+        newest_followed(&following, u32::MAX, 25, false, read.clone()).await;
+        let cast_reads = reads.load(Ordering::Relaxed);
+        assert!(cast_reads <= following.len() + 4 * 25, "{cast_reads}");
+        // Reading 25 casts and 25 recasts from every account, as the feed
+        // used to, decodes far more than the heads plus the page's window
+        let (casts, reactions) = &*data;
+        let page_from_each: usize = following
+            .iter()
+            .map(|fid| {
+                let casts = entries(casts.get(fid), None, u32::MAX).len().min(25);
+                casts + entries(reactions.get(fid), None, u32::MAX).len().min(25)
+            })
+            .sum();
+        reads.store(0, Ordering::Relaxed);
+        newest_followed(&following, u32::MAX, 25, true, read.clone()).await;
+        let reads = reads.load(Ordering::Relaxed);
+        eprintln!("read {cast_reads} casts alone, {reads} with recasts; a page from each account is {page_from_each}");
+        assert!(reads * 3 < page_from_each);
+    }
 
     fn test_ranking(signers: &[(u64, u8)]) -> TrendingRanking {
         Arc::new(RankedCasts::new(
