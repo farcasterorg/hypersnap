@@ -45,8 +45,9 @@ shuttle never silently jumps past a gap.
 ## Fork boundary
 
 Hypersnap's `[gossip.topic_cutovers]` in `validators.toml` sets the same per-shard
-boundaries as the new validator sets: shard 0 at 50,433,538; shard 1 at 51,119,199;
-shard 2 at 50,954,121. Copy those values into the shuttle's `[topic_cutovers]`.
+boundaries as the new validator sets: shard 0 at 50,477,529; shard 1 at 51,161,786;
+shard 2 at 50,996,940. These target approximately 2026-11-12 20:52:39 UTC, based
+on the observed block rates. Copy the heights into the shuttle's `[topic_cutovers]`.
 
 Votes and proposals use their block height. Decided values use their committed
 height. Status messages announce the next height after their committed tip.
@@ -61,6 +62,12 @@ phase before forwarding, and retire legacy subscriptions once all shards cross.
 Only local outbound heights advance the node's mempool/discovery phase; remote
 status messages cannot trigger an early switch. Mainnet without a configured
 schedule retains legacy topics, so custom configurations must include the schedule.
+
+A lagging node still accepts legacy Snapchain status announcements above its
+fork boundary so it can find the last shared blocks. The height passed to local
+sync is capped at the last pre-fork block; this exception ends when that local
+shard reaches the fork. Blocks, proposals and votes keep their height-based
+topic checks throughout.
 
 Configure Hypersnap validators to connect to one another before the cutoffs
 (using `gossip.bootstrap_peers` or `gossip.direct_peers` with their advertised

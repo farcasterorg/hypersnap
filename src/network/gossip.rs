@@ -1073,10 +1073,13 @@ impl SnapchainGossip {
                             // under an uncontended `parking_lot::Mutex` (no poisoning,
                             // no thread parking, won't block the tokio executor).
                             let blocked = self.peer_blocklist.lock().contains(&peer_id);
-                            let accepted = !blocked && self.topic_schedule.accepts(message.topic.as_str(), &message.data);
+                            let data = if blocked { None } else {
+                                self.topic_schedule.inbound(message.topic.as_str(), &message.data)
+                            };
+                            let accepted = data.is_some();
                             let acceptance = if accepted { gossipsub::MessageAcceptance::Accept } else { gossipsub::MessageAcceptance::Ignore };
                             self.swarm.behaviour_mut().gossipsub.report_message_validation_result(&_id, &peer_id, acceptance);
-                            if !accepted { continue; }
+                            let Some(data) = data else { continue; };
                             // Per-peer/per-topic gossip volume. `IdentTopic` uses
                             // identity hashing, so `topic.as_str()` is the human
                             // topic name (e.g. "consensus"). Cumulative — rates are
@@ -1089,7 +1092,6 @@ impl SnapchainGossip {
                             // Take an owned sender if present to avoid holding an immutable borrow during mutable self call
                             let maybe_sender = self.system_tx.as_ref().cloned();
                             if let Some(system_tx) = maybe_sender {
-                                let data = message.data.clone();
                                 if let Some(system_message) = self.map_gossip_bytes_to_system_message(peer_id, message.source, data) {
                                     if let Err(e) = system_tx.send(system_message).await {
                                         warn!("Failed to send system block message: {}", e);

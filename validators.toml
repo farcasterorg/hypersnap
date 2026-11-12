@@ -196,16 +196,15 @@ validator_public_keys = [
 # Initial Hypersnap fork: eight validators collected in issue #51.
 # Source: https://github.com/farcasterorg/hypersnap/issues/51
 # Includes haatz/cassie from the issue body and all seven comment submissions.
-# Grafana: http://85.237.203.140:3000/d/c158c14a-0b7f-4228-aefa-d913cae8db02/snapchain
-# Height snapshot: 2026-11-06 09:25:20 UTC; projected activation: 2026-11-12 09:25:20 UTC.
-# Rates measured over available history: 2026-11-06 04:27:00 UTC to 2026-11-06 09:08:00 UTC.
-# Postponed by three days so peers can prepare after consensus was lost.
-# Projection per shard: ceil(snapshot_height + observed_blocks_per_second * 518400).
+# Reference time: 2026-11-12 08:52:39 UTC; projected activation: 2026-11-12 20:52:39 UTC (12 hours later).
+# Source: upstream gRPC http://107.20.169.236:3383, sampled 2026-11-12 08:52:44 UTC.
+# Rates measured from each shard's last 3600 blocks (about one hour).
+# Projection per shard: ceil(snapshot_height + observed_blocks_per_second * (target_time - block_time)).
 # Activation time is an estimate; consensus activates at the exact heights below.
 
-# Shard 0: snapshot 49_923_111; observed rate 0.984618426255 blocks/second.
+# Shard 0: snapshot 50_434_679; observed rate 0.992008817856 blocks/second.
 [[consensus.validator_sets]]
-effective_at = 50_433_538
+effective_at = 50_477_529
 shard_ids = [ 0 ]
 validator_public_keys = [
   "ae46d4ae50bee1a9cf6d798ddddd1d7f54c8314eaf85ac0efa3bf685c9506119", # cassie (haatz.quilibrium.com)
@@ -218,9 +217,9 @@ validator_public_keys = [
   "22e82d8886c9c73fe8dd5b6c1df474100f5d9289e7352ea590361d23837074d0", # wake
 ]
 
-# Shard 2: snapshot 50_440_548; observed rate 0.990688018980 blocks/second.
+# Shard 2: snapshot 50_953_983; observed rate 0.994475138122 blocks/second.
 [[consensus.validator_sets]]
-effective_at = 50_954_121
+effective_at = 50_996_940
 shard_ids = [ 2 ]
 validator_public_keys = [
   "ae46d4ae50bee1a9cf6d798ddddd1d7f54c8314eaf85ac0efa3bf685c9506119", # cassie (haatz.quilibrium.com)
@@ -233,9 +232,9 @@ validator_public_keys = [
   "22e82d8886c9c73fe8dd5b6c1df474100f5d9289e7352ea590361d23837074d0", # wake
 ]
 
-# Shard 1: snapshot 50_605_339; observed rate 0.991241597470 blocks/second.
+# Shard 1: snapshot 51_118_805; observed rate 0.995024875622 blocks/second.
 [[consensus.validator_sets]]
-effective_at = 51_119_199
+effective_at = 51_161_786
 shard_ids = [ 1 ]
 validator_public_keys = [
   "ae46d4ae50bee1a9cf6d798ddddd1d7f54c8314eaf85ac0efa3bf685c9506119", # cassie (haatz.quilibrium.com)
@@ -250,13 +249,13 @@ validator_public_keys = [
 
 # Gossip follows the same per-shard fork boundary; pre-fork traffic stays on Snapchain topics.
 [gossip.topic_cutovers]
-"0" = 50_433_538
-"1" = 51_119_199
-"2" = 50_954_121
+"0" = 50_477_529
+"1" = 51_161_786
+"2" = 50_996_940
 
 # Native account registration activates with the new validator set on each shard.
 [consensus.native_registration.activation_heights]
-"0" = 50_433_538
-"1" = 51_119_199
-"2" = 50_954_121
+"0" = 50_477_529
+"1" = 51_161_786
+"2" = 50_996_940
 

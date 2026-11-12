@@ -1363,6 +1363,7 @@ async fn test_gossip_topics_switch_at_cutoff_without_pre_fork_partition() {
     let mut tasks = vec![];
     let mut receiving = None;
     let mut scheduled_peer = None;
+    let mut legacy_peer = None;
     for (index, config) in configs.iter().enumerate() {
         let (tx, rx) = mpsc::channel(100);
         let mut node = SnapchainGossip::create(
@@ -1377,6 +1378,9 @@ async fn test_gossip_topics_switch_at_cutoff_without_pre_fork_partition() {
         .await
         .unwrap();
         node.set_topic_routing_shards(2).unwrap();
+        if index == 0 {
+            legacy_peer = Some(*node.swarm.local_peer_id());
+        }
         if index == 1 {
             receiving = Some(rx);
             scheduled_peer = Some(*node.swarm.local_peer_id());
@@ -1395,6 +1399,44 @@ async fn test_gossip_topics_switch_at_cutoff_without_pre_fork_partition() {
         )
         .await
     );
+    // Reproduce an upstream peer crossing our configured fork before this
+    // node has synced the last shared blocks. Its status must still reach
+    // local sync, capped at 99, without switching the node's gossip phase.
+    let deadline = time::Instant::now() + Duration::from_secs(8);
+    let mut advertised_height = 1000;
+    loop {
+        assert!(
+            time::Instant::now() < deadline,
+            "lost upstream sync status at the fork boundary"
+        );
+        senders[0]
+            .send(GossipEvent::BroadcastStatus(
+                informalsystems_malachitebft_sync::Status {
+                    peer_id: MalachitePeerId::from_libp2p(&legacy_peer.unwrap()),
+                    height: Height {
+                        shard_index: 0,
+                        block_number: advertised_height,
+                    },
+                    history_min_height: Height {
+                        shard_index: 0,
+                        block_number: 1,
+                    },
+                },
+            ))
+            .await
+            .unwrap();
+        advertised_height += 1;
+        if let Ok(Some(SystemMessage::MalachiteNetwork(
+            _,
+            MalachiteNetworkEvent::Message(Channel::Sync, _, data),
+        ))) = time::timeout(Duration::from_millis(200), receiver.recv()).await
+        {
+            let status = proto::StatusMessage::decode(data).unwrap();
+            assert_eq!(status.height.unwrap().block_number, 99);
+            assert_eq!(status.min_height.unwrap().block_number, 1);
+            break;
+        }
+    }
     assert!(
         !publish_until_received(
             senders[2].clone(),
