@@ -14,18 +14,40 @@ rpc_timeout_secs = 15
 "2" = 50_954_121
 
 [hypersnap]
-rpc = "http://127.0.0.1:3383"
-peers = ["/ip4/127.0.0.1/udp/3382/quic-v1"]
+# haatz (cassie): direct gRPC origin, rather than the HTTPS API proxy.
+rpc = "http://85.237.203.140:3383"
+# Validator addresses and Ed25519 public keys:
+# https://github.com/farcasterorg/hypersnap/issues/51
+# /p2p peer IDs are derived from the corresponding public keys.
+peers = [
+  # cassie / haatz.quilibrium.com — ae46d4ae50bee1a9cf6d798ddddd1d7f54c8314eaf85ac0efa3bf685c9506119
+  "/ip4/85.237.203.140/udp/3382/quic-v1/p2p/12D3KooWMYfkXiNcn9LifPkLYiHtGmXYnknYG1yFBD53rUseUMUc",
+  # kmacb.eth — 3f9335279a61dc06eb2f097333bf9b7f1aac8760fa44c9fe38c68052d163b143
+  "/ip4/85.209.231.221/udp/3382/quic-v1/p2p/12D3KooWE6Y3ZTdrVHar9VPNwwSQJJmF8xyVdK8mgTceiXK7HiFt",
+  # derekhoiem — c37026ce39c58c55d11265bd4e348717dfe008f4da888bc67f0feb9a38fa87c3
+  "/dns4/hypersnap.rainonmeproductions.com/udp/3382/quic-v1/p2p/12D3KooWNyGrgDr5tJvbC7vPCUgrfKThKBaguZeZbfznCUdQCN9Q",
+  # infinitehomie — 0149adb8c10672b17a86fb0b9247433d12b7e22c1b888499d3be5cde5171c463
+  "/ip4/46.110.19.50/udp/3382/quic-v1/p2p/12D3KooW9uPjmgKNasKiu6j8D4h5pRCLNwLDJxovaAccnz3iRFvS",
+  # arfonzo — 7882148cc2608d13d096ea6d68891deb99000612a9f136e55af440d49173ce0d
+  "/dns4/hypersnap.imgnai.com/udp/3382/quic-v1/p2p/12D3KooWHvn8rQpVovdhKEcwko1TBcnwC8mtkZEFyfKKNearZqXJ",
+  # ivy — 1929bcf9fba23418b0a15cc7a6ffb658f7cd7688ab6eb061bac680de8d3ca3ca
+  "/dns4/procat.ivyastrix.com/udp/3382/quic-v1/p2p/12D3KooWBWbGtQxqAyGv51HR76ZgCgM1qf7TMbLb65u759dc66jT",
+  # mvr — 7b0e914a8bca87888dd9297a8defc71802ba261c399527263713a2caa8b3967a
+  "/dns4/sizzle.onchain.cooking/udp/3382/quic-v1/p2p/12D3KooWJ6jCWWekTbNMn9MUGg6io4dYmSGbnguV9CnyQwzFiRn1",
+  # wake — 22e82d8886c9c73fe8dd5b6c1df474100f5d9289e7352ea590361d23837074d0
+  "/ip4/51.79.77.116/udp/3382/quic-v1/p2p/12D3KooWCAdNQJvE9eH258D55b6zodhLoW2B8xRJEtayozGX1Jud",
+]
 # listen = "/ip4/0.0.0.0/udp/0/quic-v1"
-# Omit start_blocks to start at the observed tip + 1 on FIRST launch.
-# To replay retained history instead, set inclusive starting blocks per shard:
+# A FIRST launch before the fork reserves the fork block; after it, tip + 1.
+# Both directions wait for each Hypersnap shard's fork before relaying.
+# To replay retained post-fork history, set inclusive starting blocks per shard:
 # [hypersnap.start_blocks]
 # "0" = 50433538
 # "1" = 51119199
 # "2" = 50954121
 
 [snapchain]
-rpc = "http://127.0.0.1:4383"
-peers = ["/ip4/127.0.0.1/udp/4382/quic-v1"]
+rpc = "http://snap.farcaster.xyz:3383"
+peers = ["/dns4/snap.farcaster.xyz/udp/3382/quic-v1"]
 # Optional allowlist on either side: only the intersection is relayed.
 # message_types = [1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 13, 14, 15]

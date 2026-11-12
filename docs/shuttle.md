@@ -8,10 +8,12 @@ events, Fname system transfers, or Hyper envelopes.
 
 ## Run
 
-Build with `cargo build --release --bin shuttle`, copy `shuttle.example.toml` to
-`shuttle.toml`, and replace the two RPC endpoints and gossip peer lists with your
-nodes' addresses. RPC must be the gRPC endpoint. Both nodes must retain blocks
-from the requested starting heights. The shuttle needs outbound access to both
+Build with `cargo build --release --bin shuttle` and copy `shuttle.example.toml` to
+`shuttle.toml`. The example uses haatz's direct gRPC endpoint, all eight initial
+Hypersnap validators from [issue #51](https://github.com/farcasterorg/hypersnap/issues/51)
+with peer IDs pinned to their published keys, and `snap.farcaster.xyz` for Snapchain.
+You can replace these with your own nodes. RPC must be the gRPC endpoint. Both
+nodes must retain blocks from the requested starting heights. The shuttle needs outbound access to both
 RPC endpoints and the peers' configured QUIC/UDP or TCP ports.
 
 ```sh

@@ -70,6 +70,7 @@ fn build_swarm(identity: libp2p::identity::Keypair) -> Result<Swarm<gossipsub::B
             yamux::Config::default,
         )?
         .with_quic()
+        .with_dns()?
         .with_behaviour(|key| -> Result<gossipsub::Behaviour, Error> {
             let config = gossipsub::ConfigBuilder::default()
                 .heartbeat_interval(Duration::from_millis(500))
@@ -152,7 +153,13 @@ mod tests {
             };
             let config = Network {
                 rpc: "http://localhost:3383".into(),
-                peers: vec![address.to_string()],
+                peers: vec![if topic == snapchain_proto::topics::MEMPOOL {
+                    address
+                        .to_string()
+                        .replacen("/ip4/127.0.0.1/", "/dns4/localhost/", 1)
+                } else {
+                    address.to_string()
+                }],
                 listen: "/ip4/127.0.0.1/udp/0/quic-v1".into(),
                 start_blocks: Default::default(),
                 message_types: vec![1],

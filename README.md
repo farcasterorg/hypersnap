@@ -67,6 +67,20 @@ To retain an existing index, stop the old node and copy the entire old index
 directory to `<rocksdb_dir>/search_index` before starting the updated node.
 The backfill status endpoint is `GET /v2/farcaster/_status/backfill`.
 
+The cast-hash index automatically fills missing historical mappings from both
+legacy and Hyper cast stores in the background, without clearing existing data
+or blocking API startup. It checkpoints each batch and resumes after restart.
+The status response includes `cast_hash_backfill.complete` and per-source
+`shard_id`, `source_prefix` (3 for legacy, 30 for Hyper), `casts_indexed`,
+`last_fid`, and `complete`, plus an `error` when a batch fails and will retry.
+The `cast_hash` indexer's `backfill_complete` now means the retained-store walk
+has finished, rather than merely that an event checkpoint exists.
+During this walk, an unindexed hash can still require a fallback probe. There
+is at most one probe at a time, with no waiting queue and a two-second request
+budget; busy or timed-out lookups return HTTP 503 and can be retried. Supplying
+the author FID avoids probing for existing casts. Once coverage is complete,
+unknown hashes return 404 without a full FID scan.
+
 Cast search matches `#hashtag` exactly and takes Neynar's `sort_type`
 (`desc_chronological`, `chron`, `algorithmic`) and `cursor`. An index built
 before hashtags is moved to `<index_path>.legacy` on startup and keeps
