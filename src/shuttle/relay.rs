@@ -78,6 +78,7 @@ async fn direction(
     publisher: Publisher,
 ) -> Result<(), Error> {
     let mut schedule = config.topic_schedule()?;
+    let mut waiting = std::collections::BTreeSet::new();
     loop {
         let result = async {
             let mut source = connect(&config.side(side).rpc, config.rpc_timeout_secs).await?;
@@ -88,24 +89,26 @@ async fn direction(
                     .get_info(proto::GetInfoRequest {})
                     .await?
                     .into_inner();
-                if side.other() == Side::Hypersnap {
-                    let heads = destination
+                // Hypersnap's local heights control activation in BOTH directions.
+                // Snapchain may reach the same numeric height before Hypersnap forks.
+                let heads = if side == Side::Hypersnap {
+                    info.clone()
+                } else {
+                    destination
                         .get_info(proto::GetInfoRequest {})
                         .await?
-                        .into_inner();
-                    for shard_id in 0..=config.num_shards {
-                        let shard = heads
-                            .shard_infos
-                            .iter()
-                            .find(|s| s.shard_id == shard_id)
-                            .ok_or(
-                                "Hypersnap destination did not report every topic-routing shard",
-                            )?;
-                        schedule.observe_next(proto::Height {
-                            shard_index: shard.shard_id,
-                            block_number: shard.max_height.saturating_add(1),
-                        });
-                    }
+                        .into_inner()
+                };
+                for shard_id in 0..=config.num_shards {
+                    let shard = heads
+                        .shard_infos
+                        .iter()
+                        .find(|s| s.shard_id == shard_id)
+                        .ok_or("Hypersnap did not report every topic-routing shard")?;
+                    schedule.observe_next(proto::Height {
+                        shard_index: shard.shard_id,
+                        block_number: shard.max_height.saturating_add(1),
+                    });
                 }
                 for &shard in &config.shards {
                     let tip = info
@@ -114,15 +117,26 @@ async fn direction(
                         .find(|s| s.shard_id == shard)
                         .ok_or("source did not report configured shard")?
                         .max_height;
+                    let hyper_tip = heads
+                        .shard_infos
+                        .iter()
+                        .find(|s| s.shard_id == shard)
+                        .unwrap()
+                        .max_height;
+                    let cutoff = config.topic_cutovers[&shard.to_string()];
                     let cursor = match state.cursor(side, shard)? {
-                        Some(cursor) => cursor,
+                        Some(cursor) if cursor.next >= cutoff => cursor,
+                        Some(_) => {
+                            // Upgrade an old pre-fork cursor without fetching shared history.
+                            let cursor = Cursor {
+                                next: cutoff,
+                                hash: vec![],
+                            };
+                            state.save(side, shard, &cursor)?;
+                            cursor
+                        }
                         None => {
-                            let next = config
-                                .side(side)
-                                .start_blocks
-                                .get(&shard.to_string())
-                                .copied()
-                                .unwrap_or(tip.checked_add(1).ok_or("source height overflow")?);
+                            let next = initial_height(&config, side, shard, tip, hyper_tip)?;
                             let cursor = Cursor { next, hash: vec![] };
                             state.save(side, shard, &cursor)?;
                             info!(
@@ -134,6 +148,28 @@ async fn direction(
                             cursor
                         }
                     };
+                    if hyper_tip.saturating_add(1) < cutoff {
+                        if waiting.insert(shard) {
+                            info!(
+                                network = side.name(),
+                                shard,
+                                fork_block = cutoff,
+                                hypersnap_tip = hyper_tip,
+                                next_block = cursor.next,
+                                "Shuttle waiting for shard fork"
+                            );
+                        }
+                        continue;
+                    }
+                    if waiting.remove(&shard) {
+                        info!(
+                            network = side.name(),
+                            shard,
+                            fork_block = cutoff,
+                            next_block = cursor.next,
+                            "Shuttle shard activated"
+                        );
+                    }
                     if cursor.next > tip {
                         continue;
                     }
@@ -157,7 +193,7 @@ async fn direction(
                             schedule: &schedule,
                             publish_timeout: Duration::from_secs(config.rpc_timeout_secs),
                         };
-                        relay_block(&config, &state, side, &mut target, &block).await?;
+                        relay_block(&config, &state, side, &mut target, &block, hyper_tip).await?;
                         cursor = Cursor {
                             next: block.height.checked_add(1).ok_or("block height overflow")?,
                             hash: block.hash,
@@ -185,6 +221,31 @@ async fn direction(
         warn!(network=side.name(),error=%result.unwrap_err(),"Shuttle direction retrying from durable cursor");
         sleep(Duration::from_secs(2)).await;
     }
+}
+
+/// A launch before the fork reserves its first block even if the shuttle is
+/// restarted after the fork. A first launch after it still follows new traffic
+/// unless an operator explicitly requests retained post-fork history.
+fn initial_height(
+    config: &Config,
+    side: Side,
+    shard: u32,
+    source_tip: u64,
+    hyper_tip: u64,
+) -> Result<u64, Error> {
+    let cutoff = config.topic_cutovers[&shard.to_string()];
+    let default = if hyper_tip < cutoff {
+        cutoff
+    } else {
+        source_tip.checked_add(1).ok_or("source height overflow")?
+    };
+    Ok(config
+        .side(side)
+        .start_blocks
+        .get(&shard.to_string())
+        .copied()
+        .unwrap_or(default)
+        .max(cutoff))
 }
 async fn fetch(
     client: &mut HubServiceClient<Channel>,
@@ -270,11 +331,16 @@ impl Destination for NetworkDestination<'_> {
     }
     async fn publish(&mut self, bytes: Vec<u8>) -> Result<(), Error> {
         let topic = if self.side == Side::Hypersnap {
-            self.schedule
+            let topic = self
+                .schedule
                 .publications(snapchain_proto::topics::MEMPOOL, &bytes)
                 .into_iter()
                 .next()
-                .ok_or("message cannot be routed to Hypersnap")?
+                .ok_or("message cannot be routed to Hypersnap")?;
+            if topic != snapchain_proto::topics::MEMPOOL {
+                return Err("message's Hypersnap shard has not forked yet".into());
+            }
+            topic
         } else {
             snapchain_proto::topics::SNAPCHAIN_MEMPOOL
         };
@@ -291,7 +357,12 @@ async fn relay_block(
     side: Side,
     destination: &mut impl Destination,
     block: &CommittedBlock,
+    hyper_tip: u64,
 ) -> Result<(), Error> {
+    let cutoff = config.topic_cutovers[&block.shard.to_string()];
+    if block.height < cutoff || hyper_tip.saturating_add(1) < cutoff {
+        return Ok(());
+    }
     for transaction in &block.transactions {
         // On-chain events, Fname transfers, consensus and Hyper envelopes are not user mempool messages.
         for raw in &transaction.user_messages {
@@ -387,7 +458,10 @@ fn compatible(raw: &Message, config: &Config, side: Side) -> Option<Message> {
 mod tests {
     use super::*;
     fn config() -> Config {
-        toml::from_str(include_str!("../../shuttle.example.toml")).unwrap()
+        let mut config: Config =
+            toml::from_str(include_str!("../../shuttle.example.toml")).unwrap();
+        config.topic_cutovers = [("0".into(), 10), ("1".into(), 10), ("2".into(), 20)].into();
+        config
     }
     fn message() -> Message {
         let data = MessageData {
@@ -470,10 +544,12 @@ mod tests {
         fail: bool,
         invalid: bool,
         sent: Vec<Vec<u8>>,
+        validations: usize,
     }
     #[async_trait::async_trait]
     impl Destination for MockDestination {
         async fn validate(&mut self, _: Message) -> Result<bool, Error> {
+            self.validations += 1;
             Ok(!self.invalid)
         }
         async fn publish(&mut self, bytes: Vec<u8>) -> Result<(), Error> {
@@ -496,22 +572,22 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            relay_block(&config, &state, Side::Hypersnap, &mut target, &block)
+            relay_block(&config, &state, Side::Hypersnap, &mut target, &block, 9)
                 .await
                 .is_err()
         );
         assert!(!state.seen(Side::Snapchain, hash).unwrap());
         target.fail = false;
-        relay_block(&config, &state, Side::Hypersnap, &mut target, &block)
+        relay_block(&config, &state, Side::Hypersnap, &mut target, &block, 9)
             .await
             .unwrap();
         assert!(state.seen(Side::Snapchain, hash).unwrap());
         assert_eq!(target.sent.len(), 1);
         // Retry before the block checkpoint, then observe the message committed on the opposite chain.
-        relay_block(&config, &state, Side::Hypersnap, &mut target, &block)
+        relay_block(&config, &state, Side::Hypersnap, &mut target, &block, 9)
             .await
             .unwrap();
-        relay_block(&config, &state, Side::Snapchain, &mut target, &block)
+        relay_block(&config, &state, Side::Snapchain, &mut target, &block, 9)
             .await
             .unwrap();
         assert_eq!(target.sent.len(), 1);
@@ -530,9 +606,68 @@ mod tests {
             Side::Snapchain,
             &mut target,
             &block(message()),
+            9,
         )
         .await
         .unwrap();
         assert!(target.sent.is_empty());
+    }
+
+    #[tokio::test]
+    async fn both_directions_wait_for_each_hypersnap_shard_and_exclude_shared_history() {
+        let config = config();
+        for side in [Side::Hypersnap, Side::Snapchain] {
+            let dir = tempfile::tempdir().unwrap();
+            let state = State::open(dir.path(), 1).unwrap();
+            let mut target = MockDestination::default();
+            let mut block = block(message());
+            let hash = block.transactions[0].user_messages[0].hash.clone();
+            // Source already has the fork-height block, Hypersnap is still pre-fork.
+            relay_block(&config, &state, side, &mut target, &block, 8)
+                .await
+                .unwrap();
+            assert_eq!(target.validations, 0);
+            assert!(!state.seen(side, &hash).unwrap());
+            // Old shared blocks must not be replayed even after activation.
+            block.height = 9;
+            relay_block(&config, &state, side, &mut target, &block, 50)
+                .await
+                .unwrap();
+            assert!(target.sent.is_empty());
+            block.height = 10;
+            relay_block(&config, &state, side, &mut target, &block, 9)
+                .await
+                .unwrap();
+            assert_eq!(target.sent.len(), 1);
+
+            block.shard = 2;
+            block.height = 20;
+            relay_block(&config, &state, side, &mut target, &block, 18)
+                .await
+                .unwrap();
+            assert_eq!(target.validations, 1, "shard 2 waits for its own cutoff");
+        }
+    }
+
+    #[test]
+    fn initial_cursors_reserve_fork_block_and_never_replay_pre_fork_history() {
+        let mut config = config();
+        for side in [Side::Hypersnap, Side::Snapchain] {
+            assert_eq!(initial_height(&config, side, 1, 5, 5).unwrap(), 10);
+            // Snapchain can be ahead while Hypersnap has not forked.
+            assert_eq!(initial_height(&config, side, 1, 100, 8).unwrap(), 10);
+            assert_eq!(initial_height(&config, side, 1, 100, 9).unwrap(), 10);
+            assert_eq!(initial_height(&config, side, 1, 100, 20).unwrap(), 101);
+        }
+        config.snapchain.start_blocks.insert("1".into(), 1);
+        assert_eq!(
+            initial_height(&config, Side::Snapchain, 1, 100, 20).unwrap(),
+            10
+        );
+        config.snapchain.start_blocks.insert("1".into(), 15);
+        assert_eq!(
+            initial_height(&config, Side::Snapchain, 1, 100, 8).unwrap(),
+            15
+        );
     }
 }

@@ -29,9 +29,14 @@ Use container-reachable endpoints in that configuration; `127.0.0.1` inside the
 shuttle container refers to that container. The example Compose file persists
 `/app/.shuttle`, matching the example `state_dir`. Keep that volume across restarts.
 
-By default each missing shard cursor starts at its observed tip plus one. Set
-`start_blocks` for each source to replay retained history, using inclusive heights.
-Once a cursor exists it takes precedence over configuration. A missing/pruned
+Before each Hypersnap shard forks, both relay directions wait while their gossip
+connections stay ready. A first launch before the fork reserves that shard's
+fork block as its starting cursor, including if Snapchain is already ahead.
+A first launch after the fork starts at the source's observed tip plus one.
+Set `start_blocks` for each source to replay retained post-fork history, using
+inclusive heights. Pre-fork history is never relayed: configured starts and old
+cursors below the cutoff are advanced to the fork block. Otherwise an existing
+cursor takes precedence over configuration. A missing/pruned
 block or a parent-hash mismatch stops that shard's progress with a retry log; the
 shuttle never silently jumps past a gap.
 
@@ -61,8 +66,10 @@ addresses). Existing Snapchain validators will not relay the new topics, and a
 validator pubkey in `validators.toml` alone does not establish a connection.
 Keep legacy connections available for pre-fork consensus while those new meshes form.
 
-The shuttle uses the Hypersnap destination's RPC heights and the normal message
-shard router to select its mempool topic. Snapchain always uses `mempool`.
+Hypersnap's RPC heights activate both directions independently per shard when
+the next local block reaches its cutoff. Snapchain's height alone cannot activate
+a relay. The shuttle only reads source blocks from the cutoff onward, and only
+publishes to Hypersnap's namespaced mempool. Snapchain always uses `mempool`.
 The existing sync RPC transport remains compatible for fetching pre-fork history.
 
 ## Compatibility, recovery and progress

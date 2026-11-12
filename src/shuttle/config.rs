@@ -34,7 +34,8 @@ pub struct Network {
     pub peers: Vec<String>,
     #[serde(default = "listen")]
     pub listen: String,
-    /// Absent cursors start at the current tip + 1; explicit heights are inclusive.
+    /// First launch before the fork reserves the fork block; after it, tip + 1.
+    /// Explicit starts are inclusive and clamped to the shard's fork height.
     #[serde(default)]
     pub start_blocks: BTreeMap<String, u64>,
     /// Restrict when the deployed destination supports fewer types than the schema.
@@ -98,6 +99,7 @@ impl Config {
             || self.rpc_timeout_secs == 0
             || !(1..=100).contains(&self.batch_blocks)
             || self.shards.is_empty()
+            || self.shards.iter().any(|shard| *shard > self.num_shards)
         {
             return Err("invalid network, timing, batch size or empty shard list".into());
         }
@@ -194,5 +196,8 @@ mod tests {
         assert_eq!(start.hypersnap.start_blocks.get("0"), Some(&12));
         config.topic_cutovers.remove("1");
         assert!(config.validate().is_err());
+        let mut invalid: Config = toml::from_str(example).unwrap();
+        invalid.shards.push(3);
+        assert!(invalid.validate().is_err());
     }
 }
