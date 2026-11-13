@@ -2211,6 +2211,8 @@ impl ApiHttpHandler {
             .unwrap_or_default();
 
         let thread_hash = self.thread_root(msg).await.map(hex::encode);
+        let (format_version, chain) =
+            cast_format(msg).map_or((None, None), |(version, chain)| (Some(version), chain));
 
         Cast {
             object: "cast".to_string(),
@@ -2227,6 +2229,8 @@ impl ApiHttpHandler {
             reactions: CastReactions::default(),
             replies: CastReplies::default(),
             thread_hash,
+            format_version,
+            chain,
             mentioned_profiles,
             mentioned_profiles_ranges,
             mentioned_channels: Vec::new(),
@@ -5158,6 +5162,31 @@ fn format_timestamp(ts: u32) -> String {
         .unwrap_or_else(|| ts.to_string())
 }
 
+/// A cast's `format_version` and `chain`, read from its signed `data_bytes` when present, like the
+/// v1 HTTP API does: a block's `data` before ChainedCasts has neither field. `None` for a message
+/// without a cast body.
+fn cast_format(msg: &crate::proto::Message) -> Option<(u32, Option<types::CastChain>)> {
+    let signed = msg
+        .data_bytes
+        .as_deref()
+        .filter(|bytes| !bytes.is_empty())
+        .and_then(|bytes| crate::storage::store::account::decode_message_data(bytes, None).ok());
+    let Some(crate::proto::message_data::Body::CastAddBody(body)) =
+        &signed.as_ref().or(msg.data.as_ref())?.body
+    else {
+        return None;
+    };
+    let chain = body.chain.as_ref().map(|chain| types::CastChain {
+        root: chain.root.as_ref().map(|root| types::CastId {
+            fid: root.fid,
+            hash: hex::encode(&root.hash),
+        }),
+        index: chain.index,
+        count: chain.count,
+    });
+    Some((body.format_version, chain))
+}
+
 /// Whether a reaction message is a recast.
 fn is_recast(data: &crate::proto::MessageData) -> bool {
     matches!(
@@ -6310,6 +6339,89 @@ mod tests {
         assert!(json["mentioned_profiles"][0]
             .get("viewer_context")
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cast_format_version_and_chain_on_v2_casts() {
+        use crate::proto::message_data::Body;
+        use crate::utils::factory::messages_factory::casts;
+        use prost::Message as _;
+
+        fn set_format(
+            msg: &mut crate::proto::Message,
+            format_version: u32,
+            chain: Option<crate::proto::ChainCast>,
+        ) {
+            let Some(Body::CastAddBody(body)) = &mut msg.data.as_mut().unwrap().body else {
+                unreachable!()
+            };
+            body.format_version = format_version;
+            body.chain = chain;
+        }
+        // A cast with `format_version` and `chain`, in its signed `data_bytes` only when `signed`.
+        fn cast(
+            format_version: u32,
+            chain: Option<crate::proto::ChainCast>,
+            signed: bool,
+        ) -> crate::proto::Message {
+            let mut msg = casts::create_cast_add(7, "part", None, None);
+            set_format(&mut msg, format_version, chain);
+            if signed {
+                msg.data_bytes = Some(msg.data.as_ref().unwrap().encode_to_vec());
+                // A block's `data` before ChainedCasts, which has neither field.
+                set_format(&mut msg, 0, None);
+            }
+            msg
+        }
+        async fn lookup(msg: crate::proto::Message) -> serde_json::Value {
+            let hash = hex::encode(&msg.hash);
+            let handler = ApiHttpHandler::new(None, None, None, None, None, None);
+            handler.set_hub_query(Arc::new(MockHubQuery {
+                cast_lookup: Some(msg),
+                ..Default::default()
+            }));
+            let response = handler
+                .handle_cast_lookup(&hash, "hash", Some(7), None)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            collect_json(response).await["cast"].clone()
+        }
+
+        let root = crate::proto::CastId {
+            fid: 7,
+            hash: vec![0x22; 20],
+        };
+        let part = |index| crate::proto::ChainCast {
+            root: (index > 0).then(|| root.clone()),
+            index,
+            count: 3,
+        };
+
+        // A later part, its fields only in `data_bytes`.
+        let json = lookup(cast(1, Some(part(1)), true)).await;
+        assert_eq!(json["format_version"], 1);
+        assert_eq!(
+            json["chain"],
+            serde_json::json!({
+                "root": { "fid": 7, "hash": "22".repeat(20) },
+                "index": 1,
+                "count": 3
+            })
+        );
+        // The first part has no root. Without `data_bytes` the fields come from `data`.
+        let json = lookup(cast(1, Some(part(0)), false)).await;
+        assert_eq!(json["format_version"], 1);
+        assert_eq!(json["chain"], serde_json::json!({ "index": 0, "count": 3 }));
+        // A plain cast says so, so a client can tell it from a node without the fields.
+        for signed in [true, false] {
+            let json = lookup(cast(0, None, signed)).await;
+            assert_eq!(json["format_version"], 0);
+            assert!(json.get("chain").is_none());
+        }
+        // A cast not read from its message (a search result) leaves both out.
+        let json = serde_json::to_value(Cast::default()).unwrap();
+        assert!(json.get("format_version").is_none() && json.get("chain").is_none());
     }
 
     #[tokio::test]
