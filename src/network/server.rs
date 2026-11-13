@@ -1107,7 +1107,8 @@ impl MyHubService {
                 100,
                 None,
                 self.network,
-            );
+            )
+            .with_native_registration(self.block_stores.native_registration.clone());
 
             block_engine.simulate_message(message).map_err(|e| match e {
                 block_engine::MessageValidationError::HubError(hub_error) => {
