@@ -27,7 +27,7 @@ peers = [
   # derekhoiem — c37026ce39c58c55d11265bd4e348717dfe008f4da888bc67f0feb9a38fa87c3
   "/dns4/hypersnap.rainonmeproductions.com/udp/3382/quic-v1/p2p/12D3KooWNyGrgDr5tJvbC7vPCUgrfKThKBaguZeZbfznCUdQCN9Q",
   # infinitehomie — 0149adb8c10672b17a86fb0b9247433d12b7e22c1b888499d3be5cde5171c463
-  "/ip4/46.110.19.50/udp/3382/quic-v1/p2p/12D3KooW9uPjmgKNasKiu6j8D4h5pRCLNwLDJxovaAccnz3iRFvS",
+  "/dns4/rpc.homiehouse.xyz/udp/3382/quic-v1/p2p/12D3KooW9uPjmgKNasKiu6j8D4h5pRCLNwLDJxovaAccnz3iRFvS",
   # arfonzo — 7882148cc2608d13d096ea6d68891deb99000612a9f136e55af440d49173ce0d
   "/dns4/hypersnap.imgnai.com/udp/3382/quic-v1/p2p/12D3KooWHvn8rQpVovdhKEcwko1TBcnwC8mtkZEFyfKKNearZqXJ",
   # ivy — 1929bcf9fba23418b0a15cc7a6ffb658f7cd7688ab6eb061bac680de8d3ca3ca
