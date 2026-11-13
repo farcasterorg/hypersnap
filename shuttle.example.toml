@@ -9,9 +9,9 @@ rpc_timeout_secs = 15
 
 # Must match validators.toml on the Hypersnap nodes.
 [topic_cutovers]
-"0" = 50_433_538
-"1" = 51_119_199
-"2" = 50_954_121
+"0" = 50_477_529
+"1" = 51_161_786
+"2" = 50_996_940
 
 [hypersnap]
 # haatz (cassie): direct gRPC origin, rather than the HTTPS API proxy.
@@ -42,12 +42,14 @@ peers = [
 # Both directions wait for each Hypersnap shard's fork before relaying.
 # To replay retained post-fork history, set inclusive starting blocks per shard:
 # [hypersnap.start_blocks]
-# "0" = 50433538
-# "1" = 51119199
-# "2" = 50954121
+# "0" = 50477529
+# "1" = 51161786
+# "2" = 50996940
 
 [snapchain]
 rpc = "http://snap.farcaster.xyz:3383"
+# Public Snapchain validator RPC; used if the primary cannot answer GetInfo.
+rpc_fallbacks = ["http://107.20.169.236:3383"]
 peers = ["/dns4/snap.farcaster.xyz/udp/3382/quic-v1"]
 # Optional allowlist on either side: only the intersection is relayed.
 # message_types = [1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 13, 14, 15]

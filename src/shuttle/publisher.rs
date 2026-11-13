@@ -153,6 +153,7 @@ mod tests {
             };
             let config = Network {
                 rpc: "http://localhost:3383".into(),
+                rpc_fallbacks: vec![],
                 peers: vec![if topic == snapchain_proto::topics::MEMPOOL {
                     address
                         .to_string()

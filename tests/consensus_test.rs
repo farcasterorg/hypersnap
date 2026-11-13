@@ -275,6 +275,10 @@ struct NodeForTest {
     keep_db_on_drop: bool,
     peer_id: PeerId,
     peer_blocklist: Arc<Mutex<HashSet<PeerId>>>,
+    gossip_tx: mpsc::Sender<GossipEvent<SnapchainValidatorContext>>,
+    // Test-only dispatch filter; no fault injection is added to the production node.
+    drop_prevote: Arc<Mutex<Option<Height>>>,
+    dropped_prevote: Arc<Mutex<Option<proto::ConsensusMessage>>>,
     /// Shared `MyHubService` so the HTTP smoke test can boot an HTTP server
     /// against the same underlying stores + mempool wiring as the gRPC server.
     hub_service: Arc<MyHubService>,
@@ -558,6 +562,7 @@ impl NodeForTest {
         keep_db_on_drop: bool,
         direct_peers: Option<String>,
         chain_state: Arc<MockChainState>,
+        discovery: Option<snapchain::network::discovery::Config>,
     ) -> Self {
         let statsd_client = StatsdClientWrapper::new(
             cadence::StatsdClient::builder("", cadence::NopMetricSink {}).build(),
@@ -568,6 +573,11 @@ impl NodeForTest {
                 .with_announce_address(gossip_address);
         if let Some(direct) = direct_peers {
             config = config.with_direct_peers(direct);
+        }
+        if let Some(discovery) = discovery {
+            config.discovery = discovery;
+            // Test DHT discovery, rather than frequent contact-info advertisements.
+            config.contact_info_interval = std::time::Duration::from_secs(3600);
         }
 
         let mut consensus_config = snapchain::consensus::consensus::Config::default();
@@ -772,11 +782,40 @@ impl NodeForTest {
         }
 
         let node_for_dispatch = node.clone();
+        let drop_prevote = Arc::new(Mutex::new(None::<Height>));
+        let dropped_prevote = Arc::new(Mutex::new(None::<proto::ConsensusMessage>));
+        let drop_filter = drop_prevote.clone();
+        let dropped = dropped_prevote.clone();
         let handle = tokio::spawn(async move {
             loop {
                 if let Some(system_event) = system_rx.recv().await {
                     match system_event {
                         SystemMessage::MalachiteNetwork(event_shard, event) => {
+                            if let informalsystems_malachitebft_network::Event::Message(
+                                informalsystems_malachitebft_network::Channel::Consensus,
+                                _,
+                                bytes,
+                            ) = &event
+                            {
+                                use prost::Message as _;
+                                if let Ok(message) = proto::ConsensusMessage::decode(bytes.clone())
+                                {
+                                    if let Some(proto::consensus_message::ConsensusMessage::Vote(
+                                        vote,
+                                    )) = &message.consensus_message
+                                    {
+                                        let mut filter = drop_filter.lock();
+                                        if filter.is_some()
+                                            && *filter == vote.height
+                                            && vote.r#type == proto::VoteType::Prevote as i32
+                                        {
+                                            *filter = None;
+                                            *dropped.lock() = Some(message);
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
                             node_for_dispatch.dispatch(event_shard, event);
                         }
                         SystemMessage::Mempool(req) => {
@@ -817,6 +856,9 @@ impl NodeForTest {
             keep_db_on_drop,
             peer_id,
             peer_blocklist,
+            gossip_tx,
+            drop_prevote,
+            dropped_prevote,
             hub_service,
             boot_resub_done,
             direct_peer_force_bounce_count,
@@ -959,6 +1001,7 @@ pub struct TestNetwork {
     /// `Some(...)` by `enable_all_to_all_direct_peers` so both `start` and
     /// `restart` carry the same config across the validator's lifetime.
     direct_peers_per_node: Vec<Option<String>>,
+    sparse_discovery: bool,
     /// L1/Base state shared by every validator's chain clients.
     chain_state: Arc<MockChainState>,
 }
@@ -1050,6 +1093,7 @@ impl TestNetwork {
             read_nodes: vec![],
             test_fids: HashMap::new(),
             direct_peers_per_node: vec![None; num_validator_nodes as usize],
+            sparse_discovery: false,
             chain_state: Arc::new(MockChainState::default()),
         }
     }
@@ -1102,6 +1146,21 @@ impl TestNetwork {
             .join(",")
     }
 
+    fn discovery_for(&self, index: usize) -> Option<snapchain::network::discovery::Config> {
+        self.sparse_discovery.then(|| {
+            let seed = if index == 0 { 1 } else { 0 };
+            snapchain::network::discovery::Config {
+                enabled: true,
+                bootstrap_peers: vec![format!(
+                    "{}/p2p/{}",
+                    self.gossip_addresses[seed],
+                    peer_id_from_keypair(&self.keypairs[seed])
+                )],
+                ..Default::default()
+            }
+        })
+    }
+
     async fn start_validator_node(&mut self, index: u32) {
         let keypair = self.keypairs[index as usize].clone();
         let gossip_address = self.gossip_addresses[index as usize].clone();
@@ -1113,12 +1172,17 @@ impl TestNetwork {
             grpc_port,
             &self.validator_sets,
             gossip_address,
-            self.gossip_addresses.join(","),
+            if self.sparse_discovery {
+                String::new()
+            } else {
+                self.gossip_addresses.join(",")
+            },
             None,
             None,
             false,
             direct_peers,
             self.chain_state.clone(),
+            self.discovery_for(index as usize),
         )
         .await;
         // Pad the slot vector if needed and place the node at its assigned index.
@@ -1173,12 +1237,17 @@ impl TestNetwork {
             grpc_port,
             &self.validator_sets,
             new_gossip_address,
-            bootstrap,
+            if self.sparse_discovery {
+                String::new()
+            } else {
+                bootstrap
+            },
             None,
             None,
             false,
             direct_peers,
             self.chain_state.clone(),
+            self.discovery_for(index),
         )
         .await;
         while self.nodes.len() <= index {
@@ -1229,6 +1298,7 @@ impl TestNetwork {
             false, // resume's lifetime ends with the test, default cleanup is fine
             direct_peers,
             self.chain_state.clone(),
+            self.discovery_for(index),
         )
         .await;
         while self.nodes.len() <= index {
@@ -4313,4 +4383,116 @@ async fn test_validators_do_not_sync_from_non_validators() {
         .wait_for_shard_chunk(1, network.max_shard_height(1))
         .await
         .expect("late validator did not catch up");
+}
+
+/// Six online validators out of eight, one seed per node, no explicit peers,
+/// with a deliberately dropped initial prevote on the block shard.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[serial]
+async fn test_discovery_sparse_eight_validators_two_offline_and_lost_prevote() {
+    if std::env::var_os("RUST_LOG").is_some() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init();
+    }
+    let mut network = TestNetwork::create(8, 2).await;
+    network.sparse_discovery = true;
+    // Validators 6 and 7 participate in the set but never start their processes.
+    for index in 0..6 {
+        network.start_validator_node(index).await;
+    }
+    network
+        .wait_for_block_on_subset(&[0, 1, 2, 3, 4, 5], 3, time::Duration::from_secs(90))
+        .await
+        .expect("sparse discovery did not establish a quorum");
+    // Node 2 was given only node 0's address. Finding node 3 proves discovery
+    // extended the original star rather than merely forwarding gossip via it.
+    let leaf = network.nodes[2].as_ref().unwrap();
+    let other_leaf = network.nodes[3].as_ref().unwrap().peer_id.to_bytes();
+    let deadline = time::Instant::now() + time::Duration::from_secs(45);
+    loop {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        leaf.gossip_tx
+            .send(GossipEvent::GetConnectedPeers(tx))
+            .await
+            .unwrap();
+        let peers = time::timeout(time::Duration::from_secs(2), rx)
+            .await
+            .unwrap()
+            .unwrap();
+        if peers.iter().any(|p| p.peer_id == other_leaf) {
+            break;
+        }
+        assert!(
+            time::Instant::now() < deadline,
+            "DHT did not discover another leaf"
+        );
+        time::sleep(time::Duration::from_millis(250)).await;
+    }
+    let node = network.nodes[0].as_ref().unwrap();
+    assert!(
+        !node.boot_resub_done(),
+        "test must not use explicit GossipSub peers"
+    );
+    let target = Height::new(
+        0,
+        network
+            .live_nodes()
+            .map(|n| n.num_blocks() as u64)
+            .max()
+            .unwrap()
+            + 3,
+    );
+    *node.drop_prevote.lock() = Some(target);
+    network
+        .wait_for_block_on_subset(
+            &[0, 1, 2, 3, 4, 5],
+            target.block_number as usize + 3,
+            time::Duration::from_secs(90),
+        )
+        .await
+        .expect("missing prevote or offline proposer halted six-of-eight quorum");
+    assert!(
+        node.dropped_prevote.lock().is_some(),
+        "fault injection must drop a real prevote"
+    );
+    // Check the actual stored certificates, not just a block count: six unique
+    // members must have signed a precommit for this exact height/round/hash.
+    use informalsystems_malachitebft_core_types::{NilOrVal, Round};
+    use snapchain::core::types::{Address, Vote};
+    for node in network.live_nodes() {
+        let blocks = node
+            .block_stores()
+            .block_store
+            .get_blocks(0, None, &PageOptions::default())
+            .unwrap()
+            .blocks;
+        for block in blocks {
+            let commits = block.commits.as_ref().unwrap();
+            assert_eq!(commits.height, block.header.as_ref().unwrap().height);
+            assert_eq!(commits.value.as_ref().unwrap().hash, block.hash);
+            let signers: HashSet<_> = commits
+                .signatures
+                .iter()
+                .map(|s| s.signer.clone())
+                .collect();
+            assert_eq!(signers.len(), 6);
+            assert_eq!(commits.signatures.len(), 6);
+            for commit in &commits.signatures {
+                let key = network.keypairs[..6]
+                    .iter()
+                    .find(|k| k.public().to_bytes().as_slice() == commit.signer)
+                    .expect("signature must belong to an online validator");
+                let vote = Vote::new_precommit(
+                    commits.height.unwrap(),
+                    Round::from(commits.round),
+                    NilOrVal::Val(commits.value.clone().unwrap()),
+                    Address(key.public().to_bytes()),
+                );
+                assert!(key
+                    .public()
+                    .verify(&vote.to_sign_bytes(), &commit.signature));
+            }
+        }
+    }
 }

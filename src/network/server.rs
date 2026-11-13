@@ -1868,12 +1868,12 @@ impl HubService for MyHubService {
             //     as u64,
             num_fid_registrations: 0,
             approx_size: self.block_stores.block_store.db.approximate_size(),
-            block_delay: current_time
-                - self
-                    .block_stores
+            block_delay: current_time.saturating_sub(
+                self.block_stores
                     .block_store
                     .max_block_timestamp()
                     .unwrap_or(0),
+            ),
             mempool_size: 0,
         };
         shard_infos.push(block_info);

@@ -1,5 +1,5 @@
 use super::{
-    config::{Config, Side},
+    config::{Config, Network, Side},
     publisher::{self, Publisher},
     state::{Cursor, State},
     Error,
@@ -62,14 +62,56 @@ pub async fn run(config: Config) -> Result<(), Error> {
     while tasks.join_next().await.is_some() {}
     result
 }
-async fn connect(url: &str, seconds: u64) -> Result<HubServiceClient<Channel>, Error> {
+fn rpc_error(url: &str, operation: &str, error: &(dyn std::error::Error + 'static)) -> Error {
+    let mut message = format!("{operation} at {url}: {error}");
+    let mut cause = error.source();
+    while let Some(error) = cause {
+        message.push_str(&format!("; caused by: {error}"));
+        cause = error.source();
+    }
+    message.into()
+}
+
+async fn connect_endpoint(url: &str, seconds: u64) -> Result<HubServiceClient<Channel>, Error> {
     let endpoint = Endpoint::new(url.to_owned())?
         .connect_timeout(Duration::from_secs(seconds))
         .timeout(Duration::from_secs(seconds));
-    Ok(
-        HubServiceClient::new(endpoint.connect().await?)
-            .max_decoding_message_size(64 * 1024 * 1024),
-    )
+    let channel = endpoint
+        .connect()
+        .await
+        .map_err(|error| rpc_error(url, "connect", &error))?;
+    let mut client = HubServiceClient::new(channel).max_decoding_message_size(64 * 1024 * 1024);
+    // A TCP/HTTP2 connection can succeed even when the endpoint cannot serve
+    // gRPC (the primary Snapchain host currently breaks the first request).
+    client
+        .get_info(proto::GetInfoRequest {})
+        .await
+        .map_err(|error| rpc_error(url, "GetInfo readiness check", &error))?;
+    Ok(client)
+}
+
+async fn connect(
+    network: &Network,
+    side: Side,
+    seconds: u64,
+) -> Result<(HubServiceClient<Channel>, String), Error> {
+    let mut last_error = None;
+    for (index, url) in std::iter::once(&network.rpc)
+        .chain(&network.rpc_fallbacks)
+        .enumerate()
+    {
+        match connect_endpoint(url, seconds).await {
+            Ok(client) => {
+                info!(network = side.name(), rpc = %url, fallback = index > 0, "Shuttle RPC ready");
+                return Ok((client, url.clone()));
+            }
+            Err(error) => {
+                warn!(network = side.name(), rpc = %url, %error, "Shuttle RPC unavailable");
+                last_error = Some(error);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "no RPC endpoints configured".into()))
 }
 async fn direction(
     config: Arc<Config>,
@@ -81,13 +123,19 @@ async fn direction(
     let mut waiting = std::collections::BTreeSet::new();
     loop {
         let result = async {
-            let mut source = connect(&config.side(side).rpc, config.rpc_timeout_secs).await?;
-            let mut destination =
-                connect(&config.side(side.other()).rpc, config.rpc_timeout_secs).await?;
+            let (mut source, source_rpc) =
+                connect(config.side(side), side, config.rpc_timeout_secs).await?;
+            let (mut destination, destination_rpc) = connect(
+                config.side(side.other()),
+                side.other(),
+                config.rpc_timeout_secs,
+            )
+            .await?;
             loop {
                 let info = source
                     .get_info(proto::GetInfoRequest {})
-                    .await?
+                    .await
+                    .map_err(|error| rpc_error(&source_rpc, "GetInfo", &error))?
                     .into_inner();
                 // Hypersnap's local heights control activation in BOTH directions.
                 // Snapchain may reach the same numeric height before Hypersnap forks.
@@ -96,7 +144,8 @@ async fn direction(
                 } else {
                     destination
                         .get_info(proto::GetInfoRequest {})
-                        .await?
+                        .await
+                        .map_err(|error| rpc_error(&destination_rpc, "GetInfo", &error))?
                         .into_inner()
                 };
                 for shard_id in 0..=config.num_shards {
@@ -182,13 +231,30 @@ async fn direction(
                         Duration::from_secs(config.rpc_timeout_secs),
                         fetch(&mut source, shard, cursor.next, end),
                     )
-                    .await??;
+                    .await
+                    .map_err(|error| rpc_error(&source_rpc, "block fetch timeout", &error))?
+                    .map_err(|error| {
+                        rpc_error(
+                            &source_rpc,
+                            &format!(
+                                "{} shard={shard} blocks=[{}, {end})",
+                                if shard == 0 {
+                                    "GetBlocks"
+                                } else {
+                                    "GetShardChunks"
+                                },
+                                cursor.next
+                            ),
+                            error.as_ref(),
+                        )
+                    })?;
                     let mut cursor = cursor;
                     for block in blocks {
                         validate_block(&cursor, &block, shard)?;
                         let mut target = NetworkDestination {
                             publisher: &publisher,
                             client: &mut destination,
+                            rpc: &destination_rpc,
                             side: side.other(),
                             schedule: &schedule,
                             publish_timeout: Duration::from_secs(config.rpc_timeout_secs),
@@ -315,6 +381,7 @@ trait Destination: Send {
 struct NetworkDestination<'a> {
     publisher: &'a Publisher,
     client: &'a mut HubServiceClient<Channel>,
+    rpc: &'a str,
     side: Side,
     schedule: &'a crate::network::topic_schedule::Schedule,
     publish_timeout: Duration,
@@ -325,7 +392,8 @@ impl Destination for NetworkDestination<'_> {
         Ok(self
             .client
             .validate_message(message)
-            .await?
+            .await
+            .map_err(|error| rpc_error(self.rpc, "ValidateMessage", &error))?
             .into_inner()
             .valid)
     }
@@ -457,6 +525,101 @@ fn compatible(raw: &Message, config: &Config, side: Side) -> Option<Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone)]
+    struct InfoStub(bool);
+    impl tonic::server::NamedService for InfoStub {
+        const NAME: &'static str = "HubService";
+    }
+    impl tonic::codegen::Service<hyper::Request<tonic::body::BoxBody>> for InfoStub {
+        type Response = hyper::Response<tonic::body::BoxBody>;
+        type Error = std::convert::Infallible;
+        type Future = tonic::codegen::BoxFuture<Self::Response, Self::Error>;
+        fn poll_ready(
+            &mut self,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, request: hyper::Request<tonic::body::BoxBody>) -> Self::Future {
+            struct Reply(bool);
+            impl tonic::server::UnaryService<proto::GetInfoRequest> for Reply {
+                type Response = proto::GetInfoResponse;
+                type Future =
+                    std::future::Ready<Result<tonic::Response<Self::Response>, tonic::Status>>;
+                fn call(&mut self, _: tonic::Request<proto::GetInfoRequest>) -> Self::Future {
+                    std::future::ready(if self.0 {
+                        Err(tonic::Status::unavailable("GetInfo is not serving"))
+                    } else {
+                        Ok(tonic::Response::new(proto::GetInfoResponse {
+                            version: "healthy".into(),
+                            ..Default::default()
+                        }))
+                    })
+                }
+            }
+            let fail = self.0;
+            Box::pin(async move {
+                let codec = tonic::codec::ProstCodec::<proto::GetInfoResponse, proto::GetInfoRequest>::default();
+                Ok(tonic::server::Grpc::new(codec)
+                    .unary(Reply(fail), request)
+                    .await)
+            })
+        }
+    }
+
+    async fn info_server(fail: bool) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(InfoStub(fail))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        (url, task)
+    }
+
+    #[tokio::test]
+    async fn rpc_fallback_requires_a_successful_get_info_not_just_a_connection() {
+        let (unhealthy, primary_task) = info_server(true).await;
+        let (healthy, fallback_task) = info_server(false).await;
+        let mut network = config().snapchain;
+        network.rpc = unhealthy.clone();
+        network.rpc_fallbacks = vec![healthy.clone()];
+        let (mut client, selected) = connect(&network, Side::Snapchain, 2).await.unwrap();
+        assert_eq!(selected, healthy);
+        assert_eq!(
+            client
+                .get_info(proto::GetInfoRequest {})
+                .await
+                .unwrap()
+                .into_inner()
+                .version,
+            "healthy"
+        );
+        // A healthy primary stays selected; an unused fallback need not be reachable.
+        network.rpc = healthy.clone();
+        network.rpc_fallbacks = vec![unhealthy.clone()];
+        assert_eq!(
+            connect(&network, Side::Snapchain, 2).await.unwrap().1,
+            healthy
+        );
+        network.rpc = unhealthy.clone();
+        network.rpc_fallbacks.clear();
+        let error = connect(&network, Side::Snapchain, 2)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains(&unhealthy));
+        assert!(error.contains("GetInfo readiness check"));
+        assert!(error.contains("GetInfo is not serving"));
+        primary_task.abort();
+        fallback_task.abort();
+    }
+
     fn config() -> Config {
         let mut config: Config =
             toml::from_str(include_str!("../../shuttle.example.toml")).unwrap();

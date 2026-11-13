@@ -782,9 +782,15 @@ async fn run() -> Result<(), Box<dyn Error>> {
         vec![]
     };
 
+    let mut gossip_config = app_config.gossip.clone();
+    if gossip_config.discovery.cache_path.as_os_str().is_empty() {
+        gossip_config.discovery.cache_path = std::path::Path::new(&app_config.rocksdb_dir).join(
+            format!("discovered-peers-{}.json", app_config.fc_network as i32),
+        );
+    }
     let gossip_result = SnapchainGossip::create(
         keypair.clone(),
-        &app_config.gossip,
+        &gossip_config,
         Some(system_tx.clone()),
         read_node,
         app_config.fc_network,

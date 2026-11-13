@@ -259,3 +259,23 @@ validator_public_keys = [
 "1" = 51_161_786
 "2" = 50_996_940
 
+# Ordinary discovery bootstraps, not explicit/direct GossipSub peers. These
+# nodes run the same validator binary; bootstrap service grants no extra power.
+# Infinitehomie and ivy remain in the validator sets above, but are not seeds.
+[gossip.discovery]
+enabled = true
+target_peers = 12
+bootstrap_peers = [
+  # cassie / haatz
+  "/ip4/85.237.203.140/udp/3382/quic-v1/p2p/12D3KooWMYfkXiNcn9LifPkLYiHtGmXYnknYG1yFBD53rUseUMUc",
+  # kmacb
+  "/ip4/85.209.231.221/udp/3382/quic-v1/p2p/12D3KooWE6Y3ZTdrVHar9VPNwwSQJJmF8xyVdK8mgTceiXK7HiFt",
+  # derekhoiem
+  "/dns4/hypersnap.rainonmeproductions.com/udp/3382/quic-v1/p2p/12D3KooWNyGrgDr5tJvbC7vPCUgrfKThKBaguZeZbfznCUdQCN9Q",
+  # arfonzo
+  "/dns4/hypersnap.imgnai.com/udp/3382/quic-v1/p2p/12D3KooWHvn8rQpVovdhKEcwko1TBcnwC8mtkZEFyfKKNearZqXJ",
+  # mvr
+  "/dns4/sizzle.onchain.cooking/udp/3382/quic-v1/p2p/12D3KooWJ6jCWWekTbNMn9MUGg6io4dYmSGbnguV9CnyQwzFiRn1",
+  # wake
+  "/ip4/51.79.77.116/udp/3382/quic-v1/p2p/12D3KooWCAdNQJvE9eH258D55b6zodhLoW2B8xRJEtayozGX1Jud",
+]

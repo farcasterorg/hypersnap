@@ -1,3 +1,4 @@
+use super::{discovery, vote_recovery::RecentVotes};
 use crate::cfg::{DEFAULT_GOSSIP_PORT, DEFAULT_RPC_PORT};
 use crate::consensus::consensus::{MalachiteEventShard, SystemMessage};
 use crate::consensus::malachite::network_connector::MalachiteNetworkEvent;
@@ -25,10 +26,11 @@ use informalsystems_malachitebft_network::{Channel, PeerIdExt};
 use informalsystems_malachitebft_sync::{self as sync};
 use libp2p::identity::ed25519::Keypair;
 use libp2p::request_response::{self, InboundRequestId, OutboundRequestId};
+use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::dial_opts::DialOpts;
 use libp2p::{
-    gossipsub, noise, swarm::NetworkBehaviour, swarm::SwarmEvent, tcp, yamux, Multiaddr, PeerId,
-    Swarm,
+    gossipsub, identify, kad, noise, swarm::NetworkBehaviour, swarm::SwarmEvent, tcp, yamux,
+    Multiaddr, PeerId, Swarm,
 };
 use libp2p_connection_limits::ConnectionLimits;
 use parking_lot::Mutex;
@@ -84,6 +86,8 @@ pub struct Config {
     /// First Hypersnap consensus height for each shard. Configured in validators.toml.
     #[serde(default)]
     pub topic_cutovers: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub discovery: discovery::Config,
 }
 
 impl Default for Config {
@@ -102,6 +106,7 @@ impl Default for Config {
             enable_autodiscovery: false,
             direct_peers: "".to_string(),
             topic_cutovers: BTreeMap::new(),
+            discovery: discovery::Config::default(),
         }
     }
 }
@@ -163,6 +168,7 @@ impl Config {
         self.bootstrap_peers
             .split(',')
             .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
             .collect()
     }
 
@@ -176,6 +182,8 @@ impl Config {
 
 pub enum GossipEvent<Ctx: SnapchainContext> {
     BroadcastSignedVote(SignedVote<Ctx>),
+    /// Look up and dial a sync validator without admitting an unreachable status.
+    DiscoverPeer(MalachitePeerId),
     BroadcastSignedProposal(SignedProposal<Ctx>),
     BroadcastFullProposal(proto::FullProposal),
     BroadcastMempoolMessage(MempoolMessage),
@@ -223,6 +231,8 @@ pub enum GossipTopic {
 pub struct SnapchainBehavior {
     pub gossipsub: gossipsub::Behaviour,
     pub rpc: sync::Behaviour,
+    pub identify: Toggle<identify::Behaviour>,
+    pub kad: Toggle<kad::Behaviour<kad::store::MemoryStore>>,
     /// Mesh diagnostics request-response (the crawl). Sibling to `rpc` so it can
     /// evolve independently of Malachite's consensus sync protocol.
     pub diagnostics: diagnostics::Behaviour,
@@ -288,6 +298,9 @@ pub struct SnapchainGossip {
     system_tx: Option<Sender<SystemMessage>>,
     sync_channels: HashMap<InboundRequestId, sync::ResponseChannel>,
     read_node: bool,
+    discovery_config: discovery::Config,
+    discovery: discovery::Book,
+    recent_votes: RecentVotes,
     enable_autodiscovery: bool,
     bootstrap_addrs: HashSet<String>,
     connected_bootstrap_addrs: HashSet<String>,
@@ -410,6 +423,7 @@ impl SnapchainGossip {
                 yamux::Config::default,
             )?
             .with_quic()
+            .with_dns()?
             .with_behaviour(|key| {
                 let message_id_fn = |message: &gossipsub::Message| match message.topic.as_str() {
                     MEMPOOL_TOPIC | CONTACT_INFO | "mempool" | "contact-info" => {
@@ -471,16 +485,54 @@ impl SnapchainGossip {
                 // TODO(aditi): Connection limits are set high so that we don't keep kicking off read nodes for now
                 let connection_limits = libp2p_connection_limits::Behaviour::new(
                     ConnectionLimits::default()
-                        // .with_max_pending_incoming(Some(5))
-                        // .with_max_pending_outgoing(Some(5)),
+                        .with_max_pending_incoming(Some(32))
+                        .with_max_pending_outgoing(Some(16))
                         .with_max_established_incoming(Some(100))
                         .with_max_established_outgoing(Some(100)),
                 );
 
+                let peer = key.public().to_peer_id();
+                let identify = config.discovery.enabled.then(|| {
+                    identify::Behaviour::new(
+                        identify::Config::new(
+                            discovery::identify_protocol(fc_network as i32),
+                            key.public(),
+                        )
+                        .with_agent_version(format!("hypersnap/{}", env!("CARGO_PKG_VERSION")))
+                        .with_interval(Duration::from_secs(60))
+                        .with_push_listen_addr_updates(true)
+                        .with_cache_size(discovery::MAX_PEERS),
+                    )
+                });
+                let kad = config.discovery.enabled.then(|| {
+                    let mut kad_config = kad::Config::new(
+                        libp2p::StreamProtocol::try_from_owned(discovery::protocol(
+                            fc_network as i32,
+                        ))
+                        .expect("static protocol"),
+                    );
+                    kad_config.set_query_timeout(Duration::from_secs(10));
+                    kad_config.set_record_filtering(kad::StoreInserts::FilterBoth);
+                    // Discovery only: applications do not publish DHT records.
+                    let store_config = kad::store::MemoryStoreConfig {
+                        max_records: 0,
+                        max_provided_keys: 0,
+                        ..Default::default()
+                    };
+                    let mut kad = kad::Behaviour::with_config(
+                        peer,
+                        kad::store::MemoryStore::with_config(peer, store_config),
+                        kad_config,
+                    );
+                    kad.set_mode(Some(kad::Mode::Server));
+                    kad
+                });
                 Ok(SnapchainBehavior {
                     gossipsub,
                     rpc,
                     diagnostics,
+                    identify: identify.into(),
+                    kad: kad.into(),
                     connection_limits,
                 })
             })?
@@ -574,6 +626,38 @@ impl SnapchainGossip {
             }
         }
         let direct_peers: HashSet<PeerId> = config.direct_peers().into_iter().collect();
+        let mut discovery = discovery::Book::new(
+            *swarm.local_peer_id(),
+            fc_network == FarcasterNetwork::Devnet,
+        );
+        if config.discovery.enabled {
+            discovery.load(&config.discovery.cache_path, Instant::now());
+            for seed in &config.discovery.bootstrap_peers {
+                let mut addr: Multiaddr = seed.parse()?;
+                let Some(libp2p::multiaddr::Protocol::P2p(peer)) = addr.pop() else {
+                    return Err(
+                        format!("discovery bootstrap must end in /p2p/<peer-id>: {seed}").into(),
+                    );
+                };
+                if let Some(addr) = discovery.learn(peer, addr, false, true, Instant::now()) {
+                    swarm
+                        .behaviour_mut()
+                        .kad
+                        .as_mut()
+                        .unwrap()
+                        .add_address(&peer, addr);
+                }
+            }
+            if let Ok(addr) = announce_gossip_address.parse() {
+                if let Some(addr) = discovery::address(
+                    *swarm.local_peer_id(),
+                    addr,
+                    fc_network == FarcasterNetwork::Devnet,
+                ) {
+                    swarm.add_external_address(addr);
+                }
+            }
+        }
 
         Ok(SnapchainGossip {
             topic_schedule,
@@ -583,6 +667,9 @@ impl SnapchainGossip {
             system_tx,
             sync_channels: HashMap::new(),
             read_node,
+            discovery_config: config.discovery.clone(),
+            discovery,
+            recent_votes: RecentVotes::default(),
             bootstrap_addrs: config.bootstrap_addrs().into_iter().collect(),
             announce_gossip_address,
             announce_rpc_address,
@@ -770,8 +857,44 @@ impl SnapchainGossip {
 
         let mut publish_contact_info_timer = tokio::time::interval(self.contact_info_interval);
 
+        let mut discovery_timer = tokio::time::interval(Duration::from_secs(1));
+        let mut lookup_timer = tokio::time::interval(Duration::from_secs(30));
+        let mut save_timer = tokio::time::interval(Duration::from_secs(60));
+        let mut cache_write: Option<tokio::task::JoinHandle<()>> = None;
+        // Different nodes resend at different times; no signature is recreated.
+        let mut vote_timer =
+            tokio::time::interval(Duration::from_millis(2000 + rand::random::<u64>() % 500));
         loop {
             tokio::select! {
+                _ = vote_timer.tick(), if !self.read_node => {
+                    for vote in self.recent_votes.pending() {
+                        if let Some((_, bytes)) = self.process_gossip_event(Some(GossipEvent::BroadcastSignedVote(vote))) {
+                            self.publish(bytes, CONSENSUS_TOPIC);
+                            self.statsd_client.count("gossip.vote_rebroadcast", 1, vec![]);
+                        }
+                    }
+                },
+                _ = discovery_timer.tick(), if self.discovery_config.enabled || self.enable_autodiscovery => {
+                    let connected = self.swarm.connected_peers().copied().collect();
+                    self.statsd_client.gauge("gossip.discovery.known_peers", self.discovery.peer_ids().count() as u64, vec![]);
+                    self.statsd_client.gauge("gossip.discovery.pending_dials", self.discovery.pending_count() as u64, vec![]);
+                    for (peer, addresses) in self.discovery.candidates(&connected, self.discovery_config.target_peers.min(32), Instant::now()) {
+                        let opts = DialOpts::peer_id(peer).addresses(addresses).condition(libp2p::swarm::dial_opts::PeerCondition::DisconnectedAndNotDialing).build();
+                        if let Err(error) = self.swarm.dial(opts) { self.discovery.failed(peer, Instant::now()); debug!(%peer, %error, "Discovery dial deferred"); }
+                    }
+                },
+                _ = lookup_timer.tick(), if self.discovery_config.enabled => {
+                    if let Some(kad) = self.swarm.behaviour_mut().kad.as_mut() {
+                        kad.get_closest_peers(PeerId::random());
+                    }
+                },
+                _ = save_timer.tick(), if self.discovery_config.enabled && !self.discovery_config.cache_path.as_os_str().is_empty() => {
+                    if cache_write.as_ref().is_none_or(|t| t.is_finished()) {
+                        let path = self.discovery_config.cache_path.clone();
+                        let snapshot = self.discovery.snapshot();
+                        cache_write = Some(tokio::spawn(async move { if let Err(error) = discovery::save(path, snapshot).await { warn!(%error, "Cannot persist discovered peers"); } }));
+                    }
+                },
                 _ = reconnect_timer.tick() => {
                     self.check_and_reconnect_to_bootstrap_peers().await;
                     self.statsd_client.gauge("gossip.connected_peers", self.swarm.connected_peers().count() as u64, vec![]);
@@ -850,6 +973,7 @@ impl SnapchainGossip {
 
                     let heal_targets: Vec<PeerId> = self.direct_peers.iter()
                         .chain(self.bootstrap_peer_addrs.keys())
+                        .chain(self.discovery.peer_ids())
                         .copied()
                         .collect::<HashSet<_>>()
                         .into_iter()
@@ -929,7 +1053,7 @@ impl SnapchainGossip {
                     }
                 },
                 _ = publish_contact_info_timer.tick() => {
-                    if self.read_node {
+                    if self.read_node || self.discovery_config.enabled {
                         info!("Publishing contact info");
                         self.publish_contact_info()
                     }
@@ -937,6 +1061,7 @@ impl SnapchainGossip {
                 gossip_event = self.swarm.select_next_some() => {
                     match gossip_event {
                         SwarmEvent::ConnectionEstablished {peer_id, endpoint, ..} => {
+                            self.discovery.connected(peer_id);
                             if let libp2p::core::ConnectedPoint::Dialer { address, .. } = &endpoint {
                                 let address = address.to_string();
                                 if self.bootstrap_addrs.contains(&address) {
@@ -1024,6 +1149,7 @@ impl SnapchainGossip {
                             if !self.swarm.is_connected(&peer_id) {
                                 self.metrics.remove_peer(&peer_id, &ALL_TOPICS);
                                 self.observed_addrs.remove(&peer_id);
+                                self.discovery.failed(peer_id, Instant::now());
                             }
                             info!(direct = is_direct, "Connection closed with peer: {:?} due to: {:?}", peer_id, cause);
                             // Sync can keep using this peer while another connection
@@ -1060,6 +1186,7 @@ impl SnapchainGossip {
                             }
                         },
                         SwarmEvent::OutgoingConnectionError {connection_id: _, peer_id, error} => {
+                            if let Some(peer) = peer_id { self.discovery.failed(peer, Instant::now()); }
                             warn!("Failed to dial peer: {:?} due to: {:?}", peer_id, error);
                         },
                         SwarmEvent::Behaviour(SnapchainBehaviorEvent::Gossipsub(gossipsub::Event::Message {
@@ -1091,13 +1218,28 @@ impl SnapchainGossip {
                             );
                             // Take an owned sender if present to avoid holding an immutable borrow during mutable self call
                             let maybe_sender = self.system_tx.as_ref().cloned();
+                            let system_message = self.map_gossip_bytes_to_system_message(peer_id, message.source, data);
                             if let Some(system_tx) = maybe_sender {
-                                if let Some(system_message) = self.map_gossip_bytes_to_system_message(peer_id, message.source, data) {
+                                if let Some(system_message) = system_message {
                                     if let Err(e) = system_tx.send(system_message).await {
                                         warn!("Failed to send system block message: {}", e);
                                     }
                                 }
                             }
+                        },
+                        SwarmEvent::Behaviour(SnapchainBehaviorEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
+                            if info.public_key.to_peer_id() == peer_id && info.protocol_version == discovery::identify_protocol(self.fc_network as i32) {
+                                self.learn_verified_addresses(peer_id, info.listen_addrs);
+                            }
+                        },
+                        SwarmEvent::Behaviour(SnapchainBehaviorEvent::Kad(kad::Event::OutboundQueryProgressed { result: kad::QueryResult::GetClosestPeers(result), .. })) => {
+                            let peers = match result { Ok(ok) => ok.peers, Err(kad::GetClosestPeersError::Timeout { peers, .. }) => peers };
+                            for p in peers {
+                                for addr in p.addrs.into_iter().take(4) { self.discovery.learn(p.peer_id, addr, false, false, Instant::now()); }
+                            }
+                        },
+                        SwarmEvent::Behaviour(SnapchainBehaviorEvent::Kad(kad::Event::RoutingUpdated { peer, addresses, .. })) => {
+                            for addr in addresses.iter().take(4) { self.discovery.learn(peer, addr.clone(), false, false, Instant::now()); }
                         },
                         SwarmEvent::Behaviour(SnapchainBehaviorEvent::Rpc(sync_event)) => {
                             match sync_event {
@@ -1274,7 +1416,10 @@ impl SnapchainGossip {
     /// Peers the mesh self-heal sweep may bounce: configured direct peers and
     /// peers this node reached through a bootstrap address.
     fn is_self_heal_target(&self, peer_id: &PeerId) -> bool {
-        self.direct_peers.contains(peer_id) || self.bootstrap_peer_addrs.contains_key(peer_id)
+        self.direct_peers.contains(peer_id)
+            || self.bootstrap_peer_addrs.contains_key(peer_id)
+            || ((self.discovery_config.enabled || self.enable_autodiscovery)
+                && self.discovery.contains(peer_id))
     }
 
     pub fn set_topic_routing_shards(&mut self, num_shards: u32) -> Result<(), String> {
@@ -1330,66 +1475,57 @@ impl SnapchainGossip {
         }
     }
 
-    pub fn handle_contact_info(&mut self, contact_info: ContactInfo, peer_id: PeerId) {
-        // TODO(aditi): We might want to persist peers and reconnect to them on restart
-        if contact_info.body.is_none() {
-            warn!("Received empty contact info from peer: {}", peer_id);
-            return;
+    fn learn_verified_addresses(&mut self, peer: PeerId, addresses: Vec<Multiaddr>) {
+        let (addresses, removed) =
+            self.discovery
+                .verified_addresses(peer, addresses, Instant::now());
+        if let Some(kad) = self.swarm.behaviour_mut().kad.as_mut() {
+            for addr in removed {
+                kad.remove_address(&peer, &addr);
+            }
+            for addr in addresses {
+                kad.add_address(&peer, addr);
+            }
         }
-        let contact_info_body = contact_info.body.unwrap();
-        info!(
-            peer_id = peer_id.to_string(),
-            ip = contact_info_body.gossip_address,
-            "Received contact info from peer"
-        );
+    }
 
-        let Ok(contact_peer_id) = PeerId::from_bytes(&contact_info_body.peer_id) else {
-            warn!(
-                peer_id = peer_id.to_string(),
-                "Received contact info with an invalid peer id"
-            );
+    /// The caller supplies the signature-checked gossip author, not the relay.
+    pub fn handle_contact_info(&mut self, contact_info: ContactInfo, author: PeerId) {
+        let Some(body) = contact_info.body else {
             return;
         };
-
-        self.peers
-            .insert(contact_peer_id, contact_info_body.clone());
-
-        // Validators should just dial the bootstrap set since the validator set is fixed.
-        if !self.read_node {
+        let Ok(peer) = PeerId::from_bytes(&body.peer_id) else {
             return;
-        }
-
-        if let Some(peer_id) = self
-            .swarm
-            .connected_peers()
-            .find(|peer_id| contact_peer_id == **peer_id)
+        };
+        let now_ms = discovery::unix_seconds().saturating_mul(1000);
+        if peer != author
+            || body.network() != self.fc_network
+            || body.snapchain_version
+                != EngineVersion::current(self.fc_network)
+                    .protocol_version()
+                    .to_string()
+            || body.timestamp > now_ms.saturating_add(300_000)
+            || now_ms.saturating_sub(body.timestamp) > 1_800_000
         {
-            info!(
-                peer_id = peer_id.to_string(),
-                "Already connected to peer, so not dialing"
-            );
+            debug!(%peer, %author, "Ignoring unauthenticated, stale or incompatible contact info");
             return;
         }
-
-        if contact_info_body.network() != self.fc_network {
-            info!(
-                peer_id = contact_peer_id.to_string(),
-                "Peer running on different network"
-            );
+        let Ok(addr) = body.gossip_address.parse() else {
             return;
-        }
-
-        let current_version = EngineVersion::current(self.fc_network).protocol_version();
-        if contact_info_body.snapchain_version != current_version.to_string() {
-            info!(
-                peer_id = contact_peer_id.to_string(),
-                "Peer running a different protocol version"
-            );
+        };
+        let Some(addr) =
+            discovery::address(peer, addr, self.fc_network == FarcasterNetwork::Devnet)
+        else {
             return;
+        };
+        // Bound the API's collected-contact view as well as the discovery book.
+        self.peers
+            .retain(|_, p| now_ms.saturating_sub(p.timestamp) <= 1_800_000);
+        if self.peers.len() < discovery::MAX_PEERS || self.peers.contains_key(&peer) {
+            self.peers.insert(peer, body);
         }
-
-        if self.enable_autodiscovery {
-            let _ = Self::dial(&mut self.swarm, &contact_info_body.gossip_address);
+        if self.discovery_config.enabled || self.enable_autodiscovery {
+            self.learn_verified_addresses(peer, vec![addr]);
         }
     }
 
@@ -1403,7 +1539,9 @@ impl SnapchainGossip {
         match proto::GossipMessage::decode(gossip_message.as_slice()) {
             Ok(gossip_message) => match gossip_message.gossip_message {
                 Some(gossip_message::GossipMessage::ContactInfoMessage(contact_info)) => {
-                    self.handle_contact_info(contact_info, peer_id);
+                    if let Some(author) = source {
+                        self.handle_contact_info(contact_info, author);
+                    }
                     None
                 }
 
@@ -1474,6 +1612,9 @@ impl SnapchainGossip {
                     Some(SystemMessage::MalachiteNetwork(shard, event))
                 }
                 Some(proto::gossip_message::GossipMessage::Status(status)) => {
+                    if source.is_none_or(|author| author.to_bytes() != status.peer_id) {
+                        return None;
+                    }
                     let encoded = status.encode_to_vec();
                     let Some(height) = status.height else {
                         warn!(
@@ -1608,6 +1749,7 @@ impl SnapchainGossip {
                 ))
             }
             Some(GossipEvent::BroadcastSignedVote(vote)) => {
+                self.recent_votes.remember(&vote);
                 let vote_proto = vote.to_proto();
                 let gossip_message = proto::GossipMessage {
                     gossip_message: Some(proto::gossip_message::GossipMessage::Consensus(
@@ -1684,6 +1826,7 @@ impl SnapchainGossip {
                 }
             }
             Some(GossipEvent::BroadcastStatus(status)) => {
+                self.recent_votes.committed(status.height);
                 let encoded = snapchain_codec.encode(&status);
                 match encoded {
                     Ok(encoded) => {
@@ -1727,6 +1870,18 @@ impl SnapchainGossip {
                     .diagnostics
                     .send_request(&peer, request);
                 self.diagnostics_requests.insert(request_id, channel);
+                None
+            }
+            Some(GossipEvent::DiscoverPeer(peer)) => {
+                let peer = peer.to_libp2p();
+                if self.discovery_config.enabled
+                    && !self.swarm.is_connected(&peer)
+                    && self.discovery.request(peer, Instant::now())
+                {
+                    if let Some(kad) = self.swarm.behaviour_mut().kad.as_mut() {
+                        kad.get_closest_peers(peer);
+                    }
+                }
                 None
             }
             // Handled by the event loop before it gets here.
@@ -1891,5 +2046,96 @@ impl SnapchainGossip {
             peers,
             generated_at,
         }
+    }
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+    use crate::storage::store::test_helper::statsd_client;
+    #[tokio::test]
+    async fn discovery_contact_authentication_and_network_checks() {
+        let mut cfg = Config::default()
+            .with_announce_address("/ip4/127.0.0.1/udp/1234/quic-v1".into())
+            .with_announce_rpc_address("http://127.0.0.1:1235".into());
+        cfg.address = "/ip4/127.0.0.1/udp/0/quic-v1".into();
+        cfg.discovery.enabled = true;
+        let mut gossip = SnapchainGossip::create(
+            Keypair::generate(),
+            &cfg,
+            None,
+            false,
+            FarcasterNetwork::Devnet,
+            statsd_client(),
+            vec![],
+        )
+        .await
+        .unwrap();
+        let author = PeerId::random();
+        let relay = PeerId::random();
+        let body = ContactInfoBody {
+            peer_id: author.to_bytes(),
+            gossip_address: "/ip4/127.0.0.1/udp/1236/quic-v1".into(),
+            network: FarcasterNetwork::Devnet as i32,
+            snapchain_version: EngineVersion::current(FarcasterNetwork::Devnet)
+                .protocol_version()
+                .to_string(),
+            timestamp: discovery::unix_seconds() * 1000,
+            ..Default::default()
+        };
+        let encode = |body| {
+            proto::GossipMessage {
+                gossip_message: Some(gossip_message::GossipMessage::ContactInfoMessage(
+                    ContactInfo { body: Some(body) },
+                )),
+            }
+            .encode_to_vec()
+        };
+        gossip.map_gossip_bytes_to_system_message(relay, Some(relay), encode(body.clone()));
+        assert!(
+            gossip.peers.is_empty(),
+            "relay cannot advertise another identity"
+        );
+        gossip.map_gossip_bytes_to_system_message(relay, None, encode(body.clone()));
+        assert!(gossip.peers.is_empty(), "unsigned advertisement rejected");
+        let mut bad = body.clone();
+        bad.network = FarcasterNetwork::Mainnet as i32;
+        gossip.map_gossip_bytes_to_system_message(relay, Some(author), encode(bad));
+        let mut bad = body.clone();
+        bad.timestamp = 0;
+        gossip.map_gossip_bytes_to_system_message(relay, Some(author), encode(bad));
+        let mut bad = body.clone();
+        bad.gossip_address = "/ip4/0.0.0.0/udp/1234/quic-v1".into();
+        gossip.map_gossip_bytes_to_system_message(relay, Some(author), encode(bad));
+        assert!(gossip.peers.is_empty());
+        gossip.map_gossip_bytes_to_system_message(relay, Some(author), encode(body));
+        assert!(
+            gossip.peers.contains_key(&author),
+            "validators learn authenticated relayed contacts"
+        );
+    }
+
+    #[test]
+    fn discovery_default_seeds_exclude_offline_peers_without_removing_validators() {
+        let config: toml::Value = toml::from_str(include_str!("../../validators.toml")).unwrap();
+        let discovery: discovery::Config =
+            config["gossip"]["discovery"].clone().try_into().unwrap();
+        assert!(discovery.enabled);
+        assert_eq!(discovery.bootstrap_peers.len(), 6);
+        for seed in discovery.bootstrap_peers {
+            let mut addr: Multiaddr = seed.parse().unwrap();
+            let Some(libp2p::multiaddr::Protocol::P2p(peer)) = addr.pop() else {
+                panic!("seed must pin identity");
+            };
+            assert!(discovery::address(peer, addr, false).is_some());
+            assert!(!seed.contains("46.110.19.50"));
+            assert!(!seed.contains("procat.ivyastrix.com"));
+        }
+        let latest = config["consensus"]["validator_sets"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap();
+        assert_eq!(latest["validator_public_keys"].as_array().unwrap().len(), 8);
     }
 }

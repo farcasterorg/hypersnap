@@ -31,6 +31,9 @@ impl Side {
 #[serde(deny_unknown_fields)]
 pub struct Network {
     pub rpc: String,
+    /// Tried in order when the primary cannot answer GetInfo over gRPC.
+    #[serde(default)]
+    pub rpc_fallbacks: Vec<String>,
     pub peers: Vec<String>,
     #[serde(default = "listen")]
     pub listen: String,
@@ -112,7 +115,9 @@ impl Config {
             return Err("duplicate shard IDs".into());
         }
         for side in [&self.hypersnap, &self.snapchain] {
-            tonic::transport::Endpoint::new(side.rpc.clone())?;
+            for rpc in std::iter::once(&side.rpc).chain(&side.rpc_fallbacks) {
+                tonic::transport::Endpoint::new(rpc.clone())?;
+            }
             if side.peers.is_empty() {
                 return Err("each destination needs at least one gossip peer".into());
             }
@@ -131,7 +136,13 @@ impl Config {
                 return Err("start_blocks contains an unconfigured shard".into());
             }
         }
-        if self.hypersnap.rpc == self.snapchain.rpc {
+        let hyper_rpcs: std::collections::HashSet<_> = std::iter::once(&self.hypersnap.rpc)
+            .chain(&self.hypersnap.rpc_fallbacks)
+            .collect();
+        if std::iter::once(&self.snapchain.rpc)
+            .chain(&self.snapchain.rpc_fallbacks)
+            .any(|url| hyper_rpcs.contains(url))
+        {
             return Err("source RPCs must identify different networks".into());
         }
         Ok(())
@@ -198,6 +209,9 @@ mod tests {
         assert!(config.validate().is_err());
         let mut invalid: Config = toml::from_str(example).unwrap();
         invalid.shards.push(3);
+        assert!(invalid.validate().is_err());
+        let mut invalid: Config = toml::from_str(example).unwrap();
+        invalid.snapchain.rpc_fallbacks = vec![invalid.hypersnap.rpc.clone()];
         assert!(invalid.validate().is_err());
     }
 }

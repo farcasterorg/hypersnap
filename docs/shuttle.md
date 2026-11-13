@@ -16,6 +16,14 @@ You can replace these with your own nodes. RPC must be the gRPC endpoint. Both
 nodes must retain blocks from the requested starting heights. The shuttle needs outbound access to both
 RPC endpoints and the peers' configured QUIC/UDP or TCP ports.
 
+Each network can set `rpc_fallbacks = ["http://host:3383", ...]`. On connection,
+the shuttle tries the primary RPC and then those addresses in order, checking
+`GetInfo` before selecting one. The example keeps `snap.farcaster.xyz` as primary
+and includes a public Snapchain validator RPC as fallback. All RPCs for one side
+must serve that same network and retained history; changing endpoints keeps the
+existing cursors and parent-hash checks. Logs identify the selected RPC and the
+method, endpoint, and underlying cause of failures.
+
 ```sh
 ./target/release/shuttle --config-path shuttle.toml --check-config
 ./target/release/shuttle --config-path shuttle.toml
