@@ -128,6 +128,9 @@ struct MockChainState {
     ens_names: Mutex<HashMap<String, Vec<u8>>>,
     /// `(contract address, claim signature)` pairs the contract accepts.
     contract_signatures: Mutex<HashSet<(Vec<u8>, Vec<u8>)>>,
+    no_rpc_clients: std::sync::atomic::AtomicBool,
+    fork_from_genesis: std::sync::atomic::AtomicBool,
+    pause_block_receivers: std::sync::atomic::AtomicBool,
 }
 
 impl MockChainState {
@@ -143,6 +146,12 @@ impl MockChainState {
 
     fn chain_clients(self: &Arc<Self>) -> ChainClients {
         let mut chain_api_map: HashMap<Chain, Box<dyn ChainAPI>> = HashMap::new();
+        if self
+            .no_rpc_clients
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return ChainClients { chain_api_map };
+        }
         for chain in [Chain::EthMainnet, Chain::BaseMainnet] {
             chain_api_map.insert(chain, Box::new(MockChainClient(self.clone())));
         }
@@ -583,6 +592,13 @@ impl NodeForTest {
         let mut consensus_config = snapchain::consensus::consensus::Config::default();
         consensus_config =
             consensus_config.with((1..=num_shards).collect(), validator_sets.clone());
+        if chain_state
+            .fork_from_genesis
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            consensus_config.native_registration.activation_heights =
+                (0..=num_shards).map(|s| (s.to_string(), 1)).collect();
+        }
         consensus_config.block_time = time::Duration::from_millis(250);
         // TODO(aditi): We need to figure out the right values for these timeouts. 1s (default) is long, but these are too short.
         // consensus_config.propose_time = time::Duration::from_millis(250);
@@ -762,6 +778,12 @@ impl NodeForTest {
         join_handles.push(handle);
 
         for shard_id in 1..num_shards + 1 {
+            if chain_state
+                .pause_block_receivers
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                continue;
+            }
             let senders = node.shard_senders.get(&shard_id).unwrap();
             let mut block_receiver = BlockReceiver {
                 shard_id: shard_id,
@@ -771,10 +793,7 @@ impl NodeForTest {
                 system_tx: system_tx.clone(),
                 event_rx: senders.events_tx.subscribe(),
                 validator_sets: consensus_config.to_stored_validator_sets(shard_id),
-                config: block_receiver::Config {
-                    enabled: true,
-                    ..block_receiver::Config::default()
-                },
+                config: block_receiver::Config::default(),
                 statsd: statsd_client.clone(),
             };
             let handle = tokio::spawn(async move { block_receiver.run().await });
@@ -4495,4 +4514,241 @@ async fn test_discovery_sparse_eight_validators_two_offline_and_lost_prevote() {
             }
         }
     }
+}
+
+/// Exercise the actual submit RPC, gossip to other validators, shard-0 merge,
+/// and data-shard replay with no chain API clients. Existing custody records
+/// are seeded as historical state; there are no live contract-event listeners.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+#[serial]
+async fn test_gasless_rpc_registration_without_chain_clients() {
+    let mut network = TestNetwork::create(3, 2).await;
+    network
+        .chain_state
+        .no_rpc_clients
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(network.chain_state.chain_clients().chain_api_map.is_empty());
+    network.start_validators().await;
+    let fid = 1000;
+    let request_fid = 1003;
+    let custody = alloy_signer_local::PrivateKeySigner::random();
+    let app_custody = alloy_signer_local::PrivateKeySigner::random();
+    let key = factory::signers::generate_signer();
+    network.register_fid_with_eth_custody(fid, &custody).await;
+    network.wait_for_fid_on_block_engine(fid).await.unwrap();
+    let now = messages_factory::farcaster_time();
+    let add = messages_factory::keys::create_key_add(
+        fid,
+        &custody,
+        request_fid,
+        &app_custody,
+        &key,
+        vec![MessageType::CastAdd],
+        3600,
+        1,
+        now + 1_000_000,
+        Some(now),
+    );
+    // A missing app's custody cannot be fetched from an unconfigured RPC. This
+    // must be a visible rejection, not a success followed by a silent drop.
+    let error = network
+        .first_live_node()
+        .submit_message_via_grpc(add.clone())
+        .await
+        .expect_err("unknown requesting app must fail submission");
+    assert!(
+        error.message().contains("SignedKeyRequest"),
+        "unexpected error: {error}"
+    );
+    network
+        .register_fid_with_eth_custody(request_fid, &app_custody)
+        .await;
+    network
+        .wait_for_fid_on_block_engine(request_fid)
+        .await
+        .unwrap();
+    // Reuse the same nonce: the rejected attempt must not consume it or spend
+    // the KEY_ADD mempool quota. Submit only to one node, exercising gossip.
+    network
+        .first_live_node()
+        .submit_message_via_grpc(add)
+        .await
+        .expect("gasless KEY_ADD must work with no chain clients");
+    let pubkey = key.verifying_key().to_bytes();
+    let router = routing::ShardRouter {};
+    network
+        .wait_for_gasless_key_on_shard(fid, &pubkey, router.route_fid(fid, 2))
+        .await
+        .expect("key must propagate to every validator's data shard");
+    let cast = messages_factory::casts::create_cast_add(
+        fid,
+        "gasless without chain RPC",
+        None,
+        Some(&key),
+    );
+    network
+        .first_live_node()
+        .submit_message_via_grpc(cast.clone())
+        .await
+        .expect("new gasless signer must pass RPC validation");
+    network
+        .wait_for_cast_on_subset(&[0, 1, 2], fid, cast.hash, time::Duration::from_secs(20))
+        .await
+        .expect("all validators must merge a cast from the new signer");
+}
+
+/// Reproduce the production failure: a successful fork KEY_ADD in shard 0 is
+/// absent from the signer API while internal receivers are disabled. Starting
+/// them must recover retained committed events without another broadcast.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+#[serial]
+async fn test_gasless_fork_signer_recovers_when_block_receiver_starts_late() {
+    use snapchain::consensus::validator::{StoredValidatorSet, StoredValidatorSets};
+    use snapchain::core::types::{ShardId, SnapchainShard};
+    use std::sync::atomic::Ordering;
+    let mut network = TestNetwork::create(1, 2).await;
+    network
+        .chain_state
+        .no_rpc_clients
+        .store(true, Ordering::Relaxed);
+    network
+        .chain_state
+        .fork_from_genesis
+        .store(true, Ordering::Relaxed);
+    network
+        .chain_state
+        .pause_block_receivers
+        .store(true, Ordering::Relaxed);
+    network.start_validators().await;
+    let fid = 1000;
+    let request_fid = 1003;
+    let custody = alloy_signer_local::PrivateKeySigner::random();
+    let app = alloy_signer_local::PrivateKeySigner::random();
+    let key = factory::signers::generate_signer();
+    network.register_fid_with_eth_custody(fid, &custody).await;
+    network
+        .register_fid_with_eth_custody(request_fid, &app)
+        .await;
+    network.wait_for_fid_on_block_engine(fid).await.unwrap();
+    network
+        .wait_for_fid_on_block_engine(request_fid)
+        .await
+        .unwrap();
+    let now = messages_factory::farcaster_time();
+    let add = messages_factory::keys::create_key_add(
+        fid,
+        &custody,
+        request_fid,
+        &app,
+        &key,
+        vec![MessageType::CastAdd],
+        3600,
+        1,
+        now + 1_000_000,
+        Some(now),
+    );
+    let node = network.first_live_node();
+    node.submit_message_via_grpc(add).await.unwrap();
+    let pubkey = key.verifying_key().to_bytes();
+    wait_for(
+        || {
+            get_gasless_key_record(
+                &node.node.block_stores.db,
+                &RocksDbTransactionBatch::new(),
+                fid,
+                &pubkey,
+            )
+            .unwrap()
+            .map(|_| ())
+        },
+        time::Duration::from_secs(15),
+        time::Duration::from_millis(50),
+    )
+    .await
+    .expect("key must be committed on shard zero");
+    let mut client = node.client().await;
+    assert_eq!(
+        client
+            .get_signer(proto::SignerRequest {
+                fid,
+                signer: pubkey.to_vec()
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::NotFound
+    );
+    let cast = messages_factory::casts::create_cast_add(
+        fid,
+        "gasless key after internal replay recovery",
+        None,
+        Some(&key),
+    );
+    assert!(
+        node.submit_message_via_grpc(cast.clone()).await.is_err(),
+        "missing data-shard record must reproduce the reported failure"
+    );
+    let (system_tx, mut system_rx) = mpsc::channel(100);
+    let stores = node.node.block_stores.clone();
+    let bridge = tokio::spawn(async move {
+        while let Some(SystemMessage::BlockRequest {
+            block_event_seqnum,
+            block_tx,
+        }) = system_rx.recv().await
+        {
+            let _ = block_tx.send(stores.get_block_by_event_seqnum(block_event_seqnum));
+        }
+    });
+    let (retained_only, _) = broadcast::channel::<Block>(100);
+    let mut receivers = Vec::new();
+    for shard_id in 1..=2 {
+        let stores = node.node.shard_stores[&shard_id].clone();
+        let config = block_receiver::Config::default();
+        let sets = network
+            .validator_sets
+            .iter()
+            .map(|c| StoredValidatorSet::new(SnapchainShard::new(0), c))
+            .collect();
+        let mut receiver = BlockReceiver {
+            shard_id,
+            stores,
+            block_rx: retained_only.subscribe(),
+            mempool_tx: node.mempool_tx.clone(),
+            system_tx: system_tx.clone(),
+            event_rx: node.node.shard_senders[&shard_id].events_tx.subscribe(),
+            validator_sets: StoredValidatorSets::new(0, sets),
+            config,
+            statsd: StatsdClientWrapper::new(
+                cadence::StatsdClient::builder("", cadence::NopMetricSink {}).build(),
+                true,
+            ),
+        };
+        receivers.push(tokio::spawn(async move { receiver.run().await }));
+    }
+    network
+        .wait_for_gasless_key_on_shard(fid, &pubkey, routing::ShardRouter {}.route_fid(fid, 2))
+        .await
+        .expect("startup must recover the already-committed signer");
+    let signer = client
+        .get_signer(proto::SignerRequest {
+            fid,
+            signer: pubkey.to_vec(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .signer
+        .unwrap();
+    assert_eq!(signer.source, proto::SignerSource::Offchain as i32);
+    node.submit_message_via_grpc(cast.clone())
+        .await
+        .expect("recovered signer must authorize casts");
+    network
+        .wait_for_cast_on_subset(&[0], fid, cast.hash, time::Duration::from_secs(15))
+        .await
+        .unwrap();
+    for handle in receivers {
+        handle.abort();
+    }
+    bridge.abort();
 }

@@ -85,7 +85,6 @@ mod tests {
                 single_block_confirmation_timeout: Duration::from_secs(1),
                 sync_confirmation_timeout: Duration::from_secs(10),
                 sync_batch_size: 500,
-                enabled: true,
             },
             statsd: test_helper::statsd_client(),
         };
@@ -201,6 +200,83 @@ mod tests {
                 block_tx.send(Some(block)).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn legacy_enable_flag_is_ignored_and_no_longer_serialized() {
+        // Old node configs must keep loading, while neither value controls
+        // startup. Main starts the receiver unconditionally for validators.
+        for enabled in [false, true] {
+            let legacy = format!("enabled = {enabled}\nsync_batch_size = 123\n");
+            let config: Config = toml::from_str(&legacy).unwrap();
+            assert_eq!(config.sync_batch_size, 123);
+            assert_eq!(
+                config.single_block_confirmation_timeout,
+                Duration::from_secs(5)
+            );
+            assert!(!toml::to_string(&config).unwrap().contains("enabled"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_startup_catches_up_already_committed_fork_events_without_new_broadcast() {
+        let mut setup = setup_test().await;
+        let fork = crate::native_registration::Config {
+            activation_heights: [("0".into(), 1), ("1".into(), 1)].into(),
+            ..Default::default()
+        };
+        setup.block_engine = setup.block_engine.with_native_registration(fork.clone());
+        setup.shard_engine = setup
+            .shard_engine
+            .with_native_registration(fork, setup.block_engine.stores().db);
+        setup.block_receiver.stores = setup.shard_engine.get_stores();
+        let blocks =
+            generate_heartbeats(&mut setup.block_engine, None, &setup.validator_keypair, 1);
+        let count = blocks.iter().map(|b| b.events.len() as u32).sum::<u32>();
+        assert!(count > 0);
+        assert!(
+            setup
+                .block_engine
+                .stores()
+                .block_event_store
+                .max_seqnum()
+                .unwrap()
+                > crate::native_registration::FORK_EVENT_BASE
+        );
+        let expected = setup
+            .block_engine
+            .stores()
+            .block_event_store
+            .max_seqnum()
+            .unwrap();
+        let handle = tokio::spawn(async move { setup.block_receiver.run().await });
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            sync_block_events(
+                &setup.block_engine,
+                &mut setup.system_rx,
+                &setup.validator_keypair,
+                count,
+            ),
+        )
+        .await
+        .expect("startup must request historical events without waiting for a new block");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while setup.mempool_rx.len() < count as usize {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        process_heartbeats(&mut setup.shard_engine, &mut setup.mempool_rx, count).await;
+        assert_eq!(
+            setup
+                .shard_engine
+                .get_stores()
+                .block_event_store
+                .max_seqnum()
+                .unwrap(),
+            expected
+        );
+        handle.abort();
     }
 
     #[tokio::test]

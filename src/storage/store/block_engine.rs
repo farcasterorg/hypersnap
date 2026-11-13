@@ -1718,8 +1718,23 @@ impl BlockEngine {
                         // storage units. Emitted MergeMessageBody propagates to shards via
                         // BlockEvent so their local DBs can replay the same merge.
                         if version.is_enabled(ProtocolFeature::GaslessSigners) {
-                            if let Ok(events) = self.merge_message(message, txn_batch, version) {
-                                hub_events.extend(events);
+                            match self.merge_message(message, txn_batch, version) {
+                                Ok(events) => hub_events.extend(events),
+                                Err(err) => {
+                                    // Custody/metadata, nonce and key-existence checks run
+                                    // during merge. Simulation must return these failures
+                                    // to the submitter rather than acknowledge an unmerged
+                                    // signer. Consensus already discards validation_errors;
+                                    // recording the error adds no state or block events.
+                                    warn!(
+                                        fid = message.fid(),
+                                        hash = message.hex_hash(),
+                                        msg_type = ?message.msg_type(),
+                                        "Error merging gasless signer message: {:?}",
+                                        err
+                                    );
+                                    validation_errors.push(err);
+                                }
                             }
                         }
                     }
@@ -1750,10 +1765,8 @@ impl BlockEngine {
                                     hub_events.extend(events)
                                 }
                                 Err(err) => {
-                                    // Surfaced rather than swallowed, unlike the arms above, and
-                                    // the asymmetry is deliberate. For those types the routine
-                                    // rejections are caught in `validate_user_message`, so a merge
-                                    // error is near-unreachable. A verification's rejections --
+                                    // Surface merge-time failures as we do for gasless keys.
+                                    // A verification's rejections --
                                     // duplicate, add superseded by a newer remove, stale add after
                                     // a remove -- are all detected *here*, because the validation
                                     // arm above checks only signatures and the version floor. Drop

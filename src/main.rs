@@ -1234,22 +1234,23 @@ async fn run() -> Result<(), Box<dyn Error>> {
             None
         };
 
-        if app_config.block_receiver.enabled {
-            for shard_id in app_config.consensus.shard_ids.iter() {
-                let senders = node.shard_senders.get(shard_id).unwrap();
-                let mut block_receiver = BlockReceiver {
-                    shard_id: *shard_id,
-                    stores: node.shard_stores.get(shard_id).unwrap().clone(),
-                    block_rx: block_tx.subscribe(),
-                    mempool_tx: mempool_tx.clone(),
-                    system_tx: system_tx.clone(),
-                    event_rx: senders.events_tx.subscribe(),
-                    validator_sets: app_config.consensus.to_stored_validator_sets(0), // We care about the validator sets for shard 0 blocks only
-                    config: app_config.block_receiver.clone(),
-                    statsd: statsd_client.clone(),
-                };
-                tokio::spawn(async move { block_receiver.run().await });
-            }
+        // Applying committed shard-0 events is required for consistent signer,
+        // account and other shared state on each data shard. It always runs on
+        // validators, independently of external chain listeners and fork config.
+        for shard_id in app_config.consensus.shard_ids.iter() {
+            let senders = node.shard_senders.get(shard_id).unwrap();
+            let mut block_receiver = BlockReceiver {
+                shard_id: *shard_id,
+                stores: node.shard_stores.get(shard_id).unwrap().clone(),
+                block_rx: block_tx.subscribe(),
+                mempool_tx: mempool_tx.clone(),
+                system_tx: system_tx.clone(),
+                event_rx: senders.events_tx.subscribe(),
+                validator_sets: app_config.consensus.to_stored_validator_sets(0), // We care about the validator sets for shard 0 blocks only
+                config: app_config.block_receiver.clone(),
+                statsd: statsd_client.clone(),
+            };
+            tokio::spawn(async move { block_receiver.run().await });
         }
 
         let l1_validator = Arc::new(L1Validator::new(

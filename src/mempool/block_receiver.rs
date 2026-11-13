@@ -27,13 +27,13 @@ const STORE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_CONFIRMATION_RETRIES: u32 = 3;
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(default)]
 pub struct Config {
     #[serde(with = "humantime_serde")]
     pub single_block_confirmation_timeout: Duration,
     #[serde(with = "humantime_serde")]
     pub sync_confirmation_timeout: Duration,
     pub sync_batch_size: u64,
-    pub enabled: bool,
 }
 
 impl Default for Config {
@@ -42,7 +42,6 @@ impl Default for Config {
             single_block_confirmation_timeout: Duration::from_secs(5),
             sync_confirmation_timeout: Duration::from_secs(10),
             sync_batch_size: 500,
-            enabled: false,
         }
     }
 }
@@ -224,8 +223,42 @@ impl BlockReceiver {
 
     pub async fn run(&mut self) {
         info!(shard = self.shard_id.to_string(), "Running block receiver");
+        // A previously disabled receiver can start after signer events have
+        // already committed. Recover from the durable authority immediately;
+        // the broadcast contains only new blocks and cannot supply that history.
+        if let Some(authority) = &self.stores.native_authority {
+            let tip = crate::storage::store::account::BlockEventStore::new(authority.clone())
+                .max_seqnum();
+            if let Ok(tip) = tip {
+                let local = self.stores.block_event_store.max_seqnum().unwrap_or(0);
+                if tip > crate::native_registration::FORK_EVENT_BASE && local < tip {
+                    info!(
+                        shard = self.shard_id,
+                        from = local.saturating_add(1),
+                        to = tip,
+                        "Catching up committed fork block events on startup"
+                    );
+                    if let Err(err) = self
+                        .sync_missing_block_events(local.saturating_add(1), tip)
+                        .await
+                    {
+                        warn!(shard = self.shard_id, %err, "Startup block-event catch-up incomplete; retrying on subsequent blocks");
+                    }
+                }
+            }
+        }
         loop {
-            let block = self.block_rx.recv().await.unwrap();
+            let block = match self.block_rx.recv().await {
+                Ok(block) => block,
+                Err(broadcast::error::RecvError::Lagged(missed)) => {
+                    warn!(
+                        shard = self.shard_id,
+                        missed, "Block broadcast lagged; recovering gaps from committed blocks"
+                    );
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => return,
+            };
             info!(
                 shard = self.shard_id.to_string(),
                 num_events = block.events.len(),

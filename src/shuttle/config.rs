@@ -49,7 +49,7 @@ fn listen() -> String {
     "/ip4/0.0.0.0/udp/0/quic-v1".into()
 }
 fn types() -> Vec<i32> {
-    (1..=8).chain(11..=21).collect()
+    (1..=8).chain(11..=17).collect()
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -125,7 +125,13 @@ impl Config {
             for peer in &side.peers {
                 peer.parse::<libp2p::Multiaddr>()?;
             }
-            if side.message_types.iter().any(|t| !types().contains(t)) {
+            // Supported wire types are broader than the default allowlist:
+            // channel messages require an explicit operator opt-in.
+            if side
+                .message_types
+                .iter()
+                .any(|t| !matches!(*t, 1..=8 | 11..=21))
+            {
                 return Err("unknown or non-user message type in allowlist".into());
             }
             if side
@@ -174,6 +180,17 @@ mod tests {
         let example = include_str!("../../shuttle.example.toml");
         let mut config: Config = toml::from_str(example).unwrap();
         config.validate().unwrap();
+        for side in [&config.hypersnap, &config.snapchain] {
+            assert!(side.message_types.contains(&16));
+            assert!(side.message_types.contains(&17));
+            assert!((18..=21).all(|t| !side.message_types.contains(&t)));
+        }
+        // Removing channel types from defaults must not invalidate an explicit
+        // allowlist for deployments whose destination protocol supports them.
+        let mut explicit = config.clone();
+        explicit.hypersnap.message_types.extend(18..=21);
+        explicit.snapchain.message_types.extend(18..=21);
+        explicit.validate().unwrap();
         let validators: toml::Value =
             toml::from_str(include_str!("../../validators.toml")).unwrap();
         let cutovers: BTreeMap<String, u64> = validators["gossip"]["topic_cutovers"]

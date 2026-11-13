@@ -28,6 +28,13 @@ struct CommittedBlock {
 
 pub async fn run(config: Config) -> Result<(), Error> {
     config.validate()?;
+    for (name, message_type) in [("KEY_ADD", 16), ("KEY_REMOVE", 17)] {
+        if !config.hypersnap.message_types.contains(&message_type)
+            || !config.snapchain.message_types.contains(&message_type)
+        {
+            warn!(message_type, name, "Gasless signer relay disabled by message_types; both networks must allow this type");
+        }
+    }
     let state = Arc::new(State::open(&config.state_dir, config.network)?);
     let (hyper, hyper_task) = publisher::create(
         Side::Hypersnap,
@@ -723,6 +730,100 @@ mod tests {
             Ok(())
         }
     }
+    #[tokio::test]
+    async fn gasless_signer_messages_relay_from_block_shard_without_contract_events() {
+        use crate::utils::factory::{messages_factory, signers};
+        let key = signers::generate_signer();
+        let custody = alloy_signer_local::PrivateKeySigner::random();
+        let now = messages_factory::farcaster_time();
+        let add = messages_factory::keys::create_key_add(
+            10996,
+            &custody,
+            10996,
+            &custody,
+            &key,
+            vec![proto::MessageType::CastAdd],
+            7776000,
+            1,
+            now + 3600,
+            Some(now),
+        );
+        let remove = messages_factory::keys::create_key_remove_custody(
+            10996,
+            &custody,
+            &key,
+            &key.verifying_key().to_bytes(),
+            2,
+            now + 3600,
+            Some(now + 1),
+        );
+        let originals = [add, remove];
+        let mut wire = originals.clone();
+        for m in &mut wire {
+            m.data_bytes = Some(m.data.as_ref().unwrap().encode_to_vec());
+            m.data = None;
+        }
+        let source = CommittedBlock {
+            shard: 0,
+            height: 10,
+            hash: vec![10],
+            parent: vec![9],
+            transactions: vec![Transaction {
+                fid: 10996,
+                user_messages: wire.to_vec(),
+                ..Default::default()
+            }],
+        };
+        let config = config();
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::open(dir.path(), 1).unwrap();
+        let mut target = MockDestination::default();
+        let mut old_allowlist = config.clone();
+        old_allowlist.hypersnap.message_types.retain(|t| *t < 16);
+        relay_block(
+            &old_allowlist,
+            &state,
+            Side::Snapchain,
+            &mut target,
+            &source,
+            9,
+        )
+        .await
+        .unwrap();
+        assert!(
+            target.sent.is_empty(),
+            "one side's legacy allowlist excludes gasless messages"
+        );
+        relay_block(&config, &state, Side::Snapchain, &mut target, &source, 9)
+            .await
+            .unwrap();
+        assert_eq!(
+            target.sent.len(),
+            2,
+            "both gasless message types must be forwarded from shard 0"
+        );
+        for (bytes, original) in target.sent.iter().zip(originals) {
+            let envelope = proto::GossipMessage::decode(bytes.as_slice()).unwrap();
+            let Some(proto::gossip_message::GossipMessage::MempoolMessage(body)) =
+                envelope.gossip_message
+            else {
+                panic!("missing mempool envelope")
+            };
+            let Some(proto::mempool_message::MempoolMessage::UserMessage(message)) =
+                body.mempool_message
+            else {
+                panic!("missing signed message")
+            };
+            assert_eq!(message.hash, original.hash);
+            assert_eq!(message.signature, original.signature);
+            assert_eq!(message.signer, original.signer);
+            assert_eq!(
+                message.data_bytes.unwrap(),
+                original.data.unwrap().encode_to_vec()
+            );
+        }
+    }
+
     #[tokio::test]
     async fn retry_receipts_and_bidirectional_loop_suppression() {
         let dir = tempfile::tempdir().unwrap();

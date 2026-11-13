@@ -91,6 +91,33 @@ The existing sync RPC transport remains compatible for fetching pre-fork history
 
 ## Compatibility, recovery and progress
 
+Gasless signer messages are user messages on shard 0: `KEY_ADD` is type 16 and
+`KEY_REMOVE` is type 17. Both network allowlists must include them. The binary's
+default is 1–8 and 11–17, including gasless keys; a commented-out TOML line does
+not override it. An explicit list ending at 15 excludes gasless keys. Startup
+logs warn when either is excluded. Channel types 18–21 require an explicit
+allowlist and remain subject to destination protocol validation.
+On-chain signer events remain outside the shuttle.
+
+A successful gasless registration merges on shard 0, then its committed block
+event must replay on the FID's data shard before casts and the signer API can use
+it. This internal `block_receiver` is separate from OP/chain RPC listeners.
+Validators always start it; there is no enable switch or fork-configuration
+condition. Legacy `enabled` entries are accepted and ignored. Batch-size and
+timeout settings remain tunable. On startup it catches up retained committed
+fork events from the local shard-0 store, preserving existing data and replay sequence checks. Look for
+`Catching up committed fork block events on startup` followed by block-event
+submission logs. Older binaries still need `[block_receiver] enabled = true`
+and catch up when the next event-bearing block arrives; upgraded binaries ignore
+that obsolete flag.
+
+The receiver also applies committed native account records and storage-lending
+updates and advances heartbeat/sequence markers. Verification and channel replica
+updates remain subject to their existing protocol activation gates. Running the
+receiver does not start contract-event listeners, activate channel features, or
+restore storage-quota enforcement after the fork. Catch-up adds local reads,
+writes and block-event traffic to data-shard consensus.
+
 Both sides use the same Farcaster network ID. Relayed messages must have a known
 shared type/body, pass the configured type allowlists and match their original
 signed-data hash. `data_bytes` and signatures are preserved verbatim, including
