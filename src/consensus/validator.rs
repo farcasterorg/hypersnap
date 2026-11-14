@@ -12,7 +12,7 @@ use informalsystems_malachitebft_core_types::{Round, ValidatorSet, Validity};
 use libp2p::identity::ed25519::PublicKey;
 use std::cmp::PartialEq;
 use std::time::Duration;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum ProposalSource {
@@ -324,18 +324,54 @@ impl ShardValidator {
         round: Round,
         timeout: Duration,
     ) -> WellFormedProposal {
-        // TODO(aditi): As an optimization, we should only look inside the db on the first height after a restart. We do not need to look here in the steady state.
-        match self
-            .local_state_store
-            .get_proposal(self.shard_id.shard_id(), height, round)
-        {
+        // Preserve an exact-round body first: substituting a different value
+        // for a round already on disk could conflict with votes in the WAL.
+        let stored = match self.local_state_store.get_proposal(
+            self.shard_id.shard_id(),
+            height,
+            round,
+        ) {
             Ok(Some(proposal)) => match WellFormedProposal::try_from(proposal) {
-                Ok(proposal) => return proposal,
-                Err(err) => error!("Ignoring malformed proposal stored in db: {}", err),
+                Ok(proposal) => Some(proposal),
+                Err(err) => {
+                    error!("Ignoring malformed proposal stored in db: {}", err);
+                    None
+                }
             },
-            Ok(None) => {}
+            Ok(None) => {
+                match self
+                    .local_state_store
+                    .get_earlier_proposal(height, round, &self.address)
+                {
+                    Ok(proposal) => proposal,
+                    Err(err) => {
+                        error!(%height, error = %err, "Unable to recover earlier proposed body from disk");
+                        None
+                    }
+                }
+            }
             Err(err) => {
-                error!("Unable to retrieve proposal from db {}", err.to_string())
+                error!("Unable to retrieve proposal from db {}", err.to_string());
+                None
+            }
+        };
+        if let Some(stored) = stored {
+            if let Ok(proposal) = stored.for_round(round, self.address.clone()) {
+                // Both GetValue and RestreamValue need the body in the
+                // proposer's cache before the commit callback can use it.
+                if self
+                    .add_proposed_value(&proposal, ProposalSource::Consensus)
+                    .validity
+                    .is_valid()
+                {
+                    if let Err(err) = self.local_state_store.put_proposal(&proposal) {
+                        error!(%height, error = %err, "Unable to store recovered proposed body");
+                    }
+                    self.proposed_at = Some(std::time::Instant::now());
+                    info!(%height, %round, value = %proposal.shard_hash(), "Reusing stored proposed body");
+                    return proposal;
+                }
+                error!(%height, %round, "Stored proposed body failed validation during GetValue recovery");
             }
         }
         let proposal = if let Some(block_proposer) = &mut self.block_proposer {

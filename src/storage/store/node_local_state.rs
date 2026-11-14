@@ -202,6 +202,37 @@ impl LocalStateStore {
         }
     }
 
+    /// Find a locally proposed body from an earlier round of this height.
+    /// Keep the earliest round first so repeated cold restarts preserve the
+    /// original body rather than replacing it with a fresh timestamp/mempool.
+    pub fn get_earlier_proposal(
+        &self,
+        height: Height,
+        round: Round,
+        proposer: &crate::core::types::Address,
+    ) -> Result<Option<WellFormedProposal>, LocalStateError> {
+        let prefix = Self::make_height_prefix(height.shard_index, height.as_u64());
+        let mut found = None;
+        self.db.for_each_iterator_by_prefix(
+            Some(prefix.clone()),
+            Some(increment_vec_u8(&prefix)),
+            &PageOptions::default(),
+            |_, bytes| {
+                let proposal = WellFormedProposal::try_from(FullProposal::decode(bytes)?)
+                    .map_err(|err| HubError::invalid_internal_state(&err))?;
+                if proposal.height() == height
+                    && proposal.round() < round
+                    && proposal.proposer_address() == proposer
+                {
+                    found = Some(proposal);
+                    return Ok(true);
+                }
+                Ok(false)
+            },
+        )?;
+        Ok(found)
+    }
+
     /// Recover a body from an earlier round using the existing on-disk proposal
     /// layout. A restarted validator may know the value hash from its WAL but
     /// have lost the proposer's in-memory body cache.

@@ -2617,6 +2617,49 @@ async fn test_warm_restart() {
     assert_blocks_match_across_validators(&network);
 }
 
+/// Production has six online validators in an eight-member set: a restart
+/// temporarily removes quorum, so the remaining validators cannot advance
+/// past the missing member as the four-validator restart test allows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[serial]
+async fn test_six_of_eight_warm_restart_all_shards() {
+    if std::env::var_os("RUST_LOG").is_some() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init();
+    }
+    let mut network = TestNetwork::create(8, 2).await;
+    let online: [usize; 6] = [0, 1, 2, 3, 4, 5];
+    for index in online {
+        network.start_validator_node(index as u32).await;
+    }
+    network
+        .wait_for_block_on_subset(&online, 3, time::Duration::from_secs(60))
+        .await
+        .expect("six-of-eight network failed to start");
+    for index in [0, 1, 2] {
+        let block_target = network.max_block_height() + 3;
+        let shard_targets = [
+            network.max_shard_height(1) + 3,
+            network.max_shard_height(2) + 3,
+        ];
+        let (global, shards) = network.pause_validator_node(index).await;
+        time::sleep(time::Duration::from_secs(2)).await;
+        network.resume_validator_node(index, global, shards).await;
+        network
+            .wait_for_block_on_subset(&online, block_target, time::Duration::from_secs(60))
+            .await
+            .expect("block shard failed to recover after a quorum-losing restart");
+        for (shard, target) in [(1, shard_targets[0]), (2, shard_targets[1])] {
+            network
+                .wait_for_shard_chunk(shard, target)
+                .await
+                .expect("data shard failed to recover after a quorum-losing restart");
+        }
+    }
+    assert_blocks_match_across_validators(&network);
+}
+
 /// Subscribe to the gRPC HubEvent stream on validator 1, submit a cast on
 /// validator 0, and assert the corresponding `MERGE_MESSAGE` event is delivered
 /// over the wire within budget.

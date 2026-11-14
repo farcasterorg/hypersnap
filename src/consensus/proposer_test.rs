@@ -95,6 +95,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_value_recovers_original_body_in_later_round_after_restart() {
+        use crate::consensus::consensus::ValidatorSetConfig;
+        use crate::consensus::validator::ShardValidator;
+        use crate::storage::db::RocksDB;
+        use crate::storage::store::node_local_state::LocalStateStore;
+        use informalsystems_malachitebft_core_types::Round;
+        use std::{sync::Arc, time::Duration};
+
+        let (proposer, proposal, dir) = new_shard_proposer().await;
+        let db = Arc::new(RocksDB::new(dir.path().join("local").to_str().unwrap()));
+        db.open().unwrap();
+        let local = LocalStateStore::new(db);
+        local.put_proposal(&proposal).unwrap();
+        let make_validator = |proposer| {
+            ShardValidator::new(
+                Address([0; 32]),
+                SnapchainShard::new(1),
+                vec![ValidatorSetConfig {
+                    effective_at: 0,
+                    shard_ids: vec![1],
+                    validator_public_keys: vec![hex::encode([0; 32])],
+                }],
+                None,
+                Some(proposer),
+                local.clone(),
+                test_helper::statsd_client(),
+            )
+        };
+        let mut validator = make_validator(proposer);
+        // GetValue is distinct from RestreamValue: after a cold restart the
+        // consensus engine can request a value without knowing the old hash.
+        let recovered = validator
+            .propose_value(Height::new(1, 1), Round::new(8), Duration::from_millis(20))
+            .await;
+        assert_eq!(recovered.shard_hash(), proposal.shard_hash());
+        assert_eq!(recovered.round(), Round::new(8));
+        assert_eq!(
+            recovered.proposal().proposed_value,
+            proposal.proposal().proposed_value
+        );
+        assert_eq!(
+            validator
+                .get_proposed_value(proposal.shard_hash())
+                .unwrap()
+                .shard_hash(),
+            proposal.shard_hash()
+        );
+        assert!(local
+            .get_proposal(1, Height::new(1, 1), Round::new(8))
+            .unwrap()
+            .is_some());
+        assert_eq!(validator.get_current_height(), Height::new(1, 0));
+        drop(validator);
+
+        assert!(local
+            .get_earlier_proposal(Height::new(1, 2), Round::new(8), &Address([0; 32]))
+            .unwrap()
+            .is_none());
+        assert!(local
+            .get_earlier_proposal(Height::new(1, 1), Round::new(8), &Address([1; 32]))
+            .unwrap()
+            .is_none());
+
+        // Never substitute an earlier body for an exact-round body that may
+        // already have been voted for before the restart.
+        let mut exact = proposal.proposal().clone();
+        exact.round = 8;
+        let Some(full_proposal::ProposedValue::Shard(chunk)) = &mut exact.proposed_value else {
+            panic!("expected shard chunk")
+        };
+        let header = chunk.header.as_mut().unwrap();
+        header.timestamp -= 1;
+        chunk.hash = shard_chunk_hash(header);
+        let exact = WellFormedProposal::try_from(exact).unwrap();
+        local.put_proposal(&exact).unwrap();
+        let (cold_proposer, _, _cold_dir) = new_shard_proposer().await;
+        let mut restarted = make_validator(cold_proposer);
+        let recovered = restarted
+            .propose_value(Height::new(1, 1), Round::new(8), Duration::from_millis(20))
+            .await;
+        assert_eq!(recovered.shard_hash(), exact.shard_hash());
+        // Exercise Decided directly, without get_proposed_value's separate
+        // disk fallback masking a missing in-memory cache entry.
+        restarted
+            .decide(Commits {
+                height: Some(Height::new(1, 1)),
+                round: 8,
+                value: Some(exact.shard_hash().clone()),
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(restarted.get_current_height(), Height::new(1, 1));
+        assert!(local
+            .get_proposal(1, Height::new(1, 1), Round::new(8))
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn test_second_body_for_same_hash_does_not_replace_first() {
         let (mut proposer, first, _dir) = new_shard_proposer().await;
         let mut second = first.proposal().clone();
