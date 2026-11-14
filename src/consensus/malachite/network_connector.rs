@@ -4,14 +4,14 @@ use crate::network::gossip::GossipEvent;
 use crate::utils::statsd_wrapper::StatsdClientWrapper;
 use async_trait::async_trait;
 use informalsystems_malachitebft_core_consensus::SignedConsensusMsg;
-use informalsystems_malachitebft_core_types::Round;
+use informalsystems_malachitebft_core_types::{Round, SignedProposal};
 use informalsystems_malachitebft_engine::consensus::ConsensusCodec;
 use informalsystems_malachitebft_engine::network::{NetworkEvent, NetworkMsg as Msg, Status};
 use informalsystems_malachitebft_engine::sync::SyncCodec;
 use informalsystems_malachitebft_engine::util::output_port::OutputPort;
 use informalsystems_malachitebft_engine::util::streaming::StreamMessage;
-use informalsystems_malachitebft_network::PeerId as MalachitePeerId;
 use informalsystems_malachitebft_network::{Channel, Event};
+use informalsystems_malachitebft_network::{PeerId as MalachitePeerId, PeerIdExt};
 use informalsystems_malachitebft_sync::{self as sync, RawMessage};
 use libp2p::request_response;
 use ractor::{Actor, ActorProcessingErr, ActorRef};
@@ -44,6 +44,7 @@ pub struct NetworkConnectorState {
     pending_statuses: HashMap<MalachitePeerId, (sync::Status<SnapchainValidatorContext>, Instant)>,
     recovery_requests:
         HashMap<request_response::OutboundRequestId, (MalachitePeerId, Height, Round, Instant)>,
+    pol_requests: HashMap<(u32, u64, Round), (SignedProposal<SnapchainValidatorContext>, Instant)>,
 }
 
 pub struct NetworkConnectorArgs {
@@ -99,6 +100,7 @@ where
             participation: args.participation,
             pending_statuses: HashMap::new(),
             recovery_requests: HashMap::new(),
+            pol_requests: HashMap::new(),
         })
     }
 
@@ -128,10 +130,12 @@ where
             participation,
             pending_statuses,
             recovery_requests,
+            pol_requests,
         } = state;
 
         pending_statuses.retain(|_, (_, t)| t.elapsed() < Duration::from_secs(30));
         recovery_requests.retain(|_, (_, _, _, t)| t.elapsed() < Duration::from_secs(10));
+        pol_requests.retain(|_, (_, t)| t.elapsed() < Duration::from_secs(10));
         match msg {
             Msg::Subscribe(subscriber) => {
                 subscriber.subscribe_to_port(output_port);
@@ -280,6 +284,84 @@ where
                     .is_some_and(|p| !p.accepts_height(height.block_number))
                 {
                     return Ok(());
+                }
+
+                if let SignedConsensusMsg::Proposal(signed) = &msg {
+                    let proposal = &signed.message;
+                    // A re-proposal carries a POL round, not the actual votes.
+                    // Timeout recovery asks for the current round, which cannot
+                    // supply the older proof lost when a validator restarted.
+                    let signer = crate::network::proposal_recovery::proposal_signer(
+                        proposal,
+                        &signed.signature,
+                    )
+                    .map(|peer| MalachitePeerId::from_libp2p(&peer));
+                    let allowed = signer.is_some_and(|peer| {
+                        sync_peers
+                            .as_ref()
+                            .is_none_or(|peers| peers.contains(&peer))
+                    }) && participation
+                        .as_ref()
+                        .is_none_or(|p| p.can_recover_proposal(proposal));
+                    let key = (height.shard_index, height.block_number, proposal.pol_round);
+                    if allowed
+                        && proposal.pol_round.is_defined()
+                        && proposal.pol_round < proposal.round
+                    {
+                        if let Some((waiting, _)) = pol_requests.get_mut(&key) {
+                            if proposal.round > waiting.message.round {
+                                *waiting = signed.clone();
+                            }
+                        }
+                    }
+                    if allowed
+                        && proposal.pol_round.is_defined()
+                        && proposal.pol_round < proposal.round
+                        && !pol_requests.contains_key(&key)
+                        && pol_requests.len() < 64
+                        && recovery_requests.len() < 64
+                    {
+                        let mut peers: Vec<_> = connected_peers
+                            .iter()
+                            .copied()
+                            .filter(|p| sync_peers.as_ref().is_none_or(|set| set.contains(p)))
+                            .collect();
+                        peers.shuffle(&mut rand::thread_rng());
+                        // The current proposer claims to hold this proof; try it
+                        // first, but also ask others if it has gone offline.
+                        peers.sort_by_key(|peer| Some(*peer) != signer);
+                        if !peers.is_empty() {
+                            pol_requests.insert(key, (signed.clone(), Instant::now()));
+                            info!(%height, round = %proposal.round, pol_round = %proposal.pol_round,
+                                "Requesting prior-round votes for re-proposal");
+                        }
+                        for peer in peers.into_iter().take(4) {
+                            if recovery_requests.len() >= 64 {
+                                break;
+                            }
+                            let (tx, rx) = oneshot::channel();
+                            gossip_tx
+                                .send(GossipEvent::SyncRequest(
+                                    peer,
+                                    sync::Request::VoteSetRequest(sync::VoteSetRequest::new(
+                                        height,
+                                        proposal.pol_round,
+                                    )),
+                                    tx,
+                                ))
+                                .await?;
+                            if let Ok(id) = rx.await {
+                                recovery_requests
+                                    .insert(id, (peer, height, proposal.pol_round, Instant::now()));
+                                statsd.count_with_shard(
+                                    height.shard_index,
+                                    "sync.vote_recovery_request",
+                                    1,
+                                    vec![],
+                                );
+                            }
+                        }
+                    }
                 }
 
                 let event = match msg {
@@ -436,12 +518,32 @@ where
                         }
                         if let sync::Response::VoteSetResponse(response) = response {
                             if response.height == height && response.round == round {
+                                let mut forwarded = 0;
                                 for vote in response.vote_set.votes.into_iter().take(1024) {
                                     if vote.message.height == height && vote.message.round == round
                                     {
                                         // Consensus validates membership and signatures exactly
                                         // as it does for votes arriving through gossip.
                                         output_port.send(NetworkEvent::Vote(peer, vote));
+                                        forwarded += 1;
+                                    }
+                                }
+                                // Older-round votes do not necessarily re-evaluate
+                                // a current-round proposal in Malachite. Re-deliver
+                                // the original signed header after the votes, so it
+                                // can use the recovered proof without waiting for
+                                // another proposer rotation. Normal verification
+                                // and locking rules still apply to every event.
+                                if forwarded > 0 {
+                                    if let Some((proposal, _)) = pol_requests.get(&(
+                                        height.shard_index,
+                                        height.block_number,
+                                        round,
+                                    )) {
+                                        info!(%height, pol_round = %round, votes = forwarded,
+                                            "Received prior-round votes for re-proposal");
+                                        output_port
+                                            .send(NetworkEvent::Proposal(peer, proposal.clone()));
                                     }
                                 }
                             }

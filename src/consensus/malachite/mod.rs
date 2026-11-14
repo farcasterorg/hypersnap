@@ -10,6 +10,8 @@ pub mod spawn_read_node;
 #[cfg(test)]
 mod network_connector_test;
 #[cfg(test)]
+mod proposal_recovery_test;
+#[cfg(test)]
 mod read_node_actors_test;
 #[cfg(test)]
 mod snapchain_codec_test;

@@ -1145,8 +1145,8 @@ fn full_proposal_from(proposer: &Keypair) -> FullProposal {
     }
 }
 
-/// A full proposal reaches consensus only when its gossip author is the proposer it names,
-/// including when a later proposer re-broadcasts a cached body from an earlier round.
+/// Unsigned impersonation must fail; an authenticated re-proposal can recover
+/// the same body even when an older sender retains its original-round wrapper.
 #[tokio::test]
 #[serial]
 async fn test_full_proposal_must_be_published_by_its_proposer() {
@@ -1214,6 +1214,7 @@ async fn test_full_proposal_must_be_published_by_its_proposer() {
         .is_err());
     let expected_restreamed = restreamed.into_proposal();
     let restreamed = expected_restreamed.clone();
+    let legacy_publisher_tx = publisher_tx.clone();
     let publisher_task = tokio::spawn(async move {
         loop {
             for proposal in [&impersonated, &own, &restreamed] {
@@ -1266,6 +1267,62 @@ async fn test_full_proposal_must_be_published_by_its_proposer() {
         received_restreamed,
         "re-proposed body from the later proposer was not delivered"
     );
+
+    // Reproduce the production 0.17.7 -> newer receiver case over actual signed
+    // gossipsub, using a new body so no earlier delivery can satisfy the test.
+    let mut legacy = full_proposal_from(&other_validator);
+    if let Some(full_proposal::ProposedValue::Shard(chunk)) = &mut legacy.proposed_value {
+        chunk.header.as_mut().unwrap().timestamp = 17;
+        chunk.hash = shard_chunk_hash(chunk.header.as_ref().unwrap());
+    }
+    let legacy_body = WellFormedProposal::try_from(legacy.clone()).unwrap();
+    let header = crate::core::types::Proposal {
+        height: legacy_body.height(),
+        round: Round::new(131),
+        pol_round: Round::new(0),
+        shard_hash: legacy_body.shard_hash().clone(),
+        proposer: Address(publisher_keypair.public().to_bytes()),
+    };
+    let signed = informalsystems_malachitebft_core_types::SignedProposal::new(
+        header.clone(),
+        crate::core::types::Signature(publisher_keypair.sign(&header.to_sign_bytes())),
+    );
+    let expected = legacy_body
+        .for_round(header.round, header.proposer)
+        .unwrap()
+        .into_proposal();
+    let legacy_task = tokio::spawn(async move {
+        loop {
+            legacy_publisher_tx
+                .send(GossipEvent::BroadcastFullProposal(legacy.clone()))
+                .await
+                .unwrap();
+            legacy_publisher_tx
+                .send(GossipEvent::BroadcastSignedProposal(signed.clone()))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(SystemMessage::MalachiteNetwork(
+                _,
+                MalachiteNetworkEvent::Message(Channel::ProposalParts, from, bytes),
+            )) = receiver_system_rx.recv().await
+            {
+                let proposal = FullProposal::decode(bytes).unwrap();
+                if proposal.round == 131 {
+                    assert_eq!(from, publisher_peer_id);
+                    assert_eq!(proposal, expected);
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .expect("legacy re-proposal did not pass the real gossip receiver");
+    legacy_task.abort();
 }
 
 #[tokio::test]

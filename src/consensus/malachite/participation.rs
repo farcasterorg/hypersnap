@@ -39,6 +39,21 @@ impl Participation {
         self.is_member_at(next) && self.is_member_at(height)
     }
 
+    /// Only request recovery data for our locally pending height and its selected
+    /// proposer. Remote proposals must not drive recovery ahead.
+    pub(crate) fn can_recover_proposal(&self, proposal: &crate::core::types::Proposal) -> bool {
+        let next = self.next_height.load(Ordering::Acquire);
+        proposal.height.block_number == next
+            && self
+                .validator_sets
+                .get_validator_set(next)
+                .proposer(proposal.height, proposal.round)
+                .is_some_and(|validator| {
+                    validator.address == proposal.proposer
+                        && validator.shard_index == proposal.height.shard_index
+                })
+    }
+
     /// Called by the host only after loading or committing its own state.
     pub(crate) fn advance_to(&self, next_height: u64) {
         self.next_height.fetch_max(next_height, Ordering::AcqRel);
@@ -94,6 +109,25 @@ mod tests {
         assert!(!participation.accepts_height(99));
         assert!(participation.accepts_height(101));
         assert!(!participation.accepts_height(200));
+        let mut proposal = crate::core::types::Proposal {
+            height: crate::core::types::Height::new(1, 100),
+            round: informalsystems_malachitebft_core_types::Round::new(10),
+            pol_round: informalsystems_malachitebft_core_types::Round::new(0),
+            shard_hash: crate::proto::ShardHash {
+                shard_index: 1,
+                hash: vec![42; 32],
+            },
+            proposer: Address(local.public().to_bytes()),
+        };
+        assert!(participation.can_recover_proposal(&proposal));
+        proposal.height.block_number = 101;
+        assert!(!participation.can_recover_proposal(&proposal));
+        proposal.height.block_number = 100;
+        proposal.height.shard_index = 2;
+        assert!(!participation.can_recover_proposal(&proposal));
+        proposal.height.shard_index = 1;
+        proposal.proposer = Address(other.public().to_bytes());
+        assert!(!participation.can_recover_proposal(&proposal));
         participation.advance_to(1);
         assert!(
             participation.accepts_height(100),

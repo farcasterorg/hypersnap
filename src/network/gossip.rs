@@ -301,6 +301,7 @@ pub struct SnapchainGossip {
     discovery_config: discovery::Config,
     discovery: discovery::Book,
     recent_votes: RecentVotes,
+    proposal_recovery: super::proposal_recovery::ProposalRecovery,
     enable_autodiscovery: bool,
     bootstrap_addrs: HashSet<String>,
     connected_bootstrap_addrs: HashSet<String>,
@@ -670,6 +671,7 @@ impl SnapchainGossip {
             discovery_config: config.discovery.clone(),
             discovery,
             recent_votes: RecentVotes::default(),
+            proposal_recovery: Default::default(),
             bootstrap_addrs: config.bootstrap_addrs().into_iter().collect(),
             announce_gossip_address,
             announce_rpc_address,
@@ -1218,9 +1220,16 @@ impl SnapchainGossip {
                             );
                             // Take an owned sender if present to avoid holding an immutable borrow during mutable self call
                             let maybe_sender = self.system_tx.as_ref().cloned();
-                            let system_message = self.map_gossip_bytes_to_system_message(peer_id, message.source, data);
-                            if let Some(system_tx) = maybe_sender {
-                                if let Some(system_message) = system_message {
+                            let message_source = message.source;
+                            let messages = match proto::GossipMessage::decode(data.as_slice()) {
+                                Ok(decoded) => self.proposal_recovery.process(message_source, decoded),
+                                Err(err) => { warn!(%err, "Failed to decode gossip message"); Vec::new() }
+                            };
+                            for message in messages {
+                                // Mapping also updates peer discovery when no system
+                                // consumer is attached (for example in a gossip-only node).
+                                let system_message = self.map_decoded_gossip(peer_id, message_source, message);
+                                if let (Some(system_tx), Some(system_message)) = (&maybe_sender, system_message) {
                                     if let Err(e) = system_tx.send(system_message).await {
                                         warn!("Failed to send system block message: {}", e);
                                     }
@@ -1537,134 +1546,140 @@ impl SnapchainGossip {
         gossip_message: Vec<u8>,
     ) -> Option<SystemMessage> {
         match proto::GossipMessage::decode(gossip_message.as_slice()) {
-            Ok(gossip_message) => match gossip_message.gossip_message {
-                Some(gossip_message::GossipMessage::ContactInfoMessage(contact_info)) => {
-                    if let Some(author) = source {
-                        self.handle_contact_info(contact_info, author);
-                    }
-                    None
-                }
-
-                Some(proto::gossip_message::GossipMessage::ReadNodeMessage(read_node_message)) => {
-                    let read_node_message = read_node_message.read_node_message;
-                    match read_node_message {
-                        None => None,
-                        Some(read_node_message) => match read_node_message {
-                            read_node_message::ReadNodeMessage::DecidedValue(decided_value) => {
-                                Some(SystemMessage::DecidedValueForReadNode(decided_value))
-                            }
-                        },
-                    }
-                }
-
-                Some(proto::gossip_message::GossipMessage::FullProposal(full_proposal)) => {
-                    let full_proposal = match WellFormedProposal::try_from(full_proposal) {
-                        Ok(full_proposal) => full_proposal,
-                        Err(err) => {
-                            warn!(
-                                peer_id = peer_id.to_string(),
-                                "Dropping malformed full proposal: {}", err
-                            );
-                            return None;
-                        }
-                    };
-                    let height = full_proposal.height();
-                    debug!(
-                        "Received block with height {} from peer: {}",
-                        height, peer_id
-                    );
-                    // Gossipsub runs in strict mode, so `source` is the signature-checked author.
-                    // A validator's gossip identity is its consensus key, so this checks that the
-                    // named proposer published this proposal.
-                    let proposer = peer_id_from_validator_key(&full_proposal.proposer_address().0);
-                    let Some(author) = source.filter(|author| proposer == Some(*author)) else {
-                        warn!(
-                            peer_id = peer_id.to_string(),
-                            height = height.to_string(),
-                            "Dropping full proposal not published by its proposer"
-                        );
-                        return None;
-                    };
-                    let malachite_peer_id = MalachitePeerId::from_libp2p(&author);
-                    let bytes = Bytes::from(full_proposal.proposal().encode_to_vec());
-                    let event = MalachiteNetworkEvent::Message(
-                        Channel::ProposalParts,
-                        malachite_peer_id,
-                        bytes,
-                    );
-                    let shard = MalachiteEventShard::Shard(height.shard_index);
-                    Some(SystemMessage::MalachiteNetwork(shard, event))
-                }
-                Some(proto::gossip_message::GossipMessage::Consensus(signed_consensus_msg)) => {
-                    let malachite_peer_id = MalachitePeerId::from_libp2p(&peer_id);
-                    let bytes = Bytes::from(signed_consensus_msg.encode_to_vec());
-                    let event = MalachiteNetworkEvent::Message(
-                        Channel::Consensus,
-                        malachite_peer_id,
-                        bytes,
-                    );
-                    let shard_result = signed_consensus_msg.shard_id();
-                    if shard_result.is_err() {
-                        warn!("Failed to get shard id from consensus message");
-                        return None;
-                    }
-                    let shard = MalachiteEventShard::Shard(shard_result.unwrap());
-                    Some(SystemMessage::MalachiteNetwork(shard, event))
-                }
-                Some(proto::gossip_message::GossipMessage::Status(status)) => {
-                    if source.is_none_or(|author| author.to_bytes() != status.peer_id) {
-                        return None;
-                    }
-                    let encoded = status.encode_to_vec();
-                    let Some(height) = status.height else {
-                        warn!(
-                            "Received status message without height from peer: {}",
-                            peer_id
-                        );
-                        return None;
-                    };
-                    let shard = MalachiteEventShard::Shard(height.shard_index);
-                    let malachite_peer_id = MalachitePeerId::from_libp2p(&peer_id);
-                    let event = MalachiteNetworkEvent::Message(
-                        Channel::Sync,
-                        malachite_peer_id,
-                        Bytes::from(encoded),
-                    );
-                    Some(SystemMessage::MalachiteNetwork(shard, event))
-                }
-                Some(proto::gossip_message::GossipMessage::HyperEnvelope(_)) => {
-                    warn!(
-                        "Received hyper envelope from peer {}, ignoring (not yet supported)",
-                        peer_id
-                    );
-                    None
-                }
-                Some(proto::gossip_message::GossipMessage::MempoolMessage(message)) => {
-                    if let Some(mempool_message_proto) = message.mempool_message {
-                        let mempool_message = match mempool_message_proto {
-                            proto::mempool_message::MempoolMessage::UserMessage(message) => {
-                                let mut message_with_data = message.clone();
-                                message_bytes_decode(&mut message_with_data);
-                                MempoolMessage::UserMessage(message_with_data)
-                            }
-                        };
-                        Some(SystemMessage::Mempool(MempoolRequest::AddMessage(
-                            mempool_message,
-                            MempoolSource::Gossip,
-                            None,
-                        )))
-                    } else {
-                        warn!("Unknown mempool message from peer: {}", peer_id);
-                        None
-                    }
-                }
-                None => {
-                    warn!("Empty message from peer: {}", peer_id);
-                    None
-                }
-            },
+            Ok(message) => self.map_decoded_gossip(peer_id, source, message),
             Err(e) => {
                 warn!("Failed to decode gossip message: {}", e);
+                None
+            }
+        }
+    }
+
+    fn map_decoded_gossip(
+        &mut self,
+        peer_id: PeerId,
+        source: Option<PeerId>,
+        gossip_message: proto::GossipMessage,
+    ) -> Option<SystemMessage> {
+        match gossip_message.gossip_message {
+            Some(gossip_message::GossipMessage::ContactInfoMessage(contact_info)) => {
+                if let Some(author) = source {
+                    self.handle_contact_info(contact_info, author);
+                }
+                None
+            }
+
+            Some(proto::gossip_message::GossipMessage::ReadNodeMessage(read_node_message)) => {
+                let read_node_message = read_node_message.read_node_message;
+                match read_node_message {
+                    None => None,
+                    Some(read_node_message) => match read_node_message {
+                        read_node_message::ReadNodeMessage::DecidedValue(decided_value) => {
+                            Some(SystemMessage::DecidedValueForReadNode(decided_value))
+                        }
+                    },
+                }
+            }
+
+            Some(proto::gossip_message::GossipMessage::FullProposal(full_proposal)) => {
+                let full_proposal = match WellFormedProposal::try_from(full_proposal) {
+                    Ok(full_proposal) => full_proposal,
+                    Err(err) => {
+                        warn!(
+                            peer_id = peer_id.to_string(),
+                            "Dropping malformed full proposal: {}", err
+                        );
+                        return None;
+                    }
+                };
+                let height = full_proposal.height();
+                debug!(
+                    "Received block with height {} from peer: {}",
+                    height, peer_id
+                );
+                // Gossipsub runs in strict mode, so `source` is the signature-checked author.
+                // A validator's gossip identity is its consensus key, so this checks that the
+                // named proposer published this proposal.
+                let proposer = peer_id_from_validator_key(&full_proposal.proposer_address().0);
+                let Some(author) = source.filter(|author| proposer == Some(*author)) else {
+                    warn!(
+                        peer_id = peer_id.to_string(),
+                        height = height.to_string(),
+                        "Dropping full proposal not published by its proposer"
+                    );
+                    return None;
+                };
+                let malachite_peer_id = MalachitePeerId::from_libp2p(&author);
+                let bytes = Bytes::from(full_proposal.proposal().encode_to_vec());
+                let event = MalachiteNetworkEvent::Message(
+                    Channel::ProposalParts,
+                    malachite_peer_id,
+                    bytes,
+                );
+                let shard = MalachiteEventShard::Shard(height.shard_index);
+                Some(SystemMessage::MalachiteNetwork(shard, event))
+            }
+            Some(proto::gossip_message::GossipMessage::Consensus(signed_consensus_msg)) => {
+                let malachite_peer_id = MalachitePeerId::from_libp2p(&peer_id);
+                let bytes = Bytes::from(signed_consensus_msg.encode_to_vec());
+                let event =
+                    MalachiteNetworkEvent::Message(Channel::Consensus, malachite_peer_id, bytes);
+                let shard_result = signed_consensus_msg.shard_id();
+                if shard_result.is_err() {
+                    warn!("Failed to get shard id from consensus message");
+                    return None;
+                }
+                let shard = MalachiteEventShard::Shard(shard_result.unwrap());
+                Some(SystemMessage::MalachiteNetwork(shard, event))
+            }
+            Some(proto::gossip_message::GossipMessage::Status(status)) => {
+                if source.is_none_or(|author| author.to_bytes() != status.peer_id) {
+                    return None;
+                }
+                let encoded = status.encode_to_vec();
+                let Some(height) = status.height else {
+                    warn!(
+                        "Received status message without height from peer: {}",
+                        peer_id
+                    );
+                    return None;
+                };
+                let shard = MalachiteEventShard::Shard(height.shard_index);
+                let malachite_peer_id = MalachitePeerId::from_libp2p(&peer_id);
+                let event = MalachiteNetworkEvent::Message(
+                    Channel::Sync,
+                    malachite_peer_id,
+                    Bytes::from(encoded),
+                );
+                Some(SystemMessage::MalachiteNetwork(shard, event))
+            }
+            Some(proto::gossip_message::GossipMessage::HyperEnvelope(_)) => {
+                warn!(
+                    "Received hyper envelope from peer {}, ignoring (not yet supported)",
+                    peer_id
+                );
+                None
+            }
+            Some(proto::gossip_message::GossipMessage::MempoolMessage(message)) => {
+                if let Some(mempool_message_proto) = message.mempool_message {
+                    let mempool_message = match mempool_message_proto {
+                        proto::mempool_message::MempoolMessage::UserMessage(message) => {
+                            let mut message_with_data = message.clone();
+                            message_bytes_decode(&mut message_with_data);
+                            MempoolMessage::UserMessage(message_with_data)
+                        }
+                    };
+                    Some(SystemMessage::Mempool(MempoolRequest::AddMessage(
+                        mempool_message,
+                        MempoolSource::Gossip,
+                        None,
+                    )))
+                } else {
+                    warn!("Unknown mempool message from peer: {}", peer_id);
+                    None
+                }
+            }
+            None => {
+                warn!("Empty message from peer: {}", peer_id);
                 None
             }
         }
