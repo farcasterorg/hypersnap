@@ -127,6 +127,13 @@ enum UserDataType {
   USER_DATA_PRIMARY_ADDRESS_SOLANA = 12; // Primary address for the user on Solana
   USER_DATA_TYPE_PROFILE_TOKEN = 13; // Profile token in CAIP-19 format
   USER_DATA_TYPE_LIVE_AT = 14; // URL of the user's live activity
+  // Cast pinned to the top of the user's profile: the cast hash as a lowercase 0x-prefixed
+  // 20-byte hex string, or empty to unpin. The node does not check that the cast exists or
+  // that the user authored it; clients ignore a pin whose cast is missing or authored by
+  // someone else.
+  // Hypersnap-only type: numbered far from upstream Snapchain (1-14 so far) so a type added
+  // there later cannot collide. Must stay below 256: store keys hold the type as one byte.
+  USER_DATA_TYPE_PINNED_CAST = 200;
 }
 
 message Embed {

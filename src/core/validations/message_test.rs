@@ -787,6 +787,72 @@ mod tests {
         assert!(validate_with_version(&msg, EngineVersion::V17).is_ok());
     }
 
+    // ---- USER_DATA_TYPE_PINNED_CAST validation tests ----
+
+    fn pinned_cast(value: &str) -> proto::Message {
+        create_user_data_add(
+            1234,
+            proto::UserDataType::PinnedCast,
+            &value.to_string(),
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn test_pinned_cast_user_data_requires_activation() {
+        let msg = pinned_cast("0x0123456789abcdef0123456789abcdef01234567");
+        assert_eq!(
+            validate_with_version(&msg, EngineVersion::V24).unwrap_err(),
+            ValidationError::UnsupportedFeature
+        );
+        assert!(validate_with_version(&msg, EngineVersion::V25).is_ok());
+
+        // Unpinning is gated too: before activation the type itself is unsupported.
+        assert_eq!(
+            validate_with_version(&pinned_cast(""), EngineVersion::V24).unwrap_err(),
+            ValidationError::UnsupportedFeature
+        );
+    }
+
+    #[test]
+    fn test_pinned_cast_user_data_validation() {
+        // Store keys hold the user data type as one byte.
+        assert!((proto::UserDataType::PinnedCast as i32) < 256);
+
+        // Empty unpins; otherwise a lowercase 0x-prefixed 20-byte hash.
+        for value in [
+            "",
+            "0x0123456789abcdef0123456789abcdef01234567",
+            "0x0000000000000000000000000000000000000000",
+            "0xffffffffffffffffffffffffffffffffffffffff",
+        ] {
+            assert_valid(&pinned_cast(value));
+        }
+
+        for value in [
+            // Missing the 0x prefix.
+            "0123456789abcdef0123456789abcdef01234567",
+            "000123456789abcdef0123456789abcdef01234567",
+            // Wrong prefix case.
+            "0X0123456789abcdef0123456789abcdef01234567",
+            // Too short / too long.
+            "0x",
+            "0x0123456789abcdef0123456789abcdef0123456",
+            "0x0123456789abcdef0123456789abcdef012345678",
+            // A 32-byte hash is not a cast hash.
+            "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            // Uppercase hex.
+            "0x0123456789ABCDEF0123456789abcdef01234567",
+            // Non-hex characters.
+            "0x0123456789abcdeg0123456789abcdef01234567",
+            "0x0123456789abcdef0123456789abcdef0123456 ",
+            " 0x0123456789abcdef0123456789abcdef0123456",
+        ] {
+            assert_validation_error(&pinned_cast(value), ValidationError::InvalidPinnedCastHash);
+        }
+    }
+
     fn validate_as(
         msg: &proto::Message,
         is_pro_user: bool,
