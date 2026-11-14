@@ -1627,9 +1627,10 @@ impl TestNetwork {
 
     /// Like `register_fid`, but binds the FID's on-chain custody to a real
     /// Ethereum signer so KEY_ADD's EIP-712 recovery (which checks the
-    /// recovered address against the on-chain custody) succeeds. Returns the
-    /// generated Ed25519 signer so callers that need to sign non-gasless
-    /// messages keep working.
+    /// recovered address against the on-chain custody) succeeds. Seed every
+    /// validator because on-chain events are not gossiped and tests may have
+    /// no chain listeners. Returns the generated Ed25519 signer so callers
+    /// that need to sign non-gasless messages keep working.
     pub async fn register_fid_with_eth_custody(
         &mut self,
         fid: u64,
@@ -1660,21 +1661,22 @@ impl TestNetwork {
             ),
         ];
 
-        for event in on_chain_events {
-            let result = self
-                .first_live_node()
-                .add_message(
-                    MempoolMessage::OnchainEvent(event),
-                    MempoolSource::Local,
-                    None,
-                )
-                .await;
-            assert!(
-                result.is_ok(),
-                "Failed to register FID {} with eth custody: {:?}",
-                fid,
-                result.err()
-            );
+        for node in self.live_nodes() {
+            for event in &on_chain_events {
+                let result = node
+                    .add_message(
+                        MempoolMessage::OnchainEvent(event.clone()),
+                        MempoolSource::Local,
+                        None,
+                    )
+                    .await;
+                assert!(
+                    result.is_ok(),
+                    "Failed to register FID {} with eth custody: {:?}",
+                    fid,
+                    result.err()
+                );
+            }
         }
 
         self.test_fids.insert(fid, (signer.clone(), address));
@@ -4535,7 +4537,10 @@ async fn test_gasless_rpc_registration_without_chain_clients() {
     let app_custody = alloy_signer_local::PrivateKeySigner::random();
     let key = factory::signers::generate_signer();
     network.register_fid_with_eth_custody(fid, &custody).await;
-    network.wait_for_fid_on_block_engine(fid).await.unwrap();
+    network
+        .wait_for_fid_on_block_engine(fid)
+        .await
+        .expect("historical user custody must reach every validator's shard 0");
     let now = messages_factory::farcaster_time();
     let add = messages_factory::keys::create_key_add(
         fid,
@@ -4566,7 +4571,7 @@ async fn test_gasless_rpc_registration_without_chain_clients() {
     network
         .wait_for_fid_on_block_engine(request_fid)
         .await
-        .unwrap();
+        .expect("historical app custody must reach every validator's shard 0");
     // Reuse the same nonce: the rejected attempt must not consume it or spend
     // the KEY_ADD mempool quota. Submit only to one node, exercising gossip.
     network
