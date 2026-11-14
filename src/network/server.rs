@@ -1090,6 +1090,17 @@ impl MyHubService {
         Ok(channel_id)
     }
 
+    fn native_admission_repair_active(&self, stores: &Stores) -> Result<bool, HubError> {
+        let next_height = stores
+            .shard_store
+            .max_block_number()
+            .map_err(|e| HubError::internal_db_error(&e.to_string()))?
+            .saturating_add(1);
+        Ok(stores
+            .native_registration
+            .api_active(stores.shard_id, next_height))
+    }
+
     /// Simulates `message` on `shard_id`, returning the typed
     /// `engine::MessageValidationError` so callers can match on specific
     /// variants (e.g. `MissingFname` for the on-demand recovery flow).
@@ -1131,12 +1142,15 @@ impl MyHubService {
                 }
             };
 
+            let repair_active = self
+                .native_admission_repair_active(stores)
+                .map_err(engine::MessageValidationError::StoreError)?;
             // TODO: This is a hack to get around the fact that self cannot be made mutable
             let mut readonly_engine = ShardEngine::new(
                 stores.db.clone(),
                 self.network,
                 stores.trie.clone(),
-                1,
+                if repair_active { shard_id } else { 1 },
                 stores.store_limits.clone(),
                 self.statsd_client.clone(),
                 100,
@@ -1146,6 +1160,12 @@ impl MyHubService {
             )
             .await
             .map_err(engine::MessageValidationError::StoreError)?;
+            if repair_active {
+                readonly_engine = readonly_engine.with_native_registration(
+                    stores.native_registration.clone(),
+                    self.block_stores.db.clone(),
+                );
+            }
 
             readonly_engine.simulate_message(message)
         }
@@ -1174,6 +1194,10 @@ impl MyHubService {
                 }
             };
 
+            let repair_active = match self.native_admission_repair_active(stores) {
+                Ok(active) => active,
+                Err(error) => return messages.iter().map(|_| Err(error.clone())).collect(),
+            };
             // Create shard engine for bulk simulation
             let mut readonly_engine = match ShardEngine::new(
                 stores.db.clone(),
@@ -1189,6 +1213,10 @@ impl MyHubService {
             )
             .await
             {
+                Ok(engine) if repair_active => engine.with_native_registration(
+                    stores.native_registration.clone(),
+                    self.block_stores.db.clone(),
+                ),
                 Ok(engine) => engine,
                 Err(err) => {
                     let hub_error = HubError::invalid_internal_state(&err.to_string());

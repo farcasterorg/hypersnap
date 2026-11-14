@@ -259,6 +259,14 @@ validator_public_keys = [
 "1" = 51_161_786
 "2" = 50_996_940
 
+# Native account API admission activation: separate from registration above.
+# Reference 2026-11-14 19:58:08 UTC; target 24 hours later.
+# Haatz, kmac and wake agreed on 3600-block samples: shard 1 in 5661s,
+# shard 2 in 5658s. UTC activation is projected; exact boundaries are heights.
+[consensus.native_registration.api_activation_heights]
+"1" = 51_311_487
+"2" = 51_146_724
+
 # Ordinary discovery bootstraps, not explicit/direct GossipSub peers. These
 # nodes run the same validator binary; bootstrap service grants no extra power.
 # Infinitehomie and ivy remain in the validator sets above, but are not seeds.

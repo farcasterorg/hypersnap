@@ -17,9 +17,13 @@ with the same boundaries as the new validator sets and gossip topic switch:
 
 | Shard | First fork block |
 | --- | ---: |
-| 0 | 50,433,538 |
-| 1 | 51,119,199 |
-| 2 | 50,954,121 |
+| 0 | 50,477,529 |
+| 1 | 51,161,786 |
+| 2 | 50,996,940 |
+
+The subsequent [native account API admission repair](native-admission-repair.md)
+has a separate activation schedule. Keep these original registration heights
+when deploying that repair.
 
 Every fork validator and read node must run this code and load the updated
 configuration before activation. Startup rejects a registration schedule that

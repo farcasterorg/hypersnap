@@ -26,11 +26,16 @@ pub const ANCHOR_WINDOW: u64 = 1024;
 /// The fork starts a separate cross-shard event stream. This is well above
 /// legacy sequence numbers while remaining exactly representable in JSON numbers.
 pub const FORK_EVENT_BASE: u64 = 1 << 48;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
     pub activation_heights: BTreeMap<String, u64>,
+    /// Separate activation of native account API admission, by data shard.
+    /// An absent schedule retains the previous admission behavior.
+    #[serde(default)]
+    pub api_activation_heights: BTreeMap<String, u64>,
     #[serde(skip, default = "minimum_difficulty")]
     pub min_difficulty_bits: u32,
 }
@@ -41,6 +46,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             activation_heights: BTreeMap::new(),
+            api_activation_heights: BTreeMap::new(),
             min_difficulty_bits: MIN_DIFFICULTY_BITS,
         }
     }
@@ -52,6 +58,22 @@ impl Config {
         gossip: &BTreeMap<String, u64>,
         sets: &[crate::consensus::consensus::ValidatorSetConfig],
     ) -> Result<(), String> {
+        if !self.api_activation_heights.is_empty() {
+            if self.api_activation_heights.len() != num_shards as usize
+                || (1..=num_shards).any(|shard| {
+                    let key = shard.to_string();
+                    match (
+                        self.api_activation_heights.get(&key),
+                        self.activation_heights.get(&key),
+                    ) {
+                        (Some(api), Some(registration)) => api < registration,
+                        _ => true,
+                    }
+                })
+            {
+                return Err("native API activation requires every data shard and cannot precede registration".into());
+            }
+        }
         if self.activation_heights.is_empty() {
             return Ok(());
         }
@@ -75,6 +97,12 @@ impl Config {
         }
         Ok(())
     }
+    pub fn api_active(&self, shard: u32, next_height: u64) -> bool {
+        self.api_activation_heights
+            .get(&shard.to_string())
+            .is_some_and(|height| next_height >= *height)
+    }
+
     pub fn event_watermark(&self, shard: u32, height: u64, persisted: u64) -> u64 {
         if self.active(shard, height) {
             persisted.max(FORK_EVENT_BASE)
@@ -570,6 +598,7 @@ mod tests {
     fn config() -> Config {
         Config {
             activation_heights: [("0".into(), 2), ("1".into(), 1), ("2".into(), 1)].into(),
+            api_activation_heights: BTreeMap::new(),
             min_difficulty_bits: 4,
         }
     }
@@ -1163,6 +1192,29 @@ mod tests {
             assert!(!config.active(shard, height - 1));
             assert!(config.active(shard, *height));
         }
+        for (shard, height) in &config.api_activation_heights {
+            let shard = shard.parse().unwrap();
+            assert!(!config.api_active(shard, height - 1));
+            assert!(config.api_active(shard, *height));
+            assert!(!Config::default().api_active(shard, u64::MAX));
+        }
+        // API activation is independently configurable without moving the
+        // registration fork, validator transitions, or gossip cutovers.
+        let mut later = config.clone();
+        let cutoff = later.api_activation_heights.get_mut("1").unwrap();
+        let old_cutoff = *cutoff;
+        *cutoff += 100;
+        later.validate(2, &gossip, &sets).unwrap();
+        assert!(!later.api_active(1, old_cutoff));
+        assert!(later.api_active(1, old_cutoff + 100));
+        let mut missing = config.clone();
+        missing.api_activation_heights.remove("2");
+        assert!(missing.validate(2, &gossip, &sets).is_err());
+        let mut early = config.clone();
+        early
+            .api_activation_heights
+            .insert("1".into(), config.activation_heights["1"] - 1);
+        assert!(early.validate(2, &gossip, &sets).is_err());
         let mut wrong = config.clone();
         *wrong.activation_heights.get_mut("1").unwrap() += 1;
         assert!(wrong.validate(2, &gossip, &sets).is_err());
