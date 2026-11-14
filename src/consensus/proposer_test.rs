@@ -49,6 +49,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_restream_recovers_locally_proposed_body_after_restart() {
+        use crate::consensus::consensus::ValidatorSetConfig;
+        use crate::consensus::validator::ShardValidator;
+        use crate::storage::db::RocksDB;
+        use crate::storage::store::node_local_state::LocalStateStore;
+        use std::sync::Arc;
+
+        let (proposer, proposal, dir) = new_shard_proposer().await;
+        // Match the pre-upgrade layout: only locally generated proposals were
+        // persisted. The proposer's in-memory body cache starts empty.
+        assert!(proposer.get_proposed_value(proposal.shard_hash()).is_none());
+        let db = Arc::new(RocksDB::new(dir.path().join("local").to_str().unwrap()));
+        db.open().unwrap();
+        let local = LocalStateStore::new(db);
+        local.put_proposal(&proposal).unwrap();
+        let mut validator = ShardValidator::new(
+            Address([0; 32]),
+            SnapchainShard::new(1),
+            vec![ValidatorSetConfig {
+                effective_at: 0,
+                shard_ids: vec![1],
+                validator_public_keys: vec![hex::encode([0; 32])],
+            }],
+            None,
+            Some(proposer),
+            local,
+            test_helper::statsd_client(),
+        );
+        let recovered = validator.get_proposed_value(proposal.shard_hash());
+        assert_eq!(recovered, Some(proposal.clone()));
+        assert_eq!(validator.get_current_height(), Height::new(1, 0));
+        let restreamed = recovered
+            .unwrap()
+            .for_round(
+                informalsystems_malachitebft_core_types::Round::new(3),
+                Address([1; 32]),
+            )
+            .unwrap();
+        assert_eq!(restreamed.shard_hash(), proposal.shard_hash());
+        assert_eq!(
+            restreamed.proposal().proposed_value,
+            proposal.proposal().proposed_value
+        );
+    }
+
+    #[tokio::test]
     async fn test_second_body_for_same_hash_does_not_replace_first() {
         let (mut proposer, first, _dir) = new_shard_proposer().await;
         let mut second = first.proposal().clone();

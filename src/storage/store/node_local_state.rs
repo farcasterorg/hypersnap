@@ -6,7 +6,7 @@ use crate::proto::FnameState;
 use crate::proto::FullProposal;
 use crate::proto::Height;
 use crate::proto::OnChainEventState;
-use crate::proto::{FidAccountRootHash, ReplicationTriePartStatus};
+use crate::proto::{FidAccountRootHash, ReplicationTriePartStatus, ShardHash};
 use crate::storage::constants::RootPrefix;
 use crate::storage::db::PageOptions;
 use crate::storage::db::RocksDB;
@@ -200,6 +200,37 @@ impl LocalStateStore {
                 Ok(Some(proposal))
             }
         }
+    }
+
+    /// Recover a body from an earlier round using the existing on-disk proposal
+    /// layout. A restarted validator may know the value hash from its WAL but
+    /// have lost the proposer's in-memory body cache.
+    pub fn get_proposal_by_hash(
+        &self,
+        height: Height,
+        shard_hash: &ShardHash,
+    ) -> Result<Option<WellFormedProposal>, LocalStateError> {
+        if height.shard_index != shard_hash.shard_index {
+            return Ok(None);
+        }
+        let prefix = Self::make_height_prefix(height.shard_index, height.as_u64());
+        let mut found = None;
+        self.db.for_each_iterator_by_prefix(
+            Some(prefix.clone()),
+            Some(increment_vec_u8(&prefix)),
+            &PageOptions::default(),
+            |_, bytes| {
+                let proposal = FullProposal::decode(bytes)?;
+                let proposal = WellFormedProposal::try_from(proposal)
+                    .map_err(|err| HubError::invalid_internal_state(&err))?;
+                if proposal.height() == height && proposal.shard_hash() == shard_hash {
+                    found = Some(proposal);
+                    return Ok(true);
+                }
+                Ok(false)
+            },
+        )?;
+        Ok(found)
     }
 
     pub fn set_latest_block_number(

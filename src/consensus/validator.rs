@@ -355,13 +355,39 @@ impl ShardValidator {
     }
 
     pub fn get_proposed_value(&mut self, shard_hash: &ShardHash) -> Option<WellFormedProposal> {
-        // TODO(aditi): In the future, we may want to look the value up in the db
-        if let Some(block_proposer) = &mut self.block_proposer {
+        let cached = if let Some(block_proposer) = &mut self.block_proposer {
             block_proposer.get_proposed_value(shard_hash)
         } else if let Some(shard_proposer) = &mut self.shard_proposer {
             shard_proposer.get_proposed_value(shard_hash)
         } else {
             panic!("No proposer set");
+        };
+        if cached.is_some() {
+            return cached;
+        }
+
+        let height = self.get_current_height().increment();
+        let proposal = match self
+            .local_state_store
+            .get_proposal_by_hash(height, shard_hash)
+        {
+            Ok(proposal) => proposal?,
+            Err(err) => {
+                error!(%height, error = %err, "Unable to recover proposed body from disk");
+                return None;
+            }
+        };
+        // Revalidate against the current committed state and repopulate the
+        // proposer's cache, which the later commit path also needs.
+        if self
+            .add_proposed_value(&proposal, self.proposal_source.clone())
+            .validity
+            .is_valid()
+        {
+            Some(proposal)
+        } else {
+            error!(%height, "Stored proposed body failed validation during recovery");
+            None
         }
     }
 }
