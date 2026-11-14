@@ -1,6 +1,6 @@
 use crate::consensus::consensus::SystemMessage;
 use crate::consensus::malachite::network_connector::MalachiteNetworkEvent;
-use crate::core::types::{Height, SnapchainValidatorContext};
+use crate::core::types::{Address, Height, SnapchainValidatorContext, WellFormedProposal};
 use crate::core::util::shard_chunk_hash;
 use crate::hyper::{HyperBlockMetadata, HyperEnvelope, CAPABILITY_HYPER};
 use crate::mempool::mempool::{MempoolRequest, MempoolSource};
@@ -12,6 +12,7 @@ use crate::proto::{
 use crate::storage::store::mempool_poller::MempoolMessage;
 use crate::storage::store::test_helper::statsd_client;
 use crate::utils::factory::messages_factory;
+use informalsystems_malachitebft_core_types::Round;
 use informalsystems_malachitebft_network::{Channel, PeerId as MalachitePeerId, PeerIdExt};
 use libp2p::{identity::ed25519::Keypair, PeerId};
 use prost::Message as _;
@@ -1145,7 +1146,7 @@ fn full_proposal_from(proposer: &Keypair) -> FullProposal {
 }
 
 /// A full proposal reaches consensus only when its gossip author is the proposer it names,
-/// and it is attributed to that author.
+/// including when a later proposer re-broadcasts a cached body from an earlier round.
 #[tokio::test]
 #[serial]
 async fn test_full_proposal_must_be_published_by_its_proposer() {
@@ -1192,9 +1193,30 @@ async fn test_full_proposal_must_be_published_by_its_proposer() {
 
     let own = full_proposal_from(&publisher_keypair);
     let impersonated = full_proposal_from(&other_validator);
+    // A restarted validator may have missed this body in its original round.
+    // The next proposer must be able to deliver that same body under its own
+    // identity, without weakening the rejection of impersonated proposals.
+    let cached = WellFormedProposal::try_from(impersonated.clone()).unwrap();
+    let restreamed = cached
+        .for_round(
+            Round::new(1),
+            Address(publisher_keypair.public().to_bytes()),
+        )
+        .unwrap();
+    assert_eq!(restreamed.shard_hash(), cached.shard_hash());
+    assert_eq!(
+        restreamed.proposal().proposed_value,
+        cached.proposal().proposed_value
+    );
+    assert_eq!(cached.proposal(), &impersonated);
+    assert!(cached
+        .for_round(Round::Nil, Address(publisher_keypair.public().to_bytes()))
+        .is_err());
+    let expected_restreamed = restreamed.into_proposal();
+    let restreamed = expected_restreamed.clone();
     let publisher_task = tokio::spawn(async move {
         loop {
-            for proposal in [&impersonated, &own] {
+            for proposal in [&impersonated, &own, &restreamed] {
                 if publisher_tx
                     .send(GossipEvent::BroadcastFullProposal(proposal.clone()))
                     .await
@@ -1211,6 +1233,7 @@ async fn test_full_proposal_must_be_published_by_its_proposer() {
         &libp2p::identity::PublicKey::from(publisher_keypair.public()).to_peer_id(),
     );
     let mut received_own = false;
+    let mut received_restreamed = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while tokio::time::Instant::now() < deadline {
         let Ok(Some(SystemMessage::MalachiteNetwork(
@@ -1227,12 +1250,21 @@ async fn test_full_proposal_must_be_published_by_its_proposer() {
             "delivered a full proposal not published by its proposer"
         );
         assert_eq!(from, publisher_peer_id);
-        received_own = true;
+        if proposal.round == 0 {
+            received_own = true;
+        } else {
+            assert_eq!(proposal, expected_restreamed);
+            received_restreamed = true;
+        }
     }
     publisher_task.abort();
     assert!(
         received_own,
         "proposer's own full proposal was not delivered"
+    );
+    assert!(
+        received_restreamed,
+        "re-proposed body from the later proposer was not delivered"
     );
 }
 

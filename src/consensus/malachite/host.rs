@@ -150,8 +150,7 @@ impl Host {
                 address,
                 value_id,
             } => {
-                // This is only called for pol_rounds which we're not using?
-                warn!("RestreamValue at height: {height}, round: {round}, valid_round: {valid_round}, value_id.hash: {:#?}, value_id.shard_index: {:#?}", hex::encode(&value_id.hash), value_id.shard_index);
+                info!(%height, round = round.as_i64(), valid_round = valid_round.as_i64(), value_hash = hex::encode(&value_id.hash), "Restreaming previously proposed value");
                 let full_proposal = state.shard_validator.get_proposed_value(&value_id);
                 match full_proposal {
                     None => {
@@ -161,12 +160,11 @@ impl Host {
                         );
                     }
                     Some(full_proposal) => {
-                        if full_proposal.height() != height
-                            || full_proposal.round() != round
-                            || *full_proposal.proposer_address() != address
-                        {
-                            info!(request_height = height.as_u64(), proposal_height = full_proposal.height().as_u64(), request_round = round.as_i64(), proposal_round = full_proposal.round().as_i64(), request_address= hex::encode(address.to_vec()), proposal_address = full_proposal.proposer_address().to_hex(), "Proposal published in RestreamValue does not match height/round/proposer in the request")
+                        if full_proposal.height() != height {
+                            error!(%height, cached_height = %full_proposal.height(), "Cannot restream a cached proposal for a different height");
+                            return Ok(());
                         }
+                        let full_proposal = full_proposal.for_round(round, address)?;
                         let mut bytes = Vec::new();
                         bytes.extend_from_slice(&height.as_u64().to_be_bytes());
                         bytes.extend_from_slice(&round.as_i64().to_be_bytes());
