@@ -23,7 +23,9 @@ use snapchain::node::snapchain_read_node::SnapchainReadNode;
 use snapchain::proto::admin_service_server::AdminServiceServer;
 use snapchain::proto::hub_service_server::HubServiceServer;
 use snapchain::proto::replication_service_server::ReplicationServiceServer;
-use snapchain::storage::db::snapshot::{download_snapshots, BootstrapMethod};
+use snapchain::storage::db::snapshot::{
+    download_snapshots, has_pending_snapshot_restore, needs_snapshot_restore, BootstrapMethod,
+};
 use snapchain::storage::db::RocksDB;
 use snapchain::storage::store::block_engine::BlockStores;
 use snapchain::storage::store::engine::{PostCommitMessage, Senders};
@@ -699,76 +701,65 @@ async fn run() -> Result<(), Box<dyn Error>> {
     };
     let statsd_client = StatsdClientWrapper::new(statsd_client, app_config.statsd.use_tags);
 
-    // We only use snapshots if the db directory doesn't exist or is empty.
-    // If the user sets [force_load_db_from_snapshot], load the snapshot without checking directory contents.
-    let db_is_empty = !fs::exists(app_config.rocksdb_dir.clone()).unwrap()
-        || is_dir_empty(&app_config.rocksdb_dir).unwrap();
-
-    if db_is_empty {
-        match app_config.snapshot.bootstrap_method {
-            BootstrapMethod::Replicate => {
-                use snapchain::bootstrap::replication::service::{
-                    ReplicatorBootstrap, WorkUnitResponse,
-                };
-                use tokio::time::{sleep, Duration};
-
-                info!("Starting node with replication bootstrap");
-                let replicator = ReplicatorBootstrap::new(statsd_client.clone(), &app_config);
-
-                match replicator.bootstrap_using_replication().await {
-                    Ok(r) => {
-                        // Check for the specific success response
-                        if r == WorkUnitResponse::Finished {
-                            info!("Bootstrap using replication was successful. Will start snapchain now...");
-                            // Sleep for 5 seconds to allow any pending logs to be flushed and the gossip to shutdown and free the port
-                            sleep(Duration::from_secs(5)).await;
-                        } else {
-                            error!(
-                                "Replication bootstrap stopped with status: {:?}. Exiting.",
-                                r
-                            );
-                            process::exit(1);
-                        }
-                    }
-                    Err(e) => {
-                        error!("Replication bootstrap failed:\n{}\nPlease check your network connection and restart to resume.", e);
-                        process::exit(1);
-                    }
-                }
-            }
-            BootstrapMethod::Snapshot => {
-                if app_config.snapshot.force_load_db_from_snapshot
-                    || app_config.snapshot.load_db_from_snapshot
-                {
-                    info!("Downloading snapshots (legacy method)");
-                    let mut shard_ids = app_config.consensus.shard_ids.clone();
-                    shard_ids.push(0);
-                    // Raise if the download fails. If there's a persistent issue, disable snapshot download.
-                    download_snapshots(
-                        app_config.fc_network,
-                        &app_config.snapshot,
-                        app_config.rocksdb_dir.clone(),
-                        shard_ids,
-                    )
-                    .await
-                    .unwrap();
-                }
-            }
-        }
-    } else if app_config.snapshot.force_load_db_from_snapshot {
-        // Force snapshot load even if DB exists
-        info!("Force downloading snapshots");
-        let mut shard_ids = app_config.consensus.shard_ids.clone();
-        shard_ids.push(0);
+    let mut snapshot_shards = app_config.consensus.shard_ids.clone();
+    snapshot_shards.push(0);
+    let pending_restore = has_pending_snapshot_restore(&app_config.rocksdb_dir)
+        .expect("unable to inspect snapshot restore state");
+    if pending_restore
+        && !app_config.snapshot.load_db_from_snapshot
+        && !app_config.snapshot.force_load_db_from_snapshot
+    {
+        panic!("snapshot restore is unfinished; enable snapshot loading to resume before starting the node");
+    }
+    let restore_snapshots = pending_restore
+        || app_config.snapshot.force_load_db_from_snapshot
+        || (app_config.snapshot.bootstrap_method == BootstrapMethod::Snapshot
+            && app_config.snapshot.load_db_from_snapshot
+            && needs_snapshot_restore(&app_config.rocksdb_dir, &snapshot_shards)
+                .expect("unable to check snapshot shard databases"));
+    if restore_snapshots {
+        info!(pending_restore, "Loading snapshot databases");
         download_snapshots(
             app_config.fc_network,
             &app_config.snapshot,
             app_config.rocksdb_dir.clone(),
-            shard_ids,
+            snapshot_shards,
         )
         .await
-        .unwrap();
-    };
+        .expect("snapshot restore failed; restart to resume unfinished shards");
+    } else if app_config.snapshot.bootstrap_method == BootstrapMethod::Replicate
+        && (!fs::exists(&app_config.rocksdb_dir).unwrap()
+            || is_dir_empty(&app_config.rocksdb_dir).unwrap())
+    {
+        use snapchain::bootstrap::replication::service::{ReplicatorBootstrap, WorkUnitResponse};
+        use tokio::time::{sleep, Duration};
+
+        info!("Starting node with replication bootstrap");
+        let replicator = ReplicatorBootstrap::new(statsd_client.clone(), &app_config);
+
+        match replicator.bootstrap_using_replication().await {
+            Ok(r) => {
+                // Check for the specific success response
+                if r == WorkUnitResponse::Finished {
+                    info!(
+                        "Bootstrap using replication was successful. Will start snapchain now..."
+                    );
+                    // Sleep for 5 seconds to allow any pending logs to be flushed and the gossip to shutdown and free the port
+                    sleep(Duration::from_secs(5)).await;
+                } else {
+                    error!(
+                        "Replication bootstrap stopped with status: {:?}. Exiting.",
+                        r
+                    );
+                    process::exit(1);
+                }
+            }
+            Err(e) => {
+                error!("Replication bootstrap failed:\n{}\nPlease check your network connection and restart to resume.", e);
+                process::exit(1);
+            }
+        }
+    }
 
     let keypair = app_config.consensus.keypair().clone();
     let read_node = app_config.is_read_node();

@@ -63,7 +63,10 @@ services:
         enabled = true
 
         [snapshot]
-        endpoint_url = "https://e1f9f185c6e63471dd39f96abd3413c4.r2.cloudflarestorage.com"
+        endpoint_url = "https://5400535f796c891e31be1f53f6d89dc0.r2.cloudflarestorage.com"
+        s3_bucket = "snapshots"
+        snapshot_download_url = "https://snapshots.hypria.app"
+        backup_dir = ".rocks.backup"
         load_db_from_snapshot=true
     # Writes HYPERSNAP_CONFIG to config.toml, appends the validator sets from the
     # dedicated validators.toml file, then runs the command. See validators.toml
