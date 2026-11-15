@@ -3372,6 +3372,9 @@ impl ApiHttpHandler {
                             {
                                 "quote"
                             }
+                            Ok(crate::proto::MessageType::CastAdd) if is_mention_of(data, fid) => {
+                                "mention"
+                            }
                             Ok(crate::proto::MessageType::CastAdd) => "reply",
                             Ok(crate::proto::MessageType::LinkAdd) => "follows",
                             _ => "mention",
@@ -3509,6 +3512,9 @@ impl ApiHttpHandler {
                     let user = self.get_user(data.fid).await;
                     let notif_type = match crate::proto::MessageType::try_from(data.r#type) {
                         Ok(crate::proto::MessageType::ReactionAdd) => "likes",
+                        Ok(crate::proto::MessageType::CastAdd) if is_mention_of(data, fid) => {
+                            "mention"
+                        }
                         Ok(crate::proto::MessageType::CastAdd) => "reply",
                         Ok(crate::proto::MessageType::LinkAdd) => "follows",
                         _ => "mention",
@@ -3622,6 +3628,9 @@ impl ApiHttpHandler {
                     let user = self.get_user(data.fid).await;
                     let notif_type = match crate::proto::MessageType::try_from(data.r#type) {
                         Ok(crate::proto::MessageType::ReactionAdd) => "likes",
+                        Ok(crate::proto::MessageType::CastAdd) if is_mention_of(data, fid) => {
+                            "mention"
+                        }
                         Ok(crate::proto::MessageType::CastAdd) => "reply",
                         Ok(crate::proto::MessageType::LinkAdd) => "follows",
                         _ => "mention",
@@ -5196,6 +5205,20 @@ fn is_recast(data: &crate::proto::MessageData) -> bool {
     )
 }
 
+/// Whether a cast mentions `fid` without being a direct reply to one of their
+/// casts: a mention notification rather than a reply. Direct replies to the
+/// user's casts stay replies even when the client added an @mention of them.
+fn is_mention_of(data: &crate::proto::MessageData, fid: u64) -> bool {
+    let Some(crate::proto::message_data::Body::CastAddBody(body)) = &data.body else {
+        return false;
+    };
+    let replies_to_fid = matches!(
+        &body.parent,
+        Some(crate::proto::cast_add_body::Parent::ParentCastId(parent)) if parent.fid == fid
+    );
+    !replies_to_fid && body.mentions.contains(&fid)
+}
+
 /// Whether a cast quotes a cast by `fid` without being a direct reply to one.
 fn is_quote_of(data: &crate::proto::MessageData, fid: u64) -> bool {
     let Some(crate::proto::message_data::Body::CastAddBody(body)) = &data.body else {
@@ -6732,6 +6755,114 @@ mod tests {
             assert_eq!(notifications[0]["cast"]["hash"], "01");
             assert_eq!(notifications[1]["user"]["fid"], 123);
             assert_eq!(notifications[1]["cast"]["author"]["fid"], target_fid);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_notifications_label_mentions() {
+        let target_fid: u64 = 121;
+        let channel = "https://warpcast.com/~/channel/test";
+        let cast = |fid: u64,
+                    hash: u8,
+                    mentions: Vec<u64>,
+                    parent: Option<crate::proto::cast_add_body::Parent>| {
+            let mut msg = mock_cast(fid, vec![hash]);
+            if let Some(crate::proto::message_data::Body::CastAddBody(body)) =
+                &mut msg.data.as_mut().unwrap().body
+            {
+                body.mentions_positions = vec![0; mentions.len()];
+                body.mentions = mentions;
+                body.parent = parent;
+            }
+            msg
+        };
+        let parent_cast = |fid: u64| {
+            Some(crate::proto::cast_add_body::Parent::ParentCastId(
+                crate::proto::CastId { fid, hash: vec![9] },
+            ))
+        };
+        let parent_url = Some(crate::proto::cast_add_body::Parent::ParentUrl(
+            channel.to_string(),
+        ));
+
+        let handler = ApiHttpHandler::new(None, None, None, None, None, None);
+        handler.set_hub_query(Arc::new(MockHubQuery {
+            notifications: vec![
+                // a top-level cast tagging the user
+                cast(122, 1, vec![target_fid], None),
+                // a reply in someone else's thread tagging the user
+                cast(123, 2, vec![130, target_fid], parent_cast(130)),
+                // a channel cast tagging the user
+                cast(124, 3, vec![target_fid], parent_url),
+                // a reply to the user's cast that also tags them
+                cast(125, 4, vec![target_fid], parent_cast(target_fid)),
+                // a reply deeper in the user's thread, no tag
+                cast(126, 5, vec![], parent_cast(140)),
+                // a quote of the user's cast that also tags them
+                {
+                    let mut quote = cast(127, 6, vec![target_fid], None);
+                    if let Some(crate::proto::message_data::Body::CastAddBody(body)) =
+                        &mut quote.data.as_mut().unwrap().body
+                    {
+                        body.embeds.push(crate::proto::Embed {
+                            embed: Some(crate::proto::embed::Embed::CastId(crate::proto::CastId {
+                                fid: target_fid,
+                                hash: vec![8],
+                            })),
+                        });
+                    }
+                    quote
+                },
+            ],
+            ..Default::default()
+        }));
+
+        for flag in [false, true] {
+            let response = handler
+                .handle_notifications(target_fid, None, 10, flag)
+                .await
+                .unwrap();
+            let json = collect_json(response).await;
+            let types: Vec<(u64, &str)> = json["notifications"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|n| {
+                    (
+                        n["user"]["fid"].as_u64().unwrap(),
+                        n["type"].as_str().unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                types,
+                [
+                    (122, "mention"),
+                    (123, "mention"),
+                    (124, "mention"),
+                    (125, "reply"),
+                    (126, "reply"),
+                    (127, if flag { "quote" } else { "mention" })
+                ],
+                "include_quotes_and_deep_replies={flag}"
+            );
+        }
+
+        for response in [
+            handler
+                .handle_parent_url_notifications(target_fid, channel, None, 10)
+                .await
+                .unwrap(),
+            handler
+                .handle_channel_notifications(target_fid, channel, None, 10)
+                .await
+                .unwrap(),
+        ] {
+            let json = collect_json(response).await;
+            let notifications = json["notifications"].as_array().unwrap();
+            assert_eq!(notifications.len(), 1);
+            assert_eq!(notifications[0]["user"]["fid"], 124);
+            assert_eq!(notifications[0]["type"], "mention");
         }
     }
 }
