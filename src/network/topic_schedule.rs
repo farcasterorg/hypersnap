@@ -437,6 +437,43 @@ mod tests {
         assert_eq!(s.phases(), vec![false, true]);
     }
     #[test]
+    fn decided_value_without_a_routable_height_is_dropped() {
+        let s = schedule();
+        let chunk = |height| {
+            proto::GossipMessage {
+                gossip_message: Some(Payload::ReadNodeMessage(proto::ReadNodeMessage {
+                    read_node_message: Some(
+                        proto::read_node_message::ReadNodeMessage::DecidedValue(
+                            proto::DecidedValue {
+                                value: Some(proto::decided_value::Value::Shard(
+                                    proto::ShardChunk {
+                                        header: Some(proto::ShardHeader {
+                                            height,
+                                            ..Default::default()
+                                        }),
+                                        ..Default::default()
+                                    },
+                                )),
+                            },
+                        ),
+                    ),
+                })),
+            }
+            .encode_to_vec()
+        };
+        let out_of_range = Some(proto::Height {
+            shard_index: 3,
+            block_number: 1,
+        });
+        for bytes in [chunk(None), chunk(out_of_range)] {
+            assert!(s.publications(t::DECIDED_VALUES, &bytes).is_empty());
+            for phase in [false, true] {
+                let topic = t::wire(t::DECIDED_VALUES, phase).unwrap();
+                assert!(s.inbound(topic, &bytes).is_none());
+            }
+        }
+    }
+    #[test]
     fn mempool_routes_by_its_own_shard_in_mixed_window() {
         let mut s = schedule();
         s.observe_next(proto::Height {
