@@ -1,23 +1,28 @@
 //! Hydrated profiles kept between requests.
 //!
 //! Hydrating a user reads and decodes every user-data and verification
-//! message of the account and its custody record, which on mainnet costs
-//! about as much as the rest of a cast put together. Profiles change rarely,
-//! so they are kept here and dropped when a message or on-chain event for the
-//! account could change them. Follower and following counts change all the
-//! time and are not kept; the hydrator reads them on every request.
+//! message of the account and its custody record. Profiles change rarely, so
+//! they are kept here and dropped when something for the account could
+//! change them: any message other than a cast, reaction or link (user data,
+//! verifications, and their prunes and revokes), an on-chain event, or an
+//! fname proof moving a name between accounts. Follower and following counts
+//! change all the time and are not kept; the hydrator reads them on every
+//! request.
 //!
 //! A profile read from the store is only kept if nothing changed the account
 //! since that read started: the engine commits before it emits events, so a
 //! change the read missed is processed after the read began and blocks the
-//! write, or is processed after it and drops the entry. Lost events are
-//! replayed by the index gap repair. Writes that emit no event (the hyper
-//! backfill and reconcile) and anything else are covered by [`PROFILE_TTL`].
+//! write, or is processed after it and drops the entry. Lost message events
+//! are replayed by the index gap repair. Lost on-chain events, writes that
+//! emit no event (the hyper backfill and reconcile) and anything else can
+//! leave a profile stale for at most [`PROFILE_TTL`]. A native registration
+//! names fid 0 in its message, but it creates the account, so nothing can be
+//! kept for it before.
 
 use crate::api::events::IndexEvent;
 use crate::api::indexer::{Indexer, IndexerError, IndexerStats};
 use crate::api::types::User;
-use crate::proto::{Message, MessageType};
+use crate::proto::{hub_event, Message, MessageType};
 use async_trait::async_trait;
 use std::future::Future;
 use std::sync::Mutex;
@@ -125,6 +130,22 @@ impl Indexer for ProfileCache {
             }
             // Custody transfers, recoveries and the rest
             IndexEvent::OnChainEventProcessed { event, .. } => self.change(event.fid),
+            // An fname moving between accounts changes both
+            IndexEvent::HubEventEmitted { event, .. } => {
+                if let Some(hub_event::Body::MergeUsernameProofBody(body)) = &event.body {
+                    let proofs = [&body.username_proof, &body.deleted_username_proof];
+                    for proof in proofs.into_iter().flatten() {
+                        self.change(proof.fid);
+                    }
+                    let messages = [
+                        &body.username_proof_message,
+                        &body.deleted_username_proof_message,
+                    ];
+                    for message in messages.into_iter().flatten() {
+                        self.note(message);
+                    }
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -224,5 +245,29 @@ mod tests {
         assert_eq!(read.username, "stale");
         assert_eq!(get(2, "fresh").await.username, "fresh");
         assert_eq!(get(2, "later").await.username, "fresh");
+
+        // An fname moving from 3 to 4 drops both
+        assert_eq!(get(3, "old").await.username, "old");
+        assert_eq!(get(4, "old").await.username, "old");
+        let proof = |fid| proto::UserNameProof {
+            fid,
+            ..Default::default()
+        };
+        let moved = proto::HubEvent {
+            body: Some(hub_event::Body::MergeUsernameProofBody(
+                proto::MergeUserNameProofBody {
+                    username_proof: Some(proof(4)),
+                    deleted_username_proof: Some(proof(3)),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        cache
+            .process_event(&IndexEvent::hub_event(moved, 1))
+            .await
+            .unwrap();
+        assert_eq!(get(3, "new").await.username, "new");
+        assert_eq!(get(4, "new").await.username, "new");
     }
 }
