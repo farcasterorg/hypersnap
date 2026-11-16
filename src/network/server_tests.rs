@@ -10382,6 +10382,82 @@ mod tests {
         assert!(cursor2.is_none());
     }
 
+    /// A reply can be merged before the cast it replies to (another shard got
+    /// there first). When that cast lands, the replies under it get the thread
+    /// notifications they couldn't when they were indexed.
+    #[tokio::test]
+    async fn test_notifications_index_late_parent_completes_the_thread() {
+        use crate::api::events::IndexEvent;
+        use crate::api::indexer::Indexer;
+        use crate::api::notifications_index::Kind;
+        let (stores, _service, target, actor, base) = notified_and_actor().await;
+        let top = messages_factory::casts::create_cast_add(target, "top", Some(base), None);
+        let reply = messages_factory::casts::create_cast_with_parent(
+            actor,
+            "reply",
+            target,
+            &top.hash,
+            Some(base + 1),
+            None,
+        );
+        let deeper = messages_factory::casts::create_cast_with_parent(
+            actor,
+            "deeper",
+            actor,
+            &reply.hash,
+            Some(base + 2),
+            None,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(RocksDB::new(dir.path().to_str().unwrap()));
+        db.open().unwrap();
+        let index = crate::api::notifications_index::NotificationsIndexer::new(
+            crate::api::config::FeatureConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            db,
+            stores.clone(),
+        )
+        .with_router(Box::new(routing::EvenOddRouterForTest {}));
+        let entries = |index: &crate::api::notifications_index::NotificationsIndexer| {
+            let mut found = vec![];
+            index
+                .scan(target, None, |e| {
+                    found.push((e.hash.to_vec(), e.kind));
+                    false
+                })
+                .unwrap();
+            found
+        };
+
+        merge_into(&stores, 1, &top);
+        index
+            .process_event(&IndexEvent::message(top.clone(), 1, 1))
+            .await
+            .unwrap();
+        // The deeper reply first: the reply it answers isn't there yet.
+        merge_into(&stores, 2, &deeper);
+        index
+            .process_event(&IndexEvent::message(deeper.clone(), 2, 2))
+            .await
+            .unwrap();
+        assert!(entries(&index).is_empty());
+
+        merge_into(&stores, 2, &reply);
+        index
+            .process_event(&IndexEvent::message(reply.clone(), 2, 3))
+            .await
+            .unwrap();
+        assert_eq!(
+            entries(&index),
+            vec![
+                (deeper.hash.clone(), Kind::DeepReply),
+                (reply.hash.clone(), Kind::Reply)
+            ]
+        );
+    }
+
     /// Request time of the scan against the index on one busy account.
     /// `cargo test --release --lib notifications_latency -- --ignored --nocapture`
     #[tokio::test]

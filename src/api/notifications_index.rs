@@ -28,7 +28,7 @@ use crate::storage::util::increment_vec_u8;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Key prefix for the notifications index (in the API RocksDB).
@@ -44,6 +44,10 @@ const CHECKPOINT_NAME: &str = "notifications_index_v1";
 /// authors of the casts above that (deeper replies), the same reach as the
 /// scan `include_quotes_and_deep_replies` used to do.
 const THREAD_DEPTH: usize = 6;
+/// Most stored replies a late cast picks up per thread level.
+const REPLIES_PER_LEVEL: usize = 100;
+/// [prefix][0xFC][shard_id:4] -> the highest block whose live events are indexed.
+const INDEXED_HEIGHT: u8 = 0xFC;
 /// Pending writes per commit, so a batch stays small in memory.
 const COMMIT_EVERY: usize = 10_000;
 /// FIDs walked between checkpoints.
@@ -111,11 +115,26 @@ pub struct NotificationsIndexer {
     router: Box<dyn MessageRouter>,
     complete: AtomicBool,
     items_indexed: AtomicU64,
+    /// Per shard, the highest block whose live events are indexed (as stored).
+    heights: Mutex<HashMap<u32, u64>>,
 }
 
 impl NotificationsIndexer {
     pub fn new(config: FeatureConfig, db: Arc<RocksDB>, stores: HashMap<u32, Stores>) -> Self {
         let complete = matches!(db.get(&[PREFIX, BACKFILL_DONE]), Ok(Some(_)));
+        let mut heights = HashMap::new();
+        let start = vec![PREFIX, INDEXED_HEIGHT];
+        let _ = db.for_each_iterator_by_prefix(
+            Some(start.clone()),
+            Some(increment_vec_u8(&start)),
+            &PageOptions::default(),
+            |key, value| {
+                if let (Ok(shard), Ok(height)) = (key[2..].try_into(), value.try_into()) {
+                    heights.insert(u32::from_be_bytes(shard), u64::from_be_bytes(height));
+                }
+                Ok(false)
+            },
+        );
         Self {
             config,
             db,
@@ -123,6 +142,27 @@ impl NotificationsIndexer {
             router: Box::new(ShardRouter {}),
             complete: AtomicBool::new(complete),
             items_indexed: AtomicU64::new(0),
+            heights: Mutex::new(heights),
+        }
+    }
+
+    /// Per shard, the highest block whose live events were indexed before this
+    /// start. Events still queued when the node stopped were lost, so the
+    /// blocks from there to the tip are replayed (`index_gaps`).
+    pub fn indexed_heights(&self) -> HashMap<u32, u64> {
+        self.heights.lock().unwrap().clone()
+    }
+
+    /// Record live events' block heights in `txn`, committed with their entries.
+    fn note_height(&self, shard_id: u32, height: u64, txn: &mut RocksDbTransactionBatch) {
+        let mut heights = self.heights.lock().unwrap();
+        let known = heights.entry(shard_id).or_insert(0);
+        if height > *known {
+            *known = height;
+            txn.put(
+                [&[PREFIX, INDEXED_HEIGHT][..], &shard_id.to_be_bytes()[..]].concat(),
+                height.to_be_bytes().to_vec(),
+            );
         }
     }
 
@@ -271,7 +311,7 @@ impl NotificationsIndexer {
                 }
                 .map_err(|e| IndexerError::Storage(e.to_string()))?;
                 for message in &page.messages {
-                    self.process_message(message, MessageEventKind::Merge, txn);
+                    self.write(message, false, txn);
                     if txn.len() >= COMMIT_EVERY {
                         self.commit(std::mem::replace(txn, RocksDbTransactionBatch::new()))?;
                     }
@@ -346,6 +386,9 @@ impl NotificationsIndexer {
     /// What `cast` replies to: `None` if the stores don't hold it (so it isn't
     /// really `cast.fid`'s), `Some(None)` if it's top-level.
     fn parent_of(&self, cast: &CastId) -> Option<Option<CastId>> {
+        if self.stores.is_empty() {
+            return None;
+        }
         let shard = self.router.route_fid(cast.fid, self.stores.len() as u32);
         let stores = self.stores.get(&shard)?;
         let message = CastStore::get_cast_add(&stores.cast_store, cast.fid, cast.hash.clone())
@@ -360,26 +403,91 @@ impl NotificationsIndexer {
         })
     }
 
+    /// A live (or replayed) message. A cast that's merged after replies to it
+    /// (they reached their shard first) also completes those replies' thread
+    /// notifications, which couldn't look past it when they were indexed. The
+    /// walk doesn't need that: it reads stores that already hold every cast.
     fn process_message(
         &self,
         message: &Message,
         kind: MessageEventKind,
         txn: &mut RocksDbTransactionBatch,
     ) {
-        // Pruning keeps the message in the hyper stores the API serves.
-        if kind == MessageEventKind::Prune || message.hash.len() != HASH_LEN {
+        match kind {
+            // Pruning keeps the message in the hyper stores the API serves.
+            MessageEventKind::Prune => {}
+            MessageEventKind::Revoke => self.write(message, true, txn),
+            MessageEventKind::Merge => {
+                self.write(message, false, txn);
+                if let Some(cast) = Self::cast_id(message) {
+                    for reply in self.stored_replies(cast) {
+                        self.write(&reply, false, txn);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Put (or delete) the entries for everyone `message` notifies.
+    fn write(&self, message: &Message, delete: bool, txn: &mut RocksDbTransactionBatch) {
+        let Some(data) = &message.data else { return };
+        if message.hash.len() != HASH_LEN {
             return;
         }
-        let Some(data) = &message.data else { return };
         for (fid, why) in self.targets(message) {
             let key = Self::key(fid, data.timestamp, &message.hash, why, data.fid);
-            if kind == MessageEventKind::Revoke {
+            if delete {
                 txn.delete(key);
             } else {
                 txn.put(key, vec![]);
                 self.items_indexed.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+
+    fn cast_id(message: &Message) -> Option<CastId> {
+        let data = message.data.as_ref()?;
+        (data.r#type == MessageType::CastAdd as i32).then(|| CastId {
+            fid: data.fid,
+            hash: message.hash.clone(),
+        })
+    }
+
+    /// Replies already in the stores under `cast`, down the levels a thread
+    /// notifies, newest first and capped per level. Almost always none: a
+    /// cast is usually merged before anyone can reply to it.
+    fn stored_replies(&self, cast: CastId) -> Vec<Message> {
+        let mut found = Vec::new();
+        let mut level = vec![cast];
+        for _ in 0..THREAD_DEPTH {
+            let mut next: Vec<Message> = Vec::new();
+            for parent in &level {
+                let parent = cast_add_body::Parent::ParentCastId(parent.clone());
+                for stores in self.stores.values() {
+                    if let Ok(page) = CastStore::get_casts_by_parent(
+                        &stores.cast_store,
+                        &parent,
+                        &PageOptions {
+                            page_size: Some(REPLIES_PER_LEVEL),
+                            page_token: None,
+                            reverse: true,
+                        },
+                    ) {
+                        next.extend(page.messages);
+                    }
+                }
+                if next.len() >= REPLIES_PER_LEVEL {
+                    break;
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            next.truncate(REPLIES_PER_LEVEL);
+            level = next.iter().filter_map(Self::cast_id).collect();
+            found.extend(next);
+        }
+        found
     }
 
     fn commit(&self, txn: RocksDbTransactionBatch) -> Result<(), IndexerError> {
@@ -465,22 +573,30 @@ impl Indexer for NotificationsIndexer {
     async fn process_batch(&self, events: &[IndexEvent]) -> Result<(), IndexerError> {
         let mut txn = RocksDbTransactionBatch::new();
         for event in events {
-            match event {
+            let messages = match event {
                 IndexEvent::MessageCommitted { message, kind, .. } => {
                     self.process_message(message, *kind, &mut txn);
+                    true
                 }
                 IndexEvent::MessagesCommitted { messages, kind, .. } => {
                     for message in messages {
                         self.process_message(message, *kind, &mut txn);
                     }
+                    true
                 }
-                _ => {}
+                _ => false,
+            };
+            if let (true, Some(height)) = (messages, event.block_height()) {
+                if height > 0 {
+                    self.note_height(event.shard_id(), height, &mut txn);
+                }
             }
         }
         self.commit(txn)
     }
 
-    // Live writes are idempotent puts, so there's no event cursor to keep.
+    // Live writes are idempotent puts, and the replay after a restart goes by
+    // block height (`indexed_heights`), so there's no event cursor to keep.
     fn last_checkpoint(&self) -> u64 {
         0
     }
@@ -521,6 +637,53 @@ mod tests {
         assert!(older < newer);
         assert!(NotificationsIndexer::user_prefix(5) < older);
         assert!(newer < increment_vec_u8(&NotificationsIndexer::user_prefix(5)));
+    }
+
+    /// The highest block indexed per shard survives a restart, so the blocks
+    /// after it can be replayed.
+    #[tokio::test]
+    async fn test_indexed_heights_survive_a_restart() {
+        use crate::utils::factory::messages_factory;
+        let dir = tempfile::tempdir().unwrap();
+        let open = || {
+            let db = Arc::new(RocksDB::new(dir.path().to_str().unwrap()));
+            db.open().unwrap();
+            NotificationsIndexer::new(
+                FeatureConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+                db,
+                HashMap::new(),
+            )
+        };
+        let index = open();
+        let like = |fid| {
+            messages_factory::reactions::create_reaction_add(
+                fid,
+                crate::proto::ReactionType::Like,
+                reaction_body::Target::TargetCastId(CastId {
+                    fid: 1,
+                    hash: vec![9; HASH_LEN],
+                }),
+                None,
+                None,
+            )
+        };
+        for (shard, height) in [(2, 42), (2, 41), (1, 7)] {
+            index
+                .process_event(&IndexEvent::message(like(height), shard, height))
+                .await
+                .unwrap();
+        }
+        // Heights from the block backfill (0) don't count.
+        index
+            .process_event(&IndexEvent::message(like(3), 1, 0))
+            .await
+            .unwrap();
+        drop(index);
+        let reopened = open();
+        assert_eq!(reopened.indexed_heights(), HashMap::from([(2, 42), (1, 7)]));
     }
 
     /// Bytes per entry on disk and write rate, for sizing the store walk.

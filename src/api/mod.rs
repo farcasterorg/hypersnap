@@ -573,6 +573,15 @@ pub fn initialize(
         .iter()
         .map(|(&id, stores)| (id, stores.shard_store.max_block_number().unwrap_or(0)))
         .collect();
+    // Events still queued when the node last stopped never reached the
+    // notifications index; replay from the last block it indexed to the tip.
+    for (shard_id, from) in notifications_indexer.indexed_heights() {
+        if let Some(&tip) = tips.get(&shard_id) {
+            if from <= tip {
+                index_gaps.lost(shard_id, from, tip);
+            }
+        }
+    }
     index_gaps::spawn_repair(
         index_gaps.clone(),
         shard_stores.clone(),
