@@ -4342,12 +4342,20 @@ async fn test_malformed_decided_values_do_not_stall_the_read_node() {
     let rogue = RoguePeer::connect(&network).await;
 
     let malformed = malformed_decided_values(network.max_shard_height(1) as u64 + 1);
+    // Gossip routes a decided value by its header height, so one without a height, or for a
+    // shard the network doesn't have, is dropped before it can reach the read node.
     let markers: Vec<Vec<u8>> = malformed
         .iter()
-        .filter_map(|v| match &v.value {
-            Some(proto::decided_value::Value::Block(block)) => Some(block.hash.clone()),
-            Some(proto::decided_value::Value::Shard(chunk)) => Some(chunk.hash.clone()),
-            None => None,
+        .filter_map(|v| {
+            let (hash, header_height) = match v.value.as_ref()? {
+                proto::decided_value::Value::Block(block) => {
+                    (&block.hash, block.header.as_ref()?.height?)
+                }
+                proto::decided_value::Value::Shard(chunk) => {
+                    (&chunk.hash, chunk.header.as_ref()?.height?)
+                }
+            };
+            (header_height.shard_index <= num_shards).then(|| hash.clone())
         })
         .collect();
     let read_node = &network.read_nodes[0];
@@ -4355,7 +4363,12 @@ async fn test_malformed_decided_values_do_not_stall_the_read_node() {
     while !markers.iter().all(|m| read_node.received_decided_value(m)) {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "read node never received every malformed decided value"
+            "read node never received malformed decided values {:x?}",
+            markers
+                .iter()
+                .filter(|m| !read_node.received_decided_value(m))
+                .map(|m| m[0])
+                .collect::<Vec<_>>()
         );
         for value in &malformed {
             rogue.publish_decided_value(value.clone()).await;
