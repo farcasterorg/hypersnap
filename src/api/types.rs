@@ -173,8 +173,8 @@ pub struct Cast {
     /// The cast's place in its author's chain of casts; absent when it is in none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain: Option<CastChain>,
-    /// Where the key that signed the cast comes from: `onchain` (the KeyRegistry, so any
-    /// Farcaster node can accept the cast) or `offchain` (a gasless KEY_ADD, which only Hypersnap
+    /// Where the key that signed the cast comes from: `onchain` (a KeyRegistry key, so the cast
+    /// may also be valid on Snapchain) or `offchain` (a gasless KEY_ADD, which only Hypersnap
     /// accepts). Absent when the node can't resolve the key, or the cast was not read from its
     /// message (search results).
     #[serde(default, skip_serializing_if = "Option::is_none")]
