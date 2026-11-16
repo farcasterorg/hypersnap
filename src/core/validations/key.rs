@@ -1,5 +1,5 @@
 use alloy_dyn_abi::TypedData;
-use alloy_primitives::{Address, Signature};
+use alloy_primitives::{Address, Signature, B256};
 use alloy_sol_types::{sol, SolType};
 use serde_json::{json, Value};
 
@@ -30,6 +30,15 @@ pub enum KeyRemoveSignatureType {
     /// sufficient — the signer IS the key). Consumes the app-nonce namespace scoped by the
     /// verified `requestFid` cached at KEY_ADD time. Enables mass revocation by a compromised app.
     SelfRevoke = 2,
+    /// Sign In With Farcaster (FIP-11): `body.signature` is the custody address's EIP-191
+    /// signature over `body.authorization_message`, an EIP-4361 text for the reserved domain
+    /// `SIGN_IN_KEY_REMOVE_DOMAIN` whose nonce commits to the `KeyRemove` payload. Lets an
+    /// account that added a key by sign-in remove any of its keys the same way. Consumes the
+    /// user-nonce namespace, like `Custody`.
+    ///
+    /// Only honoured once `ProtocolFeature::SignInKeyAuthorization` is active; before that the
+    /// merge rejects it exactly as binaries that predate the variant do.
+    SignIn = 200,
 }
 
 impl TryFrom<u32> for KeyRemoveSignatureType {
@@ -38,10 +47,59 @@ impl TryFrom<u32> for KeyRemoveSignatureType {
         match v {
             1 => Ok(Self::Custody),
             2 => Ok(Self::SelfRevoke),
+            200 => Ok(Self::SignIn),
             _ => Err(ValidationError::InvalidSignatureType),
         }
     }
 }
+
+/// How a KEY_ADD's `custody_signature` authorizes the key. Wire representation is
+/// `uint32 authorization_type = 200` on `KeyAddBody`. The sign-in value is 200, like the field
+/// number, so nothing assigned on the snapchain side can collide with it.
+///
+/// The field did not exist before `ProtocolFeature::SignInKeyAuthorization`, so every earlier
+/// KEY_ADD carries 0 on the wire. 0 therefore means `Custody`, and callers must not interpret the
+/// field at all until the feature is active: an older binary ignores it, so a newer one reading
+/// it early would disagree with the rest of the network about the same message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum KeyAddAuthorizationType {
+    /// EIP-712 `KeyAdd` signature; recovered signer must equal the FID's custody address.
+    Custody = 1,
+    /// Sign In With Farcaster (FIP-11): an EIP-191 signature over `authorization_message`, an
+    /// EIP-4361 text for the reserved domain `SIGN_IN_KEY_ADD_DOMAIN` whose nonce commits to the
+    /// `KeyAdd` payload. The signer must be the FID's custody address. See
+    /// `core::validations::sign_in`.
+    SignIn = 200,
+}
+
+impl TryFrom<u32> for KeyAddAuthorizationType {
+    type Error = ValidationError;
+    fn try_from(v: u32) -> Result<Self, Self::Error> {
+        match v {
+            0 | 1 => Ok(Self::Custody),
+            200 => Ok(Self::SignIn),
+            _ => Err(ValidationError::InvalidSignatureType),
+        }
+    }
+}
+
+// The domain a sign-in message must name to authorize a KEY_ADD. The requesting client chooses
+// the domain a Farcaster app shows in its approval prompt, so fixing it here makes the prompt
+// itself say what is being granted: an ordinary sign-in to any real site carries that site's
+// domain and can never be turned into a key. The name is not resolved or fetched by anything.
+pub const SIGN_IN_KEY_ADD_DOMAIN: &str = "grant-account-access.hypersnap";
+
+// The domain a sign-in message must name to authorize a KEY_REMOVE. Distinct from the add domain
+// so an approval of one kind can never be presented as the other.
+pub const SIGN_IN_KEY_REMOVE_DOMAIN: &str = "revoke-account-access.hypersnap";
+
+// Lifetime of a key authorized by a sign-in message. Two differences from a custody-authorized
+// key: the cap is 30 days rather than 90, and the window is fixed rather than sliding — it runs
+// from the KEY_ADD's timestamp and using the key does not extend it. A key obtained by tricking
+// someone into an approval therefore cannot be kept alive by whoever holds it; the account
+// renews by approving again.
+pub const MAX_SIGN_IN_KEY_TTL_SECONDS: u32 = 30 * 24 * 60 * 60;
 
 // Maximum sliding TTL window accepted in a KeyAddBody. FIP specifies 90 days; larger values are
 // rejected at static validation so a misbehaving signer can't request an effectively-permanent key.
@@ -193,12 +251,62 @@ fn recover_from_typed_data(
     let prehash = typed_data
         .eip712_signing_hash()
         .map_err(|_| ValidationError::InvalidHash)?;
+    recover_address_from_prehash(&prehash, signature)
+}
+
+/// Recovers the address behind a 65-byte `r || s || v` signature over `prehash`. Shared by the
+/// EIP-712 paths above and the EIP-191 sign-in path, so both read `v` the same way.
+pub(crate) fn recover_address_from_prehash(
+    prehash: &B256,
+    signature: &[u8],
+) -> Result<Address, ValidationError> {
+    if signature.len() != 65 {
+        return Err(ValidationError::InvalidSignature);
+    }
     let sig = Signature::from_bytes_and_parity(
         &signature[0..64],
         signature[64] != 0x1b && signature[64] != 0x00,
     );
-    sig.recover_address_from_prehash(&prehash)
+    sig.recover_address_from_prehash(prehash)
         .map_err(|_| ValidationError::InvalidSignature)
+}
+
+/// The nonce a sign-in message must carry to authorize `payload`: the lowercase hex EIP-712
+/// signing hash of the same `KeyAdd` typed data the custody path signs.
+///
+/// Reusing that hash means a sign-in authorization commits to exactly what a custody signature
+/// commits to (fid, key, key type, scopes, ttl, nonce, deadline), with no second encoding to keep
+/// in step. 64 hex characters satisfy EIP-4361's nonce grammar (at least 8 alphanumerics).
+pub fn sign_in_key_add_nonce(
+    payload: &KeyAddPayload,
+    chain_id: u32,
+) -> Result<String, ValidationError> {
+    let prehash = key_add_typed_data(payload, chain_id)?
+        .eip712_signing_hash()
+        .map_err(|_| ValidationError::InvalidHash)?;
+    Ok(hex::encode(prehash))
+}
+
+/// The nonce a sign-in message must carry to authorize removing a key: the lowercase hex
+/// EIP-712 signing hash of the `KeyRemove` typed data the custody path signs.
+pub fn sign_in_key_remove_nonce(
+    payload: &KeyRemovePayload,
+    chain_id: u32,
+) -> Result<String, ValidationError> {
+    let prehash = key_remove_typed_data(payload, chain_id)?
+        .eip712_signing_hash()
+        .map_err(|_| ValidationError::InvalidHash)?;
+    Ok(hex::encode(prehash))
+}
+
+/// TTL bound for a key authorized by a sign-in message, on top of `validate_key_add_body`.
+/// Scopes are not narrowed: the reserved approval domain is what makes the grant explicit, and
+/// a key added this way can do whatever a custody-authorized key with the same scopes can.
+pub fn validate_sign_in_key_ttl(ttl: u32) -> Result<(), ValidationError> {
+    if ttl > MAX_SIGN_IN_KEY_TTL_SECONDS {
+        return Err(ValidationError::InvalidTtl(MAX_SIGN_IN_KEY_TTL_SECONDS));
+    }
+    Ok(())
 }
 
 /// Recovers the Ethereum address that signed the EIP-712 `KeyAdd` custody authorization.
@@ -775,6 +883,8 @@ mod tests {
             registration_tx_hash: vec![],
             scopes: vec![MessageType::CastAdd as i32],
             ttl: 86_400,
+            authorization_type: 0,
+            authorization_message: vec![],
         }
     }
 
@@ -785,6 +895,7 @@ mod tests {
             signature_type: KeyRemoveSignatureType::Custody as u32,
             deadline: 1_700_000_000,
             nonce: 2,
+            authorization_message: vec![],
         }
     }
 
@@ -1062,7 +1173,7 @@ mod tests {
     #[test]
     fn key_remove_body_rejects_unknown_signature_type() {
         let mut body = sample_key_remove_body();
-        body.signature_type = 3;
+        body.signature_type = 4;
         assert_eq!(
             validate_key_remove_body(&body),
             Err(ValidationError::InvalidSignatureType)
@@ -1077,5 +1188,139 @@ mod tests {
             validate_key_remove_body(&body),
             Err(ValidationError::MissingDeadline)
         );
+    }
+
+    // -- Sign-in authorization ------------------------------------------------------------------
+
+    #[test]
+    fn key_add_authorization_type_treats_absent_field_as_custody() {
+        assert_eq!(
+            KeyAddAuthorizationType::try_from(0),
+            Ok(KeyAddAuthorizationType::Custody)
+        );
+        assert_eq!(
+            KeyAddAuthorizationType::try_from(1),
+            Ok(KeyAddAuthorizationType::Custody)
+        );
+        assert_eq!(
+            KeyAddAuthorizationType::try_from(200),
+            Ok(KeyAddAuthorizationType::SignIn)
+        );
+        assert_eq!(
+            KeyAddAuthorizationType::try_from(2),
+            Err(ValidationError::InvalidSignatureType)
+        );
+    }
+
+    #[test]
+    fn sign_in_nonce_is_the_key_add_signing_hash_and_a_valid_siwe_nonce() {
+        let key = [0x11u8; 32];
+        let scopes = [MessageType::CastAdd as i32];
+        let payload = sample_key_add_payload(&key, &scopes);
+
+        let nonce = sign_in_key_add_nonce(&payload, ETH_MAINNET_CHAIN_ID).unwrap();
+        let expected = key_add_typed_data(&payload, ETH_MAINNET_CHAIN_ID)
+            .unwrap()
+            .eip712_signing_hash()
+            .unwrap();
+        assert_eq!(nonce, hex::encode(expected));
+        assert_eq!(nonce.len(), 64);
+        assert!(nonce.bytes().all(|b| b.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn sign_in_nonce_changes_with_every_committed_field() {
+        let key = [0x11u8; 32];
+        let other_key = [0x12u8; 32];
+        let scopes = [MessageType::CastAdd as i32];
+        let more_scopes = [MessageType::CastAdd as i32, MessageType::LinkAdd as i32];
+        let base = sample_key_add_payload(&key, &scopes);
+        let nonce = |p: &KeyAddPayload| sign_in_key_add_nonce(p, ETH_MAINNET_CHAIN_ID).unwrap();
+
+        let variants = [
+            KeyAddPayload {
+                fid: base.fid + 1,
+                ..base
+            },
+            KeyAddPayload {
+                key: &other_key,
+                ..base
+            },
+            KeyAddPayload {
+                scopes: &more_scopes,
+                ..base
+            },
+            KeyAddPayload {
+                ttl: base.ttl + 1,
+                ..base
+            },
+            KeyAddPayload {
+                nonce: base.nonce + 1,
+                ..base
+            },
+            KeyAddPayload {
+                deadline: base.deadline + 1,
+                ..base
+            },
+        ];
+        for variant in &variants {
+            assert_ne!(nonce(variant), nonce(&base));
+        }
+    }
+
+    #[test]
+    fn sign_in_remove_nonce_is_the_key_remove_signing_hash() {
+        let key = [0x11u8; 32];
+        let payload = KeyRemovePayload {
+            fid: 1234,
+            key: &key,
+            nonce: 7,
+            deadline: 1_700_000_000,
+        };
+        let nonce = sign_in_key_remove_nonce(&payload, ETH_MAINNET_CHAIN_ID).unwrap();
+        let expected = key_remove_typed_data(&payload, ETH_MAINNET_CHAIN_ID)
+            .unwrap()
+            .eip712_signing_hash()
+            .unwrap();
+        assert_eq!(nonce, hex::encode(expected));
+
+        // An add approval and a remove approval for the same key never share a nonce.
+        let scopes = [MessageType::CastAdd as i32];
+        let add = KeyAddPayload {
+            fid: 1234,
+            key: &key,
+            key_type: 1,
+            scopes: &scopes,
+            ttl: 86_400,
+            nonce: 7,
+            deadline: 1_700_000_000,
+        };
+        assert_ne!(
+            nonce,
+            sign_in_key_add_nonce(&add, ETH_MAINNET_CHAIN_ID).unwrap()
+        );
+    }
+
+    #[test]
+    fn sign_in_key_ttl_is_capped_below_the_custody_limit() {
+        assert_eq!(
+            validate_sign_in_key_ttl(MAX_SIGN_IN_KEY_TTL_SECONDS),
+            Ok(())
+        );
+        assert_eq!(
+            validate_sign_in_key_ttl(MAX_SIGN_IN_KEY_TTL_SECONDS + 1),
+            Err(ValidationError::InvalidTtl(MAX_SIGN_IN_KEY_TTL_SECONDS))
+        );
+        assert!(MAX_SIGN_IN_KEY_TTL_SECONDS < MAX_KEY_TTL_SECONDS);
+    }
+
+    #[test]
+    fn sign_in_domains_are_distinct_hostnames() {
+        assert_ne!(SIGN_IN_KEY_ADD_DOMAIN, SIGN_IN_KEY_REMOVE_DOMAIN);
+        for domain in [SIGN_IN_KEY_ADD_DOMAIN, SIGN_IN_KEY_REMOVE_DOMAIN] {
+            assert!(domain
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.'));
+        }
     }
 }

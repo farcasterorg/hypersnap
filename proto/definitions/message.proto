@@ -266,15 +266,32 @@ message KeyAddBody {
   bytes registration_tx_hash = 8; // Optional: tx hash of the FID registration transaction
   repeated int32 scopes = 9; // Allowed MessageType values; required and non-empty
   uint32 ttl = 10; // Seconds; must be > 0. Sliding expiry window; max enforced at validation.
+  // Hypersnap-only fields start at 200 so a field added to this message on the snapchain side
+  // can never share a number with them.
+  //
+  // How `custody_signature` authorizes this key. 0 or 1 = EIP-712 `KeyAdd` signed by the custody
+  // address. 200 = Sign In With Farcaster: `custody_signature` is the custody address's EIP-191
+  // signature over `authorization_message`. Read only once
+  // ProtocolFeature::SignInKeyAuthorization is active; ignored before that.
+  uint32 authorization_type = 200;
+  // The exact EIP-4361 text that was signed, when authorization_type = 200. Its domain must be
+  // `grant-account-access.hypersnap` and its Nonce the hex EIP-712 signing hash of this message's
+  // `KeyAdd` payload.
+  bytes authorization_message = 201;
 }
 
 /** Revokes an Ed25519 key via custody signature or self-revocation */
 message KeyRemoveBody {
   bytes key = 1; // Ed25519 public key to remove
-  bytes signature = 2; // EIP-712 (custody) or Ed25519 (self-revocation) signature
-  uint32 signature_type = 3; // 1 = custody (EIP-712), 2 = self (Ed25519)
+  bytes signature = 2; // EIP-712 (custody), Ed25519 (self-revocation) or EIP-191 (sign-in) signature
+  uint32 signature_type = 3; // 1 = custody (EIP-712), 2 = self (Ed25519), 200 = sign-in (EIP-191, hypersnap-only)
   uint32 deadline = 4; // Farcaster epoch timestamp after which the signature is invalid
-  uint32 nonce = 5; // Monotonically increasing nonce (user nonce for custody, app nonce for self)
+  uint32 nonce = 5; // Monotonically increasing nonce (user nonce for custody and sign-in, app nonce for self)
+  // Hypersnap-only, numbered from 200 for the same reason as on KeyAddBody. The exact EIP-4361
+  // text that was signed, when signature_type = 200. Its domain must be
+  // `revoke-account-access.hypersnap` and its Nonce the hex EIP-712 signing hash of this
+  // message's `KeyRemove` payload.
+  bytes authorization_message = 200;
 }
 
 /**

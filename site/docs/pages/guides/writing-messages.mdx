@@ -54,6 +54,30 @@ Gasless signers are live on mainnet as of engine version V16. Read both key type
 The older `GetOnChainSignersByFid` returns onchain keys only and is deprecated.
 :::
 
+### Sign-in authorization
+
+:::note
+Not active on any network yet. It is gated by `SignInKeyAuthorization`, which has no mainnet or
+testnet schedule. See `docs/sign-in-key-authorization.md` for the full rule.
+:::
+
+An account whose custody key is held by a Farcaster app cannot sign the EIP-712 `KeyAdd` payload
+without exporting that key. It can instead approve a Sign In With Farcaster (FIP-11) request, and the
+signed sign-in message authorizes the key:
+
+1. Build the `KeyAdd` payload and take the hex EIP-712 signing hash of its typed data. That is the
+   sign-in nonce.
+2. Request a sign-in for the domain `grant-account-access.hypersnap` with that nonce, signed by the
+   custody address. The user approves it in their Farcaster app.
+3. Submit the `KEY_ADD` with `authorization_type = 200`, the returned EIP-4361 text in
+   `authorization_message` and its signature in `custody_signature`.
+
+A `KEY_REMOVE` works the same way with `signature_type = 200`, the domain
+`revoke-account-access.hypersnap` and the signing hash of the `KeyRemove` typed data.
+
+Keys added this way take the same scopes as any gasless key. Their TTL is capped at 30 days and is
+fixed: it runs from the `KEY_ADD` and is not refreshed by use.
+
 ## 1. Set up constants
 
 ```typescript

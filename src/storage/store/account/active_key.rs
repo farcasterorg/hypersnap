@@ -38,9 +38,12 @@
 use std::sync::Arc;
 
 use super::{get_gasless_key_record, OnchainEventStore};
+use crate::core::util::FarcasterTime;
+use crate::core::validations::key::KeyAddAuthorizationType;
 use crate::proto::{self, message_data::Body, MessageType};
 use crate::storage::db::{RocksDB, RocksDbTransactionBatch};
 use crate::storage::store::account::onchain_event_store::OnchainEventStorageError;
+use crate::version::version::{EngineVersion, ProtocolFeature};
 
 /// Result of resolving `(fid, signer)` against the active-key indexes.
 ///
@@ -51,7 +54,16 @@ use crate::storage::store::account::onchain_event_store::OnchainEventStorageErro
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveKey {
     OnChain,
-    Gasless { scopes_mask: u64, ttl_seconds: u32 },
+    Gasless {
+        scopes_mask: u64,
+        ttl_seconds: u32,
+        /// `Some(timestamp of the KEY_ADD)` when the stored KEY_ADD carries
+        /// `authorization_type = 200`. This is the raw field, not a verdict: whether the key was
+        /// really authorized by sign-in depends on `ProtocolFeature::SignInKeyAuthorization`
+        /// having been active at that timestamp, which only the engine (it knows the network)
+        /// can decide. See `is_fixed_expiry_sign_in_key`.
+        sign_in_added_at: Option<u32>,
+    },
 }
 
 impl ActiveKey {
@@ -134,19 +146,45 @@ pub fn get_active_key(
     // A corrupt record whose embedded message lacks `data.body.key_add_body` would have failed
     // to merge in the first place (see `merge_key_add`). Treat it as a miss defensively rather
     // than panicking on a malformed row.
-    let (scopes_mask, ttl_seconds) = extract_scope_and_ttl(&record.message).unwrap_or((0, 0));
+    let (scopes_mask, ttl_seconds, sign_in_added_at) =
+        extract_scope_and_ttl(&record.message).unwrap_or((0, 0, None));
     Ok(Some(ActiveKey::Gasless {
         scopes_mask,
         ttl_seconds,
+        sign_in_added_at,
     }))
 }
 
-fn extract_scope_and_ttl(message: &Option<proto::Message>) -> Option<(u64, u32)> {
-    let key_add = match message.as_ref()?.data.as_ref()?.body.as_ref()? {
+/// Whether a gasless key's expiry window is fixed at its KEY_ADD rather than sliding with use.
+///
+/// True only for keys authorized by a sign-in message: the stored KEY_ADD says
+/// `authorization_type = 200` *and* the feature was active at that KEY_ADD's timestamp, which is
+/// the same test `merge_key_add_with_options` applied when it chose the authorization path. A
+/// custody-authorized KEY_ADD from before activation that happens to carry a 2 in the then-unread
+/// field keeps its sliding window, as it has on every binary so far.
+pub fn is_fixed_expiry_sign_in_key(
+    sign_in_added_at: Option<u32>,
+    network: proto::FarcasterNetwork,
+) -> bool {
+    sign_in_added_at.is_some_and(|added_at| {
+        EngineVersion::version_for(&FarcasterTime::new(added_at as u64), network)
+            .is_enabled(ProtocolFeature::SignInKeyAuthorization)
+    })
+}
+
+fn extract_scope_and_ttl(message: &Option<proto::Message>) -> Option<(u64, u32, Option<u32>)> {
+    let data = message.as_ref()?.data.as_ref()?;
+    let key_add = match data.body.as_ref()? {
         Body::KeyAddBody(body) => body,
         _ => return None,
     };
-    Some((compute_scopes_mask(&key_add.scopes), key_add.ttl))
+    let sign_in_added_at = (key_add.authorization_type == KeyAddAuthorizationType::SignIn as u32)
+        .then_some(data.timestamp);
+    Some((
+        compute_scopes_mask(&key_add.scopes),
+        key_add.ttl,
+        sign_in_added_at,
+    ))
 }
 
 #[cfg(test)]
@@ -193,6 +231,8 @@ mod tests {
                         registration_tx_hash: vec![],
                         scopes,
                         ttl,
+                        authorization_type: 0,
+                        authorization_message: vec![],
                     })),
                 }),
                 hash: vec![],
@@ -239,6 +279,7 @@ mod tests {
         let k = ActiveKey::Gasless {
             scopes_mask: compute_scopes_mask(&[MessageType::CastAdd as i32]),
             ttl_seconds: 3600,
+            sign_in_added_at: None,
         };
         assert!(k.admits(MessageType::CastAdd));
         assert!(!k.admits(MessageType::ReactionAdd));
@@ -250,6 +291,7 @@ mod tests {
         let k = ActiveKey::Gasless {
             scopes_mask: 0,
             ttl_seconds: 3600,
+            sign_in_added_at: None,
         };
         assert!(!k.admits(MessageType::CastAdd));
         assert!(!k.admits(MessageType::None));
@@ -297,13 +339,16 @@ mod tests {
             Some(ActiveKey::Gasless {
                 scopes_mask,
                 ttl_seconds,
+                sign_in_added_at,
             }) => {
+                assert_eq!(sign_in_added_at, None);
                 assert_eq!(scopes_mask, compute_scopes_mask(&scopes));
                 assert_eq!(ttl_seconds, 7200);
                 // Positive and negative admission inside the scope bitmask.
                 let k = ActiveKey::Gasless {
                     scopes_mask,
                     ttl_seconds,
+                    sign_in_added_at,
                 };
                 assert!(k.admits(MessageType::CastAdd));
                 assert!(k.admits(MessageType::LinkAdd));
@@ -332,5 +377,116 @@ mod tests {
         let txn = RocksDbTransactionBatch::new();
         let result = get_active_key(&store, &rocks, &txn, 3, &pubkey).unwrap();
         assert_eq!(result, Some(ActiveKey::OnChain));
+    }
+
+    // -- Sign-in keys: fixed expiry ---------------------------------------------------------------
+
+    fn sign_in_record(signer_pubkey: &[u8], ttl: u32, added_at: u32) -> GaslessKeyRecord {
+        let mut record =
+            sample_gasless_record(signer_pubkey, vec![MessageType::CastAdd as i32], ttl);
+        let data = record.message.as_mut().unwrap().data.as_mut().unwrap();
+        data.timestamp = added_at;
+        match data.body.as_mut().unwrap() {
+            Body::KeyAddBody(body) => body.authorization_type = 200,
+            _ => unreachable!(),
+        }
+        record
+    }
+
+    #[test]
+    fn get_active_key_reports_when_a_sign_in_key_was_added() {
+        let (store, rocks, _dir) = fresh_store();
+        let signer_pubkey = [0xDD; 32];
+        let mut txn = RocksDbTransactionBatch::new();
+        put_gasless_key_record(
+            &rocks,
+            &mut txn,
+            9,
+            &signer_pubkey,
+            &sign_in_record(&signer_pubkey, 3600, 123_456),
+        )
+        .unwrap();
+        rocks.commit(txn).unwrap();
+
+        let txn = RocksDbTransactionBatch::new();
+        match get_active_key(&store, &rocks, &txn, 9, &signer_pubkey).unwrap() {
+            Some(ActiveKey::Gasless {
+                sign_in_added_at, ..
+            }) => assert_eq!(sign_in_added_at, Some(123_456)),
+            other => panic!("expected a gasless key, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fixed_expiry_applies_only_where_the_feature_was_active_at_key_add() {
+        let added_at = 200_000_000;
+        // Custody-authorized keys always slide.
+        assert!(!is_fixed_expiry_sign_in_key(
+            None,
+            proto::FarcasterNetwork::Devnet
+        ));
+        // Devnet runs the latest engine version, where the feature is on.
+        assert!(is_fixed_expiry_sign_in_key(
+            Some(added_at),
+            proto::FarcasterNetwork::Devnet
+        ));
+        // Mainnet has not scheduled it: a KEY_ADD carrying a 2 in the unread field was
+        // custody-authorized there and keeps its sliding window.
+        assert!(!is_fixed_expiry_sign_in_key(
+            Some(added_at),
+            proto::FarcasterNetwork::Mainnet
+        ));
+    }
+
+    /// With `slide = false` a key lives exactly `ttl` from when it was added, however much it
+    /// is used; with `slide = true` (every other gasless key) use keeps extending it.
+    #[test]
+    fn a_fixed_window_is_not_extended_by_use() {
+        use crate::storage::store::account::{
+            check_last_used_at, get_last_used_at, init_last_used_at,
+        };
+
+        let ttl = 1_000u32;
+        let added_at = 10_000u32;
+        for slide in [false, true] {
+            let (_store, rocks, _dir) = fresh_store();
+            let key = [0xEE; 32];
+            let mut txn = RocksDbTransactionBatch::new();
+            init_last_used_at(&rocks, &mut txn, 9, &key, added_at).unwrap();
+            rocks.commit(txn).unwrap();
+
+            // Used 900 seconds in: accepted either way.
+            let mut txn = RocksDbTransactionBatch::new();
+            check_last_used_at(
+                &rocks,
+                &mut txn,
+                9,
+                &key,
+                ttl,
+                added_at + 900,
+                10_900,
+                slide,
+            )
+            .unwrap();
+            rocks.commit(txn).unwrap();
+            let read = RocksDbTransactionBatch::new();
+            let stored = get_last_used_at(&rocks, &read, 9, &key).unwrap().unwrap();
+            assert_eq!(stored, if slide { added_at + 900 } else { added_at });
+
+            // Used again 1,500 seconds after it was added: past the fixed window, inside the
+            // slid one.
+            let mut txn = RocksDbTransactionBatch::new();
+            let later = check_last_used_at(
+                &rocks,
+                &mut txn,
+                9,
+                &key,
+                ttl,
+                added_at + 1_500,
+                11_500,
+                slide,
+            );
+            assert_eq!(later.is_ok(), slide, "slide={slide}: {later:?}");
+        }
     }
 }

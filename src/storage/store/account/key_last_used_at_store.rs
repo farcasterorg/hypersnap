@@ -167,6 +167,34 @@ pub fn check_and_bump_last_used_at(
     message_timestamp: u32,
     current_block_timestamp: u64,
 ) -> Result<(), HubError> {
+    check_last_used_at(
+        db,
+        txn,
+        fid,
+        public_key,
+        ttl,
+        message_timestamp,
+        current_block_timestamp,
+        true,
+    )
+}
+
+/// `check_and_bump_last_used_at` with the bump optional.
+///
+/// With `slide = false` the expiry check is identical but `last_used_at` is never advanced, so
+/// it stays at the value `init_last_used_at` wrote when the KEY_ADD merged and the key expires
+/// `ttl` seconds after it was added no matter how much it is used. That is the rule for keys
+/// authorized by a sign-in message (see `active_key::is_fixed_expiry_sign_in_key`).
+pub fn check_last_used_at(
+    db: &RocksDB,
+    txn: &mut RocksDbTransactionBatch,
+    fid: u64,
+    public_key: &[u8],
+    ttl: u32,
+    message_timestamp: u32,
+    current_block_timestamp: u64,
+    slide: bool,
+) -> Result<(), HubError> {
     let key = make_last_used_at_key(fid, public_key)?;
     let stored = match get_from_db_or_txn(db, txn, &key)? {
         Some(bytes) => {
@@ -219,7 +247,7 @@ pub fn check_and_bump_last_used_at(
     // `message_ts > stored + 300` holds then `message_ts > stored` trivially — out-of-order
     // messages (which would only arise from a caller contract violation) can never overwrite.
     let message_ts_u64 = message_timestamp as u64;
-    if message_ts_u64 > stored + SLIDING_TTL_THROTTLE_SECONDS {
+    if slide && message_ts_u64 > stored + SLIDING_TTL_THROTTLE_SECONDS {
         txn.put(key, message_timestamp.to_be_bytes().to_vec());
     }
     Ok(())

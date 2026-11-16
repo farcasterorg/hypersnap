@@ -3320,6 +3320,124 @@ async fn test_gasless_key_add_propagates_through_consensus_cross_shard() {
     assert_network_has_cast(&network, fid, cast_hash);
 }
 
+// Sign-in authorization (ProtocolFeature::SignInKeyAuthorization) through full
+// consensus: a KEY_ADD authorized by a Sign In With Farcaster message from the
+// custody address is admitted on shard 0, replays onto the FID's home shard and
+// lets the key sign a cast; a KEY_REMOVE authorized the same way then takes the
+// key off every shard. Devnet runs the latest engine version, where the feature
+// is active.
+#[tokio::test]
+#[serial]
+async fn test_sign_in_authorized_key_add_and_remove_through_consensus() {
+    use snapchain::core::validations::key::{SIGN_IN_KEY_ADD_DOMAIN, SIGN_IN_KEY_REMOVE_DOMAIN};
+
+    let num_shards = 2;
+    let mut network = TestNetwork::create(1, num_shards).await;
+    network.start_validators().await;
+
+    let fid: u64 = 1001;
+    let custody = alloy_signer_local::PrivateKeySigner::random();
+    let key = factory::signers::generate_signer();
+    let pubkey: [u8; 32] = key.verifying_key().to_bytes();
+
+    network.register_fid_with_eth_custody(fid, &custody).await;
+    network.wait_for_fid(fid).await.unwrap();
+    network
+        .wait_for_fid_on_block_engine(fid)
+        .await
+        .expect("FID custody must reach shard 0 before KEY_ADD validation");
+
+    let timestamp = messages_factory::farcaster_time();
+    let key_add = messages_factory::keys::create_key_add_with_sign_in(
+        fid,
+        &custody,
+        SIGN_IN_KEY_ADD_DOMAIN,
+        fid,
+        &custody,
+        &key,
+        vec![MessageType::CastAdd],
+        3600,
+        1,
+        timestamp + 1_000_000,
+        timestamp,
+    );
+    for node in network.live_nodes() {
+        node.add_message(
+            MempoolMessage::UserMessage(key_add.clone()),
+            MempoolSource::Local,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    let router = routing::ShardRouter {};
+    let home_shard = router.route_fid(fid, num_shards);
+    network
+        .wait_for_gasless_key_on_shard(fid, &pubkey, home_shard)
+        .await
+        .expect("sign-in authorized key must reach the FID's home shard");
+
+    let cast = messages_factory::casts::create_cast_add(
+        fid,
+        "hello from a sign-in authorized key",
+        Some(timestamp + 2),
+        Some(&key),
+    );
+    for node in network.live_nodes() {
+        node.add_message(
+            MempoolMessage::UserMessage(cast.clone()),
+            MempoolSource::Local,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    network
+        .wait_for_cast(fid, cast.hash.clone())
+        .await
+        .expect("cast signed by the sign-in authorized key must merge");
+    assert_network_has_cast(&network, fid, cast.hash.clone());
+
+    let key_remove = messages_factory::keys::create_key_remove_sign_in(
+        fid,
+        &custody,
+        SIGN_IN_KEY_REMOVE_DOMAIN,
+        &key,
+        &pubkey,
+        2,
+        timestamp + 1_000_000,
+        timestamp + 3,
+    );
+    for node in network.live_nodes() {
+        node.add_message(
+            MempoolMessage::UserMessage(key_remove.clone()),
+            MempoolSource::Local,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    wait_for(
+        || {
+            for node in network.live_nodes() {
+                let stores = node.shard_stores().get(&home_shard)?;
+                let txn = RocksDbTransactionBatch::new();
+                match get_gasless_key_record(&stores.db, &txn, fid, &pubkey) {
+                    Ok(None) => continue,
+                    _ => return None,
+                }
+            }
+            Some(())
+        },
+        tokio::time::Duration::from_secs(30),
+        tokio::time::Duration::from_millis(100),
+    )
+    .await
+    .expect("sign-in authorized removal must take the key off the FID's home shard");
+}
+
 // ----- Mesh self-heal tests -----------------------------------------------
 //
 // These tests exercise the boot one-shot and periodic self-heal sweep added

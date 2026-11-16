@@ -21,12 +21,16 @@ use super::{
 };
 use crate::core::error::HubError;
 use crate::core::message::HubEventExt;
+use crate::core::util::FarcasterTime;
 use crate::core::validations::error::ValidationError;
 use crate::core::validations::key::{
-    recover_key_add_custody_address, recover_key_remove_custody_address,
-    verify_signed_key_request_metadata, KeyAddPayload, KeyRemovePayload, KeyRemoveSignatureType,
-    ETH_MAINNET_CHAIN_ID, MAX_GASLESS_KEYS_PER_FID,
+    recover_key_add_custody_address, recover_key_remove_custody_address, sign_in_key_add_nonce,
+    sign_in_key_remove_nonce, validate_sign_in_key_ttl, verify_signed_key_request_metadata,
+    KeyAddAuthorizationType, KeyAddPayload, KeyRemovePayload, KeyRemoveSignatureType,
+    ETH_MAINNET_CHAIN_ID, MAX_GASLESS_KEYS_PER_FID, SIGN_IN_KEY_ADD_DOMAIN,
+    SIGN_IN_KEY_REMOVE_DOMAIN,
 };
+use crate::core::validations::sign_in::verify_sign_in_message;
 use crate::proto::{self, hub_event, message_data::Body, HubEvent, HubEventType};
 use crate::storage::db::{RocksDB, RocksDbTransactionBatch};
 use crate::storage::store::engine::MessageValidationError;
@@ -79,6 +83,44 @@ pub fn merge_key_add(
     msg: &proto::Message,
     txn_batch: &mut RocksDbTransactionBatch,
     is_replay: bool,
+) -> Result<HubEvent, MessageValidationError> {
+    merge_key_add_with_options(db, onchain_event_store, msg, txn_batch, is_replay, false)
+}
+
+/// `merge_key_add` with the sign-in authorization path selectable.
+///
+/// `sign_in_authorization_enabled` is `ProtocolFeature::SignInKeyAuthorization` evaluated at the
+/// message's own timestamp. While it is false `KeyAddBody.authorization_type` is not read and
+/// every KEY_ADD takes the custody path, which is exactly what a binary without the field does.
+///
+/// ## Sign-in authorization
+///
+/// With `authorization_type = 200` the account approves the key by signing a Sign In With
+/// Farcaster message rather than the EIP-712 `KeyAdd` payload:
+///
+///   * `authorization_message` is the EIP-4361 text and `custody_signature` its EIP-191
+///     signature.
+///   * The message must be a sign-in to the reserved domain `SIGN_IN_KEY_ADD_DOMAIN`. That is
+///     the name the user is shown when approving, and no ordinary site login carries it.
+///   * The message's nonce must equal `sign_in_key_add_nonce` for this body, so the signature
+///     commits to the same fid, key, scopes, ttl, nonce and deadline a custody signature would.
+///   * The signer must be the fid's custody address.
+///   * Any admissible scope may be granted. The TTL is capped by `validate_sign_in_key_ttl`,
+///     and the engines treat it as a fixed window rather than a sliding one.
+///
+/// Everything after authorization (collision checks, the cap, the nonce CAS, the record) is
+/// shared with the custody path. The record embeds the whole message, so the authorization type
+/// and the domain the user approved stay readable for as long as the key exists.
+///
+/// Unlike the `request_fid` lookup, this check also runs on replay: a data shard holds the
+/// on-chain events of the fids it hosts, so it can and does re-verify who signed.
+pub fn merge_key_add_with_options(
+    db: &Arc<RocksDB>,
+    onchain_event_store: &OnchainEventStore,
+    msg: &proto::Message,
+    txn_batch: &mut RocksDbTransactionBatch,
+    is_replay: bool,
+    sign_in_authorization_enabled: bool,
 ) -> Result<HubEvent, MessageValidationError> {
     let message_data = msg
         .data
@@ -140,14 +182,41 @@ pub fn merge_key_add(
         nonce: key_add_body.nonce,
         deadline: key_add_body.deadline,
     };
-    let recovered =
-        recover_key_add_custody_address(&payload, &key_add_body.custody_signature, chain_id)?;
+    let authorization = if sign_in_authorization_enabled {
+        KeyAddAuthorizationType::try_from(key_add_body.authorization_type)?
+    } else {
+        KeyAddAuthorizationType::Custody
+    };
     let this_fid_event = onchain_event_store
         .get_custody_address(fid, Some(txn_batch))
         .map_err(|_| MessageValidationError::MissingFid)?
         .ok_or(MessageValidationError::MissingFid)?;
-    if this_fid_event.as_slice() != recovered.as_slice() {
-        return Err(ValidationError::InvalidSignature.into());
+    match authorization {
+        KeyAddAuthorizationType::Custody => {
+            let recovered = recover_key_add_custody_address(
+                &payload,
+                &key_add_body.custody_signature,
+                chain_id,
+            )?;
+            if this_fid_event.as_slice() != recovered.as_slice() {
+                return Err(ValidationError::InvalidSignature.into());
+            }
+        }
+        KeyAddAuthorizationType::SignIn => {
+            validate_sign_in_key_ttl(key_add_body.ttl)?;
+            let expected_nonce = sign_in_key_add_nonce(&payload, chain_id)?;
+            let signed_in = verify_sign_in_message(
+                &key_add_body.authorization_message,
+                &key_add_body.custody_signature,
+                SIGN_IN_KEY_ADD_DOMAIN,
+                fid,
+                &expected_nonce,
+                FarcasterTime::new(current_timestamp).to_unix_seconds(),
+            )?;
+            if this_fid_event.as_slice() != signed_in.signer.as_slice() {
+                return Err(ValidationError::InvalidSignature.into());
+            }
+        }
     }
 
     // Step 8 (conflict resolution). On-chain first so a signer that was minted via L2 doesn't
@@ -301,6 +370,28 @@ pub fn merge_key_remove(
     msg: &proto::Message,
     txn_batch: &mut RocksDbTransactionBatch,
 ) -> Result<HubEvent, MessageValidationError> {
+    merge_key_remove_with_options(db, onchain_event_store, msg, txn_batch, false)
+}
+
+/// `merge_key_remove` with the sign-in authorization mode selectable.
+///
+/// * `signature_type == 200` (sign-in) — `body.signature` is the custody address's EIP-191
+///   signature over `body.authorization_message`, a Sign In With Farcaster message for the
+///   reserved domain `SIGN_IN_KEY_REMOVE_DOMAIN` whose nonce is `sign_in_key_remove_nonce` for
+///   this body. It can remove any gasless key of the fid, however that key was added, and
+///   advances the **user** nonce namespace like a custody removal. This is how an account that
+///   signs in through a Farcaster app revokes a key without exporting its custody key.
+///
+/// `sign_in_authorization_enabled` is `ProtocolFeature::SignInKeyAuthorization` at the message's
+/// timestamp. While false, type 200 is rejected with the same `InvalidSignatureType` that binaries
+/// predating it return from static validation.
+pub fn merge_key_remove_with_options(
+    db: &Arc<RocksDB>,
+    onchain_event_store: &OnchainEventStore,
+    msg: &proto::Message,
+    txn_batch: &mut RocksDbTransactionBatch,
+    sign_in_authorization_enabled: bool,
+) -> Result<HubEvent, MessageValidationError> {
     let message_data = msg
         .data
         .as_ref()
@@ -355,6 +446,34 @@ pub fn merge_key_remove(
                 return Err(ValidationError::InvalidSignature.into());
             }
             check_and_set_app_nonce(db, txn_batch, record.request_fid, key_remove_body.nonce)?;
+        }
+        KeyRemoveSignatureType::SignIn => {
+            if !sign_in_authorization_enabled {
+                return Err(ValidationError::InvalidSignatureType.into());
+            }
+            let payload = KeyRemovePayload {
+                fid,
+                key: &key_remove_body.key,
+                nonce: key_remove_body.nonce,
+                deadline: key_remove_body.deadline,
+            };
+            let expected_nonce = sign_in_key_remove_nonce(&payload, chain_id)?;
+            let signed_in = verify_sign_in_message(
+                &key_remove_body.authorization_message,
+                &key_remove_body.signature,
+                SIGN_IN_KEY_REMOVE_DOMAIN,
+                fid,
+                &expected_nonce,
+                FarcasterTime::new(message_data.timestamp as u64).to_unix_seconds(),
+            )?;
+            let this_fid_event = onchain_event_store
+                .get_custody_address(fid, Some(txn_batch))
+                .map_err(|_| MessageValidationError::MissingFid)?
+                .ok_or(MessageValidationError::MissingFid)?;
+            if this_fid_event.as_slice() != signed_in.signer.as_slice() {
+                return Err(ValidationError::InvalidSignature.into());
+            }
+            check_and_set_user_nonce(db, txn_batch, fid, key_remove_body.nonce)?;
         }
     }
 

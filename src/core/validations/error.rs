@@ -186,6 +186,10 @@ pub enum ValidationError {
     MissingMetadata,
     #[error("invalid signature type")]
     InvalidSignatureType,
+    #[error("sign-in message is malformed or does not authorize this KEY_ADD")]
+    InvalidSignInMessage,
+    #[error("sign-in message is outside its validity window")]
+    SignInMessageExpired,
     #[error("key is already registered onchain for this fid")]
     KeyAlreadyRegisteredOnchain,
     #[error("key is already claimed by a different fid")]
