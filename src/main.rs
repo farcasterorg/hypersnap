@@ -23,7 +23,9 @@ use snapchain::node::snapchain_read_node::SnapchainReadNode;
 use snapchain::proto::admin_service_server::AdminServiceServer;
 use snapchain::proto::hub_service_server::HubServiceServer;
 use snapchain::proto::replication_service_server::ReplicationServiceServer;
-use snapchain::storage::db::snapshot::{download_snapshots, BootstrapMethod};
+use snapchain::storage::db::snapshot::{
+    download_snapshots, has_pending_snapshot_restore, needs_snapshot_restore, BootstrapMethod,
+};
 use snapchain::storage::db::RocksDB;
 use snapchain::storage::store::block_engine::BlockStores;
 use snapchain::storage::store::engine::{PostCommitMessage, Senders};
@@ -201,14 +203,7 @@ async fn start_servers(
         }
         if app_config.api.feeds.enabled {
             let social_graph = handler.social_graph_indexer();
-            let metrics = if app_config.api.metrics.enabled {
-                Some(Arc::new(snapchain::api::MetricsIndexer::new(
-                    app_config.api.metrics.clone(),
-                    block_stores.db.clone(),
-                )))
-            } else {
-                None
-            };
+            let metrics = handler.metrics_indexer();
             let feeds = Arc::new(snapchain::api::FeedService::new(
                 app_config.api.feeds.clone(),
                 social_graph,
@@ -380,7 +375,7 @@ async fn schedule_background_jobs(
 ) {
     let sched = JobScheduler::new().await.unwrap();
     let mut jobs = vec![];
-    if app_config.read_node {
+    if app_config.is_read_node() {
         if let Some(block_retention) = app_config.pruning.block_retention {
             let schedule = "0 0 10 * * *"; // 10am UTC every day
             let job = snapchain::jobs::block_pruning::block_pruning_job(
@@ -587,6 +582,16 @@ async fn run() -> Result<(), Box<dyn Error>> {
         }
     };
 
+    app_config
+        .consensus
+        .native_registration
+        .validate(
+            app_config.consensus.num_shards,
+            &app_config.gossip.topic_cutovers,
+            &app_config.consensus.get_validator_set_config(0),
+        )
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"))
         .add_directive("tantivy=warn".parse().unwrap());
@@ -696,78 +701,68 @@ async fn run() -> Result<(), Box<dyn Error>> {
     };
     let statsd_client = StatsdClientWrapper::new(statsd_client, app_config.statsd.use_tags);
 
-    // We only use snapshots if the db directory doesn't exist or is empty.
-    // If the user sets [force_load_db_from_snapshot], load the snapshot without checking directory contents.
-    let db_is_empty = !fs::exists(app_config.rocksdb_dir.clone()).unwrap()
-        || is_dir_empty(&app_config.rocksdb_dir).unwrap();
-
-    if db_is_empty {
-        match app_config.snapshot.bootstrap_method {
-            BootstrapMethod::Replicate => {
-                use snapchain::bootstrap::replication::service::{
-                    ReplicatorBootstrap, WorkUnitResponse,
-                };
-                use tokio::time::{sleep, Duration};
-
-                info!("Starting node with replication bootstrap");
-                let replicator = ReplicatorBootstrap::new(statsd_client.clone(), &app_config);
-
-                match replicator.bootstrap_using_replication().await {
-                    Ok(r) => {
-                        // Check for the specific success response
-                        if r == WorkUnitResponse::Finished {
-                            info!("Bootstrap using replication was successful. Will start snapchain now...");
-                            // Sleep for 5 seconds to allow any pending logs to be flushed and the gossip to shutdown and free the port
-                            sleep(Duration::from_secs(5)).await;
-                        } else {
-                            error!(
-                                "Replication bootstrap stopped with status: {:?}. Exiting.",
-                                r
-                            );
-                            process::exit(1);
-                        }
-                    }
-                    Err(e) => {
-                        error!("Replication bootstrap failed:\n{}\nPlease check your network connection and restart to resume.", e);
-                        process::exit(1);
-                    }
-                }
-            }
-            BootstrapMethod::Snapshot => {
-                if app_config.snapshot.force_load_db_from_snapshot
-                    || app_config.snapshot.load_db_from_snapshot
-                {
-                    info!("Downloading snapshots (legacy method)");
-                    let mut shard_ids = app_config.consensus.shard_ids.clone();
-                    shard_ids.push(0);
-                    // Raise if the download fails. If there's a persistent issue, disable snapshot download.
-                    download_snapshots(
-                        app_config.fc_network,
-                        &app_config.snapshot,
-                        app_config.rocksdb_dir.clone(),
-                        shard_ids,
-                    )
-                    .await
-                    .unwrap();
-                }
-            }
-        }
-    } else if app_config.snapshot.force_load_db_from_snapshot {
-        // Force snapshot load even if DB exists
-        info!("Force downloading snapshots");
-        let mut shard_ids = app_config.consensus.shard_ids.clone();
-        shard_ids.push(0);
+    let mut snapshot_shards = app_config.consensus.shard_ids.clone();
+    snapshot_shards.push(0);
+    let pending_restore = has_pending_snapshot_restore(&app_config.rocksdb_dir)
+        .expect("unable to inspect snapshot restore state");
+    if pending_restore
+        && !app_config.snapshot.load_db_from_snapshot
+        && !app_config.snapshot.force_load_db_from_snapshot
+    {
+        panic!("snapshot restore is unfinished; enable snapshot loading to resume before starting the node");
+    }
+    let restore_snapshots = pending_restore
+        || app_config.snapshot.force_load_db_from_snapshot
+        || (app_config.snapshot.bootstrap_method == BootstrapMethod::Snapshot
+            && app_config.snapshot.load_db_from_snapshot
+            && needs_snapshot_restore(&app_config.rocksdb_dir, &snapshot_shards)
+                .expect("unable to check snapshot shard databases"));
+    if restore_snapshots {
+        info!(pending_restore, "Loading snapshot databases");
         download_snapshots(
             app_config.fc_network,
             &app_config.snapshot,
             app_config.rocksdb_dir.clone(),
-            shard_ids,
+            snapshot_shards,
         )
         .await
-        .unwrap();
-    };
+        .expect("snapshot restore failed; restart to resume unfinished shards");
+    } else if app_config.snapshot.bootstrap_method == BootstrapMethod::Replicate
+        && (!fs::exists(&app_config.rocksdb_dir).unwrap()
+            || is_dir_empty(&app_config.rocksdb_dir).unwrap())
+    {
+        use snapchain::bootstrap::replication::service::{ReplicatorBootstrap, WorkUnitResponse};
+        use tokio::time::{sleep, Duration};
+
+        info!("Starting node with replication bootstrap");
+        let replicator = ReplicatorBootstrap::new(statsd_client.clone(), &app_config);
+
+        match replicator.bootstrap_using_replication().await {
+            Ok(r) => {
+                // Check for the specific success response
+                if r == WorkUnitResponse::Finished {
+                    info!(
+                        "Bootstrap using replication was successful. Will start snapchain now..."
+                    );
+                    // Sleep for 5 seconds to allow any pending logs to be flushed and the gossip to shutdown and free the port
+                    sleep(Duration::from_secs(5)).await;
+                } else {
+                    error!(
+                        "Replication bootstrap stopped with status: {:?}. Exiting.",
+                        r
+                    );
+                    process::exit(1);
+                }
+            }
+            Err(e) => {
+                error!("Replication bootstrap failed:\n{}\nPlease check your network connection and restart to resume.", e);
+                process::exit(1);
+            }
+        }
+    }
 
     let keypair = app_config.consensus.keypair().clone();
+    let read_node = app_config.is_read_node();
 
     let (system_tx, mut system_rx) = mpsc::channel::<SystemMessage>(16384);
     let (mempool_tx, mempool_rx) = mpsc::channel(app_config.mempool.queue_size as usize);
@@ -778,11 +773,17 @@ async fn run() -> Result<(), Box<dyn Error>> {
         vec![]
     };
 
+    let mut gossip_config = app_config.gossip.clone();
+    if gossip_config.discovery.cache_path.as_os_str().is_empty() {
+        gossip_config.discovery.cache_path = std::path::Path::new(&app_config.rocksdb_dir).join(
+            format!("discovered-peers-{}.json", app_config.fc_network as i32),
+        );
+    }
     let gossip_result = SnapchainGossip::create(
         keypair.clone(),
-        &app_config.gossip,
+        &gossip_config,
         Some(system_tx.clone()),
-        app_config.read_node,
+        read_node,
         app_config.fc_network,
         statsd_client.clone(),
         node_capabilities,
@@ -795,6 +796,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
     }
 
     let mut gossip = gossip_result?;
+    gossip
+        .set_topic_routing_shards(app_config.consensus.num_shards)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     // Validator PeerIds permitted to query the mesh-diagnostics behaviour;
     // the gossip responder answers only these peers (fail-closed otherwise).
     let validator_peers: HashSet<_> = snapchain::network::mesh::view::build_validator_peer_ids(
@@ -804,11 +808,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     .collect();
     gossip.set_validator_peers(validator_peers);
     let local_peer_id = gossip.swarm.local_peer_id().clone();
-    let read_or_validator = if app_config.read_node {
-        "read"
-    } else {
-        "validator"
-    };
+    let read_or_validator = if read_node { "read" } else { "validator" };
     info!(
         "Starting Snapchain {} node with public key: {} ({})",
         read_or_validator,
@@ -858,7 +858,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     );
     let local_state_store = LocalStateStore::new(global_db);
 
-    if app_config.read_node {
+    if read_node {
         // Setup post-commit channel if replication is enabled
         let (engine_post_commit_tx, engine_post_commit_rx) = if app_config.replication.enable {
             // TODO: consider increasing the buffer size to prevent blocking across multiple shards
@@ -1225,22 +1225,23 @@ async fn run() -> Result<(), Box<dyn Error>> {
             None
         };
 
-        if app_config.block_receiver.enabled {
-            for shard_id in app_config.consensus.shard_ids.iter() {
-                let senders = node.shard_senders.get(shard_id).unwrap();
-                let mut block_receiver = BlockReceiver {
-                    shard_id: *shard_id,
-                    stores: node.shard_stores.get(shard_id).unwrap().clone(),
-                    block_rx: block_tx.subscribe(),
-                    mempool_tx: mempool_tx.clone(),
-                    system_tx: system_tx.clone(),
-                    event_rx: senders.events_tx.subscribe(),
-                    validator_sets: app_config.consensus.to_stored_validator_sets(0), // We care about the validator sets for shard 0 blocks only
-                    config: app_config.block_receiver.clone(),
-                    statsd: statsd_client.clone(),
-                };
-                tokio::spawn(async move { block_receiver.run().await });
-            }
+        // Applying committed shard-0 events is required for consistent signer,
+        // account and other shared state on each data shard. It always runs on
+        // validators, independently of external chain listeners and fork config.
+        for shard_id in app_config.consensus.shard_ids.iter() {
+            let senders = node.shard_senders.get(shard_id).unwrap();
+            let mut block_receiver = BlockReceiver {
+                shard_id: *shard_id,
+                stores: node.shard_stores.get(shard_id).unwrap().clone(),
+                block_rx: block_tx.subscribe(),
+                mempool_tx: mempool_tx.clone(),
+                system_tx: system_tx.clone(),
+                event_rx: senders.events_tx.subscribe(),
+                validator_sets: app_config.consensus.to_stored_validator_sets(0), // We care about the validator sets for shard 0 blocks only
+                config: app_config.block_receiver.clone(),
+                statsd: statsd_client.clone(),
+            };
+            tokio::spawn(async move { block_receiver.run().await });
         }
 
         let l1_validator = Arc::new(L1Validator::new(

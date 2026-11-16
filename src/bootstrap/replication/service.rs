@@ -938,7 +938,7 @@ impl ReplicatorBootstrap {
                         }
 
                         // Don't check fids if theyr'e not in this vts because we wouldn't have pulled in all the messages.
-                        if fid > last_fid.unwrap() {
+                        if fid != last_fid.unwrap() {
                             fids_to_check.push(last_fid.unwrap());
                             last_fid = Some(fid);
                         }

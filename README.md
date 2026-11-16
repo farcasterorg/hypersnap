@@ -1,15 +1,10 @@
-# Snapchain
+# Hypersnap
 
-The open-source, canonical implementation of Farcaster's [Snapchain](https://github.com/farcasterxyz/protocol/discussions/207) network. 
+The open-source, canonical implementation of Farcaster's Hypersnap network. Not to be confused with Snapchain, the former protocol, which is now being developed by the Network State team, who conducted a hostile takeover of the Farcaster app and domains and mass purge of users. Farcaster as a brand is CC0, [as per Merkle cofounder Dan Romero](https://forkcaster.xyz/dwr/0x5c0fe52314b0e6bbf6eeb935a50b47ede43bed17). Hypersnap team includes one of the original developers of Snapchain. No original team members of Snapchain are working on the Network State-owned protocol. In terms of crypto parlance, it is similar to Ethereum (Hypersnap) and Ethereum Classic (Snapchain). 
 
-![snapchain](https://github.com/user-attachments/assets/e5a041db-e3ae-4250-ad6b-7043ad648d34)
+## What is Hypersnap?
 
-
-<!-- TODO:  links to installation, user docs, contributor docs -->
-
-## What is Snapchain?
-
-Snapchain is a data storage layer for the Farcaster social protocol. It is a blockchain-like decentralized p2p network that stores data created by Farcaster users. Learn more about Snapchain's design from the [whitepaper](https://github.com/farcasterxyz/protocol/discussions/207).
+Hypersnap is a data storage layer for the Farcaster social protocol. It is a blockchain-like decentralized p2p network that stores data created by Farcaster users. Learn more about Hypersnap's design from the [whitepaper](https://github.com/farcasterxyz/protocol/discussions/207) and ongoing [protocol discussions](https://github.com/orgs/farcasterorg/discussions).
 
 The main goals of this implementation are:
 
@@ -17,15 +12,12 @@ The main goals of this implementation are:
 
 2. **Data Availability**: Can be run for < $1,000/month and provide real-time access to user data. 
 
-3. **Canonical Implementation**: Is the most accurate reference for how Snapchain and Farcaster should work. 
+3. **Canonical Implementation**: Is the most accurate reference for how Hypersnap and Farcaster should work. 
 
-## Status 
-
-Snapchain is in the migration phase. Please check the [release docs](https://www.notion.so/warpcast/Snapchain-Mainnet-Public-1b96a6c0c101809493cfda3998a65c7a) for more details on timelines. 
 
 ## Running a Node
 
-A snapchain node lets you read and write messages to the network. You will need a machine with the following system requirements to get started: 
+A hypersnap node lets you read and write messages to the network. You will need a machine with the following system requirements to get started: 
 
 - 16 GB of RAM
 - 4 CPU cores or vCPUs
@@ -36,18 +28,18 @@ A snapchain node lets you read and write messages to the network. You will need 
 You can start a new node or upgrade an existing node with the following command: 
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/farcasterxyz/snapchain/refs/heads/main/scripts/snapchain-bootstrap.sh | bash
+curl -sSL https://raw.githubusercontent.com/farcasterorg/hypersnap/refs/heads/main/scripts/hypersnap-bootstrap.sh | bash
 ```
-You can manage your node using the snapchain.sh script. It uses docker compose to run the node in a container. The script provides commands to start, stop, and check the logs of your node.
+You can manage your node using the hypersnap.sh script. It uses docker compose to run the node in a container. The script provides commands to start, stop, and check the logs of your node.
 A brand new node will download historical snapshots to catchup to the latest state before it begins sync. This can take up to 2 hours. Check the node's status by running `curl http://localhost:3381/v1/info`. You should see `maxHeight` increasing and `blockDelay` decreasing until it approaches zero. 
 
 ## Upgrade
 
-To upgrade your Snapchain node to the latest version, follow these steps:
+To upgrade your Hypersnap node to the latest version, follow these steps:
 
 ```bash
-cd snapchain
-./snapchain.sh upgrade
+cd hypersnap
+./hypersnap.sh upgrade
 ```
 
 This ensures your node is always running the latest available version.
@@ -66,6 +58,20 @@ On the first upgrade, search rebuilds once at the new location when
 To retain an existing index, stop the old node and copy the entire old index
 directory to `<rocksdb_dir>/search_index` before starting the updated node.
 The backfill status endpoint is `GET /v2/farcaster/_status/backfill`.
+
+The cast-hash index automatically fills missing historical mappings from both
+legacy and Hyper cast stores in the background, without clearing existing data
+or blocking API startup. It checkpoints each batch and resumes after restart.
+The status response includes `cast_hash_backfill.complete` and per-source
+`shard_id`, `source_prefix` (3 for legacy, 30 for Hyper), `casts_indexed`,
+`last_fid`, and `complete`, plus an `error` when a batch fails and will retry.
+The `cast_hash` indexer's `backfill_complete` now means the retained-store walk
+has finished, rather than merely that an event checkpoint exists.
+During this walk, an unindexed hash can still require a fallback probe. There
+is at most one probe at a time, with no waiting queue and a two-second request
+budget; busy or timed-out lookups return HTTP 503 and can be retried. Supplying
+the author FID avoids probing for existing casts. Once coverage is complete,
+unknown hashes return 404 without a full FID scan.
 
 Cast search matches `#hashtag` exactly and takes Neynar's `sort_type`
 (`desc_chronological`, `chron`, `algorithmic`) and `cursor`. An index built
@@ -166,6 +172,20 @@ the repair, set `[api.daily_stats] repair_on_startup = false`; it defaults to
 true. The regular historical store-walk backfill has its own checkpoints and
 does not need to be reset for this repair.
 
+### Native account registration
+
+Native accounts can register with a custody signature and proof of work from the
+new validator fork heights, without an IdRegistry transaction. See
+[native registration, activation and client usage](docs/native-registration.md).
+
+### Hypersnap ↔ Hypersnap shuttle
+
+The standalone `shuttle` binary relays compatible signed user messages from each
+network's committed blocks to the opposite mempool, with persistent cursors and
+loop suppression. Gossip switches to Hypersnap topics at each shard's configured
+fork height. See [shuttle setup and fork routing](docs/shuttle.md) and
+[`shuttle.example.toml`](shuttle.example.toml).
+
 ## Contributing 
 
 We welcome contributions from developers of all skill levels. Please look for issues labeled with "help wanted" to find good tickets to work on. If you are working on something that is not explicitly a ticket, we may or may not accept it. We encourage checking with someone on the team before spending a lot of time on something. 
@@ -184,7 +204,7 @@ Before you begin, ensure you have the following installed:
 
 ### Installation
 
-Clone the snapchain and dependent repos and build snapchain:
+Clone the hypersnap and dependent repos and build hypersnap:
 ```
 git clone git@github.com:CassOnMars/eth-signature-verifier.git
 cd eth-signature-verifier
@@ -194,8 +214,8 @@ git clone git@github.com:informalsystems/malachite.git
 cd malachite
 git checkout 13bca14cd209d985c3adf101a02924acde8723a5
 cd ..
-git clone git@github.com:farcasterxyz/snapchain.git
-cd snapchain
+git clone git@github.com:farcasterorg/hypersnap.git
+cd hypersnap
 cargo build
 ```
 
@@ -245,4 +265,4 @@ make clean
 5. Ensure you have the release commit `git checkout main && git pull`
 6. Tag the commit using `git tag v0.x.y`, and push it with `git push origin HEAD --tags` to trigger the docker build
 7. Also tag with @latest using `git tag -f @latest`, and push it (with --force) so install scripts will use the latest version
-8. Once automated build is complete, confirm the Docker image was [published](https://hub.docker.com/r/farcasterxyz/snapchain)
+8. Once automated build is complete, confirm the Docker image was [published](https://hub.docker.com/r/farcasterorg/hypersnap)

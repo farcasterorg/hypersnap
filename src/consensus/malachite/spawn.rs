@@ -7,6 +7,7 @@ use informalsystems_malachitebft_network::{PeerId as MalachitePeerId, PeerIdExt}
 use informalsystems_malachitebft_sync::Metrics as SyncMetrics;
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::Span;
 
@@ -16,6 +17,7 @@ use crate::consensus::malachite::network_connector::{
     MalachiteNetworkActorMsg, MalachiteNetworkConnector, MalachiteNetworkEvent,
     NetworkConnectorArgs,
 };
+use crate::consensus::malachite::participation::Participation;
 use crate::consensus::malachite::snapchain_codec::SnapchainCodec;
 use crate::consensus::validator::ShardValidator;
 use crate::core::types::{ShardId, SnapchainValidatorContext};
@@ -34,6 +36,7 @@ pub async fn spawn_network_actor(
     local_peer_id: PeerId,
     statsd: StatsdClientWrapper,
     sync_peers: Option<HashSet<MalachitePeerId>>,
+    participation: Option<Arc<Participation>>,
 ) -> Result<NetworkRef<SnapchainValidatorContext>, ractor::SpawnErr> {
     let codec = SnapchainCodec;
     let args = NetworkConnectorArgs {
@@ -41,6 +44,7 @@ pub async fn spawn_network_actor(
         peer_id: MalachitePeerId::from_libp2p(&local_peer_id),
         statsd,
         sync_peers,
+        participation,
     };
     MalachiteNetworkConnector::spawn(codec, args)
         .await
@@ -71,6 +75,7 @@ pub async fn spawn_host(
     consensus_start_delay: u32,
     consensus_block_time: u64,
     statsd: StatsdClientWrapper,
+    participation: Arc<Participation>,
 ) -> Result<HostRef<SnapchainValidatorContext>, ractor::SpawnErr> {
     let state = HostState {
         network,
@@ -79,6 +84,7 @@ pub async fn spawn_host(
         consensus_block_time,
         gossip_tx,
         statsd,
+        participation,
     };
     let actor_ref = Host::spawn(state).await?;
     Ok(actor_ref)
@@ -152,6 +158,7 @@ pub struct MalachiteConsensusActors {
     pub host_actor: HostRef<SnapchainValidatorContext>,
     pub sync_actor: SyncRef<SnapchainValidatorContext>,
     pub consensus_actor: ConsensusRef<SnapchainValidatorContext>,
+    pub participation: Arc<Participation>,
 }
 
 fn timeout_from_config(config: &Config) -> TimeoutConfig {
@@ -182,6 +189,11 @@ impl MalachiteConsensusActors {
         let validator_set = shard_validator.get_validator_set(current_height.as_u64());
         let address = shard_validator.get_address();
         let shard_id = shard_validator.shard_id.shard_id();
+        let participation = Arc::new(Participation::new(
+            address.clone(),
+            config.to_stored_validator_sets(shard_id),
+            current_height.increment().as_u64(),
+        ));
         let name = if shard_id == 0 {
             format!("{:} Block", address.prefix())
         } else {
@@ -200,6 +212,7 @@ impl MalachiteConsensusActors {
             local_peer_id,
             statsd.clone(),
             Some(sync_peers),
+            Some(participation.clone()),
         )
         .await?;
         let wal_actor = spawn_wal_actor(
@@ -216,6 +229,7 @@ impl MalachiteConsensusActors {
             config.consensus_start_delay,
             config.block_time.as_millis() as u64,
             statsd,
+            participation.clone(),
         )
         .await?;
         let sync_config = ValueSyncConfig {
@@ -258,6 +272,7 @@ impl MalachiteConsensusActors {
             host_actor,
             sync_actor,
             consensus_actor,
+            participation,
         })
     }
 
@@ -265,6 +280,18 @@ impl MalachiteConsensusActors {
         &self,
         event: MalachiteNetworkEvent,
     ) -> Result<(), ractor::MessagingErr<MalachiteNetworkActorMsg>> {
+        if matches!(
+            event,
+            MalachiteNetworkEvent::Message(
+                informalsystems_malachitebft_network::Channel::Consensus
+                    | informalsystems_malachitebft_network::Channel::ProposalParts,
+                _,
+                _
+            )
+        ) && !self.participation.is_active()
+        {
+            return Ok(());
+        }
         self.network_actor
             .cast(MalachiteNetworkActorMsg::NewEvent(event))
     }

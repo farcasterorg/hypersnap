@@ -185,7 +185,7 @@ fn read_page(
 fn scan<D: rocksdb::DBAccess>(
     mut iter: rocksdb::DBRawIteratorWithThreadMode<'_, D>,
     start: &[u8],
-    prefix: u8,
+    _prefix: u8,
     stop: &AtomicBool,
 ) -> Result<Page, IndexerError> {
     let mut page = Page {
@@ -203,12 +203,16 @@ fn scan<D: rocksdb::DBAccess>(
         if key.len() < 1 + FID_BYTES + 1 {
             return Err(error("Invalid metrics source key"));
         }
-        let postfix = key[1 + FID_BYTES];
+        let fid_len = crate::storage::store::account::encoded_fid_len(key, 1)
+            .ok_or_else(|| error("Invalid metrics FID key"))?;
+        let postfix = *key
+            .get(1 + fid_len)
+            .ok_or_else(|| error("Missing metrics postfix"))?;
         page.last_key = Some(key.to_vec());
         if postfix == UserPostfix::CastMessage as u8
             || postfix == UserPostfix::ReactionMessage as u8
         {
-            if key.len() != 1 + FID_BYTES + 1 + TS_HASH_LENGTH {
+            if key.len() != 1 + fid_len + 1 + TS_HASH_LENGTH {
                 return Err(error("Invalid metrics source message key"));
             }
             let message = message_decode(value).map_err(error)?;
@@ -220,23 +224,13 @@ fn scan<D: rocksdb::DBAccess>(
         } else {
             // Skip entire unrelated message and secondary-index ranges. The
             // next seek starts at this fid's reactions or the next fid's casts.
-            let mut seek = key[..1 + FID_BYTES].to_vec();
+            let mut seek = key[..1 + fid_len].to_vec();
             if postfix < UserPostfix::CastMessage as u8 {
                 seek.push(UserPostfix::CastMessage as u8);
             } else if postfix < UserPostfix::ReactionMessage as u8 {
                 seek.push(UserPostfix::ReactionMessage as u8);
             } else {
-                let fid = read_fid_key(key, 1);
-                if fid == u32::MAX as u64 {
-                    iter.seek([prefix + 1]);
-                    continue;
-                }
-                seek = [
-                    vec![prefix],
-                    ((fid + 1) as u32).to_be_bytes().to_vec(),
-                    vec![UserPostfix::CastMessage as u8],
-                ]
-                .concat();
+                seek = crate::storage::util::increment_vec_u8(&key[..1 + fid_len].to_vec());
             }
             iter.seek(seek);
         }

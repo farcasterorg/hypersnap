@@ -202,7 +202,7 @@ pub fn get_gasless_key_owner_fid(
     match get_from_db_or_txn(db, txn, &key)? {
         None => Ok(None),
         Some(bytes) => {
-            if bytes.len() != FID_BYTES {
+            if super::encoded_fid_len(&bytes, 0).is_none_or(|n| bytes.len() != n) {
                 return Err(HubError {
                     code: "internal_error".to_string(),
                     message: format!(
@@ -376,7 +376,7 @@ pub fn list_gasless_keys_by_fid(
             })?;
             // Pull the 32-byte public key out of the row key tail. The layout is
             // fixed-width, so a slice is sufficient.
-            let pubkey_offset = ROOT_PREFIX_BYTES + USER_POSTFIX_BYTES + FID_BYTES;
+            let pubkey_offset = ROOT_PREFIX_BYTES + USER_POSTFIX_BYTES + super::fid_key_len(fid);
             let public_key = key
                 .get(pubkey_offset..pubkey_offset + ED25519_PUBLIC_KEY_LEN)
                 .ok_or_else(|| HubError {

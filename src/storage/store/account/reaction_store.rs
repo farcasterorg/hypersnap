@@ -39,7 +39,6 @@ enum ChannelFollowIndex {
 
 /// Both directional follow keys are `[prefix][sub-index][32-byte id][4-byte id]`,
 /// just with the two ids swapped, so one length covers both.
-const FOLLOW_KEY_LENGTH: usize = 2 + CHANNEL_ID_LENGTH + 4;
 
 /// One row of the channel-follow index.
 ///
@@ -603,7 +602,11 @@ impl ReactionStore {
         mut entry: impl FnMut(&[u8], u32) -> Result<ChannelFollowEntry, HubError>,
     ) -> Result<ChannelPage<ChannelFollowEntry>, HubError> {
         require_page_token_in_prefix(&prefix, page_options)?;
-        let suffix_length = FOLLOW_KEY_LENGTH - prefix.len();
+        let suffix_length = if prefix[1] == ChannelFollowIndex::ByFid as u8 {
+            CHANNEL_ID_LENGTH
+        } else {
+            0
+        };
         let page_size = page_options.page_size.unwrap_or(PAGE_SIZE_MAX);
         let mut entries = Vec::new();
         let mut last_key = None;
@@ -612,7 +615,12 @@ impl ReactionStore {
             Some(increment_vec_u8(&prefix)),
             page_options,
             |key, value| {
-                if key.len() != prefix.len() + suffix_length {
+                if if suffix_length != 0 {
+                    key.len() != prefix.len() + suffix_length
+                } else {
+                    super::encoded_fid_len(key, prefix.len())
+                        .is_none_or(|n| key.len() != prefix.len() + n)
+                } {
                     return Err(HubError::invalid_internal_state(
                         "channel follow key has invalid length",
                     ));

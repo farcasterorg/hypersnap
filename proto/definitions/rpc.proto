@@ -8,6 +8,8 @@ import "onchain_event.proto";
 import "request_response.proto";
 
 service HubService {
+  rpc GetNativeAccount(NativeAccountRequest) returns (NativeRegistrationRecord);
+  rpc GetNativeRegistrationInfo(GetInfoRequest) returns (NativeRegistrationInfo);
   // Write API
   rpc SubmitMessage(Message) returns (Message);
   rpc SubmitBulkMessages(SubmitBulkMessagesRequest) returns (SubmitBulkMessagesResponse);

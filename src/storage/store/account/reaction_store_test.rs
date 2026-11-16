@@ -877,6 +877,64 @@ mod tests {
         assert!(result.next_page_token.is_none());
     }
 
+    // getAllReactionMessagesByFid - time bounds are inclusive and page both ways
+    #[test]
+    fn test_get_all_reaction_messages_by_fid_in_time_range() {
+        let (store, db, _temp_dir) = create_test_store();
+        let likes: Vec<_> = (1..=6)
+            .map(|i| {
+                let cast = messages_factory::casts::create_cast_add(
+                    FID_FOR_TEST,
+                    &format!("cast {i}"),
+                    None,
+                    None,
+                );
+                let target = message::reaction_body::Target::TargetCastId(message::CastId {
+                    fid: FID_FOR_TEST,
+                    hash: cast.hash,
+                });
+                let like = messages_factory::reactions::create_reaction_add(
+                    FID_FOR_TEST,
+                    ReactionType::Like,
+                    target,
+                    Some(i * 10),
+                    None,
+                );
+                merge_message_success(&store, &db, &like);
+                like
+            })
+            .collect();
+        let read = |start, stop, reverse| {
+            let mut out = vec![];
+            let mut page_token = None;
+            loop {
+                let page_options = PageOptions {
+                    page_size: Some(1),
+                    page_token,
+                    reverse,
+                };
+                let page = store
+                    .get_all_messages_by_fid(FID_FOR_TEST, start, stop, &page_options)
+                    .unwrap();
+                out.extend(page.messages);
+                page_token = page.next_page_token;
+                if page_token.is_none() {
+                    return out;
+                }
+            }
+        };
+
+        assert_eq!(read(Some(20), Some(40), false), likes[1..4].to_vec());
+        let mut newest_first = likes[1..4].to_vec();
+        newest_first.reverse();
+        assert_eq!(read(Some(20), Some(40), true), newest_first);
+        assert_eq!(read(None, Some(15), true), likes[..1].to_vec());
+        assert_eq!(read(Some(55), None, false), likes[5..].to_vec());
+        assert_eq!(read(Some(41), Some(49), false), vec![]);
+        assert_eq!(read(Some(50), Some(10), true), vec![]);
+        assert_eq!(read(None, Some(u32::MAX), false), likes);
+    }
+
     // getAllReactionMessagesByFid - returns empty array if no messages exist
     #[test]
     fn test_get_all_reaction_messages_by_fid_empty_if_none() {

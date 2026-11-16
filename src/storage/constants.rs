@@ -82,6 +82,10 @@ pub enum RootPrefix {
     HyperVerificationByAddress = 35,
     HyperUserNameProofByName = 36,
     HyperLendStorageByRecipient = 37,
+
+    NativeFidSequence = 110,
+    NativeCustodyToFid = 111,
+    NativeAccount = 144,
 }
 
 /** Copied from the JS code */

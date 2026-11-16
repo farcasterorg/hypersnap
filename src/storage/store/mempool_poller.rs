@@ -50,6 +50,7 @@ impl MempoolMessage {
                 for_shard: _,
                 message,
             } => match &message.data {
+                Some(data) if data.seqnum > crate::native_registration::FORK_EVENT_BASE => 0,
                 Some(data) => match &data.body {
                     Some(block_event_data::Body::MergeMessageEventBody(body)) => {
                         body.message.as_ref().unwrap().fid()
@@ -183,6 +184,15 @@ impl MempoolPoller {
             if !transaction.user_messages.is_empty() || !transaction.system_messages.is_empty() {
                 transactions.push(transaction);
             }
+        }
+        if transactions.iter().any(|t| {
+            t.system_messages.iter().any(|m| {
+                m.block_event
+                    .as_ref()
+                    .is_some_and(|e| e.seqnum() > crate::native_registration::FORK_EVENT_BASE)
+            })
+        }) {
+            transactions.sort_by_key(|t| t.fid); // fork events share transaction 0 and precede dependent casts
         }
         info!(
             transactions = transactions.len(),

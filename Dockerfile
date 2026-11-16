@@ -47,7 +47,7 @@ RUN <<EOF
 set -eu
 cargo build --release --bins
 mkdir -p /out
-cp target/release/hypersnap target/release/follow_blocks target/release/setup_local_testnet \
+cp target/release/hypersnap target/release/shuttle target/release/native_register target/release/follow_blocks target/release/setup_local_testnet \
   target/release/submit_message target/release/perftest target/release/repair_block_event \
   target/release/inspect_block_event /out/
 ## Pre-generate some configurations we can use
@@ -64,12 +64,19 @@ FROM ubuntu:26.04
 ARG GRPCURL_VERSION=1.9.4
 ARG TARGETOS
 ARG TARGETARCH
+# Bootstrap HTTPS for APT before Ubuntu's ca-certificates package is installed.
+COPY --from=base /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 # ca-certificates is installed explicitly (not just as a curl recommendation) because
 # tonic's `tls-native-roots` reads the system trust store at runtime.
 RUN <<EOF
   set -eu
-  apt-get update && apt-get install -y --no-install-recommends ca-certificates curl
-  curl -fL https://github.com/fullstorydev/grpcurl/releases/download/v${GRPCURL_VERSION}/grpcurl_${GRPCURL_VERSION}_${TARGETOS}_${TARGETARCH}.deb > grpcurl.deb
+  # Covers archive/security on amd64 and ports.ubuntu.com on arm64.
+  sed -i 's|http://|https://|g' /etc/apt/sources.list.d/ubuntu.sources
+  apt-get -o Acquire::https::CAInfo=/etc/ssl/certs/ca-certificates.crt \
+    -o Acquire::Retries=3 -o APT::Update::Error-Mode=any update
+  apt-get -o Acquire::https::CAInfo=/etc/ssl/certs/ca-certificates.crt \
+    -o Acquire::Retries=3 install -y --no-install-recommends ca-certificates curl
+  curl --retry 3 -fL https://github.com/fullstorydev/grpcurl/releases/download/v${GRPCURL_VERSION}/grpcurl_${GRPCURL_VERSION}_${TARGETOS}_${TARGETARCH}.deb > grpcurl.deb
   dpkg -i grpcurl.deb
   rm grpcurl.deb
   apt-get remove -y curl

@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
     pub object: String,
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub fid: u64,
     pub username: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -164,6 +165,14 @@ pub struct Cast {
     pub replies: CastReplies,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_hash: Option<String>,
+    /// How to read `text` (FIP: Cast Format and Chained Casts); 0 is plain text. Set on every cast
+    /// read from its message, so a client can tell a plain cast from a node that leaves the field
+    /// out. Absent when the cast was not read from its message (search results).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format_version: Option<u32>,
+    /// The cast's place in its author's chain of casts; absent when it is in none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain: Option<CastChain>,
     pub mentioned_profiles: Vec<User>,
     #[serde(default)]
     pub mentioned_profiles_ranges: Vec<TextRange>,
@@ -199,6 +208,8 @@ impl Default for Cast {
             reactions: CastReactions::default(),
             replies: CastReplies::default(),
             thread_hash: None,
+            format_version: None,
+            chain: None,
             mentioned_profiles: Vec::new(),
             mentioned_profiles_ranges: Vec::new(),
             mentioned_channels: Vec::new(),
@@ -214,6 +225,7 @@ impl Default for Cast {
 /// Parent author reference (just FID).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ParentAuthor {
+    #[serde(default, with = "crate::native_registration::serde_fid::option")]
     pub fid: Option<u64>,
 }
 
@@ -252,8 +264,21 @@ pub enum Embed {
 /// Cast ID reference.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CastId {
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub fid: u64,
     pub hash: String,
+}
+
+/// A cast's place in an ordered chain of casts by one author (`CastAddBody.chain`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CastChain {
+    /// The first cast of the chain; absent on that cast itself (index 0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<CastId>,
+    /// Position in the chain, from 0.
+    pub index: u32,
+    /// Number of casts in the chain; 0 while the chain is still growing.
+    pub count: u32,
 }
 
 /// Reaction counts for a cast.
@@ -270,6 +295,7 @@ pub struct CastReactions {
 /// User who reacted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReactionUser {
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub fid: u64,
     pub fname: String,
 }
@@ -451,6 +477,7 @@ pub struct Reaction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReactionCastRef {
     pub hash: String,
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub fid: u64,
 }
 
@@ -488,6 +515,7 @@ pub struct FnameAvailabilityResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsernameProofResponse {
     pub r#type: String,
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub fid: u64,
     pub username: String,
     pub timestamp: u64,
@@ -540,6 +568,7 @@ pub struct SignerResponse {
     pub object: String,
     pub signer_uuid: String,
     pub public_key: String,
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub fid: u64,
     pub status: String,
 }
@@ -555,6 +584,7 @@ pub struct OnChainEventsResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OnChainEventEntry {
     pub object: String,
+    #[serde(with = "crate::native_registration::serde_fid")]
     pub fid: u64,
     pub event_type: String,
     pub block_number: u32,

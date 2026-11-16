@@ -206,18 +206,16 @@ pub fn initialize(
         .map(|(id, s)| (*id, s.db.clone()))
         .collect();
 
-    // Take a clone of one shard's on-chain event store for the JFS
-    // signer lookup before `shard_stores` is moved into the backfill
-    // task below. All shards see the same on-chain events so any one is
-    // sufficient.
-    let jfs_signer_store: Option<crate::storage::store::account::OnchainEventStore> =
+    // Gasless signers and legacy custody are shard-local. JFS must consult
+    // the account's owning shard, including its expiry/revocation state.
+    let jfs_signer_stores: HashMap<u32, crate::storage::store::account::OnchainEventStore> =
         if config.notifications.enabled {
             shard_stores
-                .values()
-                .next()
-                .map(|s| s.onchain_event_store.clone())
+                .iter()
+                .map(|(id, s)| (*id, s.onchain_event_store.clone()))
+                .collect()
         } else {
-            None
+            HashMap::new()
         };
     if !config.enabled {
         tracing::info!("Farcaster indexing disabled");
@@ -296,6 +294,16 @@ pub fn initialize(
         ..Default::default()
     };
     let cast_hash_indexer = Arc::new(CastHashIndexer::new(cast_hash_config, db.clone()));
+    let mut cast_hash_sources: Vec<_> = shard_stores
+        .iter()
+        .map(|(&id, stores)| (id, stores.clone()))
+        .collect();
+    if let Some(stores) = &hyper_shard_stores {
+        cast_hash_sources.extend(stores.iter().map(|(&id, stores)| (id, stores.clone())));
+    }
+    if let Err(error) = cast_hash_indexer.prepare_backfill(&cast_hash_sources) {
+        tracing::warn!(%error, "Could not initialize cast hash backfill metadata; worker will retry");
+    }
 
     // Cast quotes index is always enabled when API is enabled — it's
     // needed for the /v2/farcaster/cast/quotes/ endpoint.
@@ -516,6 +524,9 @@ pub fn initialize(
         };
 
     let shutdown_tx = worker_pool.shutdown_sender();
+    if !cast_hash_indexer.is_complete() {
+        cast_hash_indexer.spawn_backfill(cast_hash_sources, shutdown_tx.subscribe());
+    }
     let (daily_stats_handle, mut bridge_handles) = if let Some(indexer) = &daily_stats_indexer {
         let (worker, bridges) = daily_stats_worker::spawn(
             config,
@@ -705,9 +716,9 @@ pub fn initialize(
     // records). The registration management handler is set later
     // from main.rs once the custody-address lookup is available.
     let (notification_app_store, notification_token_store) = if config.notifications.enabled {
-        if let Some(onchain_store) = jfs_signer_store {
+        if !jfs_signer_stores.is_empty() {
             let lookup: Arc<dyn crate::api::notifications::ActiveSignerLookup> = Arc::new(
-                crate::api::notifications::OnchainSignerLookup::new(onchain_store),
+                crate::api::notifications::OnchainSignerLookup::for_shards(jfs_signer_stores),
             );
             let token_store = Arc::new(crate::api::notifications::NotificationStore::new(
                 db.clone(),

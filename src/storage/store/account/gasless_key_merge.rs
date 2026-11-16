@@ -121,14 +121,10 @@ pub fn merge_key_add(
 
     if !is_replay {
         let request_fid_event = onchain_event_store
-            .get_id_register_event_by_fid(verified.request_fid, Some(txn_batch))
+            .get_custody_address(verified.request_fid, Some(txn_batch))
             .map_err(|_| MessageValidationError::MissingFid)?
             .ok_or(ValidationError::InvalidSignedKeyRequest)?;
-        let request_fid_custody = match request_fid_event.body {
-            Some(proto::on_chain_event::Body::IdRegisterEventBody(b)) => b,
-            _ => return Err(ValidationError::InvalidSignedKeyRequest.into()),
-        };
-        if request_fid_custody.to.as_slice() != verified.request_signer.as_slice() {
+        if request_fid_event.as_slice() != verified.request_signer.as_slice() {
             return Err(ValidationError::SignedKeyRequestCustodyMismatch.into());
         }
     }
@@ -147,14 +143,10 @@ pub fn merge_key_add(
     let recovered =
         recover_key_add_custody_address(&payload, &key_add_body.custody_signature, chain_id)?;
     let this_fid_event = onchain_event_store
-        .get_id_register_event_by_fid(fid, Some(txn_batch))
+        .get_custody_address(fid, Some(txn_batch))
         .map_err(|_| MessageValidationError::MissingFid)?
         .ok_or(MessageValidationError::MissingFid)?;
-    let this_fid_custody = match this_fid_event.body {
-        Some(proto::on_chain_event::Body::IdRegisterEventBody(b)) => b,
-        _ => return Err(MessageValidationError::MissingFid),
-    };
-    if this_fid_custody.to.as_slice() != recovered.as_slice() {
+    if this_fid_event.as_slice() != recovered.as_slice() {
         return Err(ValidationError::InvalidSignature.into());
     }
 
@@ -263,6 +255,7 @@ pub fn merge_key_add(
     Ok(HubEvent::new_event(
         HubEventType::MergeMessage,
         hub_event::Body::MergeMessageBody(proto::MergeMessageBody {
+            native_registration: None,
             message: Some(msg.clone()),
             deleted_messages,
         }),
@@ -345,14 +338,10 @@ pub fn merge_key_remove(
             let recovered =
                 recover_key_remove_custody_address(&payload, &key_remove_body.signature, chain_id)?;
             let this_fid_event = onchain_event_store
-                .get_id_register_event_by_fid(fid, Some(txn_batch))
+                .get_custody_address(fid, Some(txn_batch))
                 .map_err(|_| MessageValidationError::MissingFid)?
                 .ok_or(MessageValidationError::MissingFid)?;
-            let this_fid_custody = match this_fid_event.body {
-                Some(proto::on_chain_event::Body::IdRegisterEventBody(b)) => b,
-                _ => return Err(MessageValidationError::MissingFid),
-            };
-            if this_fid_custody.to.as_slice() != recovered.as_slice() {
+            if this_fid_event.as_slice() != recovered.as_slice() {
                 return Err(ValidationError::InvalidSignature.into());
             }
             check_and_set_user_nonce(db, txn_batch, fid, key_remove_body.nonce)?;
@@ -385,6 +374,7 @@ pub fn merge_key_remove(
     Ok(HubEvent::new_event(
         HubEventType::MergeMessage,
         hub_event::Body::MergeMessageBody(proto::MergeMessageBody {
+            native_registration: None,
             message: Some(msg.clone()),
             deleted_messages: record.message.into_iter().collect(),
         }),

@@ -257,14 +257,8 @@ load_db_from_snapshot=false
 aws_access_key_id = "{aws_access_key_id}"
 aws_secret_access_key = "{aws_secret_access_key}"
 
-# Shard-0 merges (KEY_ADD, KEY_REMOVE, LEND_STORAGE) write to shard 0's stores, but the
-# corresponding read APIs are served from the fid's data shard. BlockReceiver is what carries
-# shard-0 block events across so each data shard replays the same merge. Without it a devnet
-# accepts those message types and no read ever observes the result, with nothing logged. Enabled
-# here even though `block_receiver::Config::default()` is `enabled = false`, so a freshly
-# generated devnet exercises the same propagation path as a real deployment.
-[block_receiver]
-enabled = true
+# Internal shard-0 block-event replay runs automatically on validators.
+# No enable flag or external chain RPC is required for signer propagation.
             "#
         );
 

@@ -466,6 +466,29 @@ mod tests {
         broadcast::Sender<ShardChunk>,
         broadcast::Sender<Block>,
     ) {
+        make_server_with_native_config(rpc_auth, admin_rpc_auth, channel_slot_cap_override, None)
+            .await
+    }
+
+    async fn make_server_with_native_config(
+        rpc_auth: Option<String>,
+        admin_rpc_auth: Option<String>,
+        channel_slot_cap_override: Option<u32>,
+        native_config: Option<crate::native_registration::Config>,
+    ) -> (
+        HashMap<u32, Stores>,
+        HashMap<u32, Senders>,
+        [ShardEngine; 2],
+        BlockEngine,
+        MyHubService,
+        broadcast::Sender<ShardChunk>,
+        broadcast::Sender<Block>,
+    ) {
+        let network = if native_config.is_some() {
+            proto::FarcasterNetwork::Mainnet
+        } else {
+            proto::FarcasterNetwork::Devnet
+        };
         let (msgs_request_tx, msgs_request_rx) = mpsc::channel(100);
 
         let statsd_client = StatsdClientWrapper::new(
@@ -492,34 +515,44 @@ mod tests {
         let db1 = engine1.db.clone();
         let db2 = engine2.db.clone();
 
-        let shard1_stores = Stores::new(
+        let mut shard1_stores = Stores::new(
             db1,
             1,
             merkle_trie::MerkleTrie::new().unwrap(),
             limits.clone(),
-            proto::FarcasterNetwork::Devnet,
+            network,
             test_helper::statsd_client(),
         );
         let shard1_senders = engine1.get_senders();
 
-        let shard2_stores = Stores::new(
+        let mut shard2_stores = Stores::new(
             db2,
             2,
             merkle_trie::MerkleTrie::new().unwrap(),
             limits.clone(),
-            proto::FarcasterNetwork::Devnet,
+            network,
             test_helper::statsd_client(),
         );
         let shard2_senders = engine2.get_senders();
+        if let Some(config) = &native_config {
+            shard1_stores.native_registration = config.clone();
+            shard2_stores.native_registration = config.clone();
+        }
         let stores = HashMap::from([(1, shard1_stores), (2, shard2_stores)]);
         let senders = HashMap::from([(1, shard1_senders), (2, shard2_senders)]);
         let num_shards = senders.len() as u32;
 
         let auth = rpc_auth.unwrap_or_else(|| format!("{}:{}", USER_NAME, PASSWORD));
 
-        let message_router = Box::new(routing::EvenOddRouterForTest {});
-        assert_eq!(message_router.route_fid(SHARD1_FID, 2), 1);
-        assert_eq!(message_router.route_fid(SHARD2_FID, 2), 2);
+        let message_router: Box<dyn MessageRouter> = if native_config.is_some() {
+            Box::new(routing::ShardRouter {})
+        } else {
+            Box::new(routing::EvenOddRouterForTest {})
+        };
+        if native_config.is_none() {
+            assert_eq!(message_router.route_fid(SHARD1_FID, 2), 1);
+            assert_eq!(message_router.route_fid(SHARD2_FID, 2), 2);
+        }
 
         let (mempool_tx, mempool_rx) = mpsc::channel(1000);
         let (gossip_tx, _gossip_rx) = mpsc::channel(1000);
@@ -530,7 +563,10 @@ mod tests {
             channel_slot_cap_override,
             ..BlockEngineOptions::default()
         });
-        let block_stores = block_engine.stores();
+        let mut block_stores = block_engine.stores();
+        if let Some(config) = native_config {
+            block_stores.native_registration = config;
+        }
 
         let mut mempool = Mempool::new(
             mempool::Config::default(),
@@ -563,7 +599,7 @@ mod tests {
             stores.clone(),
             Box::new(routing::EvenOddRouterForTest {}),
             num_shards,
-            proto::FarcasterNetwork::Devnet,
+            network,
             L1CacheConfig::default(),
         ));
         (
@@ -581,7 +617,7 @@ mod tests {
                 senders,
                 statsd_client,
                 num_shards,
-                proto::FarcasterNetwork::Devnet,
+                network,
                 message_router,
                 mempool_tx.clone(),
                 gossip_tx.clone(),
@@ -594,6 +630,215 @@ mod tests {
             shard_decision_tx,
             block_decision_tx,
         )
+    }
+
+    #[tokio::test]
+    async fn native_cast_submission_uses_owning_shard_and_fork_config() {
+        use crate::storage::store::account::merge_key_add;
+        use alloy_signer_local::PrivateKeySigner;
+        let router = routing::ShardRouter {};
+        for (shard_id, repair_active, native_active) in [
+            (1, false, true),
+            (1, true, true),
+            (2, false, true),
+            (2, true, true),
+            (1, true, false),
+            (2, true, false),
+        ] {
+            // Both original registration and the new admission repair must
+            // have activated independently. Only the local shard tip counts.
+            let config = crate::native_registration::Config {
+                activation_heights: [
+                    ("0".into(), 0),
+                    (
+                        shard_id.to_string(),
+                        if native_active { 0 } else { u64::MAX },
+                    ),
+                    ((3 - shard_id).to_string(), u64::MAX),
+                ]
+                .into(),
+                api_activation_heights: [("1".into(), 100), ("2".into(), 200)].into(),
+                ..Default::default()
+            };
+            let cutoff = config.api_activation_heights[&shard_id.to_string()];
+            let (stores, _senders, _engines, block_engine, service, _shards, _blocks) =
+                make_server_with_native_config(None, None, None, Some(config)).await;
+            let committed_height = cutoff - if repair_active { 1 } else { 2 };
+            stores[&shard_id]
+                .shard_store
+                .put_shard_chunk(&proto::ShardChunk {
+                    header: Some(proto::ShardHeader {
+                        height: Some(proto::Height {
+                            shard_index: shard_id,
+                            block_number: committed_height,
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .unwrap();
+            let fid = (crate::native_registration::FIRST_NATIVE_FID..)
+                .find(|fid| router.route_fid(*fid, 2) == shard_id)
+                .unwrap();
+            let custody = PrivateKeySigner::random();
+            let signer = generate_signer();
+            let now = messages_factory::farcaster_time();
+            let record = proto::NativeRegistrationRecord {
+                fid,
+                block_number: 1,
+                registration: Some(proto::Message {
+                    data: Some(proto::MessageData {
+                        r#type: proto::MessageType::NativeOnboard as i32,
+                        native_onboard_body: Some(
+                            proto::HyperNativeOnboardBody {
+                                custody_address: custody.address().to_vec(),
+                                ..Default::default()
+                            }
+                            .encode_to_vec(),
+                        ),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            };
+            // Seed committed replicas; proof/replication validation is covered
+            // by native_registration's end-to-end tests.
+            let block_stores = block_engine.stores();
+            for db in [&block_stores.db, &stores[&shard_id].db] {
+                let mut txn = RocksDbTransactionBatch::new();
+                crate::native_registration::apply_record(db, &mut txn, &record).unwrap();
+                db.commit(txn).unwrap();
+            }
+            let key = messages_factory::keys::create_key_add(
+                fid,
+                &custody,
+                fid,
+                &custody,
+                &signer,
+                vec![proto::MessageType::CastAdd],
+                3600,
+                1,
+                now + 86_400,
+                Some(now),
+            );
+            let store = &stores[&shard_id];
+            let mut txn = RocksDbTransactionBatch::new();
+            merge_key_add(&store.db, &store.onchain_event_store, &key, &mut txn, false).unwrap();
+            store.db.commit(txn).unwrap();
+            let cast = messages_factory::casts::create_cast_add(
+                fid,
+                "native admission test",
+                Some(now),
+                Some(&signer),
+            );
+            if !repair_active || !native_active {
+                assert!(submit_message(&service, cast.clone())
+                    .await
+                    .unwrap_err()
+                    .message()
+                    .contains("unknown fid"));
+                let bulk = submit_bulk_messages(&service, vec![cast])
+                    .await
+                    .unwrap()
+                    .into_inner();
+                assert!(matches!(&bulk.messages[0].response,
+                    Some(proto::bulk_message_response::Response::MessageError(error)) if error.message.contains("unknown fid")));
+                continue;
+            }
+            assert!(
+                service
+                    .validate_message(Request::new(cast.clone()))
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .valid
+            );
+            submit_message(&service, cast.clone()).await.unwrap();
+            let unknown = messages_factory::casts::create_cast_add(
+                fid + 10_000,
+                "unregistered account",
+                Some(now),
+                Some(&signer),
+            );
+            assert!(submit_message(&service, unknown)
+                .await
+                .unwrap_err()
+                .message()
+                .contains("unknown fid"));
+            let bulk_cast = messages_factory::casts::create_cast_add(
+                fid,
+                "native bulk admission test",
+                Some(now),
+                Some(&signer),
+            );
+            let bulk = submit_bulk_messages(&service, vec![bulk_cast])
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(bulk.messages.len(), 1);
+            assert!(
+                matches!(
+                    &bulk.messages[0].response,
+                    Some(proto::bulk_message_response::Response::Message(_))
+                ),
+                "{bulk:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_account_lookup_and_profile_hydration_use_native_custody() {
+        use crate::api::webhooks::CustodyAddressLookup;
+        use crate::api::{http::UserHydrator, HubQueryHandler};
+        let (_stores, _senders, _engines, block_engine, service, _shards, _blocks) =
+            make_server(None, None).await;
+        let fid = crate::native_registration::FIRST_NATIVE_FID;
+        let custody = vec![42; 20];
+        let message = proto::Message {
+            data: Some(proto::MessageData {
+                r#type: proto::MessageType::NativeOnboard as i32,
+                timestamp: 100,
+                native_onboard_body: Some(
+                    proto::HyperNativeOnboardBody {
+                        custody_address: custody.clone(),
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // Seed a committed receipt; consensus/proof validation is exercised by
+        // native_registration's end-to-end registration tests.
+        let record = proto::NativeRegistrationRecord {
+            fid,
+            registration: Some(message),
+            block_number: 2,
+        };
+        let db = block_engine.stores().db;
+        let mut txn = RocksDbTransactionBatch::new();
+        crate::native_registration::apply_record(&db, &mut txn, &record).unwrap();
+        db.commit(txn).unwrap();
+        let by_address = service
+            .get_native_account(Request::new(proto::NativeAccountRequest {
+                fid: 0,
+                custody_address: custody.clone(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(by_address, record);
+        assert_eq!(service.get_native_fid_by_custody(&custody).await, Some(fid));
+        assert_eq!(service.get_fids_by_address(&custody, true).await, vec![fid]);
+        let hydrator = crate::api::user_hydrator::HubUserHydrator::new(Arc::new(service), None);
+        let user = hydrator.hydrate_user(fid).await.unwrap();
+        assert_eq!(user.custody_address, format!("0x{}", hex::encode(&custody)));
+        assert!(!user.registered_at.is_empty());
+        assert_eq!(
+            hydrator.get_custody_address(fid).await.unwrap().as_slice(),
+            custody
+        );
     }
 
     #[tokio::test]
@@ -1672,10 +1917,8 @@ mod tests {
             now_unix_seconds() + 3600,
         );
 
-        // A fid outside a non-zero u32 cannot key a member slot. Without the explicit
-        // guard, `make_member_by_fid_key`'s own `try_from` failure would surface as
-        // `internal` — a server fault for what is caller input.
-        for fid in [0u64, u32::MAX as u64 + 1, u64::MAX] {
+        // Zero is not an account. All higher values are legacy or native FIDs.
+        for fid in [0u64] {
             assert_eq!(
                 service
                     .get_channel_member(Request::new(ChannelMemberRequest {
@@ -1702,6 +1945,19 @@ mod tests {
                 tonic::Code::InvalidArgument,
                 "get_channel_memberships_by_fid must reject fid {fid}"
             );
+        }
+
+        for fid in [crate::native_registration::FIRST_NATIVE_FID, u64::MAX] {
+            let member = service
+                .get_channel_member(Request::new(ChannelMemberRequest {
+                    channel_id: channel_id.clone(),
+                    fid,
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(member.state, proto::ChannelMemberState::None as i32);
+            assert!(member.last_action_ts.is_none());
         }
 
         // An i32 outside ChannelMemberState is caller input, not a store fault.
@@ -6990,6 +7246,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trending_uses_writer_generation_after_replacement_and_retirement() {
+        use crate::api::config::{FeedConfig, MetricsConfig};
+        use crate::api::events::IndexEvent;
+        use crate::api::feeds::{FeedService, TrendingFeedOptions};
+        use crate::api::http::ApiHttpHandler;
+        use crate::api::indexer::Indexer;
+        use crate::api::metrics::MetricsIndexer;
+
+        let (_, _, [mut engine, _engine2], _block_engine, service, _shard_tx, _block_tx) =
+            make_server(None, None).await;
+        let fid = SHARD1_FID;
+        register_user(
+            fid,
+            test_helper::default_signer(),
+            test_helper::default_custody_address(),
+            &mut engine,
+        )
+        .await;
+        let old_cast =
+            messages_factory::casts::create_cast_add(fid, "before metrics replacement", None, None);
+        let new_cast =
+            messages_factory::casts::create_cast_add(fid, "after metrics replacement", None, None);
+        test_helper::commit_message(&mut engine, &old_cast).await;
+        test_helper::commit_message(&mut engine, &new_cast).await;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(RocksDB::new(dir.path().to_str().unwrap()));
+        db.open().unwrap();
+        let writer = Arc::new(MetricsIndexer::new(
+            MetricsConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            db,
+        ));
+        let handler = ApiHttpHandler::new(None, None, Some(writer.clone()), None, None, None);
+        let reader = handler.metrics_indexer().unwrap();
+        assert!(Arc::ptr_eq(&reader, &writer));
+        let like = |actor, cast: &proto::Message| {
+            messages_factory::reactions::create_reaction_add(
+                actor,
+                proto::ReactionType::Like,
+                proto::reaction_body::Target::TargetCastId(proto::CastId {
+                    fid,
+                    hash: cast.hash.clone(),
+                }),
+                None,
+                None,
+            )
+        };
+        writer
+            .process_event(&IndexEvent::message(like(1000, &old_cast), 1, 1))
+            .await
+            .unwrap();
+        let feeds = FeedService::new(
+            FeedConfig {
+                enabled: true,
+                trending_cache_ttl_secs: 3600,
+                ..Default::default()
+            },
+            None,
+            Some(reader),
+            Arc::new(service),
+        );
+        let options = TrendingFeedOptions::default();
+        let first = feeds.get_trending_feed(None, 10, &options).await.unwrap();
+        assert_eq!(first.items.len(), 1);
+        assert_eq!(first.items[0].cast.hash, old_cast.hash);
+
+        // Build and publish a different ranking while the feed already exists.
+        writer.prepare().unwrap();
+        let generation = writer.building_generation().unwrap().unwrap();
+        writer
+            .view(generation)
+            .process_event(&IndexEvent::message(like(2000, &new_cast), 1, 2))
+            .await
+            .unwrap();
+        writer.switch_to(generation).unwrap();
+        while !writer.delete_retired(100).unwrap() {}
+        // A fresh opener would see the same persisted generation; no rebuild is needed.
+        // The existing feed must also see it, without waiting for its one-hour TTL.
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let page = feeds.get_trending_feed(None, 10, &options).await.unwrap();
+                if page.items.len() == 1 && page.items[0].cast.hash == new_cast.hash {
+                    assert_eq!(page.items[0].likes, 1);
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("feed did not follow metrics publication");
+    }
+
+    #[tokio::test]
     async fn trending_signer_filters_fill_pages_and_preserve_ranking() {
         use crate::api::config::{FeedConfig, MetricsConfig};
         use crate::api::events::IndexEvent;
@@ -9057,6 +9408,7 @@ mod tests {
         };
         let message = proto::Message {
             data: Some(MessageData {
+                native_onboard_body: None,
                 r#type: MessageType::KeyAdd as i32,
                 fid,
                 timestamp: 100_000,
@@ -9315,6 +9667,7 @@ mod tests {
         let record = GaslessKeyRecord {
             message: Some(proto::Message {
                 data: Some(MessageData {
+                    native_onboard_body: None,
                     r#type: MessageType::KeyAdd as i32,
                     fid,
                     timestamp: 50_000,

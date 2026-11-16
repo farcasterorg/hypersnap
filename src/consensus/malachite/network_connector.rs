@@ -1,21 +1,28 @@
+use crate::core::types::Height;
 use crate::core::types::{Shardable, SnapchainValidatorContext};
 use crate::network::gossip::GossipEvent;
 use crate::utils::statsd_wrapper::StatsdClientWrapper;
 use async_trait::async_trait;
 use informalsystems_malachitebft_core_consensus::SignedConsensusMsg;
+use informalsystems_malachitebft_core_types::{Round, SignedProposal};
 use informalsystems_malachitebft_engine::consensus::ConsensusCodec;
 use informalsystems_malachitebft_engine::network::{NetworkEvent, NetworkMsg as Msg, Status};
 use informalsystems_malachitebft_engine::sync::SyncCodec;
 use informalsystems_malachitebft_engine::util::output_port::OutputPort;
 use informalsystems_malachitebft_engine::util::streaming::StreamMessage;
-use informalsystems_malachitebft_network::PeerId as MalachitePeerId;
 use informalsystems_malachitebft_network::{Channel, Event};
+use informalsystems_malachitebft_network::{PeerId as MalachitePeerId, PeerIdExt};
 use informalsystems_malachitebft_sync::{self as sync, RawMessage};
 use libp2p::request_response;
 use ractor::{Actor, ActorProcessingErr, ActorRef};
+use rand::seq::SliceRandom;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, trace};
+
+use super::participation::Participation;
 
 pub type MalachiteNetworkActorMsg = Msg<SnapchainValidatorContext>;
 pub type MalachiteNetworkEvent = Event;
@@ -32,6 +39,12 @@ pub struct NetworkConnectorState {
     gossip_tx: mpsc::Sender<GossipEvent<SnapchainValidatorContext>>,
     statsd: StatsdClientWrapper,
     sync_peers: Option<HashSet<MalachitePeerId>>,
+    connected_peers: HashSet<MalachitePeerId>,
+    participation: Option<Arc<Participation>>,
+    pending_statuses: HashMap<MalachitePeerId, (sync::Status<SnapchainValidatorContext>, Instant)>,
+    recovery_requests:
+        HashMap<request_response::OutboundRequestId, (MalachitePeerId, Height, Round, Instant)>,
+    pol_requests: HashMap<(u32, u64, Round), (SignedProposal<SnapchainValidatorContext>, Instant)>,
 }
 
 pub struct NetworkConnectorArgs {
@@ -39,8 +52,9 @@ pub struct NetworkConnectorArgs {
     pub peer_id: MalachitePeerId,
     pub statsd: StatsdClientWrapper,
     /// Peers whose statuses are passed to sync, which only requests values from peers it has a
-    /// status for. `None` passes every peer's status.
+    /// status for. `None` passes every directly connected peer's status.
     pub sync_peers: Option<HashSet<MalachitePeerId>>,
+    pub participation: Option<Arc<Participation>>,
 }
 
 impl<Codec> MalachiteNetworkConnector<Codec>
@@ -82,6 +96,11 @@ where
             peer_id: args.peer_id,
             statsd: args.statsd,
             sync_peers: args.sync_peers,
+            connected_peers: HashSet::new(),
+            participation: args.participation,
+            pending_statuses: HashMap::new(),
+            recovery_requests: HashMap::new(),
+            pol_requests: HashMap::new(),
         })
     }
 
@@ -107,8 +126,16 @@ where
             statsd,
             peer_id: _,
             sync_peers,
+            connected_peers,
+            participation,
+            pending_statuses,
+            recovery_requests,
+            pol_requests,
         } = state;
 
+        pending_statuses.retain(|_, (_, t)| t.elapsed() < Duration::from_secs(30));
+        recovery_requests.retain(|_, (_, _, _, t)| t.elapsed() < Duration::from_secs(10));
+        pol_requests.retain(|_, (_, t)| t.elapsed() < Duration::from_secs(10));
         match msg {
             Msg::Subscribe(subscriber) => {
                 subscriber.subscribe_to_port(output_port);
@@ -150,6 +177,10 @@ where
             Msg::OutgoingRequest(peer_id, request, reply_to) => {
                 let (tx, rx) = oneshot::channel();
                 statsd.count_with_shard(request.shard_id(), "sync.request_sent", 1, vec![]);
+                let recovery = match &request {
+                    sync::Request::VoteSetRequest(r) => Some((r.height, r.round, request.clone())),
+                    _ => None,
+                };
                 gossip_tx
                     .send(GossipEvent::SyncRequest(peer_id, request, tx))
                     .await?;
@@ -162,6 +193,37 @@ where
                     vec![],
                 );
                 reply_to.send(sync::OutboundRequestId::new(request_id))?;
+                if let Some((height, round, request)) = recovery {
+                    // Keep Malachite's primary request intact. Supplementary responses
+                    // enter the normal signed-vote verifier independently, so an empty
+                    // or slow primary cannot hide useful votes from another peer.
+                    let mut peers: Vec<_> = connected_peers
+                        .iter()
+                        .copied()
+                        .filter(|p| {
+                            *p != peer_id && sync_peers.as_ref().is_none_or(|set| set.contains(p))
+                        })
+                        .collect();
+                    peers.shuffle(&mut rand::thread_rng());
+                    for peer in peers.into_iter().take(3) {
+                        if recovery_requests.len() >= 64 {
+                            break;
+                        }
+                        let (tx, rx) = oneshot::channel();
+                        gossip_tx
+                            .send(GossipEvent::SyncRequest(peer, request.clone(), tx))
+                            .await?;
+                        if let Ok(id) = rx.await {
+                            recovery_requests.insert(id, (peer, height, round, Instant::now()));
+                            statsd.count_with_shard(
+                                height.shard_index,
+                                "sync.vote_recovery_request",
+                                1,
+                                vec![],
+                            );
+                        }
+                    }
+                }
             }
 
             Msg::OutgoingResponse(request_id, response) => {
@@ -186,16 +248,25 @@ where
             }
 
             Msg::NewEvent(Event::PeerConnected(peer_id)) => {
-                // peers.insert(peer_id);
+                connected_peers.insert(peer_id);
                 output_port.send(NetworkEvent::PeerConnected(peer_id));
+                if let Some((status, _)) = pending_statuses.remove(&peer_id) {
+                    output_port.send(NetworkEvent::Status(
+                        peer_id,
+                        Status::new(status.height, status.history_min_height),
+                    ));
+                }
             }
 
             Msg::NewEvent(Event::PeerDisconnected(peer_id)) => {
-                // peers.remove(&peer_id);
+                connected_peers.remove(&peer_id);
                 output_port.send(NetworkEvent::PeerDisconnected(peer_id));
             }
 
             Msg::NewEvent(Event::Message(Channel::Consensus, from, data)) => {
+                if participation.as_ref().is_some_and(|p| !p.is_active()) {
+                    return Ok(());
+                }
                 let msg = match self.codec.decode(data) {
                     Ok(msg) => msg,
                     Err(e) => {
@@ -203,6 +274,95 @@ where
                         return Ok(());
                     }
                 };
+
+                let height = match &msg {
+                    SignedConsensusMsg::Vote(vote) => vote.message.height,
+                    SignedConsensusMsg::Proposal(proposal) => proposal.message.height,
+                };
+                if participation
+                    .as_ref()
+                    .is_some_and(|p| !p.accepts_height(height.block_number))
+                {
+                    return Ok(());
+                }
+
+                if let SignedConsensusMsg::Proposal(signed) = &msg {
+                    let proposal = &signed.message;
+                    // A re-proposal carries a POL round, not the actual votes.
+                    // Timeout recovery asks for the current round, which cannot
+                    // supply the older proof lost when a validator restarted.
+                    let signer = crate::network::proposal_recovery::proposal_signer(
+                        proposal,
+                        &signed.signature,
+                    )
+                    .map(|peer| MalachitePeerId::from_libp2p(&peer));
+                    let allowed = signer.is_some_and(|peer| {
+                        sync_peers
+                            .as_ref()
+                            .is_none_or(|peers| peers.contains(&peer))
+                    }) && participation
+                        .as_ref()
+                        .is_none_or(|p| p.can_recover_proposal(proposal));
+                    let key = (height.shard_index, height.block_number, proposal.pol_round);
+                    if allowed
+                        && proposal.pol_round.is_defined()
+                        && proposal.pol_round < proposal.round
+                    {
+                        if let Some((waiting, _)) = pol_requests.get_mut(&key) {
+                            if proposal.round > waiting.message.round {
+                                *waiting = signed.clone();
+                            }
+                        }
+                    }
+                    if allowed
+                        && proposal.pol_round.is_defined()
+                        && proposal.pol_round < proposal.round
+                        && !pol_requests.contains_key(&key)
+                        && pol_requests.len() < 64
+                        && recovery_requests.len() < 64
+                    {
+                        let mut peers: Vec<_> = connected_peers
+                            .iter()
+                            .copied()
+                            .filter(|p| sync_peers.as_ref().is_none_or(|set| set.contains(p)))
+                            .collect();
+                        peers.shuffle(&mut rand::thread_rng());
+                        // The current proposer claims to hold this proof; try it
+                        // first, but also ask others if it has gone offline.
+                        peers.sort_by_key(|peer| Some(*peer) != signer);
+                        if !peers.is_empty() {
+                            pol_requests.insert(key, (signed.clone(), Instant::now()));
+                            info!(%height, round = %proposal.round, pol_round = %proposal.pol_round,
+                                "Requesting prior-round votes for re-proposal");
+                        }
+                        for peer in peers.into_iter().take(4) {
+                            if recovery_requests.len() >= 64 {
+                                break;
+                            }
+                            let (tx, rx) = oneshot::channel();
+                            gossip_tx
+                                .send(GossipEvent::SyncRequest(
+                                    peer,
+                                    sync::Request::VoteSetRequest(sync::VoteSetRequest::new(
+                                        height,
+                                        proposal.pol_round,
+                                    )),
+                                    tx,
+                                ))
+                                .await?;
+                            if let Ok(id) = rx.await {
+                                recovery_requests
+                                    .insert(id, (peer, height, proposal.pol_round, Instant::now()));
+                                statsd.count_with_shard(
+                                    height.shard_index,
+                                    "sync.vote_recovery_request",
+                                    1,
+                                    vec![],
+                                );
+                            }
+                        }
+                    }
+                }
 
                 let event = match msg {
                     SignedConsensusMsg::Vote(vote) => NetworkEvent::Vote(from, vote),
@@ -216,6 +376,9 @@ where
             }
 
             Msg::NewEvent(Event::Message(Channel::ProposalParts, from, data)) => {
+                if participation.as_ref().is_some_and(|p| !p.is_active()) {
+                    return Ok(());
+                }
                 debug!("Received proposal parts from network");
                 let msg: StreamMessage<<SnapchainValidatorContext as informalsystems_malachitebft_core_types::Context>::ProposalPart> = match self.codec.decode(data) {
                     Ok(stream_msg) => stream_msg,
@@ -224,6 +387,15 @@ where
                         return Ok(());
                     }
                 };
+
+                if participation.as_ref().is_some_and(|p| {
+                    !msg.content
+                        .as_data()
+                        .and_then(|proposal| proposal.height)
+                        .is_some_and(|height| p.accepts_height(height.block_number))
+                }) {
+                    return Ok(());
+                }
 
                 trace!(
                     %from,
@@ -253,13 +425,26 @@ where
 
                 trace!(%from, height = %status.height, "Received status");
 
-                // `status.peer_id` can claim any peer, but sync requests go over a direct
-                // connection to that peer, so a forged status cannot redirect them.
                 if sync_peers
                     .as_ref()
                     .is_some_and(|peers| !peers.contains(&status.peer_id))
                 {
-                    debug!(peer_id = %status.peer_id, "Ignoring status from a peer outside the sync peer set");
+                    return Ok(());
+                }
+                // Request discovery, but keep unreachable peers out of sync's random
+                // peer pool until the authenticated transport has connected.
+                if !connected_peers.contains(&status.peer_id) {
+                    let peer = status.peer_id;
+                    if pending_statuses.len() < 64 || pending_statuses.contains_key(&peer) {
+                        let first = !pending_statuses.contains_key(&peer);
+                        pending_statuses
+                            .entry(peer)
+                            .and_modify(|(queued, _)| *queued = status.clone())
+                            .or_insert((status, Instant::now()));
+                        if first {
+                            gossip_tx.send(GossipEvent::DiscoverPeer(peer)).await?;
+                        }
+                    }
                     return Ok(());
                 }
 
@@ -321,6 +506,50 @@ where
                             }
                         };
 
+                    if let Some((expected_peer, height, round, _)) =
+                        recovery_requests.remove(&request_id)
+                    {
+                        if peer != expected_peer
+                            || participation.as_ref().is_some_and(|p| {
+                                !p.is_active() || !p.accepts_height(height.block_number)
+                            })
+                        {
+                            return Ok(());
+                        }
+                        if let sync::Response::VoteSetResponse(response) = response {
+                            if response.height == height && response.round == round {
+                                let mut forwarded = 0;
+                                for vote in response.vote_set.votes.into_iter().take(1024) {
+                                    if vote.message.height == height && vote.message.round == round
+                                    {
+                                        // Consensus validates membership and signatures exactly
+                                        // as it does for votes arriving through gossip.
+                                        output_port.send(NetworkEvent::Vote(peer, vote));
+                                        forwarded += 1;
+                                    }
+                                }
+                                // Older-round votes do not necessarily re-evaluate
+                                // a current-round proposal in Malachite. Re-deliver
+                                // the original signed header after the votes, so it
+                                // can use the recovered proof without waiting for
+                                // another proposer rotation. Normal verification
+                                // and locking rules still apply to every event.
+                                if forwarded > 0 {
+                                    if let Some((proposal, _)) = pol_requests.get(&(
+                                        height.shard_index,
+                                        height.block_number,
+                                        round,
+                                    )) {
+                                        info!(%height, pol_round = %round, votes = forwarded,
+                                            "Received prior-round votes for re-proposal");
+                                        output_port
+                                            .send(NetworkEvent::Proposal(peer, proposal.clone()));
+                                    }
+                                }
+                            }
+                        }
+                        return Ok(());
+                    }
                     if let sync::Response::ValueResponse(response) = &response {
                         debug!(
                             peer_id = peer.to_string(),

@@ -311,7 +311,11 @@ impl Fetcher {
                 let url = format!("{}/current", self.cfg.url);
                 debug!(%url, "fetching transfers");
 
-                let response = reqwest::get(&url).await?.json::<CurrentTransfer>().await?;
+                let response = reqwest::get(&url)
+                    .await?
+                    .error_for_status()?
+                    .json::<CurrentTransfer>()
+                    .await?;
 
                 self.position = response.transfer.id;
             }
@@ -379,14 +383,13 @@ impl Fetcher {
     }
 
     pub async fn run(&mut self) -> () {
-        match self.set_initial_position().await {
-            Ok(()) => {}
-            Err(err) => {
-                // We will just keep the default, 0
-                warn!(
-                    "Unable to set initial position for fname ingest {}",
-                    err.to_string()
-                )
+        loop {
+            match self.set_initial_position().await {
+                Ok(()) => break,
+                Err(err) => {
+                    warn!(error = %err, "Unable to set initial position for fname ingest; retrying before polling transfers");
+                    sleep(Duration::from_secs(5)).await;
+                }
             }
         }
         info!(start_id = self.position, "Starting fname ingest");
@@ -440,5 +443,97 @@ impl Fetcher {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::{db::RocksDB, store::test_helper};
+    use std::sync::Arc;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    #[tokio::test]
+    async fn failed_initial_position_retries_without_replaying_history() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (requests_tx, mut requests_rx) = mpsc::channel(8);
+        let server = tokio::spawn(async move {
+            let mut current_requests = 0;
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buffer = vec![0; 4096];
+                let len = socket.read(&mut buffer).await.unwrap();
+                let request = String::from_utf8_lossy(&buffer[..len]);
+                let path = request.split_whitespace().nth(1).unwrap().to_string();
+                requests_tx.send(path.clone()).await.unwrap();
+                let transfer = |id| {
+                    serde_json::json!({
+                        "id": id, "timestamp": 1, "username": "example", "owner": "0x01",
+                        "from": 0, "to": 42, "user_signature": "0x01", "server_signature": "0x01"
+                    })
+                };
+                let (status, body) = if path.ends_with("/current") {
+                    current_requests += 1;
+                    if current_requests == 1 {
+                        ("503 Service Unavailable", "{}".to_string())
+                    } else {
+                        (
+                            "200 OK",
+                            serde_json::json!({"transfer": transfer(1000)}).to_string(),
+                        )
+                    }
+                } else if path.ends_with("from_id=0") {
+                    (
+                        "200 OK",
+                        serde_json::json!({"transfers": [transfer(1)]}).to_string(),
+                    )
+                } else {
+                    ("200 OK", "{\"transfers\":[]}".to_string())
+                };
+                socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = RocksDB::new(dir.path().join("local.db").to_str().unwrap());
+        db.open().unwrap();
+        let (mempool_tx, mut mempool_rx) = mpsc::channel(8);
+        let (_retry_tx, retry_rx) = broadcast::channel(8);
+        let mut fetcher = Fetcher::new(
+            Config {
+                url: format!("http://{address}/transfers"),
+                ..Config::default()
+            },
+            mempool_tx,
+            test_helper::statsd_client(),
+            LocalStateStore::new(Arc::new(db)),
+            retry_rx,
+        );
+        let worker = tokio::spawn(async move { fetcher.run().await });
+        let paths = tokio::time::timeout(Duration::from_secs(15), async {
+            let mut paths = Vec::new();
+            for _ in 0..3 {
+                paths.push(requests_rx.recv().await.unwrap());
+            }
+            paths
+        })
+        .await;
+        worker.abort();
+        server.abort();
+        assert_eq!(
+            paths.unwrap(),
+            vec![
+                "/transfers/current",
+                "/transfers/current",
+                "/transfers?from_id=1000"
+            ]
+        );
+        assert!(
+            mempool_rx.try_recv().is_err(),
+            "failed initialization must not enqueue historical transfers"
+        );
     }
 }

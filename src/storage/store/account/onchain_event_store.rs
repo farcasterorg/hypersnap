@@ -1192,15 +1192,44 @@ impl OnchainEventStore {
         &self,
         page_options: &PageOptions,
     ) -> Result<(Vec<u64>, Option<Vec<u8>>), OnchainEventStorageError> {
+        let native_token = page_options
+            .page_token
+            .as_ref()
+            .is_some_and(|p| p.first() == Some(&(RootPrefix::NativeAccount as u8)));
         let start_prefix = make_onchain_event_type_prefix(OnChainEventType::EventTypeIdRegister);
+        if page_options.reverse && (page_options.page_token.is_none() || native_token) {
+            let (fids, next) = crate::native_registration::list_accounts(&self.db, page_options)?;
+            if next.is_some() {
+                return Ok((fids, next));
+            }
+            if !fids.is_empty() {
+                // A bare legacy prefix means "start the legacy phase" rather
+                // than an exclusive reverse-iteration bound.
+                return Ok((fids, Some(start_prefix)));
+            }
+        } else if native_token {
+            return crate::native_registration::list_accounts(&self.db, page_options)
+                .map_err(Into::into);
+        }
+        let legacy_options = PageOptions {
+            page_size: page_options.page_size,
+            reverse: page_options.reverse,
+            page_token: if page_options.reverse
+                && (native_token || page_options.page_token.as_ref() == Some(&start_prefix))
+            {
+                None
+            } else {
+                page_options.page_token.clone()
+            },
+        };
         let onchain_events_page = get_onchain_events(
             &self.db,
-            page_options,
+            &legacy_options,
             start_prefix.clone(),
             increment_vec_u8(&start_prefix),
         )?;
 
-        let fids = onchain_events_page
+        let fids: Vec<u64> = onchain_events_page
             .onchain_events
             .iter()
             .filter(|event| {
@@ -1213,9 +1242,70 @@ impl OnchainEventStore {
             })
             .map(|event| event.fid)
             .collect();
-        let next_page_token = onchain_events_page.next_page_token;
-
+        let mut next_page_token = onchain_events_page.next_page_token;
+        if !page_options.reverse && next_page_token.is_none() {
+            let native = crate::native_registration::list_accounts(
+                &self.db,
+                &PageOptions {
+                    page_size: Some(1),
+                    ..Default::default()
+                },
+            )?;
+            if !native.0.is_empty() {
+                if fids.is_empty() {
+                    return crate::native_registration::list_accounts(
+                        &self.db,
+                        &PageOptions {
+                            page_size: page_options.page_size,
+                            reverse: page_options.reverse,
+                            page_token: None,
+                        },
+                    )
+                    .map_err(Into::into);
+                }
+                next_page_token = Some(vec![RootPrefix::NativeAccount as u8]);
+            }
+        }
         Ok((fids, next_page_token))
+    }
+
+    /// Custody comes from the native registry for high FIDs, or IdRegistry for legacy FIDs.
+    /// Native records are not synthesized into L1 events.
+    pub fn get_custody_address(
+        &self,
+        fid: u64,
+        txn: Option<&RocksDbTransactionBatch>,
+    ) -> Result<Option<Vec<u8>>, OnchainEventStorageError> {
+        if crate::native_registration::native_fid_encoding()
+            && crate::native_registration::is_native_fid(fid)
+        {
+            let empty = RocksDbTransactionBatch::new();
+            return crate::native_registration::account(&self.db, txn.unwrap_or(&empty), fid)
+                .and_then(|record| {
+                    record
+                        .map(|record| {
+                            let message = record.registration.as_ref().ok_or_else(|| {
+                                HubError::invalid_internal_state(
+                                    "native registration missing message",
+                                )
+                            })?;
+                            Ok(crate::native_registration::body(message)?
+                                .custody_address
+                                .clone())
+                        })
+                        .transpose()
+                })
+                .map_err(Into::into);
+        }
+        if crate::native_registration::native_fid_encoding() && fid > u32::MAX as u64 {
+            return Ok(None);
+        }
+        Ok(self
+            .get_id_register_event_by_fid(fid, txn)?
+            .and_then(|event| match event.body {
+                Some(Body::IdRegisterEventBody(body)) => Some(body.to),
+                _ => None,
+            }))
     }
 
     #[inline]
@@ -1268,6 +1358,13 @@ impl OnchainEventStore {
         signer: Vec<u8>,
         txn_batch: Option<&RocksDbTransactionBatch>,
     ) -> Result<Option<OnChainEvent>, OnchainEventStorageError> {
+        // Native custody authorizes gasless KEY_ADD/KEY_REMOVE only. An L1
+        // event must never grant an unrestricted signer to a native account.
+        if crate::native_registration::native_fid_encoding()
+            && crate::native_registration::is_native_fid(fid)
+        {
+            return Ok(None);
+        }
         let signer_key = make_signer_onchain_event_by_signer_key(fid, signer);
         let signer = get_event_by_secondary_key(&self.db, signer_key, txn_batch)
             .map_err(|e| OnchainEventStorageError::from(e))?;
@@ -1404,7 +1501,25 @@ impl FIDIterator {
         self.error.take()
     }
 
+    fn fetch_native(&mut self) -> Result<Option<u64>, OnchainEventStorageError> {
+        let token = (self.last_fid >= crate::native_registration::FIRST_NATIVE_FID)
+            .then(|| crate::native_registration::account_key(self.last_fid));
+        let (fids, _) = crate::native_registration::list_accounts(
+            &self.db,
+            &PageOptions {
+                page_size: Some(Self::PAGE_SIZE_MAX),
+                page_token: token,
+                reverse: false,
+            },
+        )?;
+        let last = fids.last().copied();
+        self.fids.extend(fids);
+        Ok(last)
+    }
     fn fetch(&mut self) -> Result<Option<u64>, OnchainEventStorageError> {
+        if self.last_fid >= u32::MAX as u64 {
+            return self.fetch_native();
+        }
         let mut start_prefix =
             make_onchain_event_type_prefix(OnChainEventType::EventTypeIdRegister);
         let stop_prefix = increment_vec_u8(&start_prefix);
@@ -1453,7 +1568,11 @@ impl FIDIterator {
             )
             .map_err(|e| OnchainEventStorageError::HubError(e))?;
 
-        let ref_fid = if last_fid > 0 { Some(last_fid) } else { None };
+        let ref_fid = if last_fid > 0 {
+            Some(last_fid)
+        } else {
+            return self.fetch_native();
+        };
         Ok(ref_fid)
     }
 }

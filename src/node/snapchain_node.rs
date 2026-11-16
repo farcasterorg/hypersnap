@@ -95,6 +95,7 @@ impl SnapchainNode {
             Some(messages_request_tx.clone()),
             network,
         );
+        let engine = engine.with_native_registration(config.native_registration.clone());
         let block_stores = engine.stores();
         let hyper_db_dir: Option<String> = None;
         let hyper_block_engine = if let Some(ref hyper_dir) = hyper_db_dir {
@@ -170,6 +171,10 @@ impl SnapchainNode {
                 }
             };
 
+            let engine = engine.with_native_registration(
+                config.native_registration.clone(),
+                block_stores.db.clone(),
+            );
             shard_senders.insert(shard_id, engine.get_senders());
             shard_stores.insert(shard_id, engine.get_stores());
 

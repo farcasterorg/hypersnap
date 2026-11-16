@@ -22,18 +22,23 @@
 //! — exactly the JWS compact serialization of the (header, payload) pair.
 //! The signature is verified with the Ed25519 key from `header.key`, and
 //! that key must currently be an active app key for `header.fid` per the
-//! on-chain `IdRegistry` / `KeyRegistry` state.
+//! onchain or gasless signer state, including gasless key expiry.
 //!
 //! Only `type = "app_key"` is supported. Mini app webhook events are
 //! always signed with the user's app key per spec; `custody` and `auth`
 //! types are rejected with `JfsError::UnsupportedKeyType`.
 
-use crate::storage::store::account::OnchainEventStore;
+use crate::core::util::FarcasterTime;
+use crate::storage::db::RocksDbTransactionBatch;
+use crate::storage::store::account::{
+    get_active_key, get_last_used_at, ActiveKey, OnchainEventStore,
+};
 use async_trait::async_trait;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -47,26 +52,45 @@ pub trait ActiveSignerLookup: Send + Sync {
     async fn is_active_signer(&self, fid: u64, signer_pubkey: &[u8]) -> bool;
 }
 
-/// `OnchainEventStore`-backed implementation. Holds a clone of an existing
-/// store, so it shares the underlying RocksDB with the rest of the engine.
+/// Store-backed implementation for onchain and gasless keys. The historical
+/// type name is retained for callers; both key indexes share this RocksDB.
 pub struct OnchainSignerLookup {
-    store: OnchainEventStore,
+    stores: HashMap<u32, OnchainEventStore>,
 }
 
 impl OnchainSignerLookup {
     pub fn new(store: OnchainEventStore) -> Self {
-        Self { store }
+        Self {
+            stores: [(1, store)].into(),
+        }
+    }
+
+    pub fn for_shards(stores: HashMap<u32, OnchainEventStore>) -> Self {
+        Self { stores }
     }
 }
 
 #[async_trait]
 impl ActiveSignerLookup for OnchainSignerLookup {
     async fn is_active_signer(&self, fid: u64, signer_pubkey: &[u8]) -> bool {
-        match self
-            .store
-            .get_active_signer(fid, signer_pubkey.to_vec(), None)
-        {
-            Ok(Some(_)) => true,
+        use crate::mempool::routing::MessageRouter;
+        let store = if self.stores.len() == 1 {
+            self.stores.values().next()
+        } else {
+            let shard = (crate::mempool::routing::ShardRouter {})
+                .route_fid(fid, self.stores.len().max(1) as u32);
+            self.stores.get(&shard)
+        };
+        let Some(store) = store else {
+            return false;
+        };
+        let txn = RocksDbTransactionBatch::new();
+        match get_active_key(store, &store.db, &txn, fid, signer_pubkey) {
+            Ok(Some(ActiveKey::OnChain)) => true,
+            Ok(Some(ActiveKey::Gasless { ttl_seconds, .. })) if ttl_seconds > 0 => {
+                matches!(get_last_used_at(&store.db, &txn, fid, signer_pubkey),
+                    Ok(Some(last)) if u64::from(last).saturating_add(u64::from(ttl_seconds)) >= FarcasterTime::current().to_u64())
+            }
             _ => false,
         }
     }
@@ -104,6 +128,7 @@ pub struct VerifiedJfs {
 
 #[derive(Debug, Deserialize)]
 struct JfsHeader {
+    #[serde(with = "crate::native_registration::serde_fid")]
     fid: u64,
     #[serde(rename = "type")]
     key_type: String,
@@ -277,6 +302,96 @@ mod tests {
             "type": key_type,
             "key": format!("0x{}", pubkey_hex),
         })
+    }
+
+    #[tokio::test]
+    async fn native_gasless_jfs_checks_expiry_revocation_and_fid() {
+        use crate::proto::{self, message_data::Body};
+        use crate::storage::store::account::{
+            delete_gasless_key_record, init_last_used_at, put_gasless_key_record, GaslessKeyRecord,
+        };
+        let (engine, _dir) = crate::storage::store::test_helper::new_engine().await;
+        let stores = engine.get_stores();
+        let lookup = Arc::new(OnchainSignerLookup::new(stores.onchain_event_store.clone()));
+        let fid = crate::native_registration::FIRST_NATIVE_FID;
+        let key = SigningKey::generate(&mut OsRng);
+        let public = key.verifying_key().to_bytes();
+        let mut txn = RocksDbTransactionBatch::new();
+        put_gasless_key_record(
+            &stores.db,
+            &mut txn,
+            fid,
+            &public,
+            &GaslessKeyRecord {
+                message: Some(proto::Message {
+                    data: Some(proto::MessageData {
+                        body: Some(Body::KeyAddBody(proto::KeyAddBody {
+                            ttl: 3600,
+                            scopes: vec![proto::MessageType::CastAdd as i32],
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                request_fid: fid,
+            },
+        )
+        .unwrap();
+        init_last_used_at(
+            &stores.db,
+            &mut txn,
+            fid,
+            &public,
+            FarcasterTime::current().to_u64() as u32,
+        )
+        .unwrap();
+        stores.db.commit(txn).unwrap();
+        let envelope = make_envelope(
+            &key,
+            json!({ "fid": fid.to_string(), "type": "app_key", "key": format!("0x{}", hex::encode(public)) }),
+            json!({ "event": "miniapp_added" }),
+        );
+        assert_eq!(verify(&envelope, lookup.clone()).await.unwrap().fid, fid);
+        let (other, _other_dir) = crate::storage::store::test_helper::new_engine().await;
+        use crate::mempool::routing::MessageRouter;
+        let owner = (crate::mempool::routing::ShardRouter {}).route_fid(fid, 2);
+        let lookup = Arc::new(OnchainSignerLookup::for_shards(
+            [
+                (owner, stores.onchain_event_store.clone()),
+                (3 - owner, other.get_stores().onchain_event_store),
+            ]
+            .into(),
+        ));
+        assert!(verify(&envelope, lookup.clone()).await.is_ok());
+        assert!(!lookup.is_active_signer(fid + 1, &public).await);
+
+        let mut txn = RocksDbTransactionBatch::new();
+        init_last_used_at(&stores.db, &mut txn, fid, &public, 0).unwrap();
+        stores.db.commit(txn).unwrap();
+        assert!(matches!(
+            verify(&envelope, lookup.clone()).await,
+            Err(JfsError::SignerNotActive)
+        ));
+
+        let mut txn = RocksDbTransactionBatch::new();
+        init_last_used_at(
+            &stores.db,
+            &mut txn,
+            fid,
+            &public,
+            FarcasterTime::current().to_u64() as u32,
+        )
+        .unwrap();
+        stores.db.commit(txn).unwrap();
+        assert!(verify(&envelope, lookup.clone()).await.is_ok());
+        let mut txn = RocksDbTransactionBatch::new();
+        delete_gasless_key_record(&stores.db, &mut txn, fid, &public).unwrap();
+        stores.db.commit(txn).unwrap();
+        assert!(matches!(
+            verify(&envelope, lookup).await,
+            Err(JfsError::SignerNotActive)
+        ));
     }
 
     #[tokio::test]

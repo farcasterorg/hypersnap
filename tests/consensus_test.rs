@@ -128,6 +128,9 @@ struct MockChainState {
     ens_names: Mutex<HashMap<String, Vec<u8>>>,
     /// `(contract address, claim signature)` pairs the contract accepts.
     contract_signatures: Mutex<HashSet<(Vec<u8>, Vec<u8>)>>,
+    no_rpc_clients: std::sync::atomic::AtomicBool,
+    fork_from_genesis: std::sync::atomic::AtomicBool,
+    pause_block_receivers: std::sync::atomic::AtomicBool,
 }
 
 impl MockChainState {
@@ -143,6 +146,12 @@ impl MockChainState {
 
     fn chain_clients(self: &Arc<Self>) -> ChainClients {
         let mut chain_api_map: HashMap<Chain, Box<dyn ChainAPI>> = HashMap::new();
+        if self
+            .no_rpc_clients
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return ChainClients { chain_api_map };
+        }
         for chain in [Chain::EthMainnet, Chain::BaseMainnet] {
             chain_api_map.insert(chain, Box::new(MockChainClient(self.clone())));
         }
@@ -275,6 +284,10 @@ struct NodeForTest {
     keep_db_on_drop: bool,
     peer_id: PeerId,
     peer_blocklist: Arc<Mutex<HashSet<PeerId>>>,
+    gossip_tx: mpsc::Sender<GossipEvent<SnapchainValidatorContext>>,
+    // Test-only dispatch filter; no fault injection is added to the production node.
+    drop_prevote: Arc<Mutex<Option<Height>>>,
+    dropped_prevote: Arc<Mutex<Option<proto::ConsensusMessage>>>,
     /// Shared `MyHubService` so the HTTP smoke test can boot an HTTP server
     /// against the same underlying stores + mempool wiring as the gRPC server.
     hub_service: Arc<MyHubService>,
@@ -558,6 +571,7 @@ impl NodeForTest {
         keep_db_on_drop: bool,
         direct_peers: Option<String>,
         chain_state: Arc<MockChainState>,
+        discovery: Option<snapchain::network::discovery::Config>,
     ) -> Self {
         let statsd_client = StatsdClientWrapper::new(
             cadence::StatsdClient::builder("", cadence::NopMetricSink {}).build(),
@@ -569,10 +583,22 @@ impl NodeForTest {
         if let Some(direct) = direct_peers {
             config = config.with_direct_peers(direct);
         }
+        if let Some(discovery) = discovery {
+            config.discovery = discovery;
+            // Test DHT discovery, rather than frequent contact-info advertisements.
+            config.contact_info_interval = std::time::Duration::from_secs(3600);
+        }
 
         let mut consensus_config = snapchain::consensus::consensus::Config::default();
         consensus_config =
             consensus_config.with((1..=num_shards).collect(), validator_sets.clone());
+        if chain_state
+            .fork_from_genesis
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            consensus_config.native_registration.activation_heights =
+                (0..=num_shards).map(|s| (s.to_string(), 1)).collect();
+        }
         consensus_config.block_time = time::Duration::from_millis(250);
         // TODO(aditi): We need to figure out the right values for these timeouts. 1s (default) is long, but these are too short.
         // consensus_config.propose_time = time::Duration::from_millis(250);
@@ -752,6 +778,12 @@ impl NodeForTest {
         join_handles.push(handle);
 
         for shard_id in 1..num_shards + 1 {
+            if chain_state
+                .pause_block_receivers
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                continue;
+            }
             let senders = node.shard_senders.get(&shard_id).unwrap();
             let mut block_receiver = BlockReceiver {
                 shard_id: shard_id,
@@ -761,10 +793,7 @@ impl NodeForTest {
                 system_tx: system_tx.clone(),
                 event_rx: senders.events_tx.subscribe(),
                 validator_sets: consensus_config.to_stored_validator_sets(shard_id),
-                config: block_receiver::Config {
-                    enabled: true,
-                    ..block_receiver::Config::default()
-                },
+                config: block_receiver::Config::default(),
                 statsd: statsd_client.clone(),
             };
             let handle = tokio::spawn(async move { block_receiver.run().await });
@@ -772,11 +801,40 @@ impl NodeForTest {
         }
 
         let node_for_dispatch = node.clone();
+        let drop_prevote = Arc::new(Mutex::new(None::<Height>));
+        let dropped_prevote = Arc::new(Mutex::new(None::<proto::ConsensusMessage>));
+        let drop_filter = drop_prevote.clone();
+        let dropped = dropped_prevote.clone();
         let handle = tokio::spawn(async move {
             loop {
                 if let Some(system_event) = system_rx.recv().await {
                     match system_event {
                         SystemMessage::MalachiteNetwork(event_shard, event) => {
+                            if let informalsystems_malachitebft_network::Event::Message(
+                                informalsystems_malachitebft_network::Channel::Consensus,
+                                _,
+                                bytes,
+                            ) = &event
+                            {
+                                use prost::Message as _;
+                                if let Ok(message) = proto::ConsensusMessage::decode(bytes.clone())
+                                {
+                                    if let Some(proto::consensus_message::ConsensusMessage::Vote(
+                                        vote,
+                                    )) = &message.consensus_message
+                                    {
+                                        let mut filter = drop_filter.lock();
+                                        if filter.is_some()
+                                            && *filter == vote.height
+                                            && vote.r#type == proto::VoteType::Prevote as i32
+                                        {
+                                            *filter = None;
+                                            *dropped.lock() = Some(message);
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
                             node_for_dispatch.dispatch(event_shard, event);
                         }
                         SystemMessage::Mempool(req) => {
@@ -817,6 +875,9 @@ impl NodeForTest {
             keep_db_on_drop,
             peer_id,
             peer_blocklist,
+            gossip_tx,
+            drop_prevote,
+            dropped_prevote,
             hub_service,
             boot_resub_done,
             direct_peer_force_bounce_count,
@@ -959,6 +1020,7 @@ pub struct TestNetwork {
     /// `Some(...)` by `enable_all_to_all_direct_peers` so both `start` and
     /// `restart` carry the same config across the validator's lifetime.
     direct_peers_per_node: Vec<Option<String>>,
+    sparse_discovery: bool,
     /// L1/Base state shared by every validator's chain clients.
     chain_state: Arc<MockChainState>,
 }
@@ -1050,6 +1112,7 @@ impl TestNetwork {
             read_nodes: vec![],
             test_fids: HashMap::new(),
             direct_peers_per_node: vec![None; num_validator_nodes as usize],
+            sparse_discovery: false,
             chain_state: Arc::new(MockChainState::default()),
         }
     }
@@ -1102,6 +1165,21 @@ impl TestNetwork {
             .join(",")
     }
 
+    fn discovery_for(&self, index: usize) -> Option<snapchain::network::discovery::Config> {
+        self.sparse_discovery.then(|| {
+            let seed = if index == 0 { 1 } else { 0 };
+            snapchain::network::discovery::Config {
+                enabled: true,
+                bootstrap_peers: vec![format!(
+                    "{}/p2p/{}",
+                    self.gossip_addresses[seed],
+                    peer_id_from_keypair(&self.keypairs[seed])
+                )],
+                ..Default::default()
+            }
+        })
+    }
+
     async fn start_validator_node(&mut self, index: u32) {
         let keypair = self.keypairs[index as usize].clone();
         let gossip_address = self.gossip_addresses[index as usize].clone();
@@ -1113,12 +1191,17 @@ impl TestNetwork {
             grpc_port,
             &self.validator_sets,
             gossip_address,
-            self.gossip_addresses.join(","),
+            if self.sparse_discovery {
+                String::new()
+            } else {
+                self.gossip_addresses.join(",")
+            },
             None,
             None,
             false,
             direct_peers,
             self.chain_state.clone(),
+            self.discovery_for(index as usize),
         )
         .await;
         // Pad the slot vector if needed and place the node at its assigned index.
@@ -1173,12 +1256,17 @@ impl TestNetwork {
             grpc_port,
             &self.validator_sets,
             new_gossip_address,
-            bootstrap,
+            if self.sparse_discovery {
+                String::new()
+            } else {
+                bootstrap
+            },
             None,
             None,
             false,
             direct_peers,
             self.chain_state.clone(),
+            self.discovery_for(index),
         )
         .await;
         while self.nodes.len() <= index {
@@ -1229,6 +1317,7 @@ impl TestNetwork {
             false, // resume's lifetime ends with the test, default cleanup is fine
             direct_peers,
             self.chain_state.clone(),
+            self.discovery_for(index),
         )
         .await;
         while self.nodes.len() <= index {
@@ -1538,9 +1627,10 @@ impl TestNetwork {
 
     /// Like `register_fid`, but binds the FID's on-chain custody to a real
     /// Ethereum signer so KEY_ADD's EIP-712 recovery (which checks the
-    /// recovered address against the on-chain custody) succeeds. Returns the
-    /// generated Ed25519 signer so callers that need to sign non-gasless
-    /// messages keep working.
+    /// recovered address against the on-chain custody) succeeds. Seed every
+    /// validator because on-chain events are not gossiped and tests may have
+    /// no chain listeners. Returns the generated Ed25519 signer so callers
+    /// that need to sign non-gasless messages keep working.
     pub async fn register_fid_with_eth_custody(
         &mut self,
         fid: u64,
@@ -1571,21 +1661,22 @@ impl TestNetwork {
             ),
         ];
 
-        for event in on_chain_events {
-            let result = self
-                .first_live_node()
-                .add_message(
-                    MempoolMessage::OnchainEvent(event),
-                    MempoolSource::Local,
-                    None,
-                )
-                .await;
-            assert!(
-                result.is_ok(),
-                "Failed to register FID {} with eth custody: {:?}",
-                fid,
-                result.err()
-            );
+        for node in self.live_nodes() {
+            for event in &on_chain_events {
+                let result = node
+                    .add_message(
+                        MempoolMessage::OnchainEvent(event.clone()),
+                        MempoolSource::Local,
+                        None,
+                    )
+                    .await;
+                assert!(
+                    result.is_ok(),
+                    "Failed to register FID {} with eth custody: {:?}",
+                    fid,
+                    result.err()
+                );
+            }
         }
 
         self.test_fids.insert(fid, (signer.clone(), address));
@@ -2526,6 +2617,49 @@ async fn test_warm_restart() {
     assert_blocks_match_across_validators(&network);
 }
 
+/// Production has six online validators in an eight-member set: a restart
+/// temporarily removes quorum, so the remaining validators cannot advance
+/// past the missing member as the four-validator restart test allows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[serial]
+async fn test_six_of_eight_warm_restart_all_shards() {
+    if std::env::var_os("RUST_LOG").is_some() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init();
+    }
+    let mut network = TestNetwork::create(8, 2).await;
+    let online: [usize; 6] = [0, 1, 2, 3, 4, 5];
+    for index in online {
+        network.start_validator_node(index as u32).await;
+    }
+    network
+        .wait_for_block_on_subset(&online, 3, time::Duration::from_secs(60))
+        .await
+        .expect("six-of-eight network failed to start");
+    for index in [0, 1, 2] {
+        let block_target = network.max_block_height() + 3;
+        let shard_targets = [
+            network.max_shard_height(1) + 3,
+            network.max_shard_height(2) + 3,
+        ];
+        let (global, shards) = network.pause_validator_node(index).await;
+        time::sleep(time::Duration::from_secs(2)).await;
+        network.resume_validator_node(index, global, shards).await;
+        network
+            .wait_for_block_on_subset(&online, block_target, time::Duration::from_secs(60))
+            .await
+            .expect("block shard failed to recover after a quorum-losing restart");
+        for (shard, target) in [(1, shard_targets[0]), (2, shard_targets[1])] {
+            network
+                .wait_for_shard_chunk(shard, target)
+                .await
+                .expect("data shard failed to recover after a quorum-losing restart");
+        }
+    }
+    assert_blocks_match_across_validators(&network);
+}
+
 /// Subscribe to the gRPC HubEvent stream on validator 1, submit a cast on
 /// validator 0, and assert the corresponding `MERGE_MESSAGE` event is delivered
 /// over the wire within budget.
@@ -2762,6 +2896,54 @@ async fn test_validator_set_rotation() {
         v3_signed_after_rotation, 0,
         "validator 3 should not sign shard 1 chunks at or after rotation height {rotation_height}, but signed {v3_signed_after_rotation}"
     );
+}
+
+/// A future validator catches up through certified sync while the old set is
+/// active, then produces the first block of its own set without restarting.
+#[tokio::test]
+#[serial]
+async fn test_future_validator_syncs_then_activates_without_restart() {
+    let rotation_height = 20;
+    let mut network = TestNetwork::create_with_validator_sets(
+        4,
+        1,
+        vec![
+            ValidatorSetConfig {
+                effective_at: 0,
+                validator_public_keys: vec!["idx:0".into(), "idx:1".into(), "idx:2".into()],
+                shard_ids: vec![1],
+            },
+            ValidatorSetConfig {
+                effective_at: rotation_height,
+                validator_public_keys: vec!["idx:3".into()],
+                shard_ids: vec![1],
+            },
+        ],
+    )
+    .await;
+    network.enable_all_to_all_direct_peers();
+    network.start_validators().await;
+    network
+        .wait_for_shard_chunk(1, (rotation_height + 5) as usize)
+        .await
+        .expect("future validator failed to sync or activate");
+
+    let future_key = network.keypairs[3].public().to_bytes().to_vec();
+    let stores = &network
+        .first_live_node()
+        .shard_stores()
+        .get(&1)
+        .unwrap()
+        .shard_store;
+    for height in 1..=rotation_height + 5 {
+        let chunk = stores.get_chunk_by_height(height).unwrap().unwrap();
+        let signatures = &chunk.commits.as_ref().unwrap().signatures;
+        assert_eq!(
+            signatures.iter().any(|s| s.signer == future_key),
+            height >= rotation_height,
+            "incorrect participation at height {height}"
+        );
+    }
 }
 
 /// HTTP server end-to-end: stand up the production HTTP layer (axum/hyper +
@@ -4265,4 +4447,356 @@ async fn test_validators_do_not_sync_from_non_validators() {
         .wait_for_shard_chunk(1, network.max_shard_height(1))
         .await
         .expect("late validator did not catch up");
+}
+
+/// Six online validators out of eight, one seed per node, no explicit peers,
+/// with a deliberately dropped initial prevote on the block shard.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[serial]
+async fn test_discovery_sparse_eight_validators_two_offline_and_lost_prevote() {
+    if std::env::var_os("RUST_LOG").is_some() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init();
+    }
+    let mut network = TestNetwork::create(8, 2).await;
+    network.sparse_discovery = true;
+    // Validators 6 and 7 participate in the set but never start their processes.
+    for index in 0..6 {
+        network.start_validator_node(index).await;
+    }
+    network
+        .wait_for_block_on_subset(&[0, 1, 2, 3, 4, 5], 3, time::Duration::from_secs(90))
+        .await
+        .expect("sparse discovery did not establish a quorum");
+    // Node 2 was given only node 0's address. Finding node 3 proves discovery
+    // extended the original star rather than merely forwarding gossip via it.
+    let leaf = network.nodes[2].as_ref().unwrap();
+    let other_leaf = network.nodes[3].as_ref().unwrap().peer_id.to_bytes();
+    let deadline = time::Instant::now() + time::Duration::from_secs(45);
+    loop {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        leaf.gossip_tx
+            .send(GossipEvent::GetConnectedPeers(tx))
+            .await
+            .unwrap();
+        let peers = time::timeout(time::Duration::from_secs(2), rx)
+            .await
+            .unwrap()
+            .unwrap();
+        if peers.iter().any(|p| p.peer_id == other_leaf) {
+            break;
+        }
+        assert!(
+            time::Instant::now() < deadline,
+            "DHT did not discover another leaf"
+        );
+        time::sleep(time::Duration::from_millis(250)).await;
+    }
+    let node = network.nodes[0].as_ref().unwrap();
+    assert!(
+        !node.boot_resub_done(),
+        "test must not use explicit GossipSub peers"
+    );
+    let target = Height::new(
+        0,
+        network
+            .live_nodes()
+            .map(|n| n.num_blocks() as u64)
+            .max()
+            .unwrap()
+            + 3,
+    );
+    *node.drop_prevote.lock() = Some(target);
+    network
+        .wait_for_block_on_subset(
+            &[0, 1, 2, 3, 4, 5],
+            target.block_number as usize + 3,
+            time::Duration::from_secs(90),
+        )
+        .await
+        .expect("missing prevote or offline proposer halted six-of-eight quorum");
+    assert!(
+        node.dropped_prevote.lock().is_some(),
+        "fault injection must drop a real prevote"
+    );
+    // Check the actual stored certificates, not just a block count: six unique
+    // members must have signed a precommit for this exact height/round/hash.
+    use informalsystems_malachitebft_core_types::{NilOrVal, Round};
+    use snapchain::core::types::{Address, Vote};
+    for node in network.live_nodes() {
+        let blocks = node
+            .block_stores()
+            .block_store
+            .get_blocks(0, None, &PageOptions::default())
+            .unwrap()
+            .blocks;
+        for block in blocks {
+            let commits = block.commits.as_ref().unwrap();
+            assert_eq!(commits.height, block.header.as_ref().unwrap().height);
+            assert_eq!(commits.value.as_ref().unwrap().hash, block.hash);
+            let signers: HashSet<_> = commits
+                .signatures
+                .iter()
+                .map(|s| s.signer.clone())
+                .collect();
+            assert_eq!(signers.len(), 6);
+            assert_eq!(commits.signatures.len(), 6);
+            for commit in &commits.signatures {
+                let key = network.keypairs[..6]
+                    .iter()
+                    .find(|k| k.public().to_bytes().as_slice() == commit.signer)
+                    .expect("signature must belong to an online validator");
+                let vote = Vote::new_precommit(
+                    commits.height.unwrap(),
+                    Round::from(commits.round),
+                    NilOrVal::Val(commits.value.clone().unwrap()),
+                    Address(key.public().to_bytes()),
+                );
+                assert!(key
+                    .public()
+                    .verify(&vote.to_sign_bytes(), &commit.signature));
+            }
+        }
+    }
+}
+
+/// Exercise the actual submit RPC, gossip to other validators, shard-0 merge,
+/// and data-shard replay with no chain API clients. Existing custody records
+/// are seeded as historical state; there are no live contract-event listeners.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+#[serial]
+async fn test_gasless_rpc_registration_without_chain_clients() {
+    let mut network = TestNetwork::create(3, 2).await;
+    network
+        .chain_state
+        .no_rpc_clients
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(network.chain_state.chain_clients().chain_api_map.is_empty());
+    network.start_validators().await;
+    let fid = 1000;
+    let request_fid = 1003;
+    let custody = alloy_signer_local::PrivateKeySigner::random();
+    let app_custody = alloy_signer_local::PrivateKeySigner::random();
+    let key = factory::signers::generate_signer();
+    network.register_fid_with_eth_custody(fid, &custody).await;
+    network
+        .wait_for_fid_on_block_engine(fid)
+        .await
+        .expect("historical user custody must reach every validator's shard 0");
+    let now = messages_factory::farcaster_time();
+    let add = messages_factory::keys::create_key_add(
+        fid,
+        &custody,
+        request_fid,
+        &app_custody,
+        &key,
+        vec![MessageType::CastAdd],
+        3600,
+        1,
+        now + 1_000_000,
+        Some(now),
+    );
+    // A missing app's custody cannot be fetched from an unconfigured RPC. This
+    // must be a visible rejection, not a success followed by a silent drop.
+    let error = network
+        .first_live_node()
+        .submit_message_via_grpc(add.clone())
+        .await
+        .expect_err("unknown requesting app must fail submission");
+    assert!(
+        error.message().contains("SignedKeyRequest"),
+        "unexpected error: {error}"
+    );
+    network
+        .register_fid_with_eth_custody(request_fid, &app_custody)
+        .await;
+    network
+        .wait_for_fid_on_block_engine(request_fid)
+        .await
+        .expect("historical app custody must reach every validator's shard 0");
+    // Reuse the same nonce: the rejected attempt must not consume it or spend
+    // the KEY_ADD mempool quota. Submit only to one node, exercising gossip.
+    network
+        .first_live_node()
+        .submit_message_via_grpc(add)
+        .await
+        .expect("gasless KEY_ADD must work with no chain clients");
+    let pubkey = key.verifying_key().to_bytes();
+    let router = routing::ShardRouter {};
+    network
+        .wait_for_gasless_key_on_shard(fid, &pubkey, router.route_fid(fid, 2))
+        .await
+        .expect("key must propagate to every validator's data shard");
+    let cast = messages_factory::casts::create_cast_add(
+        fid,
+        "gasless without chain RPC",
+        None,
+        Some(&key),
+    );
+    network
+        .first_live_node()
+        .submit_message_via_grpc(cast.clone())
+        .await
+        .expect("new gasless signer must pass RPC validation");
+    network
+        .wait_for_cast_on_subset(&[0, 1, 2], fid, cast.hash, time::Duration::from_secs(20))
+        .await
+        .expect("all validators must merge a cast from the new signer");
+}
+
+/// Reproduce the production failure: a successful fork KEY_ADD in shard 0 is
+/// absent from the signer API while internal receivers are disabled. Starting
+/// them must recover retained committed events without another broadcast.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+#[serial]
+async fn test_gasless_fork_signer_recovers_when_block_receiver_starts_late() {
+    use snapchain::consensus::validator::{StoredValidatorSet, StoredValidatorSets};
+    use snapchain::core::types::{ShardId, SnapchainShard};
+    use std::sync::atomic::Ordering;
+    let mut network = TestNetwork::create(1, 2).await;
+    network
+        .chain_state
+        .no_rpc_clients
+        .store(true, Ordering::Relaxed);
+    network
+        .chain_state
+        .fork_from_genesis
+        .store(true, Ordering::Relaxed);
+    network
+        .chain_state
+        .pause_block_receivers
+        .store(true, Ordering::Relaxed);
+    network.start_validators().await;
+    let fid = 1000;
+    let request_fid = 1003;
+    let custody = alloy_signer_local::PrivateKeySigner::random();
+    let app = alloy_signer_local::PrivateKeySigner::random();
+    let key = factory::signers::generate_signer();
+    network.register_fid_with_eth_custody(fid, &custody).await;
+    network
+        .register_fid_with_eth_custody(request_fid, &app)
+        .await;
+    network.wait_for_fid_on_block_engine(fid).await.unwrap();
+    network
+        .wait_for_fid_on_block_engine(request_fid)
+        .await
+        .unwrap();
+    let now = messages_factory::farcaster_time();
+    let add = messages_factory::keys::create_key_add(
+        fid,
+        &custody,
+        request_fid,
+        &app,
+        &key,
+        vec![MessageType::CastAdd],
+        3600,
+        1,
+        now + 1_000_000,
+        Some(now),
+    );
+    let node = network.first_live_node();
+    node.submit_message_via_grpc(add).await.unwrap();
+    let pubkey = key.verifying_key().to_bytes();
+    wait_for(
+        || {
+            get_gasless_key_record(
+                &node.node.block_stores.db,
+                &RocksDbTransactionBatch::new(),
+                fid,
+                &pubkey,
+            )
+            .unwrap()
+            .map(|_| ())
+        },
+        time::Duration::from_secs(15),
+        time::Duration::from_millis(50),
+    )
+    .await
+    .expect("key must be committed on shard zero");
+    let mut client = node.client().await;
+    assert_eq!(
+        client
+            .get_signer(proto::SignerRequest {
+                fid,
+                signer: pubkey.to_vec()
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::NotFound
+    );
+    let cast = messages_factory::casts::create_cast_add(
+        fid,
+        "gasless key after internal replay recovery",
+        None,
+        Some(&key),
+    );
+    assert!(
+        node.submit_message_via_grpc(cast.clone()).await.is_err(),
+        "missing data-shard record must reproduce the reported failure"
+    );
+    let (system_tx, mut system_rx) = mpsc::channel(100);
+    let stores = node.node.block_stores.clone();
+    let bridge = tokio::spawn(async move {
+        while let Some(SystemMessage::BlockRequest {
+            block_event_seqnum,
+            block_tx,
+        }) = system_rx.recv().await
+        {
+            let _ = block_tx.send(stores.get_block_by_event_seqnum(block_event_seqnum));
+        }
+    });
+    let (retained_only, _) = broadcast::channel::<Block>(100);
+    let mut receivers = Vec::new();
+    for shard_id in 1..=2 {
+        let stores = node.node.shard_stores[&shard_id].clone();
+        let config = block_receiver::Config::default();
+        let sets = network
+            .validator_sets
+            .iter()
+            .map(|c| StoredValidatorSet::new(SnapchainShard::new(0), c))
+            .collect();
+        let mut receiver = BlockReceiver {
+            shard_id,
+            stores,
+            block_rx: retained_only.subscribe(),
+            mempool_tx: node.mempool_tx.clone(),
+            system_tx: system_tx.clone(),
+            event_rx: node.node.shard_senders[&shard_id].events_tx.subscribe(),
+            validator_sets: StoredValidatorSets::new(0, sets),
+            config,
+            statsd: StatsdClientWrapper::new(
+                cadence::StatsdClient::builder("", cadence::NopMetricSink {}).build(),
+                true,
+            ),
+        };
+        receivers.push(tokio::spawn(async move { receiver.run().await }));
+    }
+    network
+        .wait_for_gasless_key_on_shard(fid, &pubkey, routing::ShardRouter {}.route_fid(fid, 2))
+        .await
+        .expect("startup must recover the already-committed signer");
+    let signer = client
+        .get_signer(proto::SignerRequest {
+            fid,
+            signer: pubkey.to_vec(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .signer
+        .unwrap();
+    assert_eq!(signer.source, proto::SignerSource::Offchain as i32);
+    node.submit_message_via_grpc(cast.clone())
+        .await
+        .expect("recovered signer must authorize casts");
+    network
+        .wait_for_cast_on_subset(&[0], fid, cast.hash, time::Duration::from_secs(15))
+        .await
+        .unwrap();
+    for handle in receivers {
+        handle.abort();
+    }
+    bridge.abort();
 }

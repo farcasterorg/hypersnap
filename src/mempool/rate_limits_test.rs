@@ -225,6 +225,41 @@ mod tests {
     // Ported from upstream snapchain (c292bfd / PR #899).
 
     #[tokio::test]
+    async fn storage_rate_limits_disappear_at_the_local_fork() {
+        let (_engine, mut shard_stores) = setup(limits::zero()).await;
+        shard_stores
+            .get_mut(&1)
+            .unwrap()
+            .native_registration
+            .activation_heights
+            .insert("1".into(), 2);
+        let store = shard_stores[&1].clone();
+        let mut general = RateLimits::new(
+            shard_stores.clone(),
+            RateLimitsConfig::default(),
+            statsd_client(),
+            1,
+        );
+        let live = LiveAtRateLimits::new(shard_stores, statsd_client(), 1);
+        assert!(!general.consume_for_fid(FID_FOR_TEST));
+        assert!(!live.consume_for_fid(FID_FOR_TEST));
+        store
+            .shard_store
+            .put_shard_chunk(&crate::proto::ShardChunk {
+                header: Some(crate::proto::ShardHeader {
+                    height: Some(crate::proto::Height::new(1, 1)),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+        for _ in 0..6000 {
+            assert!(general.consume_for_fid(FID_FOR_TEST));
+            assert!(live.consume_for_fid(FID_FOR_TEST));
+        }
+    }
+
+    #[tokio::test]
     async fn live_at_budget_is_separate_from_general_budget() {
         let (mut engine, shard_stores) = setup(Limits {
             casts: 1,

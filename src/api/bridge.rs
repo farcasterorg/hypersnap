@@ -252,6 +252,7 @@ mod tests {
             r#type: HubEventType::MergeMessage as i32,
             id: 1,
             body: Some(hub_event::Body::MergeMessageBody(proto::MergeMessageBody {
+                native_registration: None,
                 message: Some(message),
                 deleted_messages: vec![],
             })),

@@ -116,6 +116,7 @@ message HeartbeatEventBody {
 
 message MergeMessageEventBody {
   Message message = 1;
+  NativeRegistrationRecord native_registration = 2;
 }
 
 // Carries the whole original OnChainEvent (carry-the-original convention,

@@ -39,6 +39,7 @@ enum ChannelOwnerChangeCause {
 message MergeMessageBody {
   Message message = 1;
   repeated Message deleted_messages = 2;
+  NativeRegistrationRecord native_registration = 3;
 }
 
 message MergeFailureBody {

@@ -121,6 +121,11 @@ pub trait HubQueryHandler: Send + Sync {
     /// `include_custody` is set, to the FID it is the custody address of.
     async fn get_fids_by_address(&self, address: &[u8], include_custody: bool) -> Vec<u64>;
 
+    /// Native registry lookup, without scanning legacy IdRegistry events.
+    async fn get_native_fid_by_custody(&self, _address: &[u8]) -> Option<u64> {
+        None
+    }
+
     /// Get username proof.
     async fn get_username_proof(&self, name: &[u8]) -> Option<(u64, String, u64, Vec<u8>)>;
 
@@ -299,6 +304,8 @@ const USER_SEARCH_SCAN_LIMIT: usize = 5_000;
 
 /// How long a hash stays in `missing_casts` after a probe misses it.
 const MISSING_CAST_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+const CAST_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const CAST_PROBE_BUSY: &str = "Cast hash index is rebuilding; retry or supply the author's fid";
 /// Upper bound on hashes held in `missing_casts`.
 const MISSING_CAST_CAPACITY: u64 = 100_000;
 /// Hashes per bulk cast request that may fall back to a full FID probe.
@@ -310,6 +317,12 @@ impl ApiHttpHandler {
     /// Share the migration owner's read handle with feeds and user hydration.
     pub fn social_graph_indexer(&self) -> Option<Arc<SocialGraphIndexer>> {
         self.social_graph.clone()
+    }
+
+    /// Share the writer's generation-aware handle with feed ranking. A second
+    /// MetricsIndexer would retain the generation active when it was opened.
+    pub fn metrics_indexer(&self) -> Option<Arc<MetricsIndexer>> {
+        self.metrics.clone()
     }
 
     /// Create a new handler with optional indexers.
@@ -379,6 +392,9 @@ impl ApiHttpHandler {
         let mut fids = hub.get_fids_by_address(address, false).await;
         if fids.is_empty() {
             fids.extend(custody.get_fid_by_custody_address(address));
+        }
+        if fids.is_empty() {
+            fids.extend(hub.get_native_fid_by_custody(address).await);
         }
         fids
     }
@@ -1836,11 +1852,12 @@ impl ApiHttpHandler {
                     ))
                 }
             };
-            let resolved_fid = self
-                .resolve_cast(&hash, fid_hint, true)
-                .await
-                .and_then(|msg| msg.data.map(|d| d.fid))
-                .unwrap_or(0);
+            let resolved_fid = match self.resolve_cast(&hash, fid_hint, true).await {
+                Ok(message) => message.and_then(|msg| msg.data.map(|d| d.fid)).unwrap_or(0),
+                Err(error) => {
+                    return Ok(Self::error_response(StatusCode::SERVICE_UNAVAILABLE, error))
+                }
+            };
             if resolved_fid == 0 {
                 return Ok(Self::error_response(
                     StatusCode::NOT_FOUND,
@@ -2194,6 +2211,8 @@ impl ApiHttpHandler {
             .unwrap_or_default();
 
         let thread_hash = self.thread_root(msg).await.map(hex::encode);
+        let (format_version, chain) =
+            cast_format(msg).map_or((None, None), |(version, chain)| (Some(version), chain));
 
         Cast {
             object: "cast".to_string(),
@@ -2210,6 +2229,8 @@ impl ApiHttpHandler {
             reactions: CastReactions::default(),
             replies: CastReplies::default(),
             thread_hash,
+            format_version,
+            chain,
             mentioned_profiles,
             mentioned_profiles_ranges,
             mentioned_channels: Vec::new(),
@@ -2340,7 +2361,11 @@ impl ApiHttpHandler {
             }
         };
 
-        if let Some(msg) = self.resolve_cast(&hash, fid, true).await {
+        let resolved = match self.resolve_cast(&hash, fid, true).await {
+            Ok(message) => message,
+            Err(error) => return Ok(Self::error_response(StatusCode::SERVICE_UNAVAILABLE, error)),
+        };
+        if let Some(msg) = resolved {
             let mut cast = self.message_to_cast(&msg).await;
             if let Err(e) = self.attach_cast_metrics(&mut cast, &msg.hash).await {
                 return Ok(Self::error_response(StatusCode::INTERNAL_SERVER_ERROR, &e));
@@ -2378,7 +2403,13 @@ impl ApiHttpHandler {
                 if allow_probe {
                     probes_left -= 1;
                 }
-                if let Some(msg) = self.resolve_cast(&hash, None, allow_probe).await {
+                let resolved = match self.resolve_cast(&hash, None, allow_probe).await {
+                    Ok(message) => message,
+                    Err(error) => {
+                        return Ok(Self::error_response(StatusCode::SERVICE_UNAVAILABLE, error))
+                    }
+                };
+                if let Some(msg) = resolved {
                     let mut cast = self.message_to_cast(&msg).await;
                     if let Err(e) = self.attach_cast_metrics(&mut cast, &msg.hash).await {
                         return Ok(Self::error_response(StatusCode::INTERNAL_SERVER_ERROR, &e));
@@ -2398,10 +2429,9 @@ impl ApiHttpHandler {
     /// True when no FID is known for `hash`, so resolving it would need a
     /// full FID probe.
     fn cast_needs_probe(&self, hash: &[u8]) -> bool {
-        self.cast_hash_index
-            .as_ref()
-            .map_or(true, |idx| idx.get_fid_by_hash(hash).is_none())
-            && !self.missing_casts.contains_key(hash)
+        self.cast_hash_index.as_ref().map_or(true, |idx| {
+            !idx.is_complete() && idx.get_fid_by_hash(hash).is_none()
+        }) && !self.missing_casts.contains_key(hash)
     }
 
     /// Resolve a cast by hash, given an optional caller-supplied author FID.
@@ -2410,15 +2440,18 @@ impl ApiHttpHandler {
     /// lookup. An indexed FID is authoritative, since a hash commits to its
     /// author: a miss there means the cast was removed or pruned. Only when no
     /// FID is indexed, and `allow_probe` is set, does this fall back to probing
-    /// every FID. Probes run one at a time; a hit is written back to the index
-    /// and a miss is remembered in `missing_casts`.
+    /// every FID while the retained-store backfill is incomplete. One probe can
+    /// run at a time, with no waiting queue. A slow probe continues warming the
+    /// cache after the HTTP budget expires; callers get a retryable error.
     async fn resolve_cast(
         &self,
         hash: &[u8],
         fid_param: Option<u64>,
         allow_probe: bool,
-    ) -> Option<crate::proto::Message> {
-        let hub = self.hub_query.read().unwrap().clone()?;
+    ) -> Result<Option<crate::proto::Message>, &'static str> {
+        let Some(hub) = self.hub_query.read().unwrap().clone() else {
+            return Ok(None);
+        };
         let indexed_fid = self
             .cast_hash_index
             .as_ref()
@@ -2426,39 +2459,66 @@ impl ApiHttpHandler {
 
         if let Some(fid) = fid_param.filter(|&f| Some(f) != indexed_fid) {
             if let Some(msg) = hub.get_cast_by_hash(hash, Some(fid)).await {
-                return Some(msg);
+                return Ok(Some(msg));
             }
         }
         if let Some(fid) = indexed_fid {
-            return hub.get_cast_by_hash(hash, Some(fid)).await;
+            return Ok(hub.get_cast_by_hash(hash, Some(fid)).await);
         }
-        if !allow_probe || self.missing_casts.contains_key(hash) {
-            return None;
+        if !allow_probe
+            || self.missing_casts.contains_key(hash)
+            || self
+                .cast_hash_index
+                .as_ref()
+                .is_some_and(|idx| idx.is_complete())
+        {
+            return Ok(None);
         }
 
-        let _probe = self.cast_probe_lock.lock().await;
-        // A probe that finished while this one waited may have settled the hash.
+        let probe = self
+            .cast_probe_lock
+            .clone()
+            .try_lock_owned()
+            .map_err(|_| CAST_PROBE_BUSY)?;
+        // A probe or the background backfill may have just settled the hash.
         if let Some(fid) = self
             .cast_hash_index
             .as_ref()
             .and_then(|idx| idx.get_fid_by_hash(hash))
         {
-            return hub.get_cast_by_hash(hash, Some(fid)).await;
+            return Ok(hub.get_cast_by_hash(hash, Some(fid)).await);
         }
-        if self.missing_casts.contains_key(hash) {
-            return None;
+        if self.missing_casts.contains_key(hash)
+            || self
+                .cast_hash_index
+                .as_ref()
+                .is_some_and(|idx| idx.is_complete())
+        {
+            return Ok(None);
         }
-        match hub.get_cast_by_hash(hash, None).await {
-            Some(msg) => {
-                if let (Some(idx), Some(data)) = (&self.cast_hash_index, &msg.data) {
-                    idx.record(hash, data.fid);
+        let index = self.cast_hash_index.clone();
+        let missing = self.missing_casts.clone();
+        let hash = hash.to_vec();
+        let lookup = tokio::spawn(async move {
+            // Keep the permit until the actual scan ends, even if its HTTP
+            // caller times out or disconnects. Never launch scans in parallel.
+            let _probe = probe;
+            match hub.get_cast_by_hash(&hash, None).await {
+                Some(msg) => {
+                    if let (Some(idx), Some(data)) = (&index, &msg.data) {
+                        idx.record(&hash, data.fid);
+                    }
+                    Some(msg)
                 }
-                Some(msg)
+                None => {
+                    missing.insert(hash, ());
+                    None
+                }
             }
-            None => {
-                self.missing_casts.insert(hash.to_vec(), ());
-                None
-            }
+        });
+        match tokio::time::timeout(CAST_PROBE_TIMEOUT, lookup).await {
+            Ok(Ok(message)) => Ok(message),
+            _ => Err(CAST_PROBE_BUSY),
         }
     }
 
@@ -3141,11 +3201,12 @@ impl ApiHttpHandler {
                 .and_then(|idx| idx.get_fid_by_hash(&hash))
         }) {
             Some(fid) => fid,
-            None => self
-                .resolve_cast(&hash, None, true)
-                .await
-                .and_then(|msg| msg.data.map(|d| d.fid))
-                .unwrap_or(0),
+            None => match self.resolve_cast(&hash, None, true).await {
+                Ok(message) => message.and_then(|msg| msg.data.map(|d| d.fid)).unwrap_or(0),
+                Err(error) => {
+                    return Ok(Self::error_response(StatusCode::SERVICE_UNAVAILABLE, error))
+                }
+            },
         };
         // An unresolved cast has no reactions; skip the hub's own FID probe.
         let messages = if target_fid == 0 {
@@ -3929,6 +3990,20 @@ impl ApiHttpHandler {
         };
 
         let mut body = serde_json::json!({ "indexers": indexers });
+        if let Some(index) = &self.cast_hash_index {
+            let progress = index.backfill_progress();
+            body["cast_hash_backfill"] = serde_json::json!({
+                "complete": progress.complete,
+                "error": progress.error,
+                "sources": progress.sources.iter().map(|source| serde_json::json!({
+                    "shard_id": source.shard_id,
+                    "source_prefix": source.source_prefix,
+                    "complete": source.complete,
+                    "casts_indexed": source.casts_indexed,
+                    "last_fid": source.last_fid,
+                })).collect::<Vec<_>>()
+            });
+        }
         if let Some(metrics) = &self.metrics {
             let dbs = self.shard_dbs.read().unwrap().clone();
             if let Some(dbs) = dbs {
@@ -5087,6 +5162,31 @@ fn format_timestamp(ts: u32) -> String {
         .unwrap_or_else(|| ts.to_string())
 }
 
+/// A cast's `format_version` and `chain`, read from its signed `data_bytes` when present, like the
+/// v1 HTTP API does: a block's `data` before ChainedCasts has neither field. `None` for a message
+/// without a cast body.
+fn cast_format(msg: &crate::proto::Message) -> Option<(u32, Option<types::CastChain>)> {
+    let signed = msg
+        .data_bytes
+        .as_deref()
+        .filter(|bytes| !bytes.is_empty())
+        .and_then(|bytes| crate::storage::store::account::decode_message_data(bytes, None).ok());
+    let Some(crate::proto::message_data::Body::CastAddBody(body)) =
+        &signed.as_ref().or(msg.data.as_ref())?.body
+    else {
+        return None;
+    };
+    let chain = body.chain.as_ref().map(|chain| types::CastChain {
+        root: chain.root.as_ref().map(|root| types::CastId {
+            fid: root.fid,
+            hash: hex::encode(&root.hash),
+        }),
+        index: chain.index,
+        count: chain.count,
+    });
+    Some((body.format_version, chain))
+}
+
 /// Whether a reaction message is a recast.
 fn is_recast(data: &crate::proto::MessageData) -> bool {
     matches!(
@@ -5541,6 +5641,7 @@ mod tests {
         direct_reply_count: u64,
         /// Calls to `get_cast_by_hash` without an FID, i.e. full FID probes.
         probes: std::sync::atomic::AtomicUsize,
+        probe_delay: std::time::Duration,
         /// Live links as (fid, link type, target fid).
         links: Vec<(u64, &'static str, u64)>,
         /// Live reactions as (fid, reaction type, cast hash).
@@ -5561,6 +5662,7 @@ mod tests {
             if fid_hint.is_none() {
                 self.probes
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tokio::time::sleep(self.probe_delay).await;
             }
             self.casts
                 .iter()
@@ -5799,13 +5901,22 @@ mod tests {
         let probes = || mock.probes.load(std::sync::atomic::Ordering::Relaxed);
 
         let missing = [7u8; 20];
-        assert!(handler.resolve_cast(&missing, None, true).await.is_none());
-        assert!(handler.resolve_cast(&missing, None, true).await.is_none());
+        assert!(handler
+            .resolve_cast(&missing, None, true)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(handler
+            .resolve_cast(&missing, None, true)
+            .await
+            .unwrap()
+            .is_none());
         assert_eq!(probes(), 1, "a missed hash is not probed again");
 
         assert!(handler
             .resolve_cast(&[8u8; 20], None, false)
             .await
+            .unwrap()
             .is_none());
         assert_eq!(probes(), 1, "no probe when probing is not allowed");
     }
@@ -5879,13 +5990,142 @@ mod tests {
         handler.set_hub_query(mock.clone());
         let probes = || mock.probes.load(std::sync::atomic::Ordering::Relaxed);
 
-        assert!(handler.resolve_cast(&hash, None, true).await.is_some());
+        assert!(handler
+            .resolve_cast(&hash, None, true)
+            .await
+            .unwrap()
+            .is_some());
         assert_eq!(probes(), 1);
         assert_eq!(index.get_fid_by_hash(&hash), Some(42));
 
         // Later lookups use the indexed FID directly.
-        assert!(handler.resolve_cast(&hash, None, true).await.is_some());
+        assert!(handler
+            .resolve_cast(&hash, None, true)
+            .await
+            .unwrap()
+            .is_some());
         assert_eq!(probes(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_busy_cast_probe_returns_503_without_queueing_or_blocking_fid_lookups() {
+        let handler = ApiHttpHandler::new(None, None, None, None, None, None);
+        let hash = vec![7; 20];
+        let mock = Arc::new(MockHubQuery {
+            cast_lookup: Some(mock_cast(42, hash.clone())),
+            ..Default::default()
+        });
+        handler.set_hub_query(mock.clone());
+        let _busy = handler.cast_probe_lock.lock().await;
+        let response = handler
+            .handle_cast_lookup(&hex::encode(&hash), "hash", None, None)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            !handler.missing_casts.contains_key(&hash),
+            "busy is not a confirmed miss"
+        );
+        let response = handler
+            .handle_cast_lookup(&hex::encode(&hash), "hash", Some(42), None)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(mock.probes.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn test_slow_cast_probe_keeps_its_permit_and_warms_cache_after_http_timeout() {
+        let handler = ApiHttpHandler::new(None, None, None, None, None, None);
+        let mock = Arc::new(MockHubQuery {
+            probe_delay: CAST_PROBE_TIMEOUT + std::time::Duration::from_millis(200),
+            ..Default::default()
+        });
+        handler.set_hub_query(mock.clone());
+        let hash = vec![7; 20];
+        assert!(handler.resolve_cast(&hash, None, true).await.is_err());
+        assert!(handler.resolve_cast(&[8; 20], None, true).await.is_err());
+        assert_eq!(mock.probes.load(std::sync::atomic::Ordering::Relaxed), 1);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !handler.missing_casts.contains_key(&hash) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(handler
+            .resolve_cast(&hash, None, true)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(mock.probes.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_completed_cast_hash_backfill_makes_missing_hashes_cheap() {
+        use crate::storage::db::RocksDB;
+        use crate::storage::store::stores::{StoreLimits, Stores};
+        use crate::storage::trie::merkle_trie::MerkleTrie;
+        use crate::utils::statsd_wrapper::StatsdClientWrapper;
+        let dir = tempfile::tempdir().unwrap();
+        let index = Arc::new(crate::api::cast_hash_index::CastHashIndexer::new(
+            crate::api::config::FeatureConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            RocksDB::open_shard_db(dir.path().to_str().unwrap(), 0),
+        ));
+        let store = Stores::new(
+            RocksDB::open_shard_db(dir.path().to_str().unwrap(), 1),
+            1,
+            MerkleTrie::new().unwrap(),
+            StoreLimits::default(),
+            crate::proto::FarcasterNetwork::Devnet,
+            StatsdClientWrapper::new(
+                cadence::StatsdClient::builder("test", cadence::NopMetricSink).build(),
+                false,
+            ),
+        );
+        let sources = vec![(1, store)];
+        index.prepare_backfill(&sources).unwrap();
+        let (stop, _) = tokio::sync::broadcast::channel(1);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            index.spawn_backfill(sources, stop.subscribe()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(index.is_complete());
+        let known = vec![9; 20];
+        index.record(&known, 42);
+        let handler = ApiHttpHandler::new(None, None, None, Some(index), None, None);
+        let mock = Arc::new(MockHubQuery {
+            casts: vec![mock_cast(42, known.clone())],
+            ..Default::default()
+        });
+        handler.set_hub_query(mock.clone());
+        // Even a busy legacy probe cannot hold up covered-index lookups.
+        let _busy = handler.cast_probe_lock.lock().await;
+        let missing = vec![8; 20];
+        assert!(!handler.cast_needs_probe(&missing));
+        assert_eq!(
+            handler
+                .handle_cast_lookup(&hex::encode(missing), "hash", None, None)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            handler
+                .handle_cast_lookup(&hex::encode(known), "hash", None, None)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(mock.probes.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -6102,6 +6342,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cast_format_version_and_chain_on_v2_casts() {
+        use crate::proto::message_data::Body;
+        use crate::utils::factory::messages_factory::casts;
+        use prost::Message as _;
+
+        fn set_format(
+            msg: &mut crate::proto::Message,
+            format_version: u32,
+            chain: Option<crate::proto::ChainCast>,
+        ) {
+            let Some(Body::CastAddBody(body)) = &mut msg.data.as_mut().unwrap().body else {
+                unreachable!()
+            };
+            body.format_version = format_version;
+            body.chain = chain;
+        }
+        // A cast with `format_version` and `chain`, in its signed `data_bytes` only when `signed`.
+        fn cast(
+            format_version: u32,
+            chain: Option<crate::proto::ChainCast>,
+            signed: bool,
+        ) -> crate::proto::Message {
+            let mut msg = casts::create_cast_add(7, "part", None, None);
+            set_format(&mut msg, format_version, chain);
+            if signed {
+                msg.data_bytes = Some(msg.data.as_ref().unwrap().encode_to_vec());
+                // A block's `data` before ChainedCasts, which has neither field.
+                set_format(&mut msg, 0, None);
+            }
+            msg
+        }
+        async fn lookup(msg: crate::proto::Message) -> serde_json::Value {
+            let hash = hex::encode(&msg.hash);
+            let handler = ApiHttpHandler::new(None, None, None, None, None, None);
+            handler.set_hub_query(Arc::new(MockHubQuery {
+                cast_lookup: Some(msg),
+                ..Default::default()
+            }));
+            let response = handler
+                .handle_cast_lookup(&hash, "hash", Some(7), None)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            collect_json(response).await["cast"].clone()
+        }
+
+        let root = crate::proto::CastId {
+            fid: 7,
+            hash: vec![0x22; 20],
+        };
+        let part = |index| crate::proto::ChainCast {
+            root: (index > 0).then(|| root.clone()),
+            index,
+            count: 3,
+        };
+
+        // A later part, its fields only in `data_bytes`.
+        let json = lookup(cast(1, Some(part(1)), true)).await;
+        assert_eq!(json["format_version"], 1);
+        assert_eq!(
+            json["chain"],
+            serde_json::json!({
+                "root": { "fid": 7, "hash": "22".repeat(20) },
+                "index": 1,
+                "count": 3
+            })
+        );
+        // The first part has no root. Without `data_bytes` the fields come from `data`.
+        let json = lookup(cast(1, Some(part(0)), false)).await;
+        assert_eq!(json["format_version"], 1);
+        assert_eq!(json["chain"], serde_json::json!({ "index": 0, "count": 3 }));
+        // A plain cast says so, so a client can tell it from a node without the fields.
+        for signed in [true, false] {
+            let json = lookup(cast(0, None, signed)).await;
+            assert_eq!(json["format_version"], 0);
+            assert!(json.get("chain").is_none());
+        }
+        // A cast not read from its message (a search result) leaves both out.
+        let json = serde_json::to_value(Cast::default()).unwrap();
+        assert!(json.get("format_version").is_none() && json.get("chain").is_none());
+    }
+
+    #[tokio::test]
     async fn test_user_viewer_context_only_with_viewer_fid() {
         let (followed, follower, viewer) = (10, 11, 20);
         let handler = ApiHttpHandler::new(None, None, None, None, None, None);
@@ -6156,6 +6479,7 @@ mod tests {
         // Build a reply (CastAdd) message
         let reply_msg = crate::proto::Message {
             data: Some(crate::proto::MessageData {
+                native_onboard_body: None,
                 fid: mentioner_fid,
                 r#type: crate::proto::MessageType::CastAdd as i32,
                 timestamp: 1000,
@@ -6191,6 +6515,7 @@ mod tests {
         let target_cast_hash: Vec<u8> = vec![5, 6, 7];
         let reaction_msg = crate::proto::Message {
             data: Some(crate::proto::MessageData {
+                native_onboard_body: None,
                 fid: reactor_fid,
                 r#type: crate::proto::MessageType::ReactionAdd as i32,
                 timestamp: 2000,
@@ -6218,6 +6543,7 @@ mod tests {
         // Build a follow message
         let follow_msg = crate::proto::Message {
             data: Some(crate::proto::MessageData {
+                native_onboard_body: None,
                 fid: follower_fid,
                 r#type: crate::proto::MessageType::LinkAdd as i32,
                 timestamp: 3000,
@@ -6241,6 +6567,7 @@ mod tests {
         // The cast being reacted to (needs text for hydration)
         let target_cast_msg = crate::proto::Message {
             data: Some(crate::proto::MessageData {
+                native_onboard_body: None,
                 fid: target_fid,
                 r#type: crate::proto::MessageType::CastAdd as i32,
                 timestamp: 500,
@@ -6381,6 +6708,7 @@ mod tests {
         handler.set_hub_query(Arc::new(MockHubQuery {
             notifications: vec![quote, recast],
             cast_lookup: Some(mock_cast(target_fid, target_cast_id.hash)),
+            probe_delay: Default::default(),
             direct_reply_count: 0,
             probes: Default::default(),
             casts: vec![],

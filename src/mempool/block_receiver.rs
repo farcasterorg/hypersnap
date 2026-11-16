@@ -27,13 +27,13 @@ const STORE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_CONFIRMATION_RETRIES: u32 = 3;
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(default)]
 pub struct Config {
     #[serde(with = "humantime_serde")]
     pub single_block_confirmation_timeout: Duration,
     #[serde(with = "humantime_serde")]
     pub sync_confirmation_timeout: Duration,
     pub sync_batch_size: u64,
-    pub enabled: bool,
 }
 
 impl Default for Config {
@@ -42,7 +42,6 @@ impl Default for Config {
             single_block_confirmation_timeout: Duration::from_secs(5),
             sync_confirmation_timeout: Duration::from_secs(10),
             sync_batch_size: 500,
-            enabled: false,
         }
     }
 }
@@ -87,6 +86,19 @@ impl BlockReceiver {
     /// store directly is what prevents a lagged or dropped broadcast message from
     /// being mistaken for a real failure — the bug that silently dropped a seqnum and
     /// later wedged the shard.
+    async fn wait_for_fork(&self) {
+        while !self.stores.native_registration.active(
+            self.shard_id,
+            self.stores
+                .shard_store
+                .max_block_number()
+                .unwrap_or(0)
+                .saturating_add(1),
+        ) {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
     fn confirmed_in_store(&self, seqnum: u64) -> bool {
         match self.stores.block_event_store.max_seqnum() {
             Ok(max_seqnum) => max_seqnum >= seqnum,
@@ -167,6 +179,12 @@ impl BlockReceiver {
     ) -> Result<(), BlockReceiverError> {
         info!(start_seqnum, stop_seqnum, "Syncing missing blocks",);
         let mut currrent_seqnum = start_seqnum;
+        if start_seqnum <= crate::native_registration::FORK_EVENT_BASE
+            && stop_seqnum >= crate::native_registration::FORK_EVENT_BASE
+        {
+            self.wait_for_fork().await;
+            currrent_seqnum = crate::native_registration::FORK_EVENT_BASE + 1;
+        }
         while currrent_seqnum <= stop_seqnum {
             let (block_tx, block_rx) = oneshot::channel::<Option<Block>>();
             self.system_tx
@@ -205,8 +223,42 @@ impl BlockReceiver {
 
     pub async fn run(&mut self) {
         info!(shard = self.shard_id.to_string(), "Running block receiver");
+        // A previously disabled receiver can start after signer events have
+        // already committed. Recover from the durable authority immediately;
+        // the broadcast contains only new blocks and cannot supply that history.
+        if let Some(authority) = &self.stores.native_authority {
+            let tip = crate::storage::store::account::BlockEventStore::new(authority.clone())
+                .max_seqnum();
+            if let Ok(tip) = tip {
+                let local = self.stores.block_event_store.max_seqnum().unwrap_or(0);
+                if tip > crate::native_registration::FORK_EVENT_BASE && local < tip {
+                    info!(
+                        shard = self.shard_id,
+                        from = local.saturating_add(1),
+                        to = tip,
+                        "Catching up committed fork block events on startup"
+                    );
+                    if let Err(err) = self
+                        .sync_missing_block_events(local.saturating_add(1), tip)
+                        .await
+                    {
+                        warn!(shard = self.shard_id, %err, "Startup block-event catch-up incomplete; retrying on subsequent blocks");
+                    }
+                }
+            }
+        }
         loop {
-            let block = self.block_rx.recv().await.unwrap();
+            let block = match self.block_rx.recv().await {
+                Ok(block) => block,
+                Err(broadcast::error::RecvError::Lagged(missed)) => {
+                    warn!(
+                        shard = self.shard_id,
+                        missed, "Block broadcast lagged; recovering gaps from committed blocks"
+                    );
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => return,
+            };
             info!(
                 shard = self.shard_id.to_string(),
                 num_events = block.events.len(),
@@ -216,8 +268,23 @@ impl BlockReceiver {
             if block.events.is_empty() {
                 continue;
             }
+            if block
+                .events
+                .first()
+                .is_some_and(|e| e.seqnum() > crate::native_registration::FORK_EVENT_BASE)
+            {
+                self.wait_for_fork().await;
+            }
             // The db is the source of truth, it's possible to read this out of the events_rx channel but delivery over that channel is not reliable (it's a broadcast channel) we may not have the most up to date state.
-            let last_stored_event_seqnum = self.stores.block_event_store.max_seqnum().unwrap();
+            let mut last_stored_event_seqnum = self.stores.block_event_store.max_seqnum().unwrap();
+            if block
+                .events
+                .first()
+                .is_some_and(|e| e.seqnum() > crate::native_registration::FORK_EVENT_BASE)
+            {
+                last_stored_event_seqnum =
+                    last_stored_event_seqnum.max(crate::native_registration::FORK_EVENT_BASE);
+            }
             let last_event_in_block = block.events.last().unwrap();
             if last_event_in_block.seqnum() < last_stored_event_seqnum {
                 continue;

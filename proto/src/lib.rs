@@ -1,5 +1,7 @@
 use core::fmt;
 
+pub mod topics;
+
 pub mod proto {
     tonic::include_proto!("_");
 }

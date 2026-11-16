@@ -226,7 +226,7 @@ impl StorageLendStoreDef {
         // RootPrefix::LendStorageByRecipient = 1 byte
         // make_fid_key(to_fid) = 4 bytes
         // So the lender FID (from_fid) starts at offset 5
-        read_fid_key(key, 5)
+        read_fid_key(key, 1 + super::encoded_fid_len(key, 1).unwrap())
     }
 }
 

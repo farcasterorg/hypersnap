@@ -42,6 +42,19 @@ pub mod tests {
 
     #[async_trait]
     impl HubService for MockHubService {
+        async fn get_native_account(
+            &self,
+            _: Request<crate::proto::NativeAccountRequest>,
+        ) -> Result<Response<crate::proto::NativeRegistrationRecord>, Status> {
+            Err(Status::not_found("native account not found"))
+        }
+        async fn get_native_registration_info(
+            &self,
+            _: Request<crate::proto::GetInfoRequest>,
+        ) -> Result<Response<crate::proto::NativeRegistrationInfo>, Status> {
+            Ok(Response::new(Default::default()))
+        }
+
         async fn submit_message(
             &self,
             _request: Request<Message>,

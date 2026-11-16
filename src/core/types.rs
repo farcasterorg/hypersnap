@@ -371,6 +371,16 @@ impl WellFormedProposal {
     pub fn into_proposal(self) -> FullProposal {
         self.proposal
     }
+
+    /// Re-propose the same block body in a later round. The gossip publisher
+    /// must match the proposer in this envelope, even when the block was
+    /// originally proposed by another validator.
+    pub(crate) fn for_round(&self, round: Round, proposer: Address) -> Result<Self, String> {
+        let mut proposal = self.proposal.clone();
+        proposal.round = round.as_i64();
+        proposal.proposer = proposer.to_vec();
+        Self::try_from(proposal)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
