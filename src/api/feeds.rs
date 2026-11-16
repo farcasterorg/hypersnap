@@ -16,6 +16,7 @@
 //! ```
 
 use crate::api::config::FeedConfig;
+use crate::api::followed_bounds::{newest_timestamp, Bounds, FollowedBounds};
 use crate::api::metrics::MetricsIndexer;
 use crate::api::social_graph::SocialGraphIndexer;
 use crate::proto::{self, Message};
@@ -316,14 +317,54 @@ where
     out
 }
 
+/// A k-way merge head: a cast, or an account not read yet whose casts are all
+/// at or before `bound`.
+enum Head {
+    Cast(TimestampedCast),
+    Unread { bound: u32, fid: u64 },
+}
+
+impl Head {
+    /// Ordered like the casts: an account's casts never sort above its bound.
+    fn key(&self) -> (u32, u64) {
+        match self {
+            Head::Cast(cast) => (cast.timestamp, cast.fid),
+            Head::Unread { bound, fid } => (*bound, *fid),
+        }
+    }
+}
+
+impl PartialEq for Head {
+    fn eq(&self, other: &Self) -> bool {
+        self.key() == other.key()
+    }
+}
+
+impl Eq for Head {}
+
+impl Ord for Head {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key().cmp(&other.key())
+    }
+}
+
+impl PartialOrd for Head {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// The newest `limit` casts `following` made at or before `stop`.
 ///
 /// A k-way merge: it reads each account's newest cast, then reads further
 /// into an account only when its casts reach the top, doubling the read each
 /// time. That is about one read per account plus two per page entry, however
-/// many casts each account has.
+/// many casts each account has. With `bounds` (one per account, `None` when
+/// unknown), an account is only read once its bound reaches the top, so a
+/// page reads about as many accounts as it shows.
 async fn newest_casts<R, Fut>(
     following: &[u64],
+    bounds: Option<&[Option<Bounds>]>,
     stop: u32,
     limit: usize,
     read: &R,
@@ -336,16 +377,55 @@ where
     // it has no more
     let mut sources: HashMap<u64, (usize, VecDeque<TimestampedCast>, bool)> = HashMap::new();
     let mut heap = BinaryHeap::new();
-    let heads = read_followed(following, read, FollowedKind::Casts, None, stop, 1).await;
-    for (&fid, head) in following.iter().zip(heads) {
-        if let Some(cast) = head.into_iter().next() {
-            sources.insert(fid, (1, VecDeque::new(), false));
-            heap.push(cast);
+    let mut unread = vec![];
+    match bounds {
+        None => unread.extend_from_slice(following),
+        Some(bounds) => {
+            for (&fid, bound) in following.iter().zip(bounds) {
+                match bound {
+                    None => unread.push(fid),
+                    Some(Bounds {
+                        cast: Some(bound), ..
+                    }) => heap.push(Head::Unread {
+                        bound: (*bound).min(stop),
+                        fid,
+                    }),
+                    // Has never cast
+                    Some(_) => {}
+                }
+            }
         }
     }
     let mut casts = Vec::with_capacity(limit);
     while casts.len() < limit {
-        let Some(cast) = heap.pop() else { break };
+        if !unread.is_empty() {
+            let heads = read_followed(&unread, read, FollowedKind::Casts, None, stop, 1).await;
+            for (fid, head) in unread.drain(..).zip(heads) {
+                if let Some(cast) = head.into_iter().next() {
+                    sources.insert(fid, (1, VecDeque::new(), false));
+                    heap.push(Head::Cast(cast));
+                }
+            }
+        }
+        let cast = match heap.pop() {
+            None => break,
+            Some(Head::Cast(cast)) => cast,
+            Some(Head::Unread { bound, fid }) => {
+                // The next accounts by bound, as many as the page still
+                // needs, read together. Accounts capped at `stop` sort above
+                // every cast before it, so those are all read at once.
+                let wanted = limit - casts.len();
+                unread.push(fid);
+                while let Some(&Head::Unread { bound: next, fid }) = heap.peek() {
+                    if unread.len() >= wanted && !(bound == stop && next == stop) {
+                        break;
+                    }
+                    unread.push(fid);
+                    heap.pop();
+                }
+                continue;
+            }
+        };
         let fid = cast.fid;
         casts.push(cast);
         let Some((read_so_far, unmerged, done)) = sources.get_mut(&fid) else {
@@ -359,7 +439,7 @@ where
             *read_so_far += unmerged.len();
         }
         if let Some(next) = unmerged.pop_front() {
-            heap.push(next);
+            heap.push(Head::Cast(next));
         }
     }
     casts
@@ -370,9 +450,11 @@ where
 ///
 /// Casts come from `newest_casts`. When there is a full page of them, a
 /// recast older than the last one can't make the page, so recasts are read
-/// back only to it instead of through every like before it.
+/// back only to it instead of through every like before it, and only from
+/// accounts whose recast bound reaches it.
 async fn newest_followed<R, Fut>(
     following: &[u64],
+    bounds: Option<&[Option<Bounds>]>,
     stop: u32,
     limit: usize,
     with_recasts: bool,
@@ -382,20 +464,77 @@ where
     R: Fn(u64, FollowedKind, Option<u32>, u32, usize) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = Vec<TimestampedCast>> + Send,
 {
-    let mut entries = newest_casts(following, stop, limit, &read).await;
+    let mut entries = newest_casts(following, bounds, stop, limit, &read).await;
     let full = entries.len() == limit;
     if with_recasts {
         let floor = match entries.last() {
             Some(last) if entries.len() == limit => Some(last.timestamp),
             _ => None,
         };
-        let recasts = read_followed(following, &read, FollowedKind::Recasts, floor, stop, limit);
+        let recasters: Vec<u64> = match bounds {
+            None => following.to_vec(),
+            Some(bounds) => following
+                .iter()
+                .zip(bounds)
+                .filter(|(_, bound)| match bound {
+                    None => true,
+                    Some(bound) => bound.recast.is_some_and(|t| t >= floor.unwrap_or(0)),
+                })
+                .map(|(&fid, _)| fid)
+                .collect(),
+        };
+        let recasts = read_followed(&recasters, &read, FollowedKind::Recasts, floor, stop, limit);
         entries.extend(recasts.await.into_iter().flatten());
     }
     let mut heap = BinaryHeap::from(entries);
     let newest = take_newest(&mut heap, limit);
     let more = full || newest.len() == limit;
     (newest, more)
+}
+
+/// The timestamps of each account's newest cast message and newest reaction
+/// message, read in parallel tasks; `None` for an account whose read failed.
+async fn read_newest_timestamps<S>(hub: Arc<S>, fids: Vec<u64>) -> Vec<Option<Bounds>>
+where
+    S: proto::hub_service_server::HubService,
+{
+    let tasks: Vec<_> = fids
+        .chunks(FOLLOWED_PER_TASK)
+        .map(|chunk| {
+            let (chunk, hub) = (chunk.to_vec(), hub.clone());
+            tokio::spawn(async move {
+                let mut out = Vec::with_capacity(chunk.len());
+                for fid in chunk {
+                    let request = || {
+                        Request::new(proto::FidTimestampRequest {
+                            fid,
+                            page_size: Some(1),
+                            reverse: Some(true),
+                            ..Default::default()
+                        })
+                    };
+                    let casts = hub.get_all_cast_messages_by_fid(request()).await;
+                    let reactions = hub.get_all_reaction_messages_by_fid(request()).await;
+                    out.push(match (casts, reactions) {
+                        (Ok(casts), Ok(reactions)) => Some(Bounds {
+                            cast: newest_timestamp(casts.get_ref()),
+                            recast: newest_timestamp(reactions.get_ref()),
+                        }),
+                        _ => None,
+                    });
+                }
+                out
+            })
+        })
+        .collect();
+    let mut out = Vec::with_capacity(fids.len());
+    for (task, chunk) in tasks.into_iter().zip(fids.chunks(FOLLOWED_PER_TASK)) {
+        match task.await {
+            Ok(bounds) => out.extend(bounds),
+            Err(_) => out.extend(chunk.iter().map(|_| None)),
+        }
+    }
+    out
 }
 
 /// The newest `n` casts or recasts `fid` made between `start` and `stop`
@@ -617,6 +756,7 @@ pub struct FeedService<S> {
     hub_service: Arc<S>,
     /// One slot per [`TrendingWindow`], in [`TrendingWindow::ALL`] order.
     trending: Vec<TrendingSlot>,
+    followed_bounds: Option<Arc<FollowedBounds>>,
 }
 
 impl<S> FeedService<S>
@@ -639,7 +779,14 @@ where
                 .iter()
                 .map(|_| TrendingSlot::default())
                 .collect(),
+            followed_bounds: None,
         }
+    }
+
+    /// Let the following feed skip accounts that can't reach the page.
+    pub fn with_followed_bounds(mut self, bounds: Option<Arc<FollowedBounds>>) -> Self {
+        self.followed_bounds = bounds;
+        self
     }
 
     /// Check if feeds are enabled.
@@ -831,11 +978,28 @@ where
         };
         let (newest, more) = match stop {
             Some(stop) => {
+                let bounds = match &self.followed_bounds {
+                    Some(bounds) => {
+                        let hub = self.hub_service.clone();
+                        bounds
+                            .get(&following, |fids| read_newest_timestamps(hub, fids))
+                            .await
+                    }
+                    None => None,
+                };
                 let hub = self.hub_service.clone();
                 let read = move |fid, kind, start, stop, n| {
                     read_followed_newest(hub.clone(), fid, kind, start, stop, n)
                 };
-                newest_followed(&following, stop, limit, with_recasts, read).await
+                newest_followed(
+                    &following,
+                    bounds.as_deref(),
+                    stop,
+                    limit,
+                    with_recasts,
+                    read,
+                )
+                .await
             }
             None => (vec![], false),
         };
@@ -1181,10 +1345,12 @@ mod tests {
             entries.sort_by(|a, b| b.cmp(a));
             entries
         };
+        // Store reads, and entries they decode
+        let calls = Arc::new(AtomicUsize::new(0));
         let read = {
-            let (data, reads) = (data.clone(), reads.clone());
+            let (data, reads, calls) = (data.clone(), reads.clone(), calls.clone());
             move |fid, kind, start, stop, n| {
-                let (data, reads) = (data.clone(), reads.clone());
+                let (data, reads, calls) = (data.clone(), reads.clone(), calls.clone());
                 async move {
                     let (casts, reactions) = &*data;
                     let messages = match kind {
@@ -1193,20 +1359,61 @@ mod tests {
                     };
                     let mut out = entries(messages, start, stop);
                     out.truncate(n);
+                    calls.fetch_add(1, Ordering::Relaxed);
                     reads.fetch_add(out.len(), Ordering::Relaxed);
                     out
                 }
             }
         };
         let key = |e: &TimestampedCast| (e.timestamp, e.hash.clone(), e.recaster);
+        // What the store seeds: the newest cast message (removes too) and
+        // the newest reaction of any kind
+        let newest = |messages: Option<&Vec<Message>>| {
+            messages
+                .into_iter()
+                .flatten()
+                .map(|m| m.data.as_ref().unwrap().timestamp)
+                .max()
+        };
+        let exact: Vec<Option<Bounds>> = following
+            .iter()
+            .map(|fid| {
+                Some(Bounds {
+                    cast: newest(data.0.get(fid)),
+                    recast: newest(data.1.get(fid)),
+                })
+            })
+            .collect();
+        // Raised by deleted casts, or unknown after a failed read
+        let loose: Vec<Option<Bounds>> = exact
+            .iter()
+            .map(|bound| match rng.gen_range(0..4) {
+                0 => None,
+                1 => bound.map(|b| Bounds {
+                    cast: Some(b.cast.unwrap_or(0) + rng.gen_range(0..2000)),
+                    recast: Some(b.recast.unwrap_or(0) + rng.gen_range(0..2000)),
+                }),
+                _ => *bound,
+            })
+            .collect();
         for with_recasts in [false, true] {
-            for limit in [1, 7, 25] {
+            for (limit, bounds) in [1, 7, 25]
+                .into_iter()
+                .flat_map(|l| [None, Some(&exact), Some(&loose)].map(|b| (l, b)))
+            {
                 let (casts, reactions) = &*data;
                 let mut stop = u32::MAX;
                 let mut pages = 0;
                 loop {
-                    let (page, more) =
-                        newest_followed(&following, stop, limit, with_recasts, read.clone()).await;
+                    let (page, more) = newest_followed(
+                        &following,
+                        bounds.map(|b| b.as_slice()),
+                        stop,
+                        limit,
+                        with_recasts,
+                        read.clone(),
+                    )
+                    .await;
                     let mut all: BinaryHeap<_> = following
                         .iter()
                         .flat_map(|fid| {
@@ -1221,7 +1428,8 @@ mod tests {
                     assert_eq!(
                         page.iter().map(key).collect::<Vec<_>>(),
                         expected.iter().map(key).collect::<Vec<_>>(),
-                        "with_recasts {with_recasts}, limit {limit}, stop {stop}"
+                        "with_recasts {with_recasts}, limit {limit}, stop {stop}, bounds {}",
+                        bounds.is_some()
                     );
                     pages += 1;
                     if !more {
@@ -1234,9 +1442,21 @@ mod tests {
                 assert!(pages > 3);
             }
         }
+        // With bounds, a first page reads the accounts that reach it, not
+        // every account
+        for with_recasts in [false, true] {
+            let mut accounts = vec![];
+            for bounds in [None, Some(exact.as_slice())] {
+                calls.store(0, Ordering::Relaxed);
+                newest_followed(&following, bounds, u32::MAX, 7, with_recasts, read.clone()).await;
+                accounts.push(calls.load(Ordering::Relaxed));
+            }
+            eprintln!("with_recasts {with_recasts}: {accounts:?} reads without and with bounds");
+            assert!(accounts[1] * 2 < accounts[0], "{accounts:?}");
+        }
         // Casts alone: one read per account, then a few per page entry
         reads.store(0, Ordering::Relaxed);
-        newest_followed(&following, u32::MAX, 25, false, read.clone()).await;
+        newest_followed(&following, None, u32::MAX, 25, false, read.clone()).await;
         let cast_reads = reads.load(Ordering::Relaxed);
         assert!(cast_reads <= following.len() + 4 * 25, "{cast_reads}");
         // Reading 25 casts and 25 recasts from every account, as the feed
@@ -1250,7 +1470,7 @@ mod tests {
             })
             .sum();
         reads.store(0, Ordering::Relaxed);
-        newest_followed(&following, u32::MAX, 25, true, read.clone()).await;
+        newest_followed(&following, None, u32::MAX, 25, true, read.clone()).await;
         let reads = reads.load(Ordering::Relaxed);
         eprintln!("read {cast_reads} casts alone, {reads} with recasts; a page from each account is {page_from_each}");
         assert!(reads * 3 < page_from_each);
