@@ -1043,6 +1043,7 @@ impl BlockEngine {
         // (see matching comment in `ShardEngine::validate_user_message`).
         let msg_type = MessageType::try_from(message_data.r#type).unwrap_or(MessageType::None);
         let mut gasless_ttl_for_bump: Option<u32> = None;
+        let mut gasless_ttl_slides = true;
         let is_key_message = msg_type == MessageType::KeyAdd || msg_type == MessageType::KeyRemove;
         if is_key_message && !version.is_enabled(ProtocolFeature::GaslessSigners) {
             return Err(MessageValidationError::InvalidMessageType);
@@ -1067,9 +1068,18 @@ impl BlockEngine {
             // Capture gasless ttl for the sliding-expiry bump below. Matches
             // `ShardEngine::validate_user_message` — the `ttl > 0` guard is defense in depth
             // since `validate_key_add_body` rejects `ttl == 0` for gasless keys.
-            if let crate::storage::store::account::ActiveKey::Gasless { ttl_seconds, .. } =
-                active_key
+            if let crate::storage::store::account::ActiveKey::Gasless {
+                ttl_seconds,
+                sign_in_added_at,
+                ..
+            } = active_key
             {
+                // Keys authorized by a sign-in message expire a fixed time after they were
+                // added; using them does not extend the window.
+                gasless_ttl_slides = !crate::storage::store::account::is_fixed_expiry_sign_in_key(
+                    sign_in_added_at,
+                    self.network,
+                );
                 if ttl_seconds > 0 {
                     gasless_ttl_for_bump = Some(ttl_seconds);
                 }
@@ -1275,7 +1285,7 @@ impl BlockEngine {
         // `current_block_timestamp` unit / error-handling rationale.
         if let Some(ttl) = gasless_ttl_for_bump {
             let current_block_timestamp = timestamp.to_u64();
-            crate::storage::store::account::check_and_bump_last_used_at(
+            crate::storage::store::account::check_last_used_at(
                 &self.stores.db,
                 txn_batch,
                 message_data.fid,
@@ -1283,6 +1293,7 @@ impl BlockEngine {
                 ttl,
                 message_data.timestamp,
                 current_block_timestamp,
+                gasless_ttl_slides,
             )
             .map_err(MessageValidationError::HubError)?;
         }
@@ -1334,17 +1345,22 @@ impl BlockEngine {
         block_version: EngineVersion,
     ) -> Result<Vec<proto::HubEvent>, MessageValidationError> {
         let msg_type = message.msg_type();
-        let gasless_enabled = if matches!(msg_type, MessageType::KeyAdd | MessageType::KeyRemove) {
-            let ts = message
-                .data
-                .as_ref()
-                .ok_or(MessageValidationError::NoMessageData)?
-                .timestamp;
-            let version = EngineVersion::version_for(&FarcasterTime::new(ts as u64), self.network);
-            version.is_enabled(ProtocolFeature::GaslessSigners)
-        } else {
-            false
-        };
+        let (gasless_enabled, sign_in_authorization_enabled) =
+            if matches!(msg_type, MessageType::KeyAdd | MessageType::KeyRemove) {
+                let ts = message
+                    .data
+                    .as_ref()
+                    .ok_or(MessageValidationError::NoMessageData)?
+                    .timestamp;
+                let version =
+                    EngineVersion::version_for(&FarcasterTime::new(ts as u64), self.network);
+                (
+                    version.is_enabled(ProtocolFeature::GaslessSigners),
+                    version.is_enabled(ProtocolFeature::SignInKeyAuthorization),
+                )
+            } else {
+                (false, false)
+            };
         match msg_type {
             MessageType::LendStorage => {
                 let ts = message
@@ -1365,22 +1381,26 @@ impl BlockEngine {
             MessageType::KeyAdd if gasless_enabled => {
                 // BlockEngine is the admission path — full validation, including the
                 // request_fid IdRegister + custody match.
-                Ok(vec![crate::storage::store::account::merge_key_add(
+                Ok(vec![
+                    crate::storage::store::account::merge_key_add_with_options(
+                        &self.stores.db,
+                        &self.stores.onchain_event_store,
+                        message,
+                        txn_batch,
+                        false,
+                        sign_in_authorization_enabled,
+                    )?,
+                ])
+            }
+            MessageType::KeyRemove if gasless_enabled => Ok(vec![
+                crate::storage::store::account::merge_key_remove_with_options(
                     &self.stores.db,
                     &self.stores.onchain_event_store,
                     message,
                     txn_batch,
-                    false,
-                )?])
-            }
-            MessageType::KeyRemove if gasless_enabled => {
-                Ok(vec![crate::storage::store::account::merge_key_remove(
-                    &self.stores.db,
-                    &self.stores.onchain_event_store,
-                    message,
-                    txn_batch,
-                )?])
-            }
+                    sign_in_authorization_enabled,
+                )?,
+            ]),
             MessageType::VerificationAddEthAddress | MessageType::VerificationRemove
                 if block_version.is_enabled(ProtocolFeature::VerificationsOnShardZero) =>
             {

@@ -354,6 +354,25 @@ pub struct KeyAddBody {
     pub registration_tx_hash: Vec<u8>,
     pub scopes: Vec<String>,
     pub ttl: u32,
+    // Present only for keys authorized by a sign-in message (authorization type 200), so the JSON
+    // for custody-authorized keys is unchanged.
+    #[serde(
+        rename = "authorizationType",
+        default,
+        skip_serializing_if = "is_default_key_add_authorization"
+    )]
+    pub authorization_type: u32,
+    #[serde(
+        with = "serdehex",
+        rename = "authorizationMessage",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub authorization_message: Vec<u8>,
+}
+
+fn is_default_key_add_authorization(authorization_type: &u32) -> bool {
+    *authorization_type <= 1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -366,6 +385,14 @@ pub struct KeyRemoveBody {
     pub signature_type: u32,
     pub deadline: u32,
     pub nonce: u32,
+    // Present only for removals authorized by a sign-in message (signature type 200).
+    #[serde(
+        with = "serdehex",
+        rename = "authorizationMessage",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub authorization_message: Vec<u8>,
 }
 
 #[allow(non_camel_case_types)]
@@ -2817,6 +2844,8 @@ fn map_proto_key_add_body_to_json_key_add_body(
         registration_tx_hash: key_add_body.registration_tx_hash,
         scopes,
         ttl: key_add_body.ttl,
+        authorization_type: key_add_body.authorization_type,
+        authorization_message: key_add_body.authorization_message,
     })
 }
 
@@ -2829,6 +2858,7 @@ fn map_proto_key_remove_body_to_json_key_remove_body(
         signature_type: key_remove_body.signature_type,
         deadline: key_remove_body.deadline,
         nonce: key_remove_body.nonce,
+        authorization_message: key_remove_body.authorization_message,
     })
 }
 
@@ -6556,6 +6586,8 @@ mod tests {
             registration_tx_hash: vec![0x66; 32],
             scopes: vec![MessageType::CastAdd as i32, MessageType::ReactionAdd as i32],
             ttl: 86_400,
+            authorization_type: 0,
+            authorization_message: vec![],
         };
         let json = map_proto_message_data_to_json_message_data(sample_message_data(
             Body::KeyAddBody(proto_body),
@@ -6783,6 +6815,7 @@ mod tests {
             signature_type: 2,
             deadline: 1_700_000_500,
             nonce: 7,
+            authorization_message: vec![],
         };
         let json = map_proto_message_data_to_json_message_data(sample_message_data(
             Body::KeyRemoveBody(proto_body),
@@ -6825,6 +6858,8 @@ mod tests {
             registration_tx_hash: vec![],
             scopes: vec![MessageType::CastAdd as i32, 9999],
             ttl: 1,
+            authorization_type: 0,
+            authorization_message: vec![],
         };
         let json = map_proto_message_data_to_json_message_data(sample_message_data(
             Body::KeyAddBody(proto_body),

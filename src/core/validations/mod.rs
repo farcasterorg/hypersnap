@@ -9,6 +9,7 @@ pub mod key;
 pub mod link;
 pub mod message;
 pub mod reaction;
+pub mod sign_in;
 pub mod verification;
 
 #[cfg(test)]

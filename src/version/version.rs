@@ -32,6 +32,7 @@ pub enum EngineVersion {
     V22 = 22,
     V23 = 23,
     V24 = 24,
+    V25 = 25,
 }
 
 pub enum ProtocolFeature {
@@ -71,6 +72,10 @@ pub enum ProtocolFeature {
     UniqueOnchainEventTrieKeys,
     // Shard and block headers commit to their transactions through `transactions_root`.
     HeaderTransactionsRoot,
+    // A gasless KEY_ADD may be authorized by a Sign In With Farcaster message (signed by the
+    // custody address or an auth address) instead of an EIP-712 custody signature. Until this is
+    // active, `KeyAddBody.authorization_type` is not read at all.
+    SignInKeyAuthorization,
 }
 
 pub struct VersionSchedule {
@@ -264,7 +269,7 @@ const ENGINE_VERSION_SCHEDULE_TESTNET: &[VersionSchedule] = [
 
 const ENGINE_VERSION_SCHEDULE_DEVNET: &[VersionSchedule] = [VersionSchedule {
     active_at: 0,
-    version: EngineVersion::V24,
+    version: EngineVersion::V25,
 }]
 .as_slice();
 
@@ -472,6 +477,14 @@ impl EngineVersion {
             // they are not gated on the registrar. Do not read a scheduled V20, V21 or V22 as a
             // violation of this rule.
             ProtocolFeature::ChannelFollows => self >= &EngineVersion::V24,
+            // Its own version, so it can be scheduled or withheld independently of the channel
+            // rollout at V24. It only loosens validation (a KEY_ADD / KEY_REMOVE that was rejected
+            // becomes acceptable), but it must be versioned: an upgraded proposer would include a
+            // sign-in authorized key that an un-upgraded validator rejects.
+            //
+            // V25 has no mainnet or testnet entry and the number is provisional. Renumber it to
+            // whatever the coordinated rollout assigns; never schedule it on one network alone.
+            ProtocolFeature::SignInKeyAuthorization => self >= &EngineVersion::V25,
             ProtocolFeature::UniqueOnchainEventTrieKeys
             | ProtocolFeature::HeaderTransactionsRoot => self >= &EngineVersion::V23,
         }
@@ -501,7 +514,8 @@ impl EngineVersion {
             | EngineVersion::V21
             | EngineVersion::V22
             | EngineVersion::V23
-            | EngineVersion::V24 => LATEST_PROTOCOL_VERSION,
+            | EngineVersion::V24
+            | EngineVersion::V25 => LATEST_PROTOCOL_VERSION,
         }
     }
 
@@ -1330,7 +1344,7 @@ mod version_test {
 
     #[test]
     fn test_latest() {
-        assert_eq!(EngineVersion::latest(), EngineVersion::V24);
+        assert_eq!(EngineVersion::latest(), EngineVersion::V25);
         assert_eq!(
             EngineVersion::version_for(&FarcasterTime::current(), FarcasterNetwork::Devnet),
             EngineVersion::latest()
@@ -1414,6 +1428,28 @@ mod version_test {
         assert_eq!(
             EngineVersion::next_version_timestamp_for(&time, FarcasterNetwork::Devnet),
             None
+        );
+    }
+
+    #[test]
+    fn test_sign_in_key_authorization_feature_gate() {
+        assert!(!EngineVersion::V24.is_enabled(ProtocolFeature::SignInKeyAuthorization));
+        assert!(EngineVersion::V25.is_enabled(ProtocolFeature::SignInKeyAuthorization));
+        assert!(EngineVersion::latest().is_enabled(ProtocolFeature::SignInKeyAuthorization));
+    }
+
+    #[test]
+    fn test_sign_in_key_authorization_activation_schedule() {
+        // V25 is unscheduled on mainnet/testnet, so sign-in authorizations stay rejected there
+        // until maintainers schedule it. Devnet runs the latest version.
+        let far_future = FarcasterTime::from_unix_seconds(4102444800); // 2100-01-01 UTC
+        for network in [FarcasterNetwork::Mainnet, FarcasterNetwork::Testnet] {
+            assert!(!EngineVersion::version_for(&far_future, network)
+                .is_enabled(ProtocolFeature::SignInKeyAuthorization));
+        }
+        assert!(
+            EngineVersion::version_for(&FarcasterTime::new(0), FarcasterNetwork::Devnet)
+                .is_enabled(ProtocolFeature::SignInKeyAuthorization)
         );
     }
 }

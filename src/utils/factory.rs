@@ -713,8 +713,9 @@ pub mod messages_factory {
         //! also lean on `create_key_add` so signing logic lives in exactly one place.
         use super::*;
         use crate::core::validations::key::{
-            key_add_typed_data, key_remove_typed_data, signed_key_request_typed_data,
-            KeyAddPayload, KeyRemovePayload, ETH_MAINNET_CHAIN_ID,
+            key_add_typed_data, key_remove_typed_data, sign_in_key_add_nonce,
+            sign_in_key_remove_nonce, signed_key_request_typed_data, KeyAddAuthorizationType,
+            KeyAddPayload, KeyRemovePayload, KeyRemoveSignatureType, ETH_MAINNET_CHAIN_ID,
             METADATA_TYPE_SIGNED_KEY_REQUEST,
         };
         use crate::proto::{KeyAddBody, KeyRemoveBody};
@@ -820,6 +821,8 @@ pub mod messages_factory {
                 registration_tx_hash: vec![],
                 scopes: scopes_i32,
                 ttl,
+                authorization_type: 0,
+                authorization_message: vec![],
             };
 
             create_message_with_data(
@@ -827,6 +830,147 @@ pub mod messages_factory {
                 MessageType::KeyAdd,
                 message::message_data::Body::KeyAddBody(body),
                 timestamp,
+                Some(envelope_signer),
+            )
+        }
+
+        /// The Sign In With Farcaster (FIP-11) text a Farcaster client signs, for `address`
+        /// approving a sign-in to `domain` with the given nonce at `issued_at_unix`.
+        pub fn sign_in_message_text(
+            domain: &str,
+            address: &alloy_primitives::Address,
+            fid: u64,
+            nonce: &str,
+            issued_at_unix: u64,
+        ) -> String {
+            let issued_at = chrono::DateTime::from_timestamp(issued_at_unix as i64, 0)
+                .expect("timestamp in range")
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            format!(
+                "{domain} wants you to sign in with your Ethereum account:\n{address}\n\n\
+                 Farcaster Auth\n\nURI: https://{domain}/sign-in\nVersion: 1\nChain ID: 10\n\
+                 Nonce: {nonce}\nIssued At: {issued_at}\nResources:\n- farcaster://fid/{fid}"
+            )
+        }
+
+        /// A KEY_ADD authorized by a sign-in message (`authorization_type = 200`) instead of an
+        /// EIP-712 custody signature. `sign_in_signer` is whoever approved the sign-in (the fid's
+        /// custody key, for the node to accept it) and `domain` the name the approval was for.
+        /// The message is issued at the KEY_ADD's own `timestamp` and commits to the payload
+        /// through its nonce.
+        pub fn create_key_add_with_sign_in(
+            fid: u64,
+            sign_in_signer: &PrivateKeySigner,
+            domain: &str,
+            request_fid: u64,
+            app_custody: &PrivateKeySigner,
+            envelope_signer: &SigningKey,
+            scopes: Vec<MessageType>,
+            ttl: u32,
+            nonce: u32,
+            deadline: u32,
+            timestamp: u32,
+        ) -> message::Message {
+            let key_bytes: [u8; 32] = envelope_signer.verifying_key().to_bytes();
+            let scopes_i32: Vec<i32> = scopes.iter().map(|s| *s as i32).collect();
+
+            let payload = KeyAddPayload {
+                fid,
+                key: &key_bytes,
+                key_type: KEY_TYPE_ED25519,
+                scopes: &scopes_i32,
+                ttl,
+                nonce,
+                deadline,
+            };
+            let sign_in_nonce = sign_in_key_add_nonce(&payload, ETH_MAINNET_CHAIN_ID)
+                .expect("nonce derivation is infallible for valid inputs");
+            let text = sign_in_message_text(
+                domain,
+                &sign_in_signer.address(),
+                fid,
+                &sign_in_nonce,
+                timestamp as u64 + FARCASTER_EPOCH / 1000,
+            );
+            let signature: Vec<u8> = sign_in_signer
+                .sign_message_sync(text.as_bytes())
+                .expect("PrivateKeySigner sign cannot fail")
+                .into();
+
+            let metadata =
+                build_signed_metadata_bytes(app_custody, request_fid, &key_bytes, deadline as u64);
+
+            let body = KeyAddBody {
+                key: key_bytes.to_vec(),
+                key_type: KEY_TYPE_ED25519,
+                custody_signature: signature,
+                deadline,
+                nonce,
+                metadata,
+                metadata_type: METADATA_TYPE_SIGNED_KEY_REQUEST,
+                registration_tx_hash: vec![],
+                scopes: scopes_i32,
+                ttl,
+                authorization_type: KeyAddAuthorizationType::SignIn as u32,
+                authorization_message: text.into_bytes(),
+            };
+
+            create_message_with_data(
+                fid,
+                MessageType::KeyAdd,
+                message::message_data::Body::KeyAddBody(body),
+                Some(timestamp),
+                Some(envelope_signer),
+            )
+        }
+
+        /// KEY_REMOVE with `signature_type = SignIn`: `sign_in_signer` approves a sign-in to
+        /// `domain` whose nonce commits to this removal. The envelope is signed by
+        /// `envelope_signer`, any active Ed25519 key on `fid`.
+        pub fn create_key_remove_sign_in(
+            fid: u64,
+            sign_in_signer: &PrivateKeySigner,
+            domain: &str,
+            envelope_signer: &SigningKey,
+            target_key: &[u8; 32],
+            nonce: u32,
+            deadline: u32,
+            timestamp: u32,
+        ) -> message::Message {
+            let payload = KeyRemovePayload {
+                fid,
+                key: target_key,
+                nonce,
+                deadline,
+            };
+            let sign_in_nonce = sign_in_key_remove_nonce(&payload, ETH_MAINNET_CHAIN_ID)
+                .expect("nonce derivation is infallible for valid inputs");
+            let text = sign_in_message_text(
+                domain,
+                &sign_in_signer.address(),
+                fid,
+                &sign_in_nonce,
+                timestamp as u64 + FARCASTER_EPOCH / 1000,
+            );
+            let signature: Vec<u8> = sign_in_signer
+                .sign_message_sync(text.as_bytes())
+                .expect("PrivateKeySigner sign cannot fail")
+                .into();
+
+            let body = KeyRemoveBody {
+                key: target_key.to_vec(),
+                signature,
+                signature_type: KeyRemoveSignatureType::SignIn as u32,
+                deadline,
+                nonce,
+                authorization_message: text.into_bytes(),
+            };
+
+            create_message_with_data(
+                fid,
+                MessageType::KeyRemove,
+                message::message_data::Body::KeyRemoveBody(body),
+                Some(timestamp),
                 Some(envelope_signer),
             )
         }
@@ -866,6 +1010,7 @@ pub mod messages_factory {
                 signature_type: 1, // Custody
                 deadline,
                 nonce,
+                authorization_message: vec![],
             };
 
             create_message_with_data(
@@ -894,6 +1039,7 @@ pub mod messages_factory {
                 signature_type: 2, // SelfRevoke
                 deadline,
                 nonce,
+                authorization_message: vec![],
             };
             create_message_with_data(
                 fid,

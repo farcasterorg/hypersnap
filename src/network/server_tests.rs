@@ -9405,6 +9405,8 @@ mod tests {
             registration_tx_hash: vec![],
             scopes: vec![MessageType::CastAdd as i32, MessageType::ReactionAdd as i32],
             ttl: 86_400,
+            authorization_type: 0,
+            authorization_message: vec![],
         };
         let message = proto::Message {
             data: Some(MessageData {
@@ -9663,6 +9665,8 @@ mod tests {
             registration_tx_hash: vec![],
             scopes: vec![MessageType::CastAdd as i32],
             ttl: 3_600,
+            authorization_type: 0,
+            authorization_message: vec![],
         };
         let record = GaslessKeyRecord {
             message: Some(proto::Message {
