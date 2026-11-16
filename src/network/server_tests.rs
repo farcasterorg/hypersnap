@@ -787,6 +787,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kept_profiles_follow_user_data_changes_through_merge_events() {
+        use crate::api::events::IndexEvent;
+        use crate::api::http::UserHydrator;
+        use crate::api::indexer::Indexer;
+        use crate::api::profile_cache::ProfileCache;
+        use crate::proto::UserDataType;
+        let (
+            _stores,
+            _senders,
+            [mut engine1, _engine2],
+            _block_engine,
+            service,
+            _shard_decision_tx,
+            _block_decision_tx,
+        ) = make_server(None, None).await;
+        test_helper::register_user(
+            SHARD1_FID,
+            test_helper::default_signer(),
+            test_helper::default_custody_address(),
+            &mut engine1,
+        )
+        .await;
+        let display = |name: &str, timestamp| {
+            messages_factory::user_data::create_user_data_add(
+                SHARD1_FID,
+                UserDataType::Display,
+                &name.to_string(),
+                timestamp,
+                None,
+            )
+        };
+        let first = display("first", None);
+        let t = first.data.as_ref().unwrap().timestamp;
+        test_helper::commit_message(&mut engine1, &first).await;
+
+        let (_live_tx, live) = tokio::sync::watch::channel(true);
+        let profiles = Arc::new(ProfileCache::new(live));
+        let hydrator = crate::api::user_hydrator::HubUserHydrator::new(Arc::new(service), None)
+            .with_profiles(Some(profiles.clone()));
+        let name = || async {
+            hydrator
+                .hydrate_user(SHARD1_FID)
+                .await
+                .unwrap()
+                .display_name
+        };
+        assert_eq!(name().await.as_deref(), Some("first"));
+
+        let second = display("second", Some(t + 1));
+        test_helper::commit_message(&mut engine1, &second).await;
+        assert_eq!(
+            name().await.as_deref(),
+            Some("first"),
+            "kept until its event"
+        );
+        profiles
+            .process_event(&IndexEvent::message(second, 1, 1))
+            .await
+            .unwrap();
+        assert_eq!(name().await.as_deref(), Some("second"));
+    }
+
+    #[tokio::test]
     async fn native_account_lookup_and_profile_hydration_use_native_custody() {
         use crate::api::webhooks::CustodyAddressLookup;
         use crate::api::{http::UserHydrator, HubQueryHandler};

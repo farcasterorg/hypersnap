@@ -259,6 +259,8 @@ pub struct ApiHttpHandler {
     /// `daily_stats`.
     followed_bounds:
         Arc<std::sync::RwLock<Option<Arc<crate::api::followed_bounds::FollowedBounds>>>>,
+    /// Hydrated profiles kept between requests. Late-bound like `daily_stats`.
+    profile_cache: Arc<std::sync::RwLock<Option<Arc<crate::api::profile_cache::ProfileCache>>>>,
 }
 
 /// Emit the count, latency, total and error metrics for one request.
@@ -368,7 +370,18 @@ impl ApiHttpHandler {
             custody_index: Arc::new(std::sync::RwLock::new(None)),
             user_search: Arc::new(std::sync::RwLock::new(None)),
             followed_bounds: Arc::new(std::sync::RwLock::new(None)),
+            profile_cache: Arc::new(std::sync::RwLock::new(None)),
         }
+    }
+
+    /// Install the profile cache (callable after construction).
+    pub fn set_profile_cache(&self, cache: Arc<crate::api::profile_cache::ProfileCache>) {
+        *self.profile_cache.write().unwrap() = Some(cache);
+    }
+
+    /// The profile cache, when enabled.
+    pub fn profile_cache(&self) -> Option<Arc<crate::api::profile_cache::ProfileCache>> {
+        self.profile_cache.read().unwrap().clone()
     }
 
     /// Install the following feed's bounds (callable after construction).

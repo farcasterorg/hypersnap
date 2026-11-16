@@ -48,12 +48,19 @@ pub struct ApiConfig {
     /// Daily network-wide activity rollups (the Dune-query replacement).
     #[serde(default)]
     pub daily_stats: DailyStatsConfig,
+
+    /// Keep hydrated profiles (everything but follower counts) between
+    /// requests, dropped when a message or on-chain event for the account
+    /// could change them. `false` reads every profile from the stores.
+    #[serde(default = "default_true")]
+    pub profile_cache: bool,
 }
 
 impl Default for ApiConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            profile_cache: true,
             social_graph: FeatureConfig::default(),
             channels: FeatureConfig::default(),
             metrics: MetricsConfig::default(),

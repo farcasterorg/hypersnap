@@ -42,6 +42,7 @@ pub mod metrics;
 mod metrics_scan;
 mod metrics_worker;
 pub mod notifications;
+pub mod profile_cache;
 pub mod search;
 pub mod social_graph;
 mod social_graph_worker;
@@ -417,11 +418,19 @@ pub fn initialize(
             backfill_done_tx.subscribe(),
         ))
     });
+    let profile_cache = config.profile_cache.then(|| {
+        Arc::new(profile_cache::ProfileCache::new(
+            backfill_done_tx.subscribe(),
+        ))
+    });
 
     // Create worker pool and register indexers
     let mut worker_pool = IndexWorkerPool::new(config.clone(), index_rx, db.clone());
     if let Some(ref bounds) = followed_bounds {
         worker_pool.register_arc(bounds.clone());
+    }
+    if let Some(ref profiles) = profile_cache {
+        worker_pool.register_arc(profiles.clone());
     }
 
     worker_pool.register_arc(cast_hash_indexer.clone());
@@ -577,6 +586,10 @@ pub fn initialize(
     if let Some(ref bounds) = followed_bounds {
         repaired.push(bounds.clone() as Arc<dyn Indexer>);
     }
+    // Dropping a profile twice is harmless
+    if let Some(ref profiles) = profile_cache {
+        repaired.push(profiles.clone() as Arc<dyn Indexer>);
+    }
     index_gaps::spawn_repair(
         index_gaps.clone(),
         shard_stores.clone(),
@@ -718,6 +731,9 @@ pub fn initialize(
     http_handler.set_custody_index(custody_indexer);
     if let Some(bounds) = followed_bounds {
         http_handler.set_followed_bounds(bounds);
+    }
+    if let Some(profiles) = profile_cache {
+        http_handler.set_profile_cache(profiles);
     }
     http_handler.set_user_search(user_search_indexer);
 

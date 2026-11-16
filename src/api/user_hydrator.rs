@@ -4,6 +4,7 @@
 //! to build complete User objects for API responses.
 
 use crate::api::http::UserHydrator;
+use crate::api::profile_cache::ProfileCache;
 use crate::api::social_graph::SocialGraphIndexer;
 use crate::api::types::{Bio, User, UserProfile, VerifiedAddresses};
 use crate::api::webhooks::CustodyAddressLookup;
@@ -17,24 +18,22 @@ use tonic::Request;
 pub struct HubUserHydrator<S> {
     hub_service: Arc<S>,
     social_graph: Option<Arc<SocialGraphIndexer>>,
-    users: moka::future::Cache<u64, User>,
+    profiles: Option<Arc<ProfileCache>>,
 }
-
-/// How long a hydrated user is reused. A page names the same authors and
-/// mentions many times and requests overlap; this keeps profile edits and
-/// follower counts visible within a couple of seconds.
-const USER_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl<S> HubUserHydrator<S> {
     pub fn new(hub_service: Arc<S>, social_graph: Option<Arc<SocialGraphIndexer>>) -> Self {
         Self {
             hub_service,
             social_graph,
-            users: moka::future::Cache::builder()
-                .max_capacity(100_000)
-                .time_to_live(USER_CACHE_TTL)
-                .build(),
+            profiles: None,
         }
+    }
+
+    /// Keep hydrated profiles between requests.
+    pub fn with_profiles(mut self, profiles: Option<Arc<ProfileCache>>) -> Self {
+        self.profiles = profiles;
+        self
     }
 }
 
@@ -44,13 +43,29 @@ where
     S: proto::hub_service_server::HubService + Send + Sync + 'static,
 {
     async fn hydrate_user(&self, fid: u64) -> Option<User> {
-        Some(self.users.get_with(fid, self.load_user(fid)).await)
+        let mut user = match &self.profiles {
+            Some(profiles) => profiles.get_or_load(fid, || self.load_profile(fid)).await,
+            None => self.load_profile(fid).await,
+        };
+        // Follower/following counts are direct RocksDB gets on the
+        // API-layer index — no gRPC round-trip, and never kept.
+        if let Some(ref sg) = self.social_graph {
+            if let Ok(count) = sg.get_follower_count(fid) {
+                user.follower_count = count;
+            }
+            if let Ok(count) = sg.get_following_count(fid) {
+                user.following_count = count;
+            }
+        }
+        Some(user)
     }
 
     async fn hydrate_users(&self, fids: &[u64]) -> Vec<User> {
         let mut users = Vec::with_capacity(fids.len());
         for &fid in fids {
-            users.push(self.users.get_with(fid, self.load_user(fid)).await);
+            if let Some(user) = self.hydrate_user(fid).await {
+                users.push(user);
+            }
         }
         users
     }
@@ -60,7 +75,8 @@ impl<S> HubUserHydrator<S>
 where
     S: proto::hub_service_server::HubService + Send + Sync + 'static,
 {
-    async fn load_user(&self, fid: u64) -> User {
+    /// Everything but the follower and following counts.
+    async fn load_profile(&self, fid: u64) -> User {
         let mut user = User {
             object: "user".to_string(),
             fid,
@@ -132,17 +148,6 @@ where
                     chrono::DateTime::from_timestamp(info.block_timestamp as i64, 0)
                         .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
                         .unwrap_or_default();
-            }
-        }
-
-        // Follower/following counts are direct RocksDB gets on the
-        // API-layer index — no gRPC round-trip.
-        if let Some(ref sg) = self.social_graph {
-            if let Ok(count) = sg.get_follower_count(fid) {
-                user.follower_count = count;
-            }
-            if let Ok(count) = sg.get_following_count(fid) {
-                user.following_count = count;
             }
         }
 

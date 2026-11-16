@@ -222,10 +222,10 @@ async fn start_servers(
         }
         // Wire user hydrator for populating User objects in API responses
         let social_graph_for_hydrator = handler.social_graph_indexer();
-        let hydrator = Arc::new(snapchain::api::HubUserHydrator::new(
-            api_service.clone(),
-            social_graph_for_hydrator,
-        ));
+        let hydrator = Arc::new(
+            snapchain::api::HubUserHydrator::new(api_service.clone(), social_graph_for_hydrator)
+                .with_profiles(handler.profile_cache()),
+        );
         // Hold a CustodyAddressLookup view of the hydrator before erasing
         // it as `dyn UserHydrator`, so the webhook auth verifier can reuse
         // the same hub-service-backed lookup path.
