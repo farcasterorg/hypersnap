@@ -454,7 +454,8 @@ mod tests {
             },
             db,
             stores.clone(),
-        );
+        )
+        .with_router(Box::new(routing::EvenOddRouterForTest {}));
         index.backfill().unwrap();
         assert!(index.is_complete());
         (dir, index)
@@ -10130,6 +10131,16 @@ mod tests {
             Some(base + 15),
             None,
         );
+        // A thread hung under the made-up cast: deeper replies only notify
+        // the authors of casts that really exist.
+        let under_spoofed = messages_factory::casts::create_cast_with_parent(
+            actor,
+            "deeper in a thread that isn't theirs",
+            actor,
+            &spoofed_reply.hash,
+            Some(base + 16),
+            None,
+        );
         for m in [
             &valid,
             &unliked,
@@ -10137,12 +10148,21 @@ mod tests {
             &follow,
             &spoofed_like,
             &spoofed_reply,
+            &under_spoofed,
         ] {
             merge_into(&stores, 2, m);
         }
 
         // Indexed while everything still exists, then removed.
         let (_dir, index) = walked_notifications_index(&stores);
+        {
+            use crate::api::HubQueryHandler;
+            let (with_flag, _) = service
+                .get_notifications(target, 50, None, true, None, Some(&index))
+                .await
+                .unwrap();
+            assert!(!with_flag.iter().any(|m| m.hash == under_spoofed.hash));
+        }
         let (all, _) = index_page(&service, &index, target, 50, None).await;
         assert_eq!(
             all,
@@ -10293,7 +10313,8 @@ mod tests {
             },
             db,
             stores.clone(),
-        );
+        )
+        .with_router(Box::new(routing::EvenOddRouterForTest {}));
         // Live merges land in the index before its walk has run.
         live.process_event(&IndexEvent::message(mentions[0].clone(), 2, 0))
             .await

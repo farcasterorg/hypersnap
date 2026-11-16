@@ -718,7 +718,10 @@ pub fn initialize(
     http_handler.set_shard_dbs(shard_dbs);
     http_handler.set_custody_index(custody_indexer);
     http_handler.set_user_search(user_search_indexer);
-    http_handler.set_notifications_index(notifications_indexer);
+    // Off, the endpoint never sees the index (and main.rs never walks it).
+    if config.notifications_index {
+        http_handler.set_notifications_index(notifications_indexer);
+    }
 
     // Mini app notifications — two stateful HTTP handlers wired here,
     // one more (the registration management handler) wired from

@@ -109,7 +109,7 @@ async fn start_servers(
         let notifications_index = api_handler
             .as_ref()
             .and_then(|h| h.notifications_index())
-            .filter(|i| app_config.api.notifications_index_backfill && !i.is_complete());
+            .filter(|i| !i.is_complete());
         tokio::spawn(async move {
             snapchain::hyper::backfill::run_hyper_backfill(
                 &backfill_db,

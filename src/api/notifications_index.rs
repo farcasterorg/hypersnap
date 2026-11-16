@@ -108,6 +108,7 @@ pub struct NotificationsIndexer {
     /// Stores the API serves (hyper when available), for thread lookups and
     /// the walk.
     stores: HashMap<u32, Stores>,
+    router: Box<dyn MessageRouter>,
     complete: AtomicBool,
     items_indexed: AtomicU64,
 }
@@ -119,9 +120,16 @@ impl NotificationsIndexer {
             config,
             db,
             stores,
+            router: Box::new(ShardRouter {}),
             complete: AtomicBool::new(complete),
             items_indexed: AtomicU64::new(0),
         }
+    }
+
+    /// Route FIDs to shards with `router` instead of the mainnet one.
+    pub fn with_router(mut self, router: Box<dyn MessageRouter>) -> Self {
+        self.router = router;
+        self
     }
 
     /// Whether the store walk has finished, so the index holds everything and
@@ -301,18 +309,22 @@ impl NotificationsIndexer {
                     }
                 }
                 if let Some(cast_add_body::Parent::ParentCastId(parent)) = &body.parent {
+                    // The parent is checked when read; casts further up only
+                    // notify once found in the stores, since a parent pointer
+                    // can name any fid.
                     add(parent.fid, Kind::Reply);
                     let mut notified = vec![parent.fid];
                     let mut above = parent.clone();
-                    for _ in 1..THREAD_DEPTH {
-                        let Some(next) = self.parent_of(&above) else {
+                    for depth in 1..=THREAD_DEPTH {
+                        let Some(up) = self.parent_of(&above) else {
                             break;
                         };
-                        if !notified.contains(&next.fid) {
-                            notified.push(next.fid);
-                            add(next.fid, Kind::DeepReply);
+                        if depth > 1 && !notified.contains(&above.fid) {
+                            notified.push(above.fid);
+                            add(above.fid, Kind::DeepReply);
                         }
-                        above = next;
+                        let Some(up) = up else { break };
+                        above = up;
                     }
                 }
             }
@@ -331,21 +343,21 @@ impl NotificationsIndexer {
         out
     }
 
-    /// The cast `cast` replies to, from the stores. `None` for a top-level
-    /// cast or one the stores don't hold.
-    fn parent_of(&self, cast: &CastId) -> Option<CastId> {
-        let shard = ShardRouter {}.route_fid(cast.fid, self.stores.len() as u32);
+    /// What `cast` replies to: `None` if the stores don't hold it (so it isn't
+    /// really `cast.fid`'s), `Some(None)` if it's top-level.
+    fn parent_of(&self, cast: &CastId) -> Option<Option<CastId>> {
+        let shard = self.router.route_fid(cast.fid, self.stores.len() as u32);
         let stores = self.stores.get(&shard)?;
         let message = CastStore::get_cast_add(&stores.cast_store, cast.fid, cast.hash.clone())
             .ok()
             .flatten()?;
-        match message.data?.body? {
-            Body::CastAddBody(crate::proto::CastAddBody {
+        Some(match message.data.and_then(|d| d.body) {
+            Some(Body::CastAddBody(crate::proto::CastAddBody {
                 parent: Some(cast_add_body::Parent::ParentCastId(parent)),
                 ..
-            }) => Some(parent),
+            })) => Some(parent),
             _ => None,
-        }
+        })
     }
 
     fn process_message(
