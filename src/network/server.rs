@@ -85,6 +85,8 @@ use tracing::{debug, error, info, warn};
 
 pub const MEMPOOL_ADD_REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_millis(100);
+/// How long `get_info` reuses a store's size and fid registration count.
+const STORE_STATS_TTL: Duration = Duration::from_secs(60);
 
 /// Threads used to probe FIDs in parallel when resolving a cast by hash alone.
 const CAST_SCAN_THREADS: u64 = 8;
@@ -648,6 +650,10 @@ pub struct MyHubService {
     version: String,
     peer_id: String,
     id_registry_cache: Cache<Vec<u8>, OnChainEvent>,
+    /// `get_info`'s approximate size and fid registration count per shard
+    /// (0 for the block store). Reading them walks the database directory
+    /// and counts every registration, so they are reused for a while.
+    store_stats: Cache<u32, (u64, u64)>,
     /// Short-TTL cache for the admin mesh view / topology responses. Consulted
     /// only *after* the admin auth check in each handler.
     mesh_cache: MeshCache,
@@ -781,10 +787,33 @@ impl MyHubService {
             version,
             peer_id,
             id_registry_cache,
+            store_stats: CacheBuilder::new(64).time_to_live(STORE_STATS_TTL).build(),
             mesh_cache,
             fname_lookup,
         };
         service
+    }
+
+    /// A store's approximate size and fid registration count, reused for
+    /// [`STORE_STATS_TTL`].
+    fn store_stats(
+        &self,
+        shard_id: u32,
+        db: &crate::storage::db::RocksDB,
+    ) -> Result<(u64, u64), Status> {
+        self.store_stats
+            .try_get_with(shard_id, || {
+                let fid_registrations = if shard_id == 0 {
+                    0
+                } else {
+                    db.count_keys_at_prefix(vec![
+                        RootPrefix::OnChainEvent as u8,
+                        OnChainEventPostfix::IdRegisterByFid as u8,
+                    ])? as u64
+                };
+                Ok::<_, HubError>((db.approximate_size(), fid_registrations))
+            })
+            .map_err(|err| Status::internal(err.to_string()))
     }
 
     #[cfg(test)]
@@ -1896,7 +1925,7 @@ impl HubService for MyHubService {
             //     .map_err(|err| Status::from_error(Box::new(err)))?
             //     as u64,
             num_fid_registrations: 0,
-            approx_size: self.block_stores.block_store.db.approximate_size(),
+            approx_size: self.store_stats(0, &self.block_stores.block_store.db)?.0,
             block_delay: current_time.saturating_sub(
                 self.block_stores
                     .block_store
@@ -1923,19 +1952,12 @@ impl HubService for MyHubService {
         };
 
         for (shard_index, shard_store) in self.shard_stores.iter() {
-            let shard_approx_size = shard_store.db.approximate_size();
+            let (shard_approx_size, shard_fid_registrations) =
+                self.store_stats(*shard_index, &shard_store.db)?;
             let shard_num_messages = shard_store
                 .trie
                 .get_count(&shard_store.db, &mut RocksDbTransactionBatch::new(), &[])
                 .map_err(|err| Status::internal(err.to_string()))?;
-            let shard_fid_registrations = shard_store
-                .db
-                .count_keys_at_prefix(vec![
-                    RootPrefix::OnChainEvent as u8,
-                    OnChainEventPostfix::IdRegisterByFid as u8,
-                ])
-                .map_err(|err| Status::from_error(Box::new(err)))?
-                as u64;
 
             let max_block_time = shard_store.shard_store.max_block_timestamp().unwrap_or(0);
 
