@@ -1877,8 +1877,14 @@ impl ApiHttpHandler {
             .await
         {
             Ok(conversation) => {
+                // Every cast in the tree descends from its root, so they all
+                // share the root's thread, one hop further per level
+                let root_thread = self.thread_root(&conversation.root.cast).await;
                 let mut cast_with_replies = match self
-                    .conversation_cast_to_cast_with_replies(&conversation.root)
+                    .conversation_cast_to_cast_with_replies(
+                        &conversation.root,
+                        root_thread.as_ref(),
+                    )
                     .await
                 {
                     Ok(cast) => cast,
@@ -1914,16 +1920,26 @@ impl ApiHttpHandler {
     fn conversation_cast_to_cast_with_replies<'a>(
         &'a self,
         conv_cast: &'a crate::api::conversations::ConversationCast,
+        root_thread: Option<&'a (Vec<u8>, usize)>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<CastWithReplies, String>> + Send + 'a>,
     > {
         Box::pin(async move {
-            let mut cast = self.message_to_cast(&conv_cast.cast).await;
+            // What `thread_root` would find walking up through the tree
+            let thread_hash = root_thread
+                .filter(|(_, hops)| hops + conv_cast.depth as usize <= MAX_THREAD_HOPS)
+                .map(|(hash, _)| hash.clone());
+            let mut cast = self
+                .message_to_cast_in_thread(&conv_cast.cast, thread_hash)
+                .await;
             self.attach_cast_metrics(&mut cast, &conv_cast.cast.hash)
                 .await?;
             let mut direct_replies = Vec::with_capacity(conv_cast.replies.len());
             for reply in &conv_cast.replies {
-                direct_replies.push(self.conversation_cast_to_cast_with_replies(reply).await?);
+                direct_replies.push(
+                    self.conversation_cast_to_cast_with_replies(reply, root_thread)
+                        .await?,
+                );
             }
             Ok(CastWithReplies {
                 cast,
@@ -2133,6 +2149,16 @@ impl ApiHttpHandler {
 
     /// Helper: convert a proto Message to an API Cast.
     async fn message_to_cast(&self, msg: &crate::proto::Message) -> Cast {
+        let thread_hash = self.thread_root(msg).await.map(|(hash, _)| hash);
+        self.message_to_cast_in_thread(msg, thread_hash).await
+    }
+
+    /// `message_to_cast` for a cast whose conversation root is known.
+    async fn message_to_cast_in_thread(
+        &self,
+        msg: &crate::proto::Message,
+        thread_hash: Option<Vec<u8>>,
+    ) -> Cast {
         let data = msg.data.as_ref();
         let fid = data.map(|d| d.fid).unwrap_or(0);
         let timestamp = data.map(|d| d.timestamp).unwrap_or(0);
@@ -2210,7 +2236,7 @@ impl ApiHttpHandler {
             })
             .unwrap_or_default();
 
-        let thread_hash = self.thread_root(msg).await.map(hex::encode);
+        let thread_hash = thread_hash.map(hex::encode);
         let (format_version, chain) =
             cast_format(msg).map_or((None, None), |(version, chain)| (Some(version), chain));
 
@@ -2244,9 +2270,10 @@ impl ApiHttpHandler {
 
     /// Hash of the conversation root above `msg`: its own hash for a
     /// top-level cast, else the top-most ancestor reached through parent cast
-    /// ids. `None` when an ancestor is missing or the chain is longer than
-    /// `MAX_THREAD_HOPS`. Each hop is one cast store lookup by FID and hash.
-    async fn thread_root(&self, msg: &crate::proto::Message) -> Option<Vec<u8>> {
+    /// ids, with the number of ancestors walked. `None` when an ancestor is
+    /// missing or the chain is longer than `MAX_THREAD_HOPS`. Each hop is one
+    /// cast store lookup by FID and hash.
+    async fn thread_root(&self, msg: &crate::proto::Message) -> Option<(Vec<u8>, usize)> {
         fn parent_of(msg: &crate::proto::Message) -> Option<crate::proto::CastId> {
             match &msg.data.as_ref()?.body {
                 Some(crate::proto::message_data::Body::CastAddBody(body)) => match &body.parent {
@@ -2258,14 +2285,14 @@ impl ApiHttpHandler {
         }
 
         let Some(mut parent) = parent_of(msg) else {
-            return Some(msg.hash.clone());
+            return Some((msg.hash.clone(), 0));
         };
         let hub = self.hub_query.read().unwrap().clone()?;
-        for _ in 0..MAX_THREAD_HOPS {
+        for hops in 1..=MAX_THREAD_HOPS {
             let ancestor = hub.get_cast_by_hash(&parent.hash, Some(parent.fid)).await?;
             match parent_of(&ancestor) {
                 Some(next) => parent = next,
-                None => return Some(ancestor.hash),
+                None => return Some((ancestor.hash, hops)),
             }
         }
         None
@@ -6218,7 +6245,7 @@ mod tests {
         assert_eq!(json["cast"]["replies"]["count"], 1);
 
         let shallow = handler
-            .conversation_cast_to_cast_with_replies(&conversation_cast)
+            .conversation_cast_to_cast_with_replies(&conversation_cast, None)
             .await
             .unwrap();
         assert!(shallow.direct_replies.is_empty());
@@ -6266,6 +6293,57 @@ mod tests {
         assert_eq!(thread_hash(deep).await, root_hex);
         assert_eq!(thread_hash(orphan).await, None, "missing ancestor");
         assert_eq!(thread_hash(looped).await, None, "hop limit");
+    }
+
+    #[tokio::test]
+    async fn test_conversation_thread_hashes_match_a_walk_from_each_cast() {
+        use crate::api::conversations::ConversationCast;
+        use crate::utils::factory::messages_factory::casts;
+
+        // chain[k] has k ancestors
+        let mut chain = vec![casts::create_cast_add(1, "top", None, None)];
+        while chain.len() < MAX_THREAD_HOPS + 3 {
+            let parent = chain.last().unwrap().hash.clone();
+            let text = format!("reply {}", chain.len());
+            chain.push(casts::create_cast_with_parent(
+                1, &text, 1, &parent, None, None,
+            ));
+        }
+        let handler = ApiHttpHandler::new(None, None, None, None, None, None);
+        handler.set_hub_query(Arc::new(MockHubQuery {
+            casts: chain.clone(),
+            ..Default::default()
+        }));
+        // Two levels below roots on either side of the hop limit
+        for start in [
+            0,
+            1,
+            MAX_THREAD_HOPS - 2,
+            MAX_THREAD_HOPS - 1,
+            MAX_THREAD_HOPS,
+        ] {
+            let node = |depth: usize, replies| ConversationCast {
+                cast: chain[start + depth].clone(),
+                replies,
+                depth: depth as u32,
+            };
+            let tree = node(0, vec![node(1, vec![node(2, vec![])])]);
+            let root_thread = handler.thread_root(&tree.cast).await;
+            let mut converted = handler
+                .conversation_cast_to_cast_with_replies(&tree, root_thread.as_ref())
+                .await
+                .unwrap();
+            for depth in 0..3 {
+                let walked = handler.message_to_cast(&chain[start + depth]).await;
+                assert_eq!(
+                    converted.cast.thread_hash, walked.thread_hash,
+                    "root {start}, depth {depth}"
+                );
+                if let Some(reply) = converted.direct_replies.pop() {
+                    converted = reply;
+                }
+            }
+        }
     }
 
     #[tokio::test]
