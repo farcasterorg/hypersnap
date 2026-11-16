@@ -222,6 +222,9 @@ pub fn load_and_merge_config(args: Vec<String>) -> Result<Config, Box<dyn Error>
     figment = figment.merge(Env::prefixed("SNAPCHAIN_").split("__"));
 
     let mut config: Config = figment.extract()?;
+    config
+        .mempool
+        .validate_fixed_rate_limit_schedule(config.consensus.num_shards)?;
 
     if let Some(log_format) = cli_args.log_format {
         config.log_format = log_format;

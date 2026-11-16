@@ -267,6 +267,19 @@ validator_public_keys = [
 "1" = 51_311_487
 "2" = 51_146_724
 
+# Fixed message admission quota: 1,008/hour per FID (burst 1,008), independent
+# of storage and mempool.enable_rate_limits. Key additions keep their separate
+# 1/min quota; key removals and native onboarding are exempt from this bucket.
+# Reference 2026-11-16 00:49:08 UTC; projected activation 48 hours later,
+# at approximately 2026-11-18 00:49:08 UTC.
+# Haatz and kmacb agreed on tips 50_647_345 / 51_322_016 / 51_157_187.
+# Last 3,600 blocks took 5,654 / 5,662 / 5,656 seconds respectively on Haatz.
+# UTC activation is approximate; admission switches at these exact candidate heights.
+[mempool.fixed_rate_limit_activation_heights]
+"0" = 50_757_411
+"1" = 51_431_928
+"2" = 51_267_213
+
 # Ordinary discovery bootstraps, not explicit/direct GossipSub peers. These
 # nodes run the same validator binary; bootstrap service grants no extra power.
 # Infinitehomie and ivy remain in the validator sets above, but are not seeds.
