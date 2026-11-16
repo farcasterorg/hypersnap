@@ -435,6 +435,63 @@ mod tests {
         service.submit_bulk_messages(request).await
     }
 
+    /// A notifications index over `stores`, filled by its store walk.
+    fn walked_notifications_index(
+        stores: &HashMap<u32, Stores>,
+    ) -> (
+        tempfile::TempDir,
+        crate::api::notifications_index::NotificationsIndexer,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(crate::storage::db::RocksDB::new(
+            dir.path().to_str().unwrap(),
+        ));
+        db.open().unwrap();
+        let index = crate::api::notifications_index::NotificationsIndexer::new(
+            crate::api::config::FeatureConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            db,
+            stores.clone(),
+        );
+        index.backfill().unwrap();
+        assert!(index.is_complete());
+        (dir, index)
+    }
+
+    /// Notifications from the scan of the user's newest casts and from the
+    /// notifications index over the same stores, which must agree on what
+    /// the scan can reach. Returns the index's page.
+    async fn both(
+        service: &MyHubService,
+        stores: &HashMap<u32, Stores>,
+        fid: u64,
+        limit: usize,
+        cursor: Option<&str>,
+        include_quotes_and_deep_replies: bool,
+        quotes: Option<&crate::api::cast_quotes_index::CastQuotesIndexer>,
+    ) -> Result<(Vec<proto::Message>, Option<String>), String> {
+        use crate::api::HubQueryHandler;
+        let flag = include_quotes_and_deep_replies;
+        let scanned =
+            HubQueryHandler::get_notifications(service, fid, limit, cursor, flag, quotes, None)
+                .await?;
+        let (_dir, index) = walked_notifications_index(stores);
+        let indexed = HubQueryHandler::get_notifications(
+            service,
+            fid,
+            limit,
+            cursor,
+            flag,
+            quotes,
+            Some(&index),
+        )
+        .await?;
+        assert_eq!(indexed, scanned, "index and scan disagree");
+        Ok(indexed)
+    }
+
     async fn make_server(
         rpc_auth: Option<String>,
         admin_rpc_auth: Option<String>,
@@ -8301,7 +8358,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_notifications_returns_mentions() {
-        use crate::api::HubQueryHandler;
         let (
             stores,
             _senders,
@@ -8344,8 +8400,7 @@ mod tests {
             .unwrap();
         shard2_stores.db.commit(txn).unwrap();
 
-        let (messages, _cursor) = service
-            .get_notifications(target_fid, 50, None, false, None)
+        let (messages, _cursor) = both(&service, &stores, target_fid, 50, None, false, None)
             .await
             .unwrap();
         assert!(
@@ -8362,7 +8417,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_notifications_returns_reactions() {
-        use crate::api::HubQueryHandler;
         let (
             stores,
             _senders,
@@ -8416,8 +8470,7 @@ mod tests {
             .unwrap();
         shard2_stores.db.commit(txn).unwrap();
 
-        let (messages, _cursor) = service
-            .get_notifications(target_fid, 50, None, false, None)
+        let (messages, _cursor) = both(&service, &stores, target_fid, 50, None, false, None)
             .await
             .unwrap();
         let has_reaction = messages.iter().any(|m| {
@@ -8430,7 +8483,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_notifications_returns_follows() {
-        use crate::api::HubQueryHandler;
         let (
             stores,
             _senders,
@@ -8469,8 +8521,7 @@ mod tests {
             .unwrap();
         shard2_stores.db.commit(txn).unwrap();
 
-        let (messages, _cursor) = service
-            .get_notifications(target_fid, 50, None, false, None)
+        let (messages, _cursor) = both(&service, &stores, target_fid, 50, None, false, None)
             .await
             .unwrap();
         let has_follow = messages.iter().any(|m| {
@@ -8483,7 +8534,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_notifications_excludes_self_reactions() {
-        use crate::api::HubQueryHandler;
         let (
             stores,
             _senders,
@@ -8525,8 +8575,7 @@ mod tests {
             .unwrap();
         shard1_stores.db.commit(txn).unwrap();
 
-        let (messages, _cursor) = service
-            .get_notifications(fid, 50, None, false, None)
+        let (messages, _cursor) = both(&service, &stores, fid, 50, None, false, None)
             .await
             .unwrap();
         let has_self_reaction = messages.iter().any(|m| {
@@ -8541,7 +8590,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_notifications_sorted_newest_first() {
-        use crate::api::HubQueryHandler;
         let (
             stores,
             _senders,
@@ -8607,8 +8655,7 @@ mod tests {
             shard2_stores.db.commit(txn).unwrap();
         }
 
-        let (messages, _cursor) = service
-            .get_notifications(target_fid, 50, None, false, None)
+        let (messages, _cursor) = both(&service, &stores, target_fid, 50, None, false, None)
             .await
             .unwrap();
 
@@ -8631,7 +8678,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_notifications_limit_truncation() {
-        use crate::api::HubQueryHandler;
         let (
             stores,
             _senders,
@@ -8676,8 +8722,7 @@ mod tests {
             shard2_stores.db.commit(txn).unwrap();
         }
 
-        let (messages, _cursor) = service
-            .get_notifications(target_fid, 3, None, false, None)
+        let (messages, _cursor) = both(&service, &stores, target_fid, 3, None, false, None)
             .await
             .unwrap();
         assert_eq!(messages.len(), 3, "Should respect limit of 3");
@@ -8685,7 +8730,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_notifications_cursor_pagination_no_duplicates() {
-        use crate::api::HubQueryHandler;
         let (
             stores,
             _senders,
@@ -8731,26 +8775,39 @@ mod tests {
         }
 
         // Page 1
-        let (page1, cursor1) = service
-            .get_notifications(target_fid, 2, None, false, None)
+        let (page1, cursor1) = both(&service, &stores, target_fid, 2, None, false, None)
             .await
             .unwrap();
         assert_eq!(page1.len(), 2, "Page 1 should have 2 items");
         assert!(cursor1.is_some(), "Should have next cursor");
 
         // Page 2
-        let (page2, cursor2) = service
-            .get_notifications(target_fid, 2, cursor1.as_deref(), false, None)
-            .await
-            .unwrap();
+        let (page2, cursor2) = both(
+            &service,
+            &stores,
+            target_fid,
+            2,
+            cursor1.as_deref(),
+            false,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(page2.len(), 2, "Page 2 should have 2 items");
         assert!(cursor2.is_some(), "Should have next cursor");
 
         // Page 3 (last page, 1 remaining)
-        let (page3, cursor3) = service
-            .get_notifications(target_fid, 2, cursor2.as_deref(), false, None)
-            .await
-            .unwrap();
+        let (page3, cursor3) = both(
+            &service,
+            &stores,
+            target_fid,
+            2,
+            cursor2.as_deref(),
+            false,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(page3.len(), 1, "Page 3 should have 1 remaining item");
         assert!(cursor3.is_none(), "Last page should have no cursor");
 
@@ -8766,9 +8823,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_notifications_empty_result() {
-        use crate::api::HubQueryHandler;
         let (
-            _stores,
+            stores,
             _senders,
             [mut engine1, _engine2],
             _block_engine,
@@ -8782,8 +8838,7 @@ mod tests {
 
         test_helper::register_user(fid, signer.clone(), custody.clone(), &mut engine1).await;
 
-        let (messages, cursor) = service
-            .get_notifications(fid, 50, None, false, None)
+        let (messages, cursor) = both(&service, &stores, fid, 50, None, false, None)
             .await
             .unwrap();
         assert!(
@@ -8795,7 +8850,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_notifications_replies_via_parent_without_mention() {
-        use crate::api::HubQueryHandler;
         let (
             stores,
             _senders,
@@ -8847,8 +8901,7 @@ mod tests {
             .unwrap();
         shard2_stores.db.commit(txn).unwrap();
 
-        let (messages, _cursor) = service
-            .get_notifications(target_fid, 50, None, false, None)
+        let (messages, _cursor) = both(&service, &stores, target_fid, 50, None, false, None)
             .await
             .unwrap();
         let reply_messages: Vec<_> = messages
@@ -8868,7 +8921,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_notifications_replies_excludes_self() {
-        use crate::api::HubQueryHandler;
         let (
             stores,
             _senders,
@@ -8918,8 +8970,7 @@ mod tests {
             .unwrap();
         shard1_stores.db.commit(txn).unwrap();
 
-        let (messages, _cursor) = service
-            .get_notifications(target_fid, 50, None, false, None)
+        let (messages, _cursor) = both(&service, &stores, target_fid, 50, None, false, None)
             .await
             .unwrap();
         let self_replies: Vec<_> = messages
@@ -9733,7 +9784,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_notifications_deep_replies_with_flag() {
-        use crate::api::HubQueryHandler;
         let (
             stores,
             _senders,
@@ -9804,15 +9854,13 @@ mod tests {
         }
         let deep = [&reply_to_reply.hash, &deeper_reply.hash];
 
-        let (messages, _cursor) = service
-            .get_notifications(target_fid, 50, None, false, None)
+        let (messages, _cursor) = both(&service, &stores, target_fid, 50, None, false, None)
             .await
             .unwrap();
         assert!(messages.iter().any(|m| m.hash == reply.hash));
         assert!(!messages.iter().any(|m| deep.contains(&&m.hash)));
 
-        let (messages, _cursor) = service
-            .get_notifications(target_fid, 50, None, true, None)
+        let (messages, _cursor) = both(&service, &stores, target_fid, 50, None, true, None)
             .await
             .unwrap();
         assert!(messages.iter().any(|m| m.hash == reply.hash));
@@ -9827,7 +9875,6 @@ mod tests {
     #[tokio::test]
     async fn test_notifications_quotes_with_flag() {
         use crate::api::indexer::Indexer;
-        use crate::api::HubQueryHandler;
         let (
             stores,
             _senders,
@@ -9900,19 +9947,527 @@ mod tests {
             .await
             .unwrap();
 
-        let (messages, _cursor) = service
-            .get_notifications(target_fid, 50, None, false, Some(&quotes))
-            .await
-            .unwrap();
+        let (messages, _cursor) = both(
+            &service,
+            &stores,
+            target_fid,
+            50,
+            None,
+            false,
+            Some(&quotes),
+        )
+        .await
+        .unwrap();
         assert!(!messages.iter().any(|m| m.hash == quote.hash));
 
-        let (messages, _cursor) = service
-            .get_notifications(target_fid, 50, None, true, Some(&quotes))
-            .await
-            .unwrap();
+        let (messages, _cursor) =
+            both(&service, &stores, target_fid, 50, None, true, Some(&quotes))
+                .await
+                .unwrap();
         assert!(
             messages.iter().any(|m| m.hash == quote.hash),
             "Expected the quote cast with the flag"
         );
+    }
+
+    // ---- notifications index ----------------------------------------------
+
+    /// Merges `message` straight into a shard's stores.
+    fn merge_into(stores: &HashMap<u32, Stores>, shard_id: u32, message: &proto::Message) {
+        use proto::MessageType::*;
+        let shard = stores.get(&shard_id).unwrap();
+        let mut txn = RocksDbTransactionBatch::new();
+        let ctx = test_helper::default_merge_ctx();
+        match proto::MessageType::try_from(message.data.as_ref().unwrap().r#type).unwrap() {
+            CastAdd | CastRemove => shard.cast_store.merge(message, &mut txn, &ctx),
+            ReactionAdd | ReactionRemove => shard.reaction_store.merge(message, &mut txn, &ctx),
+            _ => shard.link_store.merge(message, &mut txn, &ctx),
+        }
+        .unwrap();
+        shard.db.commit(txn).unwrap();
+    }
+
+    /// Two registered users: the one notified (shard 1) and the one acting (shard 2).
+    async fn notified_and_actor() -> (HashMap<u32, Stores>, MyHubService, u64, u64, u32) {
+        let (stores, _senders, [mut engine1, mut engine2], _block_engine, service, _s, _b) =
+            make_server(None, None).await;
+        for (fid, engine) in [(SHARD1_FID, &mut engine1), (SHARD2_FID, &mut engine2)] {
+            test_helper::register_user(
+                fid,
+                test_helper::default_signer(),
+                test_helper::default_custody_address(),
+                engine,
+            )
+            .await;
+        }
+        let base = crate::core::util::get_farcaster_time().unwrap() as u32 - 100_000;
+        (stores, service, SHARD1_FID, SHARD2_FID, base)
+    }
+
+    fn like(fid: u64, cast: &proto::Message, ts: u32) -> proto::Message {
+        messages_factory::reactions::create_reaction_add(
+            fid,
+            proto::ReactionType::Like,
+            proto::reaction_body::Target::TargetCastId(proto::CastId {
+                fid: cast.data.as_ref().unwrap().fid,
+                hash: cast.hash.clone(),
+            }),
+            Some(ts),
+            None,
+        )
+    }
+
+    async fn index_page(
+        service: &MyHubService,
+        index: &crate::api::notifications_index::NotificationsIndexer,
+        fid: u64,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> (Vec<Vec<u8>>, Option<String>) {
+        use crate::api::HubQueryHandler;
+        let (messages, cursor) = service
+            .get_notifications(fid, limit, cursor, false, None, Some(index))
+            .await
+            .unwrap();
+        (messages.into_iter().map(|m| m.hash).collect(), cursor)
+    }
+
+    /// The bug the index fixes: the scan only looks at the user's 100 newest
+    /// casts, so activity on anything older never shows up.
+    #[tokio::test]
+    async fn test_notifications_index_reaches_casts_older_than_the_newest_100() {
+        use crate::api::HubQueryHandler;
+        let (stores, service, target, actor, base) = notified_and_actor().await;
+        let casts: Vec<_> = (0..150)
+            .map(|i| {
+                messages_factory::casts::create_cast_add(
+                    target,
+                    &format!("cast {i}"),
+                    Some(base + i),
+                    None,
+                )
+            })
+            .collect();
+        for cast in &casts {
+            merge_into(&stores, 1, cast);
+        }
+        let on_oldest = like(actor, &casts[0], base + 1002);
+        let reply_to_oldest = messages_factory::casts::create_cast_with_parent(
+            actor,
+            "late reply",
+            target,
+            &casts[0].hash,
+            Some(base + 1001),
+            None,
+        );
+        let on_newest = like(actor, &casts[149], base + 1000);
+        for m in [&on_oldest, &reply_to_oldest, &on_newest] {
+            merge_into(&stores, 2, m);
+        }
+
+        let (scanned, _) = service
+            .get_notifications(target, 50, None, false, None, None)
+            .await
+            .unwrap();
+        let scanned: Vec<_> = scanned.into_iter().map(|m| m.hash).collect();
+        assert_eq!(
+            scanned,
+            vec![on_newest.hash.clone()],
+            "the scan misses old casts"
+        );
+
+        let (_dir, index) = walked_notifications_index(&stores);
+        let (page1, cursor1) = index_page(&service, &index, target, 2, None).await;
+        assert_eq!(
+            page1,
+            vec![on_oldest.hash.clone(), reply_to_oldest.hash.clone()]
+        );
+        let (page2, cursor2) = index_page(&service, &index, target, 2, cursor1.as_deref()).await;
+        assert_eq!(page2, vec![on_newest.hash.clone()]);
+        assert!(cursor2.is_none());
+    }
+
+    /// Entries outlive what they point at; each page reads the message back,
+    /// so unlikes, deleted casts, unfollows and made-up targets don't show.
+    #[tokio::test]
+    async fn test_notifications_index_skips_removed_and_spoofed() {
+        use crate::api::events::{IndexEvent, MessageEventKind};
+        use crate::api::indexer::Indexer;
+        let (stores, service, target, actor, base) = notified_and_actor().await;
+        let kept = messages_factory::casts::create_cast_add(target, "kept", Some(base), None);
+        let deleted =
+            messages_factory::casts::create_cast_add(target, "deleted", Some(base + 1), None);
+        merge_into(&stores, 1, &kept);
+        merge_into(&stores, 1, &deleted);
+
+        let valid = like(actor, &kept, base + 10);
+        let unliked = messages_factory::reactions::create_reaction_add(
+            actor,
+            proto::ReactionType::Recast,
+            proto::reaction_body::Target::TargetCastId(proto::CastId {
+                fid: target,
+                hash: kept.hash.clone(),
+            }),
+            Some(base + 11),
+            None,
+        );
+        let on_deleted = like(actor, &deleted, base + 12);
+        let follow = messages_factory::links::create_link_add(
+            actor,
+            "follow",
+            target,
+            Some(base + 13),
+            None,
+        );
+        let fake_cast =
+            messages_factory::casts::create_cast_add(target, "never sent", Some(base + 2), None);
+        let spoofed_like = like(actor, &fake_cast, base + 14);
+        let spoofed_reply = messages_factory::casts::create_cast_with_parent(
+            actor,
+            "reply to nothing",
+            target,
+            &fake_cast.hash,
+            Some(base + 15),
+            None,
+        );
+        for m in [
+            &valid,
+            &unliked,
+            &on_deleted,
+            &follow,
+            &spoofed_like,
+            &spoofed_reply,
+        ] {
+            merge_into(&stores, 2, m);
+        }
+
+        // Indexed while everything still exists, then removed.
+        let (_dir, index) = walked_notifications_index(&stores);
+        let (all, _) = index_page(&service, &index, target, 50, None).await;
+        assert_eq!(
+            all,
+            vec![
+                follow.hash.clone(),
+                on_deleted.hash.clone(),
+                unliked.hash.clone(),
+                valid.hash.clone()
+            ]
+        );
+        merge_into(
+            &stores,
+            2,
+            &messages_factory::reactions::create_reaction_remove(
+                actor,
+                proto::ReactionType::Recast,
+                proto::reaction_body::Target::TargetCastId(proto::CastId {
+                    fid: target,
+                    hash: kept.hash.clone(),
+                }),
+                Some(base + 20),
+                None,
+            ),
+        );
+        merge_into(
+            &stores,
+            1,
+            &messages_factory::casts::create_cast_remove(
+                target,
+                &deleted.hash,
+                Some(base + 21),
+                None,
+            ),
+        );
+        merge_into(
+            &stores,
+            2,
+            &messages_factory::links::create_link_remove(
+                actor,
+                "follow",
+                target,
+                Some(base + 22),
+                None,
+            ),
+        );
+        let (left, cursor) = index_page(&service, &index, target, 50, None).await;
+        assert_eq!(left, vec![valid.hash.clone()]);
+        assert!(cursor.is_none());
+
+        // A revoked message's entries go too.
+        index
+            .process_event(&IndexEvent::message_of_kind(
+                valid.clone(),
+                2,
+                0,
+                MessageEventKind::Revoke,
+            ))
+            .await
+            .unwrap();
+        let mut hashes = vec![];
+        index
+            .scan(target, None, |entry| {
+                hashes.push(entry.hash.to_vec());
+                false
+            })
+            .unwrap();
+        // The six indexed messages (spoofed ones are filtered when read), less the revoked one.
+        assert_eq!(hashes.len(), 5);
+        assert!(!hashes.contains(&valid.hash));
+
+        // The hyper stores the API reads drop a removed add the same way.
+        let hyper = stores
+            .get(&2)
+            .unwrap()
+            .with_state_context(crate::hyper::StateContext::Hyper);
+        let liked = like(actor, &deleted, base + 30);
+        let ts_hash = crate::storage::store::account::make_ts_hash(base + 30, &liked.hash).unwrap();
+        let mut txn = RocksDbTransactionBatch::new();
+        hyper
+            .reaction_store
+            .merge(&liked, &mut txn, &test_helper::default_merge_ctx())
+            .unwrap();
+        hyper.db.commit(txn).unwrap();
+        assert!(hyper
+            .reaction_store
+            .get_by_ts_hash(actor, &ts_hash)
+            .unwrap()
+            .is_some());
+        let mut txn = RocksDbTransactionBatch::new();
+        hyper
+            .reaction_store
+            .merge(
+                &messages_factory::reactions::create_reaction_remove(
+                    actor,
+                    proto::ReactionType::Like,
+                    proto::reaction_body::Target::TargetCastId(proto::CastId {
+                        fid: target,
+                        hash: deleted.hash.clone(),
+                    }),
+                    Some(base + 31),
+                    None,
+                ),
+                &mut txn,
+                &test_helper::default_merge_ctx(),
+            )
+            .unwrap();
+        hyper.db.commit(txn).unwrap();
+        assert!(hyper
+            .reaction_store
+            .get_by_ts_hash(actor, &ts_hash)
+            .unwrap()
+            .is_none());
+    }
+
+    /// Until its walk is done the index isn't used, even with live entries in
+    /// it; once it is, a cursor from the scan carries on in the index.
+    #[tokio::test]
+    async fn test_notifications_index_fallback_and_cursor_handover() {
+        use crate::api::events::IndexEvent;
+        use crate::api::indexer::Indexer;
+        use crate::api::HubQueryHandler;
+        let (stores, service, target, actor, base) = notified_and_actor().await;
+        let mentions: Vec<_> = (0..3)
+            .map(|i| {
+                messages_factory::casts::create_cast_add_rich(
+                    actor,
+                    "hey",
+                    None,
+                    vec![],
+                    None,
+                    vec![target],
+                    Some(base + i),
+                    None,
+                )
+            })
+            .collect();
+        for m in &mentions {
+            merge_into(&stores, 2, m);
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(RocksDB::new(dir.path().to_str().unwrap()));
+        db.open().unwrap();
+        let live = crate::api::notifications_index::NotificationsIndexer::new(
+            crate::api::config::FeatureConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            db,
+            stores.clone(),
+        );
+        // Live merges land in the index before its walk has run.
+        live.process_event(&IndexEvent::message(mentions[0].clone(), 2, 0))
+            .await
+            .unwrap();
+        assert!(!live.is_complete());
+        let scanned = service
+            .get_notifications(target, 50, None, false, None, None)
+            .await
+            .unwrap();
+        let with_incomplete = service
+            .get_notifications(target, 50, None, false, None, Some(&live))
+            .await
+            .unwrap();
+        assert_eq!(with_incomplete, scanned);
+        assert_eq!(with_incomplete.0.len(), 3);
+
+        let (page1, cursor1) = service
+            .get_notifications(target, 2, None, false, None, None)
+            .await
+            .unwrap();
+        live.backfill().unwrap();
+        let (page2, cursor2) = index_page(&service, &live, target, 2, cursor1.as_deref()).await;
+        assert_eq!(
+            page1.iter().map(|m| m.hash.clone()).collect::<Vec<_>>(),
+            vec![mentions[2].hash.clone(), mentions[1].hash.clone()]
+        );
+        assert_eq!(page2, vec![mentions[0].hash.clone()]);
+        assert!(cursor2.is_none());
+    }
+
+    /// Entries a request skips (here quotes, without the flag) count against a
+    /// read budget; a page that runs out ends early with a cursor to go on.
+    #[tokio::test]
+    async fn test_notifications_index_budget_ends_page_with_cursor() {
+        let (stores, service, target, actor, base) = notified_and_actor().await;
+        let cast =
+            messages_factory::casts::create_cast_add(target, "quoted a lot", Some(base), None);
+        merge_into(&stores, 1, &cast);
+        let liked = like(actor, &cast, base + 1);
+        merge_into(&stores, 2, &liked);
+        for i in 0..250 {
+            let quote = messages_factory::casts::create_cast_add_rich(
+                actor,
+                &format!("quote {i}"),
+                None,
+                vec![proto::Embed {
+                    embed: Some(proto::embed::Embed::CastId(proto::CastId {
+                        fid: target,
+                        hash: cast.hash.clone(),
+                    })),
+                }],
+                None,
+                vec![],
+                Some(base + 10 + i),
+                None,
+            );
+            merge_into(&stores, 2, &quote);
+        }
+        let (_dir, index) = walked_notifications_index(&stores);
+        let (page1, cursor1) = index_page(&service, &index, target, 1, None).await;
+        assert!(page1.is_empty());
+        assert!(cursor1.is_some(), "an exhausted budget hands back a cursor");
+        let (page2, cursor2) = index_page(&service, &index, target, 1, cursor1.as_deref()).await;
+        assert_eq!(page2, vec![liked.hash.clone()]);
+        assert!(cursor2.is_none());
+    }
+
+    /// Request time of the scan against the index on one busy account.
+    /// `cargo test --release --lib notifications_latency -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn bench_notifications_latency() {
+        use crate::api::HubQueryHandler;
+        let (stores, service, target, actor, base) = notified_and_actor().await;
+        // 300 casts, each liked, recast and replied to, every tenth reply
+        // answered twice more down the thread; every like is then undone
+        // after indexing, leaving 300 dead entries for the index to skip.
+        let mut ts = base;
+        let mut next = || {
+            ts += 1;
+            ts
+        };
+        let mut dead = vec![];
+        for i in 0..300 {
+            let cast = messages_factory::casts::create_cast_add(
+                target,
+                &format!("cast {i}"),
+                Some(next()),
+                None,
+            );
+            merge_into(&stores, 1, &cast);
+            merge_into(&stores, 2, &like(actor, &cast, next()));
+            let recast = messages_factory::reactions::create_reaction_add(
+                actor,
+                proto::ReactionType::Recast,
+                proto::reaction_body::Target::TargetCastId(proto::CastId {
+                    fid: target,
+                    hash: cast.hash.clone(),
+                }),
+                Some(next()),
+                None,
+            );
+            merge_into(&stores, 2, &recast);
+            let mut parent = (target, cast.hash.clone());
+            for depth in 0..if i % 10 == 0 { 3 } else { 1 } {
+                let reply = messages_factory::casts::create_cast_with_parent(
+                    actor,
+                    &format!("reply {i} {depth}"),
+                    parent.0,
+                    &parent.1,
+                    Some(next()),
+                    None,
+                );
+                merge_into(&stores, 2, &reply);
+                parent = (actor, reply.hash.clone());
+            }
+            dead.push(cast);
+        }
+        let (_dir, index) = walked_notifications_index(&stores);
+        // Unlike everything after it was indexed: dead entries the index skips.
+        let late = next() + 1000;
+        for cast in &dead {
+            let target_id = proto::reaction_body::Target::TargetCastId(proto::CastId {
+                fid: target,
+                hash: cast.hash.clone(),
+            });
+            merge_into(
+                &stores,
+                2,
+                &messages_factory::reactions::create_reaction_remove(
+                    actor,
+                    proto::ReactionType::Like,
+                    target_id,
+                    Some(late),
+                    None,
+                ),
+            );
+        }
+
+        async fn median(
+            service: &MyHubService,
+            index: Option<&crate::api::notifications_index::NotificationsIndexer>,
+            fid: u64,
+            limit: usize,
+            flag: bool,
+        ) -> (Duration, usize) {
+            let mut times = vec![];
+            let mut n = 0;
+            for _ in 0..30 {
+                let started = Instant::now();
+                let (page, _) = service
+                    .get_notifications(fid, limit, None, flag, None, index)
+                    .await
+                    .unwrap();
+                times.push(started.elapsed());
+                n = page.len();
+            }
+            times.sort();
+            (times[times.len() / 2], n)
+        }
+
+        eprintln!("case                         scan            index");
+        for (name, limit, flag) in [
+            ("limit 50, flag on (Quilcast)", 50, true),
+            ("limit 50, flag off", 50, false),
+            ("limit 1 (unread dot)", 1, true),
+            ("limit 250 (channel views)", 250, false),
+        ] {
+            let (scan, scan_n) = median(&service, None, target, limit, flag).await;
+            let (idx, idx_n) = median(&service, Some(&index), target, limit, flag).await;
+            eprintln!(
+                "{name:<28} {:>8.2?} ({scan_n:>3})  {:>8.2?} ({idx_n:>3})",
+                scan, idx
+            );
+        }
     }
 }

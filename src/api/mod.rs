@@ -41,6 +41,7 @@ pub mod metrics;
 mod metrics_scan;
 mod metrics_worker;
 pub mod notifications;
+pub mod notifications_index;
 pub mod search;
 pub mod social_graph;
 mod social_graph_worker;
@@ -345,6 +346,22 @@ pub fn initialize(
         },
         db.clone(),
     ));
+    // Notifications index is always enabled when API is enabled — it backs
+    // /v2/farcaster/notifications. Live merges keep it current from the start;
+    // its store walk is started from main.rs once the hyper stores are filled,
+    // and until that walk finishes notifications use the old bounded scan.
+    let notifications_indexer =
+        Arc::new(crate::api::notifications_index::NotificationsIndexer::new(
+            FeatureConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            db.clone(),
+            hyper_shard_stores
+                .clone()
+                .unwrap_or_else(|| shard_stores.clone()),
+        ));
+
     if !user_search_indexer.is_complete() {
         let indexer = user_search_indexer.clone();
         let stores = hyper_shard_stores
@@ -415,6 +432,7 @@ pub fn initialize(
     worker_pool.register_arc(user_data_indexer.clone());
     worker_pool.register_arc(custody_indexer.clone());
     worker_pool.register_arc(user_search_indexer.clone());
+    worker_pool.register_arc(notifications_indexer.clone());
 
     if let Some(ref indexer) = channels_indexer {
         worker_pool.register_arc(indexer.clone());
@@ -561,6 +579,7 @@ pub fn initialize(
         vec![
             cast_hash_indexer.clone() as Arc<dyn Indexer>,
             cast_quotes_indexer.clone() as Arc<dyn Indexer>,
+            notifications_indexer.clone() as Arc<dyn Indexer>,
         ],
         shutdown_tx.subscribe(),
     );
@@ -699,6 +718,7 @@ pub fn initialize(
     http_handler.set_shard_dbs(shard_dbs);
     http_handler.set_custody_index(custody_indexer);
     http_handler.set_user_search(user_search_indexer);
+    http_handler.set_notifications_index(notifications_indexer);
 
     // Mini app notifications — two stateful HTTP handlers wired here,
     // one more (the registration management handler) wired from

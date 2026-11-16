@@ -145,6 +145,8 @@ pub trait HubQueryHandler: Send + Sync {
     /// Get notifications for a user (reactions + mentions on their casts + follows).
     /// With `include_quotes_and_deep_replies`, also replies deeper in threads
     /// under the user's casts and, when `quotes` is given, casts quoting them.
+    /// Once `index` is complete, pages come from it, reaching back through all
+    /// of the user's history instead of only their newest casts.
     async fn get_notifications(
         &self,
         fid: u64,
@@ -152,6 +154,7 @@ pub trait HubQueryHandler: Send + Sync {
         cursor: Option<&str>,
         include_quotes_and_deep_replies: bool,
         quotes: Option<&crate::api::cast_quotes_index::CastQuotesIndexer>,
+        index: Option<&crate::api::notifications_index::NotificationsIndexer>,
     ) -> Result<(Vec<crate::proto::Message>, Option<String>), String>;
 
     /// Get links by FID and link type (e.g. "follow", "block", "mute").
@@ -255,6 +258,9 @@ pub struct ApiHttpHandler {
     /// Username / display-name prefix index. Late-bound like `daily_stats`.
     user_search:
         Arc<std::sync::RwLock<Option<Arc<crate::api::user_search_index::UserSearchIndexer>>>>,
+    /// Notifications index. Late-bound like `daily_stats`.
+    notifications_index:
+        Arc<std::sync::RwLock<Option<Arc<crate::api::notifications_index::NotificationsIndexer>>>>,
 }
 
 /// Emit the count, latency, total and error metrics for one request.
@@ -363,7 +369,23 @@ impl ApiHttpHandler {
             cast_probe_lock: Arc::new(tokio::sync::Mutex::new(())),
             custody_index: Arc::new(std::sync::RwLock::new(None)),
             user_search: Arc::new(std::sync::RwLock::new(None)),
+            notifications_index: Arc::new(std::sync::RwLock::new(None)),
         }
+    }
+
+    /// Install the notifications index (callable after construction).
+    pub fn set_notifications_index(
+        &self,
+        index: Arc<crate::api::notifications_index::NotificationsIndexer>,
+    ) {
+        *self.notifications_index.write().unwrap() = Some(index);
+    }
+
+    /// The notifications index, for starting its store walk.
+    pub fn notifications_index(
+        &self,
+    ) -> Option<Arc<crate::api::notifications_index::NotificationsIndexer>> {
+        self.notifications_index.read().unwrap().clone()
     }
 
     /// Install the user search index (callable after construction).
@@ -3352,6 +3374,7 @@ impl ApiHttpHandler {
                 cursor,
                 include_quotes_and_deep_replies,
                 self.cast_quotes_index.as_deref(),
+                self.notifications_index().as_deref(),
             )
             .await
         {
@@ -3474,7 +3497,14 @@ impl ApiHttpHandler {
 
         // Fetch more notifications than needed so we can filter
         match hub
-            .get_notifications(fid, limit * 10, cursor, false, None)
+            .get_notifications(
+                fid,
+                limit * 10,
+                cursor,
+                false,
+                None,
+                self.notifications_index().as_deref(),
+            )
             .await
         {
             Ok((messages, next_cursor)) => {
@@ -3588,7 +3618,14 @@ impl ApiHttpHandler {
         let target_urls: Vec<&str> = parent_urls_param.split(',').map(|s| s.trim()).collect();
 
         match hub
-            .get_notifications(fid, limit * 10, cursor, false, None)
+            .get_notifications(
+                fid,
+                limit * 10,
+                cursor,
+                false,
+                None,
+                self.notifications_index().as_deref(),
+            )
             .await
         {
             Ok((messages, next_cursor)) => {
@@ -5753,6 +5790,7 @@ mod tests {
             _cursor: Option<&str>,
             _include_quotes_and_deep_replies: bool,
             _quotes: Option<&crate::api::cast_quotes_index::CastQuotesIndexer>,
+            _index: Option<&crate::api::notifications_index::NotificationsIndexer>,
         ) -> Result<(Vec<crate::proto::Message>, Option<String>), String> {
             Ok((self.notifications.clone(), None))
         }

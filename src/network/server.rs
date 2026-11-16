@@ -1063,6 +1063,139 @@ impl MyHubService {
         self.get_stores_for_shard(shard_id)
     }
 
+    /// A page of `fid`'s notifications from the notifications index: one
+    /// reverse scan from the cursor, plus one read per message to load it,
+    /// which also skips anything removed since it was indexed. Same order,
+    /// cursor and messages as the scan in `get_notifications`, but over all of
+    /// the user's history.
+    fn notifications_from_index(
+        &self,
+        index: &crate::api::notifications_index::NotificationsIndexer,
+        fid: u64,
+        limit: usize,
+        cursor: Option<&str>,
+        include_quotes_and_deep_replies: bool,
+    ) -> Result<(Vec<Message>, Option<String>), String> {
+        use crate::api::notifications_index::Kind;
+
+        let limit = limit.max(1);
+        let before = cursor.and_then(decode_notifications_cursor).map(|c| {
+            (
+                c.before_timestamp,
+                hex::decode(&c.before_hash).unwrap_or_default(),
+            )
+        });
+        // Bounds one request's reads when most entries are skipped (flag-only
+        // kinds, removed messages); the page then ends early with a cursor.
+        let budget = limit * 4 + 200;
+        let mut scanned = 0;
+        let mut page: Vec<Message> = Vec::with_capacity(limit + 1);
+        // Entries for one message (one per reason it notifies) sit next to each
+        // other; it's loaded once and listed once.
+        let mut current: Option<(u32, [u8; 20])> = None;
+        let mut loaded: Option<Option<Message>> = None;
+        let mut listed = false;
+        let mut stopped_at: Option<(u32, [u8; 20])> = None;
+        // Whether a cast hash is one of `fid`'s casts: a message's target is
+        // its author's claim, so it only counts when the cast is really theirs.
+        let mut own: HashMap<Vec<u8>, bool> = HashMap::new();
+        let own_stores = self.get_stores_for(fid).ok();
+        let mut is_own = |cast: &crate::proto::CastId| {
+            cast.fid == fid
+                && *own.entry(cast.hash.clone()).or_insert_with(|| {
+                    own_stores.is_some_and(|s| {
+                        matches!(
+                            CastStore::get_cast_add(&s.cast_store, fid, cast.hash.clone()),
+                            Ok(Some(_))
+                        )
+                    })
+                })
+        };
+
+        index
+            .scan(
+                fid,
+                before.as_ref().map(|(ts, hash)| (*ts, hash.as_slice())),
+                |entry| {
+                    let at = (entry.timestamp, entry.hash);
+                    if current != Some(at) {
+                        if page.len() > limit {
+                            return true;
+                        }
+                        if scanned >= budget {
+                            stopped_at = current;
+                            return true;
+                        }
+                        scanned += 1;
+                        current = Some(at);
+                        loaded = None;
+                        listed = false;
+                    }
+                    if listed || (entry.kind.needs_flag() && !include_quotes_and_deep_replies) {
+                        return false;
+                    }
+                    let message = loaded.get_or_insert_with(|| {
+                        let stores = self.get_stores_for(entry.actor).ok()?;
+                        let ts_hash = make_ts_hash(entry.timestamp, &entry.hash.to_vec()).ok()?;
+                        match entry.kind {
+                            Kind::Reaction => stores.reaction_store.get_by_ts_hash(entry.actor, &ts_hash),
+                            Kind::Follow => stores.link_store.get_by_ts_hash(entry.actor, &ts_hash),
+                            _ => stores.cast_store.get_by_ts_hash(entry.actor, &ts_hash),
+                        }
+                        .ok()
+                        .flatten()
+                    });
+                    let Some(message) = message else {
+                        return false;
+                    };
+                    let Some(data) = &message.data else {
+                        return false;
+                    };
+                    let notifies = match (entry.kind, &data.body) {
+                        (Kind::Reaction, Some(message_data::Body::ReactionBody(body))) => {
+                            matches!(&body.target, Some(proto::reaction_body::Target::TargetCastId(c)) if is_own(c))
+                        }
+                        (Kind::Reply, Some(message_data::Body::CastAddBody(body))) => {
+                            matches!(&body.parent, Some(cast_add_body::Parent::ParentCastId(c)) if is_own(c))
+                        }
+                        (Kind::Quote, Some(message_data::Body::CastAddBody(body))) => {
+                            body.embeds.iter().any(|e| {
+                                matches!(&e.embed, Some(proto::embed::Embed::CastId(c)) if is_own(c))
+                            })
+                        }
+                        (Kind::Mention, Some(message_data::Body::CastAddBody(body))) => {
+                            body.mentions.contains(&fid)
+                        }
+                        // The thread was looked up in the stores when indexed.
+                        (Kind::DeepReply, Some(message_data::Body::CastAddBody(_))) => true,
+                        (Kind::Follow, Some(message_data::Body::LinkBody(body))) => {
+                            body.target == Some(proto::link_body::Target::TargetFid(fid))
+                        }
+                        _ => false,
+                    };
+                    if notifies && data.fid != fid {
+                        page.push(message.clone());
+                        listed = true;
+                    }
+                    false
+                },
+            )
+            .map_err(|e| e.to_string())?;
+
+        let next_cursor = if page.len() > limit {
+            let boundary = &page[limit - 1];
+            let ts = boundary.data.as_ref().map(|d| d.timestamp).unwrap_or(0);
+            Some(encode_notifications_cursor(
+                ts,
+                &hex::encode(&boundary.hash),
+            ))
+        } else {
+            stopped_at.map(|(ts, hash)| encode_notifications_cursor(ts, &hex::encode(hash)))
+        };
+        page.truncate(limit);
+        Ok((page, next_cursor))
+    }
+
     /// Validates the width and registration of a caller-supplied channel id, and
     /// returns the id as a fixed-width array.
     ///
@@ -4375,7 +4508,20 @@ impl crate::api::HubQueryHandler for MyHubService {
         cursor: Option<&str>,
         include_quotes_and_deep_replies: bool,
         quotes: Option<&crate::api::cast_quotes_index::CastQuotesIndexer>,
+        index: Option<&crate::api::notifications_index::NotificationsIndexer>,
     ) -> Result<(Vec<Message>, Option<String>), String> {
+        if let Some(index) = index.filter(|i| i.is_complete()) {
+            return self.notifications_from_index(
+                index,
+                fid,
+                limit,
+                cursor,
+                include_quotes_and_deep_replies,
+            );
+        }
+
+        // Until the index is complete: a scan of the user's newest casts, which
+        // only reaches the activity on their last 100 casts.
         let mut notifications: Vec<Message> = Vec::new();
         let fetch_limit = limit.max(25);
 

@@ -48,6 +48,12 @@ pub struct ApiConfig {
     /// Daily network-wide activity rollups (the Dune-query replacement).
     #[serde(default)]
     pub daily_stats: DailyStatsConfig,
+
+    /// Walk the stores once (after the hyper stores are filled) to index the
+    /// notifications history. Until the walk finishes, notifications come from
+    /// a scan of each user's newest casts; turning it off keeps that scan.
+    #[serde(default = "default_true")]
+    pub notifications_index_backfill: bool,
 }
 
 impl Default for ApiConfig {
@@ -64,6 +70,7 @@ impl Default for ApiConfig {
             webhooks: WebhooksConfig::default(),
             notifications: NotificationsConfig::default(),
             daily_stats: DailyStatsConfig::default(),
+            notifications_index_backfill: true,
         }
     }
 }

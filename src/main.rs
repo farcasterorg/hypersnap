@@ -104,6 +104,12 @@ async fn start_servers(
         let backfill_db = block_stores.db.clone();
         let backfill_shard_stores = shard_stores.clone();
         let backfill_hyper_stores = hyper_shard_stores.clone();
+        // The notifications index walks the hyper stores, so it starts once
+        // they're filled; reconciliation writes them without events.
+        let notifications_index = api_handler
+            .as_ref()
+            .and_then(|h| h.notifications_index())
+            .filter(|i| app_config.api.notifications_index_backfill && !i.is_complete());
         tokio::spawn(async move {
             snapchain::hyper::backfill::run_hyper_backfill(
                 &backfill_db,
@@ -128,6 +134,15 @@ async fn start_servers(
             });
             if let Err(e) = reconcile.await {
                 warn!(error = %e, "Hyper reconciliation task failed");
+            }
+            if let Some(index) = notifications_index {
+                let walk = tokio::task::spawn_blocking(move || index.backfill()).await;
+                match walk {
+                    Ok(Ok(())) => {}
+                    // Resumes from its checkpoints on the next start.
+                    Ok(Err(e)) => warn!(error = %e, "Notifications index walk stopped"),
+                    Err(e) => warn!(error = %e, "Notifications index walk task failed"),
+                }
             }
         });
     }
