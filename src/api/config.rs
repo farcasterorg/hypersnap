@@ -48,12 +48,19 @@ pub struct ApiConfig {
     /// Daily network-wide activity rollups (the Dune-query replacement).
     #[serde(default)]
     pub daily_stats: DailyStatsConfig,
+
+    /// Keep hydrated profiles (everything but follower counts) between
+    /// requests, dropped when a message or on-chain event for the account
+    /// could change them. `false` reads every profile from the stores.
+    #[serde(default = "default_true")]
+    pub profile_cache: bool,
 }
 
 impl Default for ApiConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            profile_cache: true,
             social_graph: FeatureConfig::default(),
             channels: FeatureConfig::default(),
             metrics: MetricsConfig::default(),
@@ -344,6 +351,12 @@ pub struct FeedConfig {
     /// Seconds a trending ranking is served before a background refresh.
     #[serde(default = "default_trending_cache_ttl_secs")]
     pub trending_cache_ttl_secs: u64,
+
+    /// Keep each followed account's newest cast and recast time in memory,
+    /// so the following feed reads only the accounts that can reach the
+    /// page instead of every followed account. `false` reads them all.
+    #[serde(default = "default_true")]
+    pub followed_bounds: bool,
 }
 
 impl Default for FeedConfig {
@@ -353,6 +366,7 @@ impl Default for FeedConfig {
             max_following_fetch: default_max_following_fetch(),
             default_page_size: default_feed_page_size(),
             trending_cache_ttl_secs: default_trending_cache_ttl_secs(),
+            followed_bounds: true,
         }
     }
 }
