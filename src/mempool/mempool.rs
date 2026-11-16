@@ -44,6 +44,14 @@ use tracing::{error, warn};
 
 type DirectRateLimiter = RateLimiter<NotKeyed, InMemoryState, QuantaClock>;
 
+/// Fixed per-FID admission quota: 0.28 messages/second, burst 1,008.
+/// Independent of storage balances and the legacy enable_rate_limits switch.
+const FIXED_MESSAGES_PER_HOUR: u32 = 1008;
+
+fn fixed_message_quota() -> Quota {
+    Quota::per_hour(NonZeroU32::new(FIXED_MESSAGES_PER_HOUR).unwrap())
+}
+
 pub struct RateLimitsConfig {
     pub time_to_idle: Duration,
     pub max_capacity: u64,
@@ -262,6 +270,10 @@ pub struct Config {
     pub capacity_per_shard: u64,
     pub rx_poll_interval: Duration,
     pub enable_rate_limits: bool,
+    /// Per-shard candidate heights enabling the fixed, storage-independent FID quota.
+    /// Network rollout values belong in validators.toml. Empty means unscheduled.
+    #[serde(default)]
+    pub fixed_rate_limit_activation_heights: BTreeMap<String, u64>,
 }
 
 impl Default for Config {
@@ -272,7 +284,25 @@ impl Default for Config {
             capacity_per_shard: 1_000_000,
             rx_poll_interval: Duration::from_millis(1),
             enable_rate_limits: false,
+            fixed_rate_limit_activation_heights: BTreeMap::new(),
         }
+    }
+}
+
+impl Config {
+    pub fn validate_fixed_rate_limit_schedule(&self, num_shards: u32) -> Result<(), String> {
+        let heights = &self.fixed_rate_limit_activation_heights;
+        if !heights.is_empty()
+            && (heights.len() != num_shards as usize + 1
+                || (0..=num_shards).any(|shard| {
+                    !heights
+                        .get(&shard.to_string())
+                        .is_some_and(|height| *height > 0)
+                }))
+        {
+            return Err("mempool.fixed_rate_limit_activation_heights must specify a positive height for every shard, including shard 0".into());
+        }
+        Ok(())
     }
 }
 
@@ -682,6 +712,7 @@ pub struct Mempool {
     statsd_client: StatsdClientWrapper,
     read_node_mempool: ReadNodeMempool,
     rate_limits: Option<RateLimits>,
+    fixed_rate_limits: Cache<u64, Arc<DirectRateLimiter>>,
     // Always present (not `Option`) — KEY_ADD rate limiting is a FIP-required safety
     // guardrail, not a configurable throughput knob. See `KeyAddRateLimits`.
     key_add_rate_limits: KeyAddRateLimits,
@@ -704,6 +735,11 @@ impl Mempool {
         statsd_client: StatsdClientWrapper,
     ) -> Self {
         Mempool {
+            fixed_rate_limits: CacheBuilder::new(1_000_000)
+                // A full refill takes one hour; idle eviction must not refresh it sooner.
+                .time_to_idle(Duration::from_secs(2 * 60 * 60))
+                .eviction_policy(EvictionPolicy::lru())
+                .build(),
             messages: HashMap::new(),
             messages_request_rx,
             shard_decision_rx,
@@ -739,7 +775,30 @@ impl Mempool {
         }
     }
 
-    fn message_exceeds_rate_limits(&mut self, message: &MempoolMessage) -> bool {
+    fn fixed_rate_limit_active(&self, shard: u32) -> bool {
+        let Some(activation) = self
+            .config
+            .fixed_rate_limit_activation_heights
+            .get(&shard.to_string())
+        else {
+            return false;
+        };
+        let tip = if shard == 0 {
+            self.read_node_mempool
+                .block_stores
+                .block_store
+                .max_block_number()
+                .ok()
+        } else {
+            let Some(stores) = self.read_node_mempool.shard_stores.get(&shard) else {
+                return false;
+            };
+            stores.shard_store.max_block_number().ok()
+        };
+        tip.is_some_and(|tip| tip.saturating_add(1) >= *activation)
+    }
+
+    fn message_exceeds_rate_limits(&mut self, shard: u32, message: &MempoolMessage) -> bool {
         match message {
             MempoolMessage::UserMessage(user_msg) => {
                 let fid = user_msg.fid();
@@ -757,6 +816,21 @@ impl Mempool {
                             .count("mempool.key_add_rate_limit_hit", 1, vec![]);
                         return true;
                     }
+                }
+
+                if self.fixed_rate_limit_active(shard) {
+                    // Custody operations keep their existing separate protection. Native
+                    // onboarding has not yet established a FID and must not share FID 0's bucket.
+                    if matches!(
+                        user_msg.msg_type(),
+                        MessageType::KeyAdd | MessageType::KeyRemove | MessageType::NativeOnboard
+                    ) {
+                        return false;
+                    }
+                    let limiter = self
+                        .fixed_rate_limits
+                        .get_with(fid, || Arc::new(RateLimiter::direct(fixed_message_quota())));
+                    return limiter.check().is_err();
                 }
 
                 let storage_disabled = self
@@ -942,7 +1016,7 @@ impl Mempool {
         // exactly once, at admission. Re-running them at pull time would double-charge
         // the 1/min KEY_ADD quota and silently drop every accepted message before it
         // ever reached the engine.
-        if at_admission && self.message_exceeds_rate_limits(message) {
+        if at_admission && self.message_exceeds_rate_limits(shard, message) {
             self.statsd_client
                 .count_with_shard(shard, "mempool.rate_limit_hit", 1, vec![]);
             return Err(HubError::rate_limited(&format!(
@@ -1281,5 +1355,167 @@ impl Mempool {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod fixed_rate_tests {
+    use super::*;
+    use crate::storage::store::{block_engine_test_helpers, test_helper};
+    use governor::clock::FakeRelativeClock;
+
+    #[test]
+    fn fixed_quota_burst_and_refill() {
+        let clock = FakeRelativeClock::default();
+        let limiter = RateLimiter::direct_with_clock(fixed_message_quota(), clock.clone());
+        for _ in 0..1008 {
+            assert!(limiter.check().is_ok());
+        }
+        assert!(limiter.check().is_err());
+        clock.advance(Duration::from_millis(3571));
+        assert!(limiter.check().is_err());
+        clock.advance(Duration::from_millis(1));
+        assert!(limiter.check().is_ok());
+        assert!(limiter.check().is_err());
+        clock.advance(Duration::from_secs(3600));
+        for _ in 0..1008 {
+            assert!(limiter.check().is_ok());
+        }
+        assert!(limiter.check().is_err());
+    }
+
+    fn message(fid: u64, kind: MessageType) -> MempoolMessage {
+        MempoolMessage::UserMessage(proto::Message {
+            data: Some(proto::MessageData {
+                fid,
+                r#type: kind as i32,
+                body: if kind == MessageType::KeyAdd {
+                    Some(proto::message_data::Body::KeyAddBody(Default::default()))
+                } else {
+                    None
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn fixed_rate_limit_activation_and_shared_bucket_without_storage() {
+        let (engine, _dir) = test_helper::new_engine().await;
+        let (block_engine, _block_dir) = block_engine_test_helpers::setup();
+        let mut stores = engine.get_stores();
+        stores.native_registration.activation_heights =
+            [("0".into(), 1), ("1".into(), 1), ("2".into(), 1)].into();
+        assert!(stores.storage_limits_disabled());
+        let config = Config {
+            fixed_rate_limit_activation_heights: [
+                ("0".into(), 10),
+                ("1".into(), 20),
+                ("2".into(), 30),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let (_, rx) = mpsc::channel(1);
+        let (_, requests) = mpsc::channel(1);
+        let (gossip, _) = mpsc::channel(1);
+        let (_, shard_decisions) = broadcast::channel(1);
+        let (_, block_decisions) = broadcast::channel(1);
+        let mut pool = Mempool::new(
+            config,
+            FarcasterNetwork::Devnet,
+            rx,
+            requests,
+            2,
+            [(1, stores.clone()), (2, stores.clone())].into(),
+            block_engine.stores(),
+            gossip,
+            shard_decisions,
+            block_decisions,
+            test_helper::statsd_client(),
+        );
+        let cast = MempoolMessage::UserMessage(
+            crate::utils::factory::messages_factory::casts::create_cast_add(
+                42,
+                "fixed quota",
+                None,
+                None,
+            ),
+        );
+        // No account registration or storage exists; legacy switch is disabled.
+        for _ in 0..1010 {
+            assert!(!pool.message_exceeds_rate_limits(1, &cast));
+        }
+        let set_tip = |height| {
+            stores
+                .shard_store
+                .put_shard_chunk(&ShardChunk {
+                    header: Some(proto::ShardHeader {
+                        height: Some(Height::new(1, height)),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .unwrap();
+        };
+        set_tip(18);
+        assert!(!pool.fixed_rate_limit_active(1));
+        set_tip(19);
+        assert!(pool.fixed_rate_limit_active(1));
+        assert!(!pool.fixed_rate_limit_active(2));
+        for kind in [
+            MessageType::CastAdd,
+            MessageType::ReactionAdd,
+            MessageType::LinkAdd,
+        ] {
+            for _ in 0..336 {
+                assert!(!pool.message_exceeds_rate_limits(1, &message(42, kind)));
+            }
+        }
+        assert!(pool.message_exceeds_rate_limits(1, &cast));
+        // Pulling an admitted message must not charge a second token or drop it.
+        assert!(pool.message_is_valid(1, &cast, false).is_ok());
+        assert!(pool.message_is_valid(1, &cast, true).is_err());
+        assert!(!pool.message_exceeds_rate_limits(1, &message(43, MessageType::CastAdd)));
+        assert!(!pool.message_exceeds_rate_limits(1, &message(42, MessageType::KeyRemove)));
+        assert!(!pool.message_exceeds_rate_limits(1, &message(42, MessageType::KeyAdd)));
+        assert!(pool.message_exceeds_rate_limits(1, &message(42, MessageType::KeyAdd)));
+        assert!(!pool.message_exceeds_rate_limits(1, &message(0, MessageType::NativeOnboard)));
+        // At/past activation, even the old storage-derived switch cannot override the quota.
+        pool.config.enable_rate_limits = true;
+        assert!(pool.message_exceeds_rate_limits(1, &cast));
+        let mut block = block_engine_test_helpers::default_block();
+        block.header.as_mut().unwrap().height = Some(Height::new(0, 8));
+        block_engine.stores().block_store.put_block(&block).unwrap();
+        assert!(!pool.fixed_rate_limit_active(0));
+        block.header.as_mut().unwrap().height = Some(Height::new(0, 9));
+        block_engine.stores().block_store.put_block(&block).unwrap();
+        assert!(pool.fixed_rate_limit_active(0));
+    }
+
+    #[test]
+    fn fixed_rate_limit_schedule_validation() {
+        let mut config = Config::default();
+        assert!(config.validate_fixed_rate_limit_schedule(2).is_ok());
+        config
+            .fixed_rate_limit_activation_heights
+            .insert("0".into(), 10);
+        assert!(config.validate_fixed_rate_limit_schedule(2).is_err());
+        config
+            .fixed_rate_limit_activation_heights
+            .extend([("1".into(), 20), ("2".into(), 30)]);
+        assert!(config.validate_fixed_rate_limit_schedule(2).is_ok());
+        config
+            .fixed_rate_limit_activation_heights
+            .insert("2".into(), 0);
+        assert!(config.validate_fixed_rate_limit_schedule(2).is_err());
+        let file: toml::Value = toml::from_str(include_str!("../../validators.toml")).unwrap();
+        config.fixed_rate_limit_activation_heights = file["mempool"]
+            ["fixed_rate_limit_activation_heights"]
+            .clone()
+            .try_into()
+            .unwrap();
+        assert!(config.validate_fixed_rate_limit_schedule(2).is_ok());
     }
 }
