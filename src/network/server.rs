@@ -4274,6 +4274,22 @@ impl crate::api::HubQueryHandler for MyHubService {
             .flatten()
     }
 
+    async fn get_signer_source(&self, fid: u64, signer: &[u8]) -> Option<&'static str> {
+        let stores = self.get_stores_for(fid).ok()?;
+        let key = crate::storage::store::account::get_active_key(
+            &stores.onchain_event_store,
+            &stores.db,
+            &RocksDbTransactionBatch::new(),
+            fid,
+            signer,
+        )
+        .ok()??;
+        Some(match key {
+            crate::storage::store::account::ActiveKey::OnChain => "onchain",
+            crate::storage::store::account::ActiveKey::Gasless { .. } => "offchain",
+        })
+    }
+
     async fn get_fids_by_address(&self, address: &[u8], include_custody: bool) -> Vec<u64> {
         let mut fids = Vec::new();
 

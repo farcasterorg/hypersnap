@@ -126,6 +126,12 @@ pub trait HubQueryHandler: Send + Sync {
         None
     }
 
+    /// `"onchain"` or `"offchain"` for an active key of `fid`, the same lookup message
+    /// validation uses; `None` when the key isn't known.
+    async fn get_signer_source(&self, _fid: u64, _signer: &[u8]) -> Option<&'static str> {
+        None
+    }
+
     /// Get username proof.
     async fn get_username_proof(&self, name: &[u8]) -> Option<(u64, String, u64, Vec<u8>)>;
 
@@ -2174,8 +2180,17 @@ impl ApiHttpHandler {
         // FIDs, so we fan them out concurrently rather than serially.
         let author_fut = self.get_user(fid);
         let mention_futs: Vec<_> = mentions.iter().map(|&mf| self.get_user(mf)).collect();
-        let (author, mentioned_profiles_vec) =
-            tokio::join!(author_fut, futures::future::join_all(mention_futs),);
+        let hub = self.hub_query.read().unwrap().clone();
+        let signer_source_fut = async {
+            hub?.get_signer_source(fid, &msg.signer)
+                .await
+                .map(str::to_string)
+        };
+        let (author, mentioned_profiles_vec, signer_source) = tokio::join!(
+            author_fut,
+            futures::future::join_all(mention_futs),
+            signer_source_fut
+        );
         let mentioned_profiles = mentioned_profiles_vec;
         let mut mentioned_profiles_ranges = Vec::with_capacity(mentions.len());
         for i in 0..mentions.len() {
@@ -2231,6 +2246,7 @@ impl ApiHttpHandler {
             thread_hash,
             format_version,
             chain,
+            signer_source,
             mentioned_profiles,
             mentioned_profiles_ranges,
             mentioned_channels: Vec::new(),
@@ -5646,6 +5662,8 @@ mod tests {
         links: Vec<(u64, &'static str, u64)>,
         /// Live reactions as (fid, reaction type, cast hash).
         reactions: Vec<(u64, i32, Vec<u8>)>,
+        /// Active keys as (fid, signer, source).
+        signers: Vec<(u64, Vec<u8>, &'static str)>,
     }
 
     #[async_trait]
@@ -5721,6 +5739,13 @@ mod tests {
 
         async fn get_fids_by_address(&self, _address: &[u8], _include_custody: bool) -> Vec<u64> {
             vec![]
+        }
+
+        async fn get_signer_source(&self, fid: u64, signer: &[u8]) -> Option<&'static str> {
+            self.signers
+                .iter()
+                .find(|(f, s, _)| *f == fid && s == signer)
+                .map(|(_, _, source)| *source)
         }
 
         async fn get_username_proof(&self, _name: &[u8]) -> Option<(u64, String, u64, Vec<u8>)> {
@@ -6425,6 +6450,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_signer_source_on_v2_casts() {
+        use crate::utils::factory::messages_factory::casts;
+
+        let msg = casts::create_cast_add(7, "hi", None, None);
+        let hash = hex::encode(&msg.hash);
+        let lookup = |signers: Vec<(u64, Vec<u8>, &'static str)>| {
+            let handler = ApiHttpHandler::new(None, None, None, None, None, None);
+            handler.set_hub_query(Arc::new(MockHubQuery {
+                cast_lookup: Some(msg.clone()),
+                signers,
+                ..Default::default()
+            }));
+            let hash = hash.clone();
+            async move {
+                let response = handler
+                    .handle_cast_lookup(&hash, "hash", Some(7), None)
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                collect_json(response).await["cast"].clone()
+            }
+        };
+
+        for source in ["onchain", "offchain"] {
+            let json = lookup(vec![(7, msg.signer.clone(), source)]).await;
+            assert_eq!(json["signer_source"], source);
+        }
+        // An unknown key, or the same key under another FID, leaves the field out.
+        for signers in [vec![], vec![(8, msg.signer.clone(), "onchain")]] {
+            assert!(lookup(signers).await.get("signer_source").is_none());
+        }
+        // So does a cast not read from its message (a search result).
+        let json = serde_json::to_value(Cast::default()).unwrap();
+        assert!(json.get("signer_source").is_none());
+    }
+
+    #[tokio::test]
     async fn test_user_viewer_context_only_with_viewer_fid() {
         let (followed, follower, viewer) = (10, 11, 20);
         let handler = ApiHttpHandler::new(None, None, None, None, None, None);
@@ -6714,6 +6776,7 @@ mod tests {
             casts: vec![],
             links: vec![],
             reactions: vec![],
+            signers: vec![],
         }));
 
         for (flag, expected) in [(false, ["reply", "likes"]), (true, ["quote", "recasts"])] {

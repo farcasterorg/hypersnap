@@ -173,6 +173,12 @@ pub struct Cast {
     /// The cast's place in its author's chain of casts; absent when it is in none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain: Option<CastChain>,
+    /// Where the key that signed the cast comes from: `onchain` (the KeyRegistry, so any
+    /// Farcaster node can accept the cast) or `offchain` (a gasless KEY_ADD, which only Hypersnap
+    /// accepts). Absent when the node can't resolve the key, or the cast was not read from its
+    /// message (search results).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer_source: Option<String>,
     pub mentioned_profiles: Vec<User>,
     #[serde(default)]
     pub mentioned_profiles_ranges: Vec<TextRange>,
@@ -210,6 +216,7 @@ impl Default for Cast {
             thread_hash: None,
             format_version: None,
             chain: None,
+            signer_source: None,
             mentioned_profiles: Vec::new(),
             mentioned_profiles_ranges: Vec::new(),
             mentioned_channels: Vec::new(),
