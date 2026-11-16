@@ -180,9 +180,12 @@ impl CastIndex {
         let writer = index
             .writer(writer_bytes)
             .map_err(|e| IndexerError::Storage(format!("Failed to create writer: {}", e)))?;
+        // Reloaded by `commit`. `OnCommitWithDelay` reloads from a detached watcher thread
+        // that can outlive the index and recreate its lock file while the legacy index's
+        // directory is being deleted.
         let reader: IndexReader = index
             .reader_builder()
-            .reload_policy(ReloadPolicy::OnCommitWithDelay)
+            .reload_policy(ReloadPolicy::Manual)
             .try_into()
             .map_err(|e| IndexerError::Storage(format!("Failed to create reader: {}", e)))?;
         let schema = index.schema();
@@ -229,7 +232,16 @@ impl CastIndex {
             .map_err(|_| IndexerError::Storage("Failed to acquire write lock".to_string()))?
             .commit()
             .map_err(|e| IndexerError::Storage(format!("Failed to commit: {}", e)))?;
-        Ok(())
+        self.reader
+            .reload()
+            .map_err(|e| IndexerError::Storage(format!("Failed to reload reader: {}", e)))
+    }
+
+    /// Drop the index once its merge threads finish, so none writes into its directory after.
+    fn close(self) {
+        if let Ok(writer) = self.writer.into_inner() {
+            let _ = writer.wait_merging_threads();
+        }
     }
 
     fn search(
@@ -432,7 +444,7 @@ impl SearchIndexer {
         }
         let legacy = self.legacy.write().unwrap().take();
         if let Some((legacy, path)) = legacy {
-            drop(legacy);
+            legacy.close();
             match std::fs::remove_dir_all(&path) {
                 Ok(()) => {
                     tracing::info!(path = %path.display(), "Search rebuild complete; removed legacy index")
