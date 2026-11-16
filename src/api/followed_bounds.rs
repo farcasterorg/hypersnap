@@ -13,7 +13,8 @@
 //! processed after it raises the bound. A deleted cast leaves its bound high,
 //! which only costs a read. Lost merge events are replayed by the index gap
 //! repair, so a bound can lag the store by as long as that takes, the same as
-//! the cast hash index.
+//! the cast hash index. Messages the hyper backfill and reconcile copy into the
+//! store emit no event, so bounds are read again after [`RESEED_AFTER`].
 
 use crate::api::events::{IndexEvent, MessageEventKind};
 use crate::api::indexer::{Indexer, IndexerError, IndexerStats};
@@ -21,7 +22,11 @@ use crate::proto::{self, message_data::Body, Message, MessageType, ReactionType}
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tokio::sync::watch;
+
+/// How long a seeded bound is trusted before the store is read again.
+pub const RESEED_AFTER: Duration = Duration::from_secs(10 * 60);
 
 /// The newest cast and the newest recast an account can have; `None` when it
 /// has none.
@@ -34,16 +39,18 @@ pub struct Bounds {
 #[derive(Default)]
 struct Entry {
     bounds: Bounds,
-    seeded: bool,
+    /// When the store read that seeded it started.
+    seeded: Option<Instant>,
 }
 
 pub struct FollowedBounds {
     // ponytail: one entry per account a following feed has read, never
-    // evicted (~40 bytes each); add an LRU if that set gets large.
+    // evicted (~50 bytes each); add an LRU if that set gets large.
     entries: Mutex<HashMap<u64, Entry>>,
     /// Whether live merge events reach `process_event`. The bridges start
     /// after startup backfill; bounds are not used before then.
     live: watch::Receiver<bool>,
+    reseed_after: Duration,
 }
 
 fn raise(bound: &mut Option<u32>, timestamp: Option<u32>) {
@@ -55,11 +62,18 @@ impl FollowedBounds {
         Self {
             entries: Mutex::new(HashMap::new()),
             live,
+            reseed_after: RESEED_AFTER,
         }
     }
 
-    /// The bounds of `fids`, in order, reading the store once for each
-    /// account seen for the first time; `None` for an account whose read
+    fn fresh(&self, entry: &Entry) -> bool {
+        entry
+            .seeded
+            .is_some_and(|at| at.elapsed() < self.reseed_after)
+    }
+
+    /// The bounds of `fids`, in order, reading the store for each account
+    /// not seeded within [`RESEED_AFTER`]; `None` for an account whose read
     /// failed. `newest` gives the timestamp of each account's newest cast
     /// message and newest reaction message (of any kind). `None` until merge
     /// events are live.
@@ -71,11 +85,12 @@ impl FollowedBounds {
         if !*self.live.borrow() {
             return None;
         }
+        let read_at = Instant::now();
         let unseeded: Vec<u64> = {
             let mut entries = self.entries.lock().unwrap();
             fids.iter()
                 .copied()
-                .filter(|fid| !entries.entry(*fid).or_default().seeded)
+                .filter(|fid| !self.fresh(entries.entry(*fid).or_default()))
                 .collect()
         };
         let seeds = if unseeded.is_empty() {
@@ -89,12 +104,12 @@ impl FollowedBounds {
             let entry = entries.entry(*fid).or_default();
             raise(&mut entry.bounds.cast, seed.cast);
             raise(&mut entry.bounds.recast, seed.recast);
-            entry.seeded = true;
+            entry.seeded = Some(read_at);
         }
         Some(
             fids.iter()
                 .map(|fid| match entries.get(fid) {
-                    Some(entry) if entry.seeded => Some(entry.bounds),
+                    Some(entry) if self.fresh(entry) => Some(entry.bounds),
                     _ => None,
                 })
                 .collect(),
@@ -249,5 +264,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got[0].unwrap().cast, Some(99));
+        // A stale seed is read again, which finds a cast that reached the
+        // store without a merge event
+        let mut bounds = bounds;
+        bounds.reseed_after = Duration::from_millis(20);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let got = bounds
+            .get(&[2], |fids: Vec<u64>| async move {
+                fids.iter()
+                    .map(|_| {
+                        Some(Bounds {
+                            cast: Some(70),
+                            recast: None,
+                        })
+                    })
+                    .collect()
+            })
+            .await
+            .unwrap();
+        assert_eq!(got[0].unwrap().cast, Some(70));
     }
 }

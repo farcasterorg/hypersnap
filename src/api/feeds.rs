@@ -494,7 +494,7 @@ where
 
 /// The timestamps of each account's newest cast message and newest reaction
 /// message, read in parallel tasks; `None` for an account whose read failed.
-async fn read_newest_timestamps<S>(hub: Arc<S>, fids: Vec<u64>) -> Vec<Option<Bounds>>
+pub(crate) async fn read_newest_timestamps<S>(hub: Arc<S>, fids: Vec<u64>) -> Vec<Option<Bounds>>
 where
     S: proto::hub_service_server::HubService,
 {
