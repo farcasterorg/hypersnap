@@ -8932,6 +8932,84 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_notifications_excludes_self_mentions() {
+        use crate::api::HubQueryHandler;
+        let (
+            stores,
+            _senders,
+            [mut engine1, mut engine2],
+            _block_engine,
+            service,
+            _shard_decision_tx,
+            _block_decision_tx,
+        ) = make_server(None, None).await;
+        let target_fid = SHARD1_FID;
+        let mentioner_fid = SHARD2_FID;
+        let signer = test_helper::default_signer();
+        let custody = test_helper::default_custody_address();
+
+        test_helper::register_user(target_fid, signer.clone(), custody.clone(), &mut engine1).await;
+        test_helper::register_user(
+            mentioner_fid,
+            test_helper::default_signer(),
+            test_helper::default_custody_address(),
+            &mut engine2,
+        )
+        .await;
+
+        // The user tags themselves in their own top-level cast.
+        let self_mention = messages_factory::casts::create_cast_add_rich(
+            target_fid,
+            "@me look at this",
+            None,
+            vec![],
+            None,
+            vec![target_fid],
+            None,
+            None,
+        );
+        let shard1_stores = stores.get(&1u32).unwrap();
+        let mut txn = RocksDbTransactionBatch::new();
+        shard1_stores
+            .cast_store
+            .merge(&self_mention, &mut txn, &test_helper::default_merge_ctx())
+            .unwrap();
+        shard1_stores.db.commit(txn).unwrap();
+
+        // Someone else tags the user, which must still notify.
+        let other_mention = messages_factory::casts::create_cast_add_rich(
+            mentioner_fid,
+            "@target hello",
+            None,
+            vec![],
+            None,
+            vec![target_fid],
+            None,
+            None,
+        );
+        let shard2_stores = stores.get(&2u32).unwrap();
+        let mut txn = RocksDbTransactionBatch::new();
+        shard2_stores
+            .cast_store
+            .merge(&other_mention, &mut txn, &test_helper::default_merge_ctx())
+            .unwrap();
+        shard2_stores.db.commit(txn).unwrap();
+
+        let (messages, _cursor) = service
+            .get_notifications(target_fid, 50, None, false, None)
+            .await
+            .unwrap();
+        assert!(
+            !messages.iter().any(|m| m.hash == self_mention.hash),
+            "Casts where the user mentions themselves should be excluded from notifications"
+        );
+        assert!(
+            messages.iter().any(|m| m.hash == other_mention.hash),
+            "Mentions by other users should still be returned"
+        );
+    }
+
     // ---- channel follows -------------------------------------------------
 
     const FOLLOW_CHANNEL: [u8; 32] = [0xf0; 32];
