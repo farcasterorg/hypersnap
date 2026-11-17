@@ -1,0 +1,25 @@
+[package]
+name = "informalsystems-malachitebft-config"
+description = "Configuration for the Malachite BFT consensus engine"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+readme = "../../../README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true
+
+[dependencies]
+malachitebft-core-types.workspace = true
+
+bytesize = { workspace = true, features = ["serde"] }
+config = { workspace = true }
+humantime-serde = { workspace = true }
+multiaddr = { workspace = true }
+serde = { workspace = true, features = ["derive"] }

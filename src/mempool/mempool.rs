@@ -487,6 +487,69 @@ impl ReadNodeMempool {
         }
     }
 
+    /// Checks FID ownership before any quota or relay verdict is granted.
+    fn verify_user_message(&self, message: &proto::Message) -> Result<(), HubError> {
+        validate_gossiped_message(message, self.network)
+            .map_err(|e| HubError::validation_failure(&e.to_string()))?;
+        if message.msg_type() == MessageType::NativeOnboard {
+            let height = self
+                .block_stores
+                .block_store
+                .max_block_number()
+                .map_err(|e| HubError::internal_db_error(&e.to_string()))?
+                .saturating_add(1);
+            return crate::native_registration::validate(
+                &self.block_stores.native_registration,
+                &self.block_stores,
+                &RocksDbTransactionBatch::new(),
+                message,
+                height,
+            );
+        }
+        use crate::storage::store::account::verify_message_signer;
+        let result = if matches!(
+            message.msg_type(),
+            MessageType::KeyAdd | MessageType::KeyRemove
+        ) {
+            let height = self
+                .block_stores
+                .block_store
+                .max_block_number()
+                .map_err(|e| HubError::internal_db_error(&e.to_string()))?
+                .saturating_add(1);
+            let _encoding = crate::native_registration::FidEncodingScope::or_next(
+                &self.block_stores.native_registration,
+                0,
+                height,
+            );
+            verify_message_signer(
+                &self.block_stores.onchain_event_store,
+                &self.block_stores.db,
+                message,
+            )
+        } else {
+            let shard = self
+                .message_router
+                .route_fid(message.fid(), self.num_shards);
+            let stores = self
+                .shard_stores
+                .get(&shard)
+                .ok_or_else(|| HubError::invalid_internal_state("signer shard is not hosted"))?;
+            let height = stores
+                .shard_store
+                .max_block_number()
+                .map_err(|e| HubError::internal_db_error(&e.to_string()))?
+                .saturating_add(1);
+            let _encoding = crate::native_registration::FidEncodingScope::or_next(
+                &stores.native_registration,
+                shard,
+                height,
+            );
+            verify_message_signer(&stores.onchain_event_store, &stores.db, message)
+        };
+        result.map_err(|e| HubError::validation_failure(&e.to_string()))
+    }
+
     fn message_already_exists(&self, shard: u32, message: &MempoolMessage) -> bool {
         let fid = message.fid();
 
@@ -621,6 +684,16 @@ impl ReadNodeMempool {
                 MempoolRequest::AddMessage(message, source, reply_to) => {
                     self.statsd_client
                         .count("read_mempool.messages_received", 1, vec![]);
+                    if source == MempoolSource::Gossip {
+                        if let MempoolMessage::UserMessage(user_message) = &message {
+                            if let Err(error) = self.verify_user_message(user_message) {
+                                if let Some(reply) = reply_to {
+                                    let _ = reply.send(Err(error));
+                                }
+                                continue;
+                            }
+                        }
+                    }
                     let results: Vec<Result<(), HubError>> = self
                         .route_mempool_message(&message)
                         .iter()
@@ -1011,6 +1084,17 @@ impl Mempool {
         if self.message_already_exists(shard, message) {
             return Err(HubError::duplicate("message has already been merged"));
         }
+        if at_admission {
+            if let MempoolMessage::UserMessage(_) = message {
+                if !self.config.allow_unlimited_mempool_size
+                    && self.messages.get(&shard).is_some_and(|messages| {
+                        messages.len() as u64 >= self.config.capacity_per_shard
+                    })
+                {
+                    return Err(HubError::unavailable("mempool is full for this shard"));
+                }
+            }
+        }
         // Rate-limit checks are token-consuming (the KEY_ADD limiter uses
         // `governor::RateLimiter::check`, which decrements the bucket). They must run
         // exactly once, at admission. Re-running them at pull time would double-charge
@@ -1102,19 +1186,13 @@ impl Mempool {
         message: MempoolMessage,
         source: MempoolSource,
     ) -> Result<(), HubError> {
-        // RPC submissions are fully simulated before they get here; gossip from any peer is not.
-        if let (MempoolMessage::UserMessage(user_message), MempoolSource::Gossip) =
-            (&message, &source)
-        {
-            if let Err(err) =
-                validate_gossiped_message(user_message, self.read_node_mempool.network)
-            {
-                self.statsd_client
-                    .count("mempool.gossip_validation_failure", 1, vec![]);
-                return Err(HubError::validation_failure(&err.to_string()));
+        // RPC has already simulated the message; internal Local messages are
+        // trusted. Gossip must prove FID authority before spending any quota.
+        if source == MempoolSource::Gossip {
+            if let MempoolMessage::UserMessage(user_message) = &message {
+                self.read_node_mempool.verify_user_message(user_message)?;
             }
         }
-
         let shard_ids = self.read_node_mempool.route_mempool_message(&message);
 
         let mut errors = vec![];
@@ -1320,7 +1398,6 @@ impl Mempool {
                     let total_messages: u64 = self.messages.values().map(|m| m.len() as u64).sum();
                     self.statsd_client.gauge("mempool.total_messages", total_messages, vec![]);
                     for _ in 0..256 {
-                        if self.config.allow_unlimited_mempool_size || total_messages < self.config.capacity_per_shard {
                             match self.read_node_mempool.mempool_rx.try_recv() {
                                 Ok(MempoolRequest::AddMessage(message, source, reply_to)) => {
                                     let result = self.insert(message, source).await;
@@ -1347,10 +1424,6 @@ impl Mempool {
                                 },
 
                             }
-                        } else {
-                            self.statsd_client.count("mempool.capacity_limited", 1, vec![]);
-                            break;
-                        }
                     }
                 }
             }
@@ -1517,5 +1590,75 @@ mod fixed_rate_tests {
             .try_into()
             .unwrap();
         assert!(config.validate_fixed_rate_limit_schedule(2).is_ok());
+    }
+    #[tokio::test]
+    async fn forged_gossip_cannot_consume_victims_fixed_quota() {
+        use crate::utils::factory::messages_factory::casts::create_cast_add;
+        let (mut engine, _dir) = test_helper::new_engine().await;
+        test_helper::register_user(
+            42,
+            test_helper::default_signer(),
+            test_helper::default_custody_address(),
+            &mut engine,
+        )
+        .await;
+        let (block_engine, _block_dir) = block_engine_test_helpers::setup();
+        let config = Config {
+            fixed_rate_limit_activation_heights: [("0".into(), 1), ("1".into(), 1)].into(),
+            ..Default::default()
+        };
+        let (_, rx) = mpsc::channel(1);
+        let (_, requests) = mpsc::channel(1);
+        let (gossip, _) = mpsc::channel(2048);
+        let (_, shard_decisions) = broadcast::channel(1);
+        let (_, block_decisions) = broadcast::channel(1);
+        let mut pool = Mempool::new(
+            config,
+            FarcasterNetwork::Devnet,
+            rx,
+            requests,
+            1,
+            [(1, engine.get_stores())].into(),
+            block_engine.stores(),
+            gossip,
+            shard_decisions,
+            block_decisions,
+            test_helper::statsd_client(),
+        );
+        let attacker = ed25519_dalek::SigningKey::from_bytes(&[99; 32]);
+        let forged =
+            MempoolMessage::UserMessage(create_cast_add(42, "forged", None, Some(&attacker)));
+        for _ in 0..1009 {
+            assert!(pool
+                .insert(forged.clone(), MempoolSource::Gossip)
+                .await
+                .is_err());
+        }
+        assert!(pool.fixed_rate_limits.get(&42).is_none());
+        let genuine = create_cast_add(42, "genuine", None, None);
+        assert!(pool
+            .insert(
+                MempoolMessage::UserMessage(genuine.clone()),
+                MempoolSource::Gossip
+            )
+            .await
+            .is_ok());
+        let limiter = pool.fixed_rate_limits.get(&42).unwrap();
+        for _ in 0..1007 {
+            assert!(limiter.check().is_ok());
+        }
+        assert!(limiter.check().is_err());
+        // A duplicate does not use another token, and pull-time checks do not
+        // re-charge an already admitted message.
+        assert!(pool
+            .insert(
+                MempoolMessage::UserMessage(genuine.clone()),
+                MempoolSource::Gossip
+            )
+            .await
+            .is_err());
+        assert!(pool
+            .message_is_valid(1, &MempoolMessage::UserMessage(genuine), false)
+            .is_ok());
     }
 }

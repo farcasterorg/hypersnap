@@ -18,6 +18,8 @@ nodes/
 Procfile
 .vscode/
 .cargo/
+!vendor/malachite/code/.cargo/
+!vendor/malachite/code/.cargo/config.toml
 /.idea
 node_modules
 grafana/data
