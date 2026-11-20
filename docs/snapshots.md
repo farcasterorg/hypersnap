@@ -22,9 +22,9 @@ free space falls below the configured reserve.
 ## Deployment
 
 Upgrade read nodes to this version before publishing streaming snapshots. New
-binaries restore both the existing chunked tar/gzip archives and the new
-`key_value_v1` stream. Older binaries cannot restore the new format. Block and
-consensus formats are unchanged.
+binaries restore only explicitly marked `key_value_v1` streams. Legacy tar/gzip
+archives and manifests without a format are rejected before any chunk download.
+Older binaries cannot restore the new format. Block and consensus formats are unchanged.
 
 The defaults use the dedicated Hypersnap bucket and public download URL shown
 below. Keep the publisher credentials and admin upload RPC. The publisher
@@ -96,7 +96,6 @@ chunks or an uncompressed archive. The database is installed only after full
 verification and flush. On failure, the temporary database is removed and any
 existing destination shard is preserved. Replacing an existing database still
 requires space for the old and new databases until the new one is verified.
-Restoring legacy archives retains their previous staging requirements.
 
 Restore progress is recorded in `<rocksdb_dir>/.snapshot-restore.json`. Completed
 shards are kept across restarts; an interrupted shard is imported again from its
@@ -126,7 +125,7 @@ starting another replacement on a future restart.
 
 Downloads share an HTTP client with connect, read-idle, and total-request deadlines.
 Transient failures and timeouts are retried a bounded number of times. The same
-deadlines cover metadata and legacy downloads. S3 operations also have explicit
+deadlines cover metadata and streaming chunk downloads. S3 operations also have explicit
 deadlines, and metadata body consumption has its own deadline because the SDK's
 operation deadline ends at response headers. Timeout settings must be positive;
 the total deadline applies per request, not to the whole multi-hour snapshot.
@@ -142,7 +141,7 @@ Tests cover consistent export during live writes, binary key/value round trips
 into a reopened TransactionDB, bounded chunks split through record boundaries,
 empty databases, corrupt/truncated streams, failed uploads and disk reserve
 exhaustion, publication ordering, preservation of existing databases on restore
-failure, legacy archive restores, multi-page cleanup, and concurrent publishers.
+failure, rejection of legacy manifests, multi-page cleanup, and concurrent publishers.
 Regression tests also terminate a child process during import, exercise each
 installation crash window, resume after a later-shard failure, time out stalled
 HTTP headers and bodies, and retain older readers across repeated publications.

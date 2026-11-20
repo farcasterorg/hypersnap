@@ -6,7 +6,7 @@ use crate::utils::statsd_wrapper::StatsdClientWrapper;
 use aws_config::Region;
 use aws_sdk_s3::config::http::HttpResponse;
 use aws_sdk_s3::config::Credentials;
-use aws_sdk_s3::error::{BuildError, DisplayErrorContext, SdkError};
+use aws_sdk_s3::error::{BuildError, SdkError};
 use aws_sdk_s3::operation::abort_multipart_upload::AbortMultipartUploadError;
 use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadError;
 use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadError;
@@ -17,21 +17,17 @@ use aws_sdk_s3::operation::upload_part::UploadPartError;
 use aws_sdk_s3::primitives::{ByteStream, ByteStreamError};
 use aws_sdk_s3::types::{Delete, ObjectIdentifier};
 use aws_sdk_s3::Client;
-use flate2::read::GzDecoder;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::io::{self, BufReader, Read};
+use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::{SystemTime, SystemTimeError, UNIX_EPOCH};
-use tar::Archive;
 use thiserror::Error;
-use tokio::io::AsyncReadExt;
-use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio_retry2::{Retry, RetryError};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum BootstrapMethod {
@@ -210,11 +206,9 @@ pub enum SnapshotError {
     RocksDbError(#[from] RocksdbError),
 }
 
-#[derive(Default, Serialize, Deserialize, PartialEq, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
 #[serde(rename_all = "snake_case")]
 enum SnapshotFormat {
-    #[default]
-    TarGzip,
     KeyValueV1,
 }
 
@@ -223,7 +217,6 @@ struct SnapshotMetadata {
     key_base: String,
     chunks: Vec<String>,
     timestamp: i64,
-    #[serde(default)]
     format: SnapshotFormat,
     #[serde(default)]
     sha256: Vec<String>,
@@ -508,10 +501,7 @@ pub async fn download_snapshots(
         all_metadata.insert(id, metadata);
     }
     let total = all_metadata.values().map(|m| m.chunks.len() as u64).sum();
-    let multi_progress = indicatif::MultiProgress::new();
-    let main_pb = multi_progress.add(indicatif::ProgressBar::new(total));
-    let use_progress_bars = atty::is(atty::Stream::Stdout);
-    let global_start = SystemTime::now();
+    let main_pb = indicatif::ProgressBar::new(total);
     for id in shard_ids {
         if session.completed(id) {
             info!(shard_id = id, "Keeping previously restored snapshot shard");
@@ -524,30 +514,15 @@ pub async fn download_snapshots(
             chunks = metadata.chunks.len(),
             "Restoring snapshot shard"
         );
-        let result = if metadata.format == SnapshotFormat::KeyValueV1 {
-            download_streaming_snapshot(
-                &client,
-                snapshot_config,
-                &db_dir,
-                &session.staged_db(id),
-                metadata,
-                &main_pb,
-            )
-            .await
-        } else {
-            download_legacy_snapshot(
-                &client,
-                snapshot_config,
-                &session.stage(id),
-                id,
-                metadata,
-                &main_pb,
-                &multi_progress,
-                global_start,
-                use_progress_bars,
-            )
-            .await
-        };
+        let result = download_streaming_snapshot(
+            &client,
+            snapshot_config,
+            &db_dir,
+            &session.staged_db(id),
+            metadata,
+            &main_pb,
+        )
+        .await;
         if let Err(error) = result {
             session.discard_import(id)?;
             return Err(error);
@@ -589,352 +564,6 @@ fn cleanup_snapshot_downloads(snapshot_dir: &str) {
             warn!(path = snapshot_dir, %error, "Snapshot restored, but unable to remove download scratch files");
         }
     }
-}
-
-async fn download_legacy_snapshot(
-    client: &reqwest::Client,
-    snapshot_config: &Config,
-    staging: &std::path::Path,
-    shard_id: u32,
-    metadata_json: &SnapshotMetadata,
-    main_pb: &indicatif::ProgressBar,
-    multi_progress: &indicatif::MultiProgress,
-    global_start: SystemTime,
-    use_progress_bars: bool,
-) -> Result<(), SnapshotError> {
-    let snapshot_dir = &snapshot_config.snapshot_download_dir;
-    let base_path = &metadata_json.key_base;
-    let shard_start = SystemTime::now();
-
-    std::fs::create_dir_all(format!("{}/shard-{}", snapshot_dir, shard_id))?;
-
-    let mut local_chunks = vec![];
-    // Process each chunk sequentially within the shard
-    for (chunk_index, chunk) in metadata_json.chunks.iter().enumerate() {
-        let eta_str = if !use_progress_bars && chunk_index > 0 {
-            let elapsed = shard_start.elapsed().unwrap_or_default().as_secs();
-            let remaining_chunks = metadata_json.chunks.len() - chunk_index;
-            let eta_seconds = (elapsed * remaining_chunks as u64) / chunk_index as u64;
-            format!(
-                "Shard ETA: {}h{}m",
-                eta_seconds / 3600,
-                (eta_seconds % 3600) / 60
-            )
-        } else {
-            String::new()
-        };
-
-        info!(
-            "Downloading zipped snapshot chunk {} for shard {} ({}/{} chunks in shard) {}",
-            chunk,
-            shard_id,
-            chunk_index + 1,
-            metadata_json.chunks.len(),
-            eta_str
-        );
-        let download_path = format!(
-            "{}/{}/{}",
-            snapshot_config.snapshot_download_url, base_path, chunk
-        );
-
-        let filename = format!("{}/shard-{}/{}", snapshot_dir, shard_id, chunk);
-
-        // Set up individual progress bar for this chunk (only if TTY available)
-        let chunk_pb = if use_progress_bars {
-            multi_progress.add(indicatif::ProgressBar::new(0)) // Length set in download_file
-        } else {
-            indicatif::ProgressBar::hidden()
-        };
-
-        let retry_strategy = tokio_retry2::strategy::FixedInterval::from_millis(10_000).take(5);
-        // Directly await the download of the current chunk before proceeding to the next
-        let result = Retry::spawn(retry_strategy, || {
-            let download_path_clone = download_path.clone();
-            let filename_clone = filename.clone();
-            let chunk_pb_clone = chunk_pb.clone();
-            let main_pb_clone = main_pb.clone();
-            async move {
-                let result = download_file(
-                    client,
-                    &download_path_clone,
-                    &filename_clone,
-                    chunk_pb_clone,
-                    main_pb_clone,
-                    use_progress_bars,
-                    global_start,
-                )
-                .await;
-                match result {
-                    Ok(_) => Ok(()),
-                    Err(e) => {
-                        warn!("Failed to download {} due to error: {}", filename_clone, e);
-                        RetryError::to_transient(e)
-                    }
-                }
-            }
-        })
-        .await;
-
-        chunk_pb.finish_and_clear(); // Remove the finished chunk bar
-
-        if let Err(e) = result {
-            error!("Failed to download snapshot chunk {}: {}", filename, e);
-            main_pb.finish_with_message("Download failed!");
-            return Err(SnapshotError::from(e));
-        }
-        local_chunks.push(filename);
-    }
-
-    let tar_filename = format!("{}/shard_{}_snapshot.tar", snapshot_dir, shard_id);
-    let mut tar_file = BufWriter::new(tokio::fs::File::create(tar_filename.clone()).await?);
-
-    for filename in local_chunks {
-        info!(
-            "Unzipping snapshot chunk {} for shard {}",
-            filename, shard_id
-        );
-        let file = std::fs::File::open(filename)?;
-        let reader = BufReader::new(file);
-        let mut gz_decoder = GzDecoder::new(reader);
-        let mut buffer = Vec::new();
-        // These files are small, 100MB max each
-        gz_decoder.read_to_end(&mut buffer)?;
-        tar_file.write_all(&buffer).await?;
-    }
-    tar_file.flush().await?;
-
-    let file = std::fs::File::open(tar_filename.clone())?;
-    info!(
-        "Unpacking snapshot file {} for shard {}",
-        tar_filename, shard_id
-    );
-    let mut archive = Archive::new(file);
-    std::fs::create_dir_all(staging)?;
-    archive.unpack(staging)?;
-    Ok(())
-}
-
-async fn download_file(
-    client: &reqwest::Client,
-    url: &str,
-    filename: &str,
-    chunk_pb: indicatif::ProgressBar,
-    main_pb: indicatif::ProgressBar,
-    use_progress_bars: bool,
-    global_start: SystemTime,
-) -> Result<(), SnapshotError> {
-    let mut file = BufWriter::new(tokio::fs::File::create(filename).await?);
-    let download_response = client.get(url).send().await?.error_for_status()?;
-    let content_length = download_response.content_length();
-
-    // Configure the progress bar for the current chunk
-    if let Some(length) = content_length {
-        chunk_pb.set_length(length);
-        if !use_progress_bars {
-            info!(
-                "Starting download of {} ({} bytes)",
-                filename.split('/').last().unwrap_or(filename),
-                length
-            );
-        }
-    }
-    chunk_pb.set_style(
-        indicatif::ProgressStyle::default_bar()
-            .template("{spinner:.green} {msg:30.bold} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec})")
-            .unwrap()
-            .progress_chars("=>-"),
-    );
-    chunk_pb.set_message(filename.split('/').last().unwrap_or(filename).to_string());
-
-    let mut byte_stream = download_response.bytes_stream();
-
-    while let Some(piece) = byte_stream.next().await {
-        let chunk = piece?;
-        file.write_all(&chunk).await?;
-        let chunk_len = chunk.len() as u64;
-
-        // Update only the individual chunk progress bar during download
-        chunk_pb.inc(chunk_len);
-    }
-    file.flush().await?;
-
-    // File integrity check
-    let file_size = tokio::fs::metadata(filename).await?.len();
-    if let Some(content_length) = content_length {
-        if file_size != content_length {
-            return Err(SnapshotError::IoError(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "Downloaded file size {} does not match content length {}",
-                    file_size, content_length
-                ),
-            )));
-        }
-    } else {
-        warn!(
-            "Content-Length header was not present for {}. Cannot verify downloaded file size {}.",
-            url, file_size
-        );
-    }
-
-    // Increment the main progress bar by 1 chunk after successful download
-    main_pb.inc(1);
-
-    if !use_progress_bars {
-        let current_chunk = main_pb.position();
-        let total_chunks = main_pb.length().unwrap_or(0);
-
-        // Calculate global ETA based on overall progress
-        let global_eta_str = if current_chunk > 0 {
-            let global_elapsed = global_start.elapsed().unwrap_or_default().as_secs();
-            let remaining_chunks = total_chunks - current_chunk;
-            let global_eta_seconds = (global_elapsed * remaining_chunks) / current_chunk;
-            let eta_formatted = format!(
-                "{}h{}m",
-                global_eta_seconds / 3600,
-                (global_eta_seconds % 3600) / 60
-            );
-            format!(" (ETA: {})", eta_formatted)
-        } else {
-            String::new()
-        };
-
-        info!(
-            "Completed download of {} ({} bytes). Progress: {}/{} chunks ({}%){}",
-            filename.split('/').last().unwrap_or(filename),
-            file_size,
-            current_chunk,
-            total_chunks,
-            if total_chunks > 0 {
-                (current_chunk * 100) / total_chunks
-            } else {
-                0
-            },
-            global_eta_str
-        );
-    }
-
-    Ok(())
-}
-
-pub async fn upload_to_s3(
-    network: FarcasterNetwork,
-    chunked_dir_path: String,
-    snapshot_config: &Config,
-    shard_id: u32,
-    statsd_client: &StatsdClientWrapper,
-) -> Result<(), SnapshotError> {
-    info!(shard_id, chunked_dir_path, "Starting upload to s3");
-    let start_timetamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
-    let start_date = chrono::DateTime::from_timestamp_millis(start_timetamp)
-        .ok_or(SnapshotError::DateError)?
-        .date_naive();
-    let upload_dir = format!(
-        "{}/snapshot-{}-{}.tar.gz",
-        snapshot_directory(network, shard_id),
-        start_date,
-        start_timetamp / 1000
-    );
-    let files = std::fs::read_dir(chunked_dir_path)?;
-    let mut file_names: Vec<String> = vec![];
-    for entry in files {
-        let entry = entry?;
-        let file_name = entry
-            .file_name()
-            .to_str()
-            .ok_or(SnapshotError::UnableToParseFileName)?
-            .to_string();
-        let key = format!("{}/{}", upload_dir, file_name);
-
-        let mut file = tokio::fs::File::open(entry.path()).await?;
-        let mut buffer = Vec::new();
-        file.read_to_end(&mut buffer).await?;
-
-        let retry_strategy = tokio_retry2::strategy::FixedInterval::from_millis(10_000).take(5);
-        Retry::spawn(retry_strategy, || {
-            let buffer = buffer.clone();
-            let key = key.clone();
-            let bucket = snapshot_config.s3_bucket.clone();
-            let config = snapshot_config.clone();
-            async move {
-                let client = create_s3_client(&config)
-                    .await
-                    .map_err(RetryError::permanent)?;
-                let result = client
-                    .put_object()
-                    .bucket(bucket.clone())
-                    .key(key.clone())
-                    .body(ByteStream::from(buffer))
-                    .send()
-                    .await;
-                match result {
-                    Ok(_) => Ok(()),
-                    Err(err) => {
-                        warn!(
-                            "Failed to upload chunk to s3: {}, key: {}, bucket: {}",
-                            DisplayErrorContext(&err),
-                            key,
-                            bucket
-                        );
-                        RetryError::to_transient(SnapshotError::from(err))
-                    }
-                }
-            }
-        })
-        .await?;
-
-        info!(key, "Finished uploading snapshot to s3");
-        statsd_client.count_with_shard(shard_id, "snapshots.successful_upload", 1, vec![]);
-
-        file_names.push(file_name)
-    }
-
-    let metadata = SnapshotMetadata {
-        key_base: upload_dir,
-        chunks: file_names,
-        timestamp: start_timetamp,
-        format: SnapshotFormat::TarGzip,
-        sha256: vec![],
-        records: 0,
-        previous_key_base: None,
-    };
-
-    let metadata_json = serde_json::to_string(&metadata)?;
-    let metadata_key = metadata_path(network, shard_id);
-    let retry_strategy = tokio_retry2::strategy::FixedInterval::from_millis(10_000).take(5);
-    Retry::spawn(retry_strategy, || {
-        let body = metadata_json.as_bytes().to_vec();
-        let key = metadata_key.clone();
-        let bucket = snapshot_config.s3_bucket.clone();
-        let config = snapshot_config.clone();
-        async move {
-            let client = create_s3_client(&config)
-                .await
-                .map_err(RetryError::permanent)?;
-            let result = client
-                .put_object()
-                .bucket(bucket.clone())
-                .key(key.clone())
-                .body(ByteStream::from(body))
-                .content_type("application/json")
-                .send()
-                .await;
-            match result {
-                Ok(_) => Ok(()),
-                Err(err) => {
-                    warn!(
-                        "Failed to upload metadata to s3: {}, key: {}, bucket: {}",
-                        DisplayErrorContext(&err),
-                        key,
-                        bucket
-                    );
-                    RetryError::to_transient(SnapshotError::from(err))
-                }
-            }
-        }
-    })
-    .await?;
-    Ok(())
 }
 
 async fn put_snapshot_object(
@@ -1168,6 +797,7 @@ mod streaming_tests {
         atomic::{AtomicBool, Ordering},
         Mutex,
     };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     struct Store {
         url: String,
@@ -1641,50 +1271,6 @@ mod streaming_tests {
         assert!(objects.contains_key(&format!("/bucket/{base}0/keep")));
     }
 
-    #[tokio::test]
-    async fn restores_legacy_tar_gzip_metadata_without_format_field() {
-        use std::io::Write;
-        let store = Store::new().await;
-        let dir = tempfile::TempDir::new().unwrap();
-        let config = store.config(dir.path());
-        let db = source(dir.path());
-        db.close();
-        let mut tar = tar::Builder::new(Vec::new());
-        tar.append_dir_all("shard-1", dir.path().join("source"))
-            .unwrap();
-        let archive = tar.into_inner().unwrap();
-        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-        gzip.write_all(&archive).unwrap();
-        store.objects.lock().unwrap().insert(
-            "/bucket/legacy/chunk_0001.bin".into(),
-            gzip.finish().unwrap(),
-        );
-        store.objects.lock().unwrap().insert(
-            pointer(),
-            br#"{"key_base":"legacy","chunks":["chunk_0001.bin"],"timestamp":1}"#.to_vec(),
-        );
-        let restored = dir.path().join("restored");
-        download_snapshots(
-            FarcasterNetwork::Devnet,
-            &config,
-            restored.to_string_lossy().into_owned(),
-            vec![1],
-        )
-        .await
-        .unwrap();
-        let db = RocksDB::new(restored.join("shard-1").to_str().unwrap());
-        db.open().unwrap();
-        assert_eq!(db.get(b"height").unwrap(), Some(b"51250009".to_vec()));
-        assert!(!needs_snapshot_restore(restored.to_str().unwrap(), &[1]).unwrap());
-        assert!(std::path::Path::new(&config.snapshot_download_dir).is_dir());
-        assert_eq!(
-            std::fs::read_dir(&config.snapshot_download_dir)
-                .unwrap()
-                .count(),
-            0
-        );
-    }
-
     fn snapshot_job_stores(
         dir: &std::path::Path,
     ) -> (
@@ -1719,6 +1305,16 @@ mod streaming_tests {
             })
             .collect();
         (blocks, shards)
+    }
+
+    #[test]
+    fn rejects_legacy_snapshot_metadata() {
+        for json in [
+            r#"{"key_base":"legacy","chunks":["../../outside"],"timestamp":1}"#,
+            r#"{"key_base":"legacy","chunks":["../../outside"],"timestamp":1,"format":"tar_gzip"}"#,
+        ] {
+            assert!(serde_json::from_str::<SnapshotMetadata>(json).is_err());
+        }
     }
 
     #[tokio::test]

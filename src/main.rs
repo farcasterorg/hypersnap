@@ -997,7 +997,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             &app_config,
             gossip_tx.clone(),
             local_peer_id,
-            mempool_tx,
+            mempool_tx.clone(),
             shutdown_tx,
             onchain_events_request_tx,
             fname_request_tx,
@@ -1062,7 +1062,13 @@ async fn run() -> Result<(), Box<dyn Error>> {
                             // Forward to appropriate consensus actors
                             node.dispatch_network_event(shard, event);
                         },
-                        SystemMessage::Mempool(_) => {},// No need to store mempool messages from other nodes in read nodes
+                        SystemMessage::Mempool(request) => {
+                            if let Err(err) = mempool_tx.try_send(request) {
+                                if let MempoolRequest::AddMessage(_, _, Some(reply)) = err.into_inner() {
+                                    let _ = reply.send(Err(snapchain::core::error::HubError::unavailable("read-node mempool unavailable")));
+                                }
+                            }
+                        },
                         SystemMessage::DecidedValueForReadNode(decided_value) => {
                             node.dispatch_decided_value(decided_value);
                         }

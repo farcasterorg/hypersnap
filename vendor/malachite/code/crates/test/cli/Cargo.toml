@@ -1,0 +1,32 @@
+[package]
+name = "informalsystems-malachitebft-test-cli"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+malachitebft-core-types.workspace = true
+malachitebft-metrics.workspace = true
+malachitebft-config.workspace = true
+malachitebft-app.workspace = true
+
+axum = { workspace = true }
+bytesize = { workspace = true }
+clap = { workspace = true, features = ["derive", "env"] }
+color-eyre = { workspace = true }
+directories = { workspace = true }
+itertools = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "json"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rand = { workspace = true }
+toml = { workspace = true }

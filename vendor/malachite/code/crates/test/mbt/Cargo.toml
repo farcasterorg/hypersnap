@@ -1,0 +1,33 @@
+[package]
+name = "informalsystems-malachitebft-test-mbt"
+description = "Library for model-based testing of the Malachite consensus engine"
+publish = false
+
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+malachitebft-core-types = { workspace = true }
+malachitebft-core-votekeeper = { workspace = true }
+malachitebft-core-state-machine = { workspace = true }
+malachitebft-test = { workspace = true }
+malachitebft-starknet-host = { workspace = true }
+malachitebft-engine = { workspace = true }
+malachitebft-peer = { workspace = true }
+
+itf = { workspace = true }
+rand = { workspace = true }
+num-bigint = { workspace = true, features = ["serde"] }
+num-traits = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+serde_with = { workspace = true }
+glob = { workspace = true }
+pretty_assertions = { workspace = true }
+multihash = { workspace = true }
+
+[dev-dependencies]
+tempfile = { version = "3.15.0" }

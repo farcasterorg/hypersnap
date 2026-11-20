@@ -1,0 +1,31 @@
+[package]
+name = "informalsystems-malachitebft-core-driver"
+description = "Driver for the state machine of Malachite BFT consensus engine"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+readme = "../../../README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+std = ["malachitebft-core-state-machine/std"]
+debug = ["std", "malachitebft-core-state-machine/debug"]
+
+[lints]
+workspace = true
+
+[dependencies]
+malachitebft-core-types = { workspace = true }
+malachitebft-core-state-machine = { workspace = true }
+malachitebft-core-votekeeper = { workspace = true }
+
+derive-where = { workspace = true }
+thiserror = { workspace = true, default-features = false }
+
+[dev-dependencies]
+malachitebft-test = { workspace = true }

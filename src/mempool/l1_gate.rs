@@ -44,8 +44,7 @@ use crate::core::error::HubError;
 use crate::mempool::l1_validator::{L1CacheConfig, L1ValidationError, L1Validator};
 use crate::mempool::mempool::{validate_gossiped_message, MempoolRequest, MempoolSource};
 use crate::proto::{self, FarcasterNetwork};
-use crate::storage::db::RocksDbTransactionBatch;
-use crate::storage::store::account::get_active_key;
+use crate::storage::store::account::verify_message_signer;
 use crate::storage::store::mempool_poller::MempoolMessage;
 use crate::utils::statsd_wrapper::StatsdClientWrapper;
 
@@ -107,7 +106,10 @@ enum Refusal {
 /// Entry point for mempool requests that arrived over gossip. Cheap to call
 /// from an event loop: it never awaits.
 pub struct GossipL1Gate {
-    checks_tx: mpsc::Sender<proto::Message>,
+    checks_tx: mpsc::Sender<(
+        proto::Message,
+        Option<tokio::sync::oneshot::Sender<Result<(), HubError>>>,
+    )>,
     mempool_tx: mpsc::Sender<MempoolRequest>,
     statsd_client: StatsdClientWrapper,
     l1_rejection_count: Arc<AtomicU64>,
@@ -178,14 +180,21 @@ impl GossipL1Gate {
             MempoolRequest::AddMessage(
                 MempoolMessage::UserMessage(message),
                 MempoolSource::Gossip,
-                _,
+                reply_to,
             ) if L1Validator::requires_l1_validation(&message) => {
-                match self.checks_tx.try_send(message) {
+                match self.checks_tx.try_send((message, reply_to)) {
                     Ok(()) => {}
-                    Err(TrySendError::Full(_)) => {
+                    Err(TrySendError::Full((_, reply))) => {
+                        if let Some(reply) = reply {
+                            let _ = reply.send(Err(HubError::unavailable("L1 gate queue is full")));
+                        }
                         record(&self.statsd_client, Refusal::Dropped("queue_full"));
                     }
-                    Err(TrySendError::Closed(_)) => {
+                    Err(TrySendError::Closed((_, reply))) => {
+                        if let Some(reply) = reply {
+                            let _ =
+                                reply.send(Err(HubError::unavailable("L1 gate worker stopped")));
+                        }
                         error!("L1 gate worker has stopped; dropping gossiped message");
                         record(&self.statsd_client, Refusal::Dropped("worker_stopped"));
                     }
@@ -195,13 +204,19 @@ impl GossipL1Gate {
             request => request,
         };
         if let Err(e) = self.mempool_tx.try_send(request) {
-            warn!("Failed to add to local mempool: {:?}", e);
+            if let MempoolRequest::AddMessage(_, _, Some(reply)) = e.into_inner() {
+                let _ = reply.send(Err(HubError::unavailable("mempool unavailable")));
+            }
+            warn!("Failed to add to local mempool");
         }
     }
 }
 
 pub struct GossipL1GateWorker {
-    checks_rx: mpsc::Receiver<proto::Message>,
+    checks_rx: mpsc::Receiver<(
+        proto::Message,
+        Option<tokio::sync::oneshot::Sender<Result<(), HubError>>>,
+    )>,
     validator: Arc<L1Validator>,
     network: FarcasterNetwork,
     mempool_tx: mpsc::Sender<MempoolRequest>,
@@ -214,7 +229,7 @@ pub struct GossipL1GateWorker {
 
 impl GossipL1GateWorker {
     pub async fn run(mut self) {
-        while let Some(message) = self.checks_rx.recv().await {
+        while let Some((message, reply_to)) = self.checks_rx.recv().await {
             if let Err(refusal) = self.precheck(&message) {
                 debug!(
                     fid = message.fid(),
@@ -222,10 +237,18 @@ impl GossipL1GateWorker {
                     "Gossiped message refused before L1 check"
                 );
                 record(&self.statsd_client, refusal);
+                if let Some(reply) = reply_to {
+                    let _ = reply.send(Err(HubError::validation_failure(
+                        "L1 admission precheck failed",
+                    )));
+                }
                 continue;
             }
             let Ok(permit) = self.in_flight.clone().try_acquire_owned() else {
                 record(&self.statsd_client, Refusal::Dropped("at_capacity"));
+                if let Some(reply) = reply_to {
+                    let _ = reply.send(Err(HubError::unavailable("L1 validation is at capacity")));
+                }
                 continue;
             };
 
@@ -243,9 +266,13 @@ impl GossipL1GateWorker {
                         if let Err(e) = mempool_tx.try_send(MempoolRequest::AddMessage(
                             MempoolMessage::UserMessage(message),
                             MempoolSource::Gossip,
-                            None,
+                            reply_to,
                         )) {
-                            warn!("Failed to add to local mempool: {:?}", e);
+                            if let MempoolRequest::AddMessage(_, _, Some(reply)) = e.into_inner() {
+                                let _ =
+                                    reply.send(Err(HubError::unavailable("mempool unavailable")));
+                            }
+                            warn!("Failed to add to local mempool");
                         }
                     }
                     // Logged at warn because only messages that passed the
@@ -261,14 +288,24 @@ impl GossipL1GateWorker {
                         );
                         record(&statsd_client, Refusal::Rejected("l1_check_failed"));
                         l1_rejection_count.fetch_add(1, Ordering::Relaxed);
+                        if let Some(reply) = reply_to {
+                            let _ = reply.send(Err(err));
+                        }
                     }
                     L1Outcome::Unavailable(err) => {
                         debug!(fid = message.fid(), error = %err, "L1 check unavailable");
                         record(&statsd_client, Refusal::L1Error("unavailable"));
+                        if let Some(reply) = reply_to {
+                            let _ = reply.send(Err(err));
+                        }
                     }
                     L1Outcome::TimedOut => {
                         debug!(fid = message.fid(), "L1 check timed out");
                         record(&statsd_client, Refusal::L1Error("timeout"));
+                        if let Some(reply) = reply_to {
+                            let _ =
+                                reply.send(Err(HubError::unavailable("L1 validation timed out")));
+                        }
                     }
                 }
             });
@@ -284,17 +321,18 @@ impl GossipL1GateWorker {
             .validator
             .stores_for(fid)
             .ok_or(Refusal::Rejected("shard_not_hosted"))?;
-        let active_key = get_active_key(
-            &stores.onchain_event_store,
-            &stores.db,
-            &RocksDbTransactionBatch::new(),
-            fid,
-            &message.signer,
-        )
-        .map_err(|_| Refusal::Rejected("signer_lookup_failed"))?;
-        if !active_key.is_some_and(|key| key.admits(message.msg_type())) {
-            return Err(Refusal::Rejected("inactive_signer"));
-        }
+        let height = stores
+            .shard_store
+            .max_block_number()
+            .map_err(|_| Refusal::Rejected("signer_lookup_failed"))?
+            .saturating_add(1);
+        let _encoding = crate::native_registration::FidEncodingScope::or_next(
+            &stores.native_registration,
+            stores.shard_id,
+            height,
+        );
+        verify_message_signer(&stores.onchain_event_store, &stores.db, message)
+            .map_err(|_| Refusal::Rejected("inactive_signer"))?;
 
         if !self.consume_for_fid(fid) {
             return Err(Refusal::Dropped("rate_limited"));

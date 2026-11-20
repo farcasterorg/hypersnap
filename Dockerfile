@@ -2,28 +2,21 @@ FROM rust:1.95 AS base
 
 WORKDIR /usr/src/app
 
-ARG MALACHITE_GIT_REPO_URL=https://github.com/informalsystems/malachite.git
-ENV MALACHITE_GIT_REPO_URL=$MALACHITE_GIT_REPO_URL
-ARG MALACHITE_GIT_REF=13bca14cd209d985c3adf101a02924acde8723a5
 ARG ETH_SIGNATURE_VERIFIER_GIT_REPO_URL=https://github.com/CassOnMars/eth-signature-verifier.git
 ENV ETH_SIGNATURE_VERIFIER_GIT_REPO_URL=$ETH_SIGNATURE_VERIFIER_GIT_REPO_URL
 ARG ETH_SIGNATURE_VERIFIER_GIT_REF=8deb4a091982c345949dc66bf8684489d9f11889
 ENV RUST_BACKTRACE=1
 RUN <<EOF
 set -eu
-apt-get update && apt-get install -y build-essential libclang-dev git libjemalloc-dev llvm-dev make protobuf-compiler libssl-dev openssh-client cmake
+apt-get -o Acquire::Retries=0 update && apt-get -o Acquire::Retries=0 install -y --only-upgrade apt && apt-get install -y build-essential libclang-dev git libjemalloc-dev llvm-dev make protobuf-compiler libssl-dev openssh-client cmake
 cd ..
 git clone $ETH_SIGNATURE_VERIFIER_GIT_REPO_URL
 cd eth-signature-verifier
 git checkout $ETH_SIGNATURE_VERIFIER_GIT_REF
 cd ..
-
-git clone $MALACHITE_GIT_REPO_URL
-cd malachite
-git checkout $MALACHITE_GIT_REF
 EOF
 # cargo-chef splits the build: every dependency (malachite included) compiles
-# in its own layer, keyed only by Cargo.toml/Cargo.lock, so a source change
+# in its own layer, keyed by manifests and vendored dependencies, so a source change
 # rebuilds snapchain alone and CI can keep that layer in its cache.
 RUN cargo install cargo-chef --locked
 
@@ -33,6 +26,8 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 FROM base AS builder
 COPY --from=planner /usr/src/app/recipe.json recipe.json
+# cargo-chef does not include excluded workspaces or crates.io patches.
+COPY vendor ./vendor
 RUN cargo chef cook --release --recipe-path recipe.json
 
 COPY Cargo.lock Cargo.toml ./
@@ -58,7 +53,8 @@ EOF
 
 #################################################################################
 
-FROM ubuntu:26.04
+# Official multi-architecture Ubuntu 26.04 image refreshed 2026-11-16.
+FROM ubuntu:26.04@sha256:d66b366dac61b575bee2aef07e9c26e8070096fbe84a3d4d3eb0da069b5d76db
 
 # Easier debugging within container
 ARG GRPCURL_VERSION=1.9.4
@@ -73,9 +69,10 @@ RUN <<EOF
   # Covers archive/security on amd64 and ports.ubuntu.com on arm64.
   sed -i 's|http://|https://|g' /etc/apt/sources.list.d/ubuntu.sources
   apt-get -o Acquire::https::CAInfo=/etc/ssl/certs/ca-certificates.crt \
-    -o Acquire::Retries=3 -o APT::Update::Error-Mode=any update
+    -o Acquire::Retries=0 -o APT::Update::Error-Mode=any update
   apt-get -o Acquire::https::CAInfo=/etc/ssl/certs/ca-certificates.crt \
-    -o Acquire::Retries=3 install -y --no-install-recommends ca-certificates curl
+    -o Acquire::Retries=0 install -y --no-install-recommends apt ca-certificates curl
+  dpkg --compare-versions "$(dpkg-query -W -f='${Version}' apt)" ge 3.2.1ubuntu0.1
   curl --retry 3 -fL https://github.com/fullstorydev/grpcurl/releases/download/v${GRPCURL_VERSION}/grpcurl_${GRPCURL_VERSION}_${TARGETOS}_${TARGETARCH}.deb > grpcurl.deb
   dpkg -i grpcurl.deb
   rm grpcurl.deb

@@ -798,7 +798,7 @@ mod tests {
             _,
         ) = setup(Some(config1), false, 1).await;
         let (
-            _,
+            mut engines2,
             _,
             gossip2,
             mut mempool2,
@@ -808,6 +808,14 @@ mod tests {
             _block_decision_tx1,
             mut system_rx2,
         ) = setup(Some(config2), false, 1).await;
+
+        test_helper::register_user(
+            1234,
+            default_signer(),
+            default_custody_address(),
+            engines2.get_mut(&1).unwrap(),
+        )
+        .await;
 
         // Spawn gossip tasks
         tokio::spawn(async move {
@@ -1512,7 +1520,7 @@ mod tests {
     #[tokio::test]
     async fn test_malformed_gossiped_messages_are_rejected_without_stopping_the_mempool() {
         let (
-            _,
+            mut engines,
             _,
             _,
             mut mempool,
@@ -1522,6 +1530,13 @@ mod tests {
             _block_decision_tx,
             _,
         ) = setup(None, false, 1).await;
+        test_helper::register_user(
+            1234,
+            default_signer(),
+            default_custody_address(),
+            engines.get_mut(&1).unwrap(),
+        )
+        .await;
         tokio::spawn(async move {
             mempool.run().await;
         });
