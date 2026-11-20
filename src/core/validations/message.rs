@@ -684,6 +684,23 @@ pub fn validate_user_location(location: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
+/// A pinned cast is the empty string (unpin) or a cast hash written as `0x` plus 40 lowercase hex
+/// characters. Only the format is checked: whether the cast exists and belongs to the user is
+/// left to clients, which ignore a pin that fails either check.
+fn validate_pinned_cast_hash(value: &str) -> Result<(), ValidationError> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    match value.strip_prefix("0x") {
+        Some(hex)
+            if hex.len() == 40 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) =>
+        {
+            Ok(())
+        }
+        _ => Err(ValidationError::InvalidPinnedCastHash),
+    }
+}
+
 pub fn validate_user_data_add_body(
     body: &UserDataBody,
     is_pro_user: bool,
@@ -766,6 +783,12 @@ pub fn validate_user_data_add_body(
             if value_bytes.len() > 256 {
                 return Err(ValidationError::UrlValueTooLong);
             }
+        }
+        UserDataType::PinnedCast => {
+            if !version.is_enabled(ProtocolFeature::PinnedCast) {
+                return Err(ValidationError::UnsupportedFeature);
+            }
+            validate_pinned_cast_hash(&body.value)?;
         }
         UserDataType::None => return Err(ValidationError::InvalidUserDataType),
     }

@@ -32,6 +32,7 @@ pub enum EngineVersion {
     V22 = 22,
     V23 = 23,
     V24 = 24,
+    V25 = 25,
 }
 
 pub enum ProtocolFeature {
@@ -71,6 +72,8 @@ pub enum ProtocolFeature {
     UniqueOnchainEventTrieKeys,
     // Shard and block headers commit to their transactions through `transactions_root`.
     HeaderTransactionsRoot,
+    // Accepts `UserDataType::PinnedCast`, which pins one cast to the top of a profile.
+    PinnedCast,
 }
 
 pub struct VersionSchedule {
@@ -264,7 +267,7 @@ const ENGINE_VERSION_SCHEDULE_TESTNET: &[VersionSchedule] = [
 
 const ENGINE_VERSION_SCHEDULE_DEVNET: &[VersionSchedule] = [VersionSchedule {
     active_at: 0,
-    version: EngineVersion::V24,
+    version: EngineVersion::V25,
 }]
 .as_slice();
 
@@ -474,6 +477,19 @@ impl EngineVersion {
             ProtocolFeature::ChannelFollows => self >= &EngineVersion::V24,
             ProtocolFeature::UniqueOnchainEventTrieKeys
             | ProtocolFeature::HeaderTransactionsRoot => self >= &EngineVersion::V23,
+            // Accepts `UserDataType::PinnedCast`. Like IncreaseEmbedLimitForAllUsers this only
+            // loosens validation: nothing that validated before the boundary stops validating
+            // after it. It is versioned because an upgraded proposer would include a pin that an
+            // un-upgraded validator rejects as an unknown user data type.
+            //
+            // V25 has no mainnet or testnet entry, and the number is provisional. Mainnet and
+            // testnet validators run the snapchain engine version table, so this can only be
+            // activated at a boundary every validator schedules together (the same type number,
+            // the same validation, the same engine version). Renumber V25 and the type to match
+            // whatever that coordinated rollout assigns; never schedule it here alone, and never
+            // move it below the channel block locally, which would make V24 mean something
+            // different here than on the other validators.
+            ProtocolFeature::PinnedCast => self >= &EngineVersion::V25,
         }
     }
 
@@ -501,7 +517,8 @@ impl EngineVersion {
             | EngineVersion::V21
             | EngineVersion::V22
             | EngineVersion::V23
-            | EngineVersion::V24 => LATEST_PROTOCOL_VERSION,
+            | EngineVersion::V24
+            | EngineVersion::V25 => LATEST_PROTOCOL_VERSION,
         }
     }
 
@@ -1219,6 +1236,28 @@ mod version_test {
     }
 
     #[test]
+    fn test_pinned_cast_feature_gate() {
+        assert!(!EngineVersion::V24.is_enabled(ProtocolFeature::PinnedCast));
+        assert!(EngineVersion::V25.is_enabled(ProtocolFeature::PinnedCast));
+        assert!(EngineVersion::latest().is_enabled(ProtocolFeature::PinnedCast));
+    }
+
+    #[test]
+    fn test_pinned_cast_activation_schedule() {
+        // V25 is unscheduled on mainnet/testnet, so pins stay rejected there until maintainers
+        // schedule it (or move the feature to a scheduled version). Devnet runs the latest version.
+        let far_future = FarcasterTime::from_unix_seconds(4102444800); // 2100-01-01 UTC
+        for network in [FarcasterNetwork::Mainnet, FarcasterNetwork::Testnet] {
+            assert!(!EngineVersion::version_for(&far_future, network)
+                .is_enabled(ProtocolFeature::PinnedCast));
+        }
+        assert!(
+            EngineVersion::version_for(&FarcasterTime::new(0), FarcasterNetwork::Devnet)
+                .is_enabled(ProtocolFeature::PinnedCast)
+        );
+    }
+
+    #[test]
     fn test_channel_features_activate_together() {
         // CONSENSUS INVARIANT: the four channel features must be enabled at the exact same
         // versions. VerificationsOnShardZero is pinned alongside them for a weaker reason, spelled
@@ -1330,7 +1369,7 @@ mod version_test {
 
     #[test]
     fn test_latest() {
-        assert_eq!(EngineVersion::latest(), EngineVersion::V24);
+        assert_eq!(EngineVersion::latest(), EngineVersion::V25);
         assert_eq!(
             EngineVersion::version_for(&FarcasterTime::current(), FarcasterNetwork::Devnet),
             EngineVersion::latest()
