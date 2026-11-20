@@ -4535,7 +4535,7 @@ impl crate::api::HubQueryHandler for MyHubService {
         let mut cast_targets: Vec<crate::proto::CastId> = Vec::new();
 
         for stores in self.shard_stores.values() {
-            // 1. Mentions of this user (replies)
+            // 1. Mentions of this user, except casts where they tag themselves
             let mention_options = PageOptions {
                 page_size: Some(fetch_limit),
                 page_token: None,
@@ -4544,7 +4544,11 @@ impl crate::api::HubQueryHandler for MyHubService {
             if let Ok(page) =
                 CastStore::get_casts_by_mention(&stores.cast_store, fid, &mention_options)
             {
-                notifications.extend(page.messages);
+                notifications.extend(
+                    page.messages
+                        .into_iter()
+                        .filter(|m| m.data.as_ref().map(|d| d.fid).unwrap_or(0) != fid),
+                );
             }
 
             // 2. Collect user's recent cast targets
