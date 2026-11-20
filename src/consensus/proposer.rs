@@ -311,8 +311,8 @@ impl Proposer for ShardProposer {
         let height = commits.height.unwrap();
         if let Some(proposal) = self.proposed_chunks.get_by_shard_hash(&value) {
             let chunk = proposal.proposal().shard_chunk(commits).unwrap();
-            self.publish_new_shard_chunk(&chunk.clone()).await;
             self.engine.commit_shard_chunk(&chunk).await;
+            self.publish_new_shard_chunk(&chunk).await;
             self.proposed_chunks.decide(height);
         } else {
             panic!(

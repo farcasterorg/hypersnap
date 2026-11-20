@@ -9049,7 +9049,7 @@ mod tests {
         shard2_stores.db.commit(txn).unwrap();
 
         let (messages, _cursor) = service
-            .get_notifications(target_fid, 50, None, false, None)
+            .get_notifications(target_fid, 50, None, false, None, None)
             .await
             .unwrap();
         assert!(

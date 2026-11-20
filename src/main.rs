@@ -1089,10 +1089,11 @@ async fn run() -> Result<(), Box<dyn Error>> {
                         }
                         SystemMessage::ExitWithError(err) => {
                             error!("Exiting due to: {}", err);
-                            if let Some(api) = api_system {
-                                api.shutdown().await;
-                            }
+                            SHUTTING_DOWN.store(true, Ordering::SeqCst);
                             node.stop();
+                            if let Some(api) = api_system {
+                                shut_down_api(api).await;
+                            }
                             return Err(err.into());
                         }
                     }
@@ -1469,10 +1470,11 @@ async fn run() -> Result<(), Box<dyn Error>> {
                         },
                         SystemMessage::ExitWithError(err) => {
                             error!("Exiting due to: {}", err);
-                            if let Some(api) = api_system {
-                                api.shutdown().await;
-                            }
+                            SHUTTING_DOWN.store(true, Ordering::SeqCst);
                             node.stop();
+                            if let Some(api) = api_system {
+                                shut_down_api(api).await;
+                            }
                             return Err(err.into());
                         }
                     }

@@ -51,6 +51,9 @@ use thiserror::Error;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
+const FORK_BLOCK_EVENT_WAIT: Duration = Duration::from_secs(30);
+const FORK_BLOCK_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 #[derive(Error, Debug)]
 pub enum EngineError {
     #[error(transparent)]
@@ -79,6 +82,11 @@ pub enum EngineError {
 
     #[error(transparent)]
     BlockEventStoreError(#[from] BlockEventStorageError),
+
+    #[error(
+        "fork block event {seqnum} from block {block_number} is not committed on shard zero yet"
+    )]
+    MissingForkBlockEvent { seqnum: u64, block_number: u64 },
 
     #[error("Replicator merge error: {0}")]
     ReplicatorError(String),
@@ -1634,9 +1642,14 @@ impl ShardEngine {
                         let committed =
                             crate::storage::store::account::BlockEventStore::new(authority.clone())
                                 .get_block_event_by_seqnum(block_event.seqnum())?;
-                        if committed.as_ref() != Some(block_event) {
+                        let committed =
+                            committed.ok_or_else(|| EngineError::MissingForkBlockEvent {
+                                seqnum: block_event.seqnum(),
+                                block_number: block_event.block_number(),
+                            })?;
+                        if &committed != block_event {
                             return Err(HubError::validation_failure(
-                                "fork block event is not committed on shard zero yet",
+                                "fork block event differs from the committed shard-zero event",
                             )
                             .into());
                         }
@@ -3109,9 +3122,31 @@ impl ShardEngine {
         true
     }
 
-    pub async fn commit_shard_chunk(&mut self, shard_chunk: &ShardChunk) {
-        let mut txn = RocksDbTransactionBatch::new();
+    async fn wait_for_fork_block_event(
+        &self,
+        seqnum: u64,
+        block_number: u64,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), EngineError> {
+        let authority =
+            self.stores.native_authority.as_ref().ok_or_else(|| {
+                HubError::invalid_internal_state("fork event authority unavailable")
+            })?;
+        let events = crate::storage::store::account::BlockEventStore::new(authority.clone());
+        tokio::time::timeout_at(deadline, async {
+            while events.get_block_event_by_seqnum(seqnum)?.is_none() {
+                tokio::time::sleep(FORK_BLOCK_EVENT_POLL_INTERVAL).await;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap_or(Err(EngineError::MissingForkBlockEvent {
+            seqnum,
+            block_number,
+        }))
+    }
 
+    pub async fn commit_shard_chunk(&mut self, shard_chunk: &ShardChunk) {
         let shard_root = &shard_chunk.header.as_ref().unwrap().shard_root;
         let transactions = &shard_chunk.transactions;
 
@@ -3148,28 +3183,57 @@ impl ShardEngine {
             }
             let header = &shard_chunk.header.as_ref().unwrap();
             let block_number = header.height.unwrap().block_number;
-            self.stores.event_handler.set_current_height(block_number);
             let version = self.version_for(&FarcasterTime::new(header.timestamp));
 
-            let count_fn = self.metrics.make_count_fn();
-            let count_callback = move |read_count: (u64, u64)| {
-                count_fn("trie.db_get_count.total", read_count.0, vec![]);
-                count_fn("trie.db_get_count.for_commit", read_count.0, vec![]);
-                count_fn("trie.mem_get_count.total", read_count.1, vec![]);
-                count_fn("trie.mem_get_count.for_commit", read_count.1, vec![]);
+            let deadline = tokio::time::Instant::now() + FORK_BLOCK_EVENT_WAIT;
+            let mut txn;
+            let result = loop {
+                self.stores.event_handler.set_current_height(block_number);
+                txn = RocksDbTransactionBatch::new();
+                let count_fn = self.metrics.make_count_fn();
+                let count_callback = move |read_count: (u64, u64)| {
+                    count_fn("trie.db_get_count.total", read_count.0, vec![]);
+                    count_fn("trie.mem_get_count.total", read_count.1, vec![]);
+                    count_fn("trie.db_get_count.for_commit", read_count.0, vec![]);
+                    count_fn("trie.mem_get_count.for_commit", read_count.1, vec![]);
+                };
+                let result = self.replay_proposal(
+                    &merkle_trie::Context::with_callback(count_callback),
+                    &mut txn,
+                    transactions,
+                    shard_root,
+                    ProposalSource::Commit,
+                    version,
+                    &FarcasterTime::new(header.timestamp),
+                    header.height.unwrap(),
+                );
+                let Err(EngineError::MissingForkBlockEvent {
+                    seqnum,
+                    block_number: dependency_height,
+                }) = result
+                else {
+                    break result;
+                };
+                warn!(
+                    shard_id = self.shard_id,
+                    height = block_number,
+                    dependency_height,
+                    seqnum,
+                    "Waiting for shard zero before committing certified chunk"
+                );
+                if let Err(err) = self
+                    .wait_for_fork_block_event(seqnum, dependency_height, deadline)
+                    .await
+                {
+                    break Err(err);
+                }
+                // A failed replay may have staged writes and changed the in-memory trie.
+                if let Err(err) = self.stores.trie.reload(&self.db) {
+                    break Err(err.into());
+                }
             };
-            let trie_ctx = &merkle_trie::Context::with_callback(count_callback);
 
-            match self.replay_proposal(
-                trie_ctx,
-                &mut txn,
-                transactions,
-                shard_root,
-                ProposalSource::Commit,
-                version,
-                &FarcasterTime::new(header.timestamp),
-                header.height.unwrap(),
-            ) {
+            match result {
                 Err(err) => {
                     // Persist before panicking. The panic below is caught by
                     // ractor, which stops the ReadHost actor but leaves the

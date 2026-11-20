@@ -33,6 +33,68 @@ mod tests {
     use informalsystems_malachitebft_core_types::Round;
     use prost::Message;
 
+    #[tokio::test]
+    async fn certified_chunk_waits_for_its_shard_zero_event() {
+        use crate::native_registration::{Config, FORK_EVENT_BASE};
+        use crate::storage::store::account::BlockEventStore;
+        use crate::storage::store::block_engine_test_helpers;
+        use std::time::Duration;
+
+        let config = Config {
+            activation_heights: [("0".into(), 1), ("1".into(), 1)].into(),
+            ..Default::default()
+        };
+        let (authority, _authority_dir) = block_engine_test_helpers::setup();
+        let event = events_factory::create_heartbeat_event(FORK_EVENT_BASE + 1);
+        let authority_events = BlockEventStore::new(authority.stores().db);
+        let mut event_batch = authority_events.db.txn();
+        authority_events
+            .put_block_event(&event, &mut event_batch)
+            .unwrap();
+        authority_events.db.commit(event_batch).unwrap();
+
+        let (proposer, _proposer_dir) = test_helper::new_engine().await;
+        let mut proposer = proposer.with_native_registration(config.clone(), authority_events.db);
+        let state_change = proposer.propose_state_change(
+            1,
+            vec![MempoolMessage::BlockEvent {
+                for_shard: 1,
+                message: event.clone(),
+            }],
+            None,
+        );
+        let chunk =
+            test_helper::validate_and_commit_state_change(&mut proposer, &state_change).await;
+
+        let (lagging_authority, _lagging_authority_dir) = block_engine_test_helpers::setup();
+        let lagging_events = BlockEventStore::new(lagging_authority.stores().db);
+        let (lagging_shard, _lagging_shard_dir) = test_helper::new_engine().await;
+        let mut lagging_shard =
+            lagging_shard.with_native_registration(config, lagging_events.db.clone());
+        assert!(!lagging_shard.validate_shard_chunk(&chunk));
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(lagging_shard.commit_shard_chunk(&chunk), async {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                let mut batch = lagging_events.db.txn();
+                lagging_events.put_block_event(&event, &mut batch).unwrap();
+                lagging_events.db.commit(batch).unwrap();
+            });
+        })
+        .await
+        .expect("chunk should commit when its event arrives");
+
+        assert_eq!(lagging_shard.get_last_shard_chunk(), Some(chunk));
+        assert_eq!(
+            lagging_shard
+                .get_stores()
+                .block_event_store
+                .max_seqnum()
+                .unwrap(),
+            FORK_EVENT_BASE + 1
+        );
+    }
+
     fn from_hex(s: &str) -> Vec<u8> {
         hex::decode(s).unwrap()
     }
