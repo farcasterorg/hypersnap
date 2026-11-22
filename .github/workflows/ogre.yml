@@ -15,8 +15,9 @@ on:
 permissions:
   contents: read
 
+# The nightly seed refresh has its own group, so a merge doesn't cancel it.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'schedule' && 'nightly' || github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 # The same as Verify's, so this build reuses Verify's caches.
@@ -38,6 +39,10 @@ jobs:
       actions: write # main deletes the Ogre caches it supersedes
     runs-on: ${{ vars.RUNS_ON == 'true' && fromJSON(format('["runs-on={0}","runner=64cpu-linux-arm64"]', github.run_id)) || 'ubuntu-24.04-arm' }}
     steps:
+      - name: Start time
+        id: start
+        run: echo "at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
         with:
@@ -86,14 +91,14 @@ jobs:
           echo "image=$image" >> "$GITHUB_OUTPUT"
           echo "sha=${image##*:}" >> "$GITHUB_OUTPUT"
 
+      # A change to the exporter exports a new seed; the nightly always does.
       - name: Restore the seed
         id: seed
-        if: github.event_name != 'schedule'
         uses: actions/cache/restore@v4
         with:
           path: ogre/seed.bin
-          key: ogre-seed-v1-${{ github.run_id }}
-          restore-keys: ogre-seed-v1-
+          key: ogre-seed-v2-${{ hashFiles('snapchain/src/bin/ogre/seed.rs', 'snapchain/src/bin/ogre/convert.rs') }}-${{ github.run_id }}
+          restore-keys: ${{ github.event_name != 'schedule' && format('ogre-seed-v2-{0}-', hashFiles('snapchain/src/bin/ogre/seed.rs', 'snapchain/src/bin/ogre/convert.rs')) || '' }}
 
       - name: Export a seed from mainnet
         if: steps.seed.outputs.cache-matched-key == ''
@@ -116,13 +121,6 @@ jobs:
             --base "docker:${{ steps.digest.outputs.image }}" \
             --work ogre/chain --report "$GITHUB_STEP_SUMMARY"
 
-      - name: Save the seeded chain
-        if: steps.chain.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: ogre/chain
-          key: ${{ steps.chain.outputs.cache-primary-key }}
-
       - name: Roll out
         run: |
           cp -a ogre/chain ogre/run
@@ -131,14 +129,21 @@ jobs:
             --under-test snapchain/target/debug/hypersnap \
             --work ogre/run --report "$GITHUB_STEP_SUMMARY"
 
-      # Only a seed that built a chain and passed a rollout is reused, so one
-      # that can't doesn't fail later runs. A pull request's caches are its own.
+      # Only a seed and chain that passed a rollout are reused, so one that
+      # can't doesn't fail later runs. A pull request's caches are its own.
+      - name: Save the seeded chain
+        if: steps.chain.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ogre/chain
+          key: ${{ steps.chain.outputs.cache-primary-key }}
+
       - name: Save the seed
         if: steps.seed.outputs.cache-matched-key == ''
         uses: actions/cache/save@v4
         with:
           path: ogre/seed.bin
-          key: ogre-seed-v1-${{ github.run_id }}
+          key: ${{ steps.seed.outputs.cache-primary-key }}
 
       - name: Node logs
         if: failure()
@@ -150,12 +155,15 @@ jobs:
             ogre/run/logs
           retention-days: 7
 
+      # Only caches older than this run: a nightly running alongside keeps its own.
       - name: Delete superseded Ogre caches
         if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
-          SEED: ${{ steps.seed.outputs.cache-matched-key || format('ogre-seed-v1-{0}', github.run_id) }}
+          SEED: ${{ steps.seed.outputs.cache-matched-key || steps.seed.outputs.cache-primary-key }}
           CHAIN: ${{ steps.chain.outputs.cache-primary-key }}
+          START: ${{ steps.start.outputs.at }}
         run: |
-          gh cache list --repo "$GITHUB_REPOSITORY" --key ogre- --ref refs/heads/main --limit 100 --json key --jq '.[].key' |
+          gh cache list --repo "$GITHUB_REPOSITORY" --key ogre- --ref refs/heads/main --limit 100 --json key,createdAt \
+            --jq '.[] | select(.createdAt < env.START) | .key' |
             grep -vx -e "$SEED" -e "$CHAIN" | xargs -r -n1 gh cache delete --repo "$GITHUB_REPOSITORY"

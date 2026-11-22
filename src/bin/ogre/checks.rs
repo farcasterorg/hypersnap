@@ -35,6 +35,8 @@ impl Findings {
 pub struct Subjects {
     pub fid: u64,
     pub fid2: u64,
+    /// Another seeded account, which the native account follows in round 2.
+    pub fid3: u64,
     pub cast_hash: String,
     /// More of the subject's top-level casts, one liked per write round.
     pub like_targets: Vec<String>,
@@ -64,6 +66,11 @@ impl Subjects {
             *fids.iter().next().ok_or("empty seed")?
         };
         let fid2 = fids.iter().copied().find(|&f| f != fid).unwrap_or(fid);
+        let fid3 = fids
+            .iter()
+            .copied()
+            .find(|&f| f != fid && f != fid2)
+            .ok_or("seed has fewer than 3 accounts")?;
         let casts = |f: u64| {
             seed.messages.iter().rev().filter(move |m| {
                 let d = m.data.as_ref().unwrap();
@@ -139,6 +146,7 @@ impl Subjects {
             location: user_data(proto::UserDataType::Location),
             fid,
             fid2,
+            fid3,
             cast_hash: format!("0x{}", hex::encode(&top_level.hash)),
             like_targets: vec![],
             username,
@@ -482,20 +490,160 @@ async fn compare(net: &Net, path: &str) -> Compared {
     if is_empty(&u_body) {
         return Compared::Failed(format!("{path}: empty, the base release returns data"));
     }
-    let mut gone = Vec::new();
-    missing(&shape(&b_body), &shape(&u_body), "", &mut gone);
-    if !gone.is_empty() {
+    let mut lost = Vec::new();
+    missing(&shape(&b_body), &shape(&u_body), "", &mut lost);
+    let (b, u) = (strip_volatile(&b_body), strip_volatile(&u_body));
+    shrunk(&b, &u, "", "", &mut lost);
+    let mut differs = Vec::new();
+    differences(&b, &u, "", &mut differs);
+    let route = route(path);
+    let (ok, lost): (Vec<_>, Vec<_>) = lost.into_iter().partition(|i| accepted(route, i));
+    let (ok_values, differs): (Vec<_>, Vec<_>) =
+        differs.into_iter().partition(|i| accepted(route, i));
+    if !lost.is_empty() {
         return Compared::Failed(format!(
             "{path}: the base release returns what this build doesn't: {}",
-            gone.join(", ")
+            lost.join(", ")
         ));
     }
-    match first_difference(&strip_volatile(&b_body), &strip_volatile(&u_body), "") {
-        Some(d) => Compared::Differs(format!(
-            "{path}: same shape, different values than the base release: {d}"
-        )),
-        None => Compared::Same,
+    let mut notes = Vec::new();
+    if !ok.is_empty() || !ok_values.is_empty() {
+        notes.push(format!(
+            "accepted differences (docs/ogre-accepted.txt): {}",
+            few(&[ok, ok_values].concat())
+        ));
     }
+    if !differs.is_empty() {
+        notes.push(format!(
+            "{} other values differ from the base release: {}",
+            differs.len(),
+            few(&differs)
+        ));
+    }
+    if notes.is_empty() {
+        Compared::Same
+    } else {
+        Compared::Differs(format!("{path}: {}", notes.join("; ")))
+    }
+}
+
+fn few(items: &[String]) -> String {
+    let mut s = items.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+    if items.len() > 3 {
+        s.push_str(", ...");
+    }
+    s
+}
+
+/// Values the build lost on the same chain: an array with fewer items than the
+/// base release's, or a count (a `*count` field) that dropped by more than 2%
+/// (any drop below 50). Array items are matched by their id, since nodes can
+/// order ties differently.
+fn shrunk(base: &Value, under: &Value, key: &str, path: &str, out: &mut Vec<String>) {
+    match (base, under) {
+        (Value::Object(b), Value::Object(u)) => {
+            for (k, bv) in b {
+                if let Some(uv) = u.get(k) {
+                    shrunk(bv, uv, k, &format!("{path}.{k}"), out);
+                }
+            }
+        }
+        (Value::Array(b), Value::Array(u)) => {
+            if u.len() < b.len() {
+                out.push(format!("{path} ({} -> {} items)", b.len(), u.len()));
+            }
+            for (i, bv) in b.iter().enumerate() {
+                let Some(id) = ident(bv) else { continue };
+                if let Some(uv) = u.iter().find(|uv| ident(uv) == Some(id)) {
+                    shrunk(bv, uv, key, &format!("{path}[{i}]"), out);
+                }
+            }
+        }
+        (Value::Number(b), Value::Number(u)) if key.to_ascii_lowercase().ends_with("count") => {
+            if let (Some(b), Some(u)) = (b.as_u64(), u.as_u64()) {
+                if u < b && b - u > b / 50 {
+                    out.push(format!("{path} ({b} -> {u})"));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// What identifies an array item: its hash, fid or name, or its user's or cast's.
+fn ident(v: &Value) -> Option<&Value> {
+    ["hash", "fid", "name"]
+        .into_iter()
+        .find_map(|k| v.get(k).filter(|x| x.is_string() || x.is_number()))
+        .or_else(|| {
+            ["user", "cast"]
+                .into_iter()
+                .find_map(|k| v.get(k).and_then(ident))
+        })
+}
+
+/// Every value that differs, as `path: base -> under`.
+fn differences(base: &Value, under: &Value, path: &str, out: &mut Vec<String>) {
+    match (base, under) {
+        (Value::Object(b), Value::Object(u)) => {
+            for (k, bv) in b {
+                differences(
+                    bv,
+                    u.get(k).unwrap_or(&Value::Null),
+                    &format!("{path}.{k}"),
+                    out,
+                );
+            }
+        }
+        (Value::Array(b), Value::Array(u)) if b.len() == u.len() => {
+            for (i, (bv, uv)) in b.iter().zip(u).enumerate() {
+                differences(bv, uv, &format!("{path}[{i}]"), out);
+            }
+        }
+        _ if base == under => {}
+        _ => out.push(format!("{path}: {} -> {}", short(base), short(under))),
+    }
+}
+
+/// Differences between the base release and this build that are intended:
+/// `<route> <JSON path>` lines. docs/ogre.md says when to add and remove one.
+/// It lives outside src/bin/ogre so an entry doesn't rebuild the cached chain.
+const ACCEPTED: &str = include_str!("../../../docs/ogre-accepted.txt");
+
+/// The route of an endpoint spec, without its query or POST body.
+fn route(spec: &str) -> &str {
+    let s = spec.strip_prefix("POST ").unwrap_or(spec);
+    s.split(['?', ' ']).next().unwrap_or(s)
+}
+
+/// Whether a difference found on `route` (a JSON path, then what changed) is
+/// in the accepted list. Paths match without array indexes, and an entry
+/// covers everything under its path.
+fn accepted(route: &str, difference: &str) -> bool {
+    accepted_in(ACCEPTED, route, difference)
+}
+
+fn accepted_in(list: &str, route: &str, difference: &str) -> bool {
+    let path = unindexed(difference.split([' ', ':']).next().unwrap_or(""));
+    list.lines().any(|l| {
+        let words: Vec<&str> = l.split('#').next().unwrap_or("").split_whitespace().collect();
+        matches!(words[..], [r, p, ..] if r == route
+            && path.strip_prefix(p).is_some_and(|rest| rest.is_empty() || rest.starts_with(['.', '['])))
+    })
+}
+
+/// `.users[3].fid` as `.users[].fid`.
+fn unindexed(path: &str) -> String {
+    let mut out = String::new();
+    let mut in_index = false;
+    for c in path.chars() {
+        if in_index && c != ']' {
+            continue;
+        }
+        in_index = c == '[';
+        out.push(c);
+    }
+    out
 }
 
 /// Every endpoint on the API node under test against the base reference node,
@@ -558,22 +706,6 @@ pub async fn endpoints(
     summary
 }
 
-/// The first value that differs, as `path: base -> under`.
-fn first_difference(base: &Value, under: &Value, path: &str) -> Option<String> {
-    match (base, under) {
-        (Value::Object(b), Value::Object(u)) => b.iter().find_map(|(k, bv)| {
-            first_difference(bv, u.get(k).unwrap_or(&Value::Null), &format!("{path}.{k}"))
-        }),
-        (Value::Array(b), Value::Array(u)) if b.len() == u.len() => b
-            .iter()
-            .zip(u)
-            .enumerate()
-            .find_map(|(i, (bv, uv))| first_difference(bv, uv, &format!("{path}[{i}]"))),
-        _ if base == under => None,
-        _ => Some(format!("{path}: {} -> {}", short(base), short(under))),
-    }
-}
-
 fn strip_volatile(v: &Value) -> Value {
     match v {
         Value::Object(o) => Value::Object(
@@ -589,6 +721,11 @@ fn strip_volatile(v: &Value) -> Value {
                             | "version"
                             | "numMessages"
                             | "dbStats"
+                            // Work a node's indexers did since it started, and
+                            // how far along the event log they are: the same
+                            // release on the same chain differs between nodes.
+                            | "items_indexed"
+                            | "last_event_id"
                             | "shardInfos"
                     )
                 })
@@ -897,9 +1034,11 @@ fn hash_of(m: &proto::Message) -> String {
     format!("0x{}", hex::encode(&m.hash))
 }
 
-/// Signs and submits a cast, a reply, a mention, a like, a recast and follows
-/// through `via`, then checks every node has them and the API node's views
-/// (feeds, notifications, conversation, counts, search) show them.
+/// Signs and submits a cast, a reply, a mention, a like, a recast and two
+/// follows (one of an account round `round_no` follows for the first time)
+/// through `via`, then checks every node at the tip stores each of them and the
+/// read nodes' views (feeds, notifications, conversation, counts, recasters,
+/// following list, search) show them.
 pub async fn writes(
     net: &Net,
     s: &Subjects,
@@ -917,7 +1056,8 @@ pub async fn writes(
     };
     let token = format!("ogre{}{}", round, std::process::id());
 
-    let (nfid, nkey) = &w.native;
+    let (nfid, nkey) = (&w.native.0, &w.native.1);
+    let native_fid = *nfid;
     let k = Some(&w.legacy_key);
     let text = format!("{token} hello  from ogre");
     let mention = messages_factory::create_message_with_data(
@@ -958,7 +1098,8 @@ pub async fn writes(
         messages_factory::casts::create_cast_add(*nfid, &format!("{token} native"), None, n);
     let follow_legacy =
         messages_factory::links::create_link_add(*nfid, "follow", w.legacy_fid, None, n);
-    let follow_subject = messages_factory::links::create_link_add(*nfid, "follow", s.fid, None, n);
+    let followed = if round_no == 0 { s.fid } else { s.fid3 };
+    let follow_new = messages_factory::links::create_link_add(*nfid, "follow", followed, None, n);
     let like = messages_factory::reactions::create_reaction_add(
         *nfid,
         proto::ReactionType::Like,
@@ -976,15 +1117,51 @@ pub async fn writes(
         None,
         n,
     );
-    for m in [
-        &follow_legacy,
-        &follow_subject,
-        &mention,
-        &reply,
-        &native_cast,
-        &like,
-        &recast,
-    ] {
+    let liked_ref =
+        format!("fid={nfid}&target_fid={liked_fid}&target_hash={liked}&reaction_type=Like");
+    let recast_ref = format!(
+        "fid={nfid}&target_fid={}&target_hash={}&reaction_type=Recast",
+        w.legacy_fid,
+        hash_of(&mention)
+    );
+    // Each message and where a node serves it.
+    let sent = [
+        (
+            "follow",
+            &follow_legacy,
+            format!(
+                "/v1/linkById?fid={nfid}&target_fid={}&link_type=follow",
+                w.legacy_fid
+            ),
+        ),
+        (
+            "new follow",
+            &follow_new,
+            format!("/v1/linkById?fid={nfid}&target_fid={followed}&link_type=follow"),
+        ),
+        (
+            "mention",
+            &mention,
+            format!(
+                "/v1/castById?fid={}&hash={}",
+                w.legacy_fid,
+                hash_of(&mention)
+            ),
+        ),
+        (
+            "reply",
+            &reply,
+            format!("/v1/castById?fid={}&hash={}", w.legacy_fid, hash_of(&reply)),
+        ),
+        (
+            "native cast",
+            &native_cast,
+            format!("/v1/castById?fid={nfid}&hash={}", hash_of(&native_cast)),
+        ),
+        ("like", &like, format!("/v1/reactionById?{liked_ref}")),
+        ("recast", &recast, format!("/v1/reactionById?{recast_ref}")),
+    ];
+    for (_, m, _) in &sent {
         if let Err(e) = submit(net, via, m).await {
             f.fail(format!(
                 "{round}: node {via} refused a {:?}: {e}",
@@ -996,30 +1173,27 @@ pub async fn writes(
 
     let t = Instant::now();
     let deadline = Duration::from_secs(30);
-    // Every node stores the casts.
-    // Every node at the tip stores them; the fresh node is still replaying.
-    for node in net
+    // Every node at the tip serves every message (this one, not an older one
+    // for the same link); the fresh node is still replaying.
+    let stored = net
         .nodes
         .iter()
         .filter(|n| n.running() && n.i != net::FRESH)
-    {
-        for (what, fid, m) in [
-            ("cast", w.legacy_fid, &mention),
-            ("native cast", *nfid, &native_cast),
-        ] {
-            let path = format!("/v1/castById?fid={fid}&hash={}", hash_of(m));
+        .flat_map(|node| {
+            sent.iter()
+                .map(move |(what, m, path)| (node.i, what, m, path))
+        })
+        .map(|(i, what, m, path)| async move {
+            let hash = contains(hash_of(m));
             let ok = poll(deadline, || async {
-                matches!(net.get(node.i, &path).await, Ok((200, _))).then_some(())
+                matches!(net.get(i, path).await, Ok((200, v)) if hash(&v)).then_some(())
             })
             .await;
-            if ok.is_none() {
-                f.fail(format!(
-                    "{round}: node {} doesn't have the {what} after {deadline:?}",
-                    node.i
-                ));
-            }
-        }
-    }
+            ok.is_none().then(|| {
+                format!("{round}: node {i} doesn't have the {what} after {deadline:?} ({path})")
+            })
+        });
+    let stored = futures::future::join_all(stored).await;
     let landed = t.elapsed();
 
     let views: Vec<(&str, String, Check)> = vec![
@@ -1052,9 +1226,32 @@ pub async fn writes(
             contains(hash_of(&native_cast)),
         ),
         (
+            "following list shows the newly followed account",
+            format!("/v2/farcaster/following?fid={nfid}&limit=25"),
+            Box::new(move |v: &Value| has_fid(v, followed)),
+        ),
+        (
             "profile counts the native account's follows",
             format!("/v2/farcaster/user?fid={nfid}"),
-            Box::new(|v: &Value| v["user"]["following_count"].as_u64() >= Some(2)),
+            Box::new(move |v: &Value| {
+                v["user"]["following_count"].as_u64() >= Some(2 + round_no as u64)
+            }),
+        ),
+        (
+            "cast counts the recast",
+            format!(
+                "/v2/farcaster/cast?identifier={}&type=hash",
+                hash_of(&mention)
+            ),
+            Box::new(|v: &Value| v["cast"]["reactions"]["recasts_count"].as_u64() >= Some(1)),
+        ),
+        (
+            "recasters list the native account",
+            format!(
+                "/v2/farcaster/reactions/cast?hash={}&types=recasts&limit=25",
+                hash_of(&mention)
+            ),
+            Box::new(move |v: &Value| has_fid(v, native_fid)),
         ),
         (
             "search finds the new cast",
@@ -1062,8 +1259,10 @@ pub async fn writes(
             contains(hash_of(&mention)),
         ),
     ];
-    for node in [net::API, net::REFERENCE] {
-        for (what, path, ok) in &views {
+    let shown = [net::API, net::REFERENCE]
+        .into_iter()
+        .flat_map(|node| views.iter().map(move |v| (node, v)))
+        .map(|(node, (what, path, ok))| async move {
             let seen = poll(deadline, || async {
                 match net.get(node, path).await {
                     Ok((200, v)) if ok(&v) => Some(()),
@@ -1071,15 +1270,20 @@ pub async fn writes(
                 }
             })
             .await;
-            if seen.is_none() {
-                let which = if node == net::API {
-                    "API node"
-                } else {
-                    "base reference node"
-                };
-                f.fail(format!("{round}: {which}: {what} ({path})"));
-            }
-        }
+            let which = if node == net::API {
+                "API node"
+            } else {
+                "base reference node"
+            };
+            seen.is_none()
+                .then(|| format!("{round}: {which}: {what} ({path})"))
+        });
+    for failure in stored
+        .into_iter()
+        .chain(futures::future::join_all(shown).await)
+        .flatten()
+    {
+        f.fail(failure);
     }
     let liked = poll(deadline, || async {
         match (likes_before, likes(net, &liked).await) {
@@ -1093,7 +1297,10 @@ pub async fn writes(
             "{round}: like count of the liked cast didn't go up from {likes_before:?}"
         ));
     }
-    eprintln!("  {round}: 7 messages on every node in {landed:.1?}");
+    eprintln!(
+        "  {round}: {} messages on every node at the tip in {landed:.1?}",
+        sent.len()
+    );
 }
 
 /// A test of an API response.
@@ -1107,6 +1314,17 @@ fn contains(hash: String) -> Check {
     })
 }
 
+/// Whether any `fid` field in `v` is `fid`.
+fn has_fid(v: &Value, fid: u64) -> bool {
+    match v {
+        Value::Object(o) => o
+            .iter()
+            .any(|(k, v)| (k == "fid" && v.as_u64() == Some(fid)) || has_fid(v, fid)),
+        Value::Array(a) => a.iter().any(|v| has_fid(v, fid)),
+        _ => false,
+    }
+}
+
 async fn likes(net: &Net, hash: &str) -> Option<u64> {
     let path = format!("/v2/farcaster/cast?identifier={hash}&type=hash");
     let (_, v) = net.get(net::API, &path).await.ok()?;
@@ -1115,8 +1333,79 @@ async fn likes(net: &Net, hash: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{missing, shape};
+    use super::{accepted_in, has_fid, missing, shape, shrunk, unindexed};
     use serde_json::json;
+
+    fn lost(base: serde_json::Value, under: serde_json::Value) -> Vec<String> {
+        let mut out = Vec::new();
+        shrunk(&base, &under, "", "", &mut out);
+        out
+    }
+
+    #[test]
+    fn shrunk_finds_fewer_items_and_dropped_counts() {
+        let base = json!({"users": [{"fid": 1, "follower_count": 10}, {"fid": 2, "follower_count": 1000}]});
+        assert!(lost(base.clone(), base.clone()).is_empty());
+        // fewer items
+        assert_eq!(
+            lost(
+                base.clone(),
+                json!({"users": [{"fid": 1, "follower_count": 10}]})
+            ),
+            [".users (2 -> 1 items)"]
+        );
+        // items matched by id, in another order; a 1% drop of a large count is
+        // tolerated, any drop of a small one isn't
+        assert!(lost(
+            base.clone(),
+            json!({"users": [{"fid": 2, "follower_count": 990}, {"fid": 1, "follower_count": 10}]})
+        )
+        .is_empty());
+        assert_eq!(
+            lost(
+                base.clone(),
+                json!({"users": [{"fid": 2, "follower_count": 900}, {"fid": 1, "follower_count": 9}]})
+            ),
+            [
+                ".users[0].follower_count (10 -> 9)",
+                ".users[1].follower_count (1000 -> 900)"
+            ]
+        );
+        // ids and other numbers aren't counts; counts near u64::MAX don't overflow
+        assert!(lost(json!({"fid": 9, "units": 5}), json!({"fid": 1, "units": 1})).is_empty());
+        assert_eq!(
+            lost(json!({"count": u64::MAX}), json!({"count": 0})),
+            [format!(".count ({} -> 0)", u64::MAX)]
+        );
+        // nested under a matched item's user
+        assert_eq!(
+            lost(
+                json!({"reactions": [{"user": {"fid": 5, "following_count": 3}}]}),
+                json!({"reactions": [{"user": {"fid": 5, "following_count": 0}}]})
+            ),
+            [".reactions[0].user.following_count (3 -> 0)"]
+        );
+    }
+
+    #[test]
+    fn accepted_matches_route_and_path_prefix() {
+        let list = "# comment\n/v2/a .users  why (PR 1)\n/v2/b .x[].units\n";
+        assert_eq!(unindexed(".x[12].units[0]"), ".x[].units[]");
+        assert!(accepted_in(list, "/v2/a", ".users[0].fid: 1 -> 2"));
+        assert!(accepted_in(list, "/v2/a", ".users (5 -> 4 items)"));
+        assert!(accepted_in(list, "/v2/b", ".x[3].units: 1 -> 2"));
+        assert!(!accepted_in(list, "/v2/a", ".users_count: 1 -> 2"));
+        assert!(!accepted_in(list, "/v2/b", ".users[0].fid: 1 -> 2"));
+        assert!(!accepted_in(list, "/v2/c", ".users"));
+        assert!(!accepted_in(list, "/v2/b", ".x[].unitsx: 1 -> 2"));
+    }
+
+    #[test]
+    fn has_fid_finds_nested_fids() {
+        let v = json!({"users": [{"object": "follow", "user": {"fid": 7}}]});
+        assert!(has_fid(&v, 7));
+        assert!(!has_fid(&v, 8));
+    }
 
     fn gone(base: serde_json::Value, under: serde_json::Value) -> Vec<String> {
         let mut out = Vec::new();

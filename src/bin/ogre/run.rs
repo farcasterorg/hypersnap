@@ -60,10 +60,10 @@ pub async fn chain(args: ChainArgs) -> Result<(), Error> {
     // Validators take the seed; the read nodes join afterwards and sync it, as
     // a read node joins mainnet (indexing a burst of live merges loses
     // notifications on some nodes, which made runs disagree).
-    for i in 1..=net::VALIDATORS {
-        net.start(i, &args.base)?;
-    }
     let result = async {
+        for i in 1..=net::VALIDATORS {
+            net.start(i, &args.base)?;
+        }
         for i in 1..=net::VALIDATORS {
             net.wait_up(i, Duration::from_secs(120)).await?;
         }
@@ -524,6 +524,15 @@ async fn scenario(
         ));
     }
 
+    // The fresh read node has been replaying since the start; it is checked for
+    // progress from here to the end of the run.
+    let fresh_from = (
+        Instant::now(),
+        net.heights(net::FRESH)
+            .await
+            .ok_or("fresh read node stopped answering")?,
+    );
+
     r.phase("Read API again, on the upgraded network");
     let summary = checks::endpoints(net, s, "upgraded", args.min_compared, &mut r.findings).await;
     r.note(summary);
@@ -546,14 +555,10 @@ async fn scenario(
     // test: a change to how blocks apply shows up as it stopping. A debug build
     // replays slowly, so it only has to keep going, not reach the tip.
     r.phase("Fresh read node: replaying the chain from an empty database");
-    let fresh = net::FRESH;
-    let before = net
-        .heights(fresh)
-        .await
-        .ok_or("fresh read node stopped answering")?;
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    let (since, before) = fresh_from;
+    tokio::time::sleep(Duration::from_secs(10).saturating_sub(since.elapsed())).await;
     let after = net
-        .heights(fresh)
+        .heights(net::FRESH)
         .await
         .ok_or("fresh read node stopped answering")?;
     let tip = net

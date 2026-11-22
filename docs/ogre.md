@@ -25,8 +25,9 @@ Each run starts from the same chain; nothing is uploaded as a snapshot.
 `ogre chain` builds that chain on the release mainnet runs
 (`farcasterorg/hypersnap:latest`) and stops it. CI caches the seed (refreshed
 daily) and the chain (per base release, seed and Ogre source), so a run starts
-from a stopped network, the way an operator's node is upgraded. A new seed is
-cached only after it built a chain and passed a rollout.
+from a stopped network, the way an operator's node is upgraded. A new seed and
+chain are cached only after they passed a rollout, and a change to the exporter
+(`seed.rs`, `convert.rs`) exports a new seed.
 
 `ogre run` then:
 
@@ -36,18 +37,24 @@ cached only after it built a chain and passed a rollout.
 2. Calls every read endpoint on the read node under test and on the base read
    node, and fails when the build returns an error or an empty result, drops a
    field, empties an array or changes a value's JSON type where the base release
-   has data. Endpoints where the base release has no data are listed as not
-   compared, and the run fails when fewer than `--min-compared` endpoints had
-   base data (a reference node that errs can't turn every check into a skip).
-   Different values are warnings. A failing endpoint is retried for 6 seconds.
+   has data. On values, it fails when an array has fewer items than the base
+   release's, or a count (a field named `*count`) drops by more than 2% (any
+   drop below 50); array items are matched by their hash or fid, since nodes
+   can order ties differently. Other different values are warnings, and fields
+   that differ between nodes on the same release (heights, peers, indexer work
+   counters) are ignored. Endpoints where the base release has no data are
+   listed as not compared, and the run fails when fewer than `--min-compared`
+   endpoints had base data (a reference node that errs can't turn every check
+   into a skip). A failing endpoint is retried for 6 seconds.
 3. Signs up a native account with a gasless signer, as new users do, and sends
    casts, a reply, a mention, a like, a recast and follows from it and from a
    real seeded account, through the read node's HTTP API. It checks every node
-   at the tip stores them and the API shows them: following feed, notifications,
-   conversation, author feed, profile counts, like count and search.
+   at the tip stores each of those messages, and both read nodes show them:
+   following feed, following list, notifications, conversation, author feed,
+   profile counts, like count, recast count, recasters and search.
 4. Restarts validators 1-4 on the build one at a time (a rolling upgrade),
    compares every endpoint again, then sends the writes again through the base
-   read node.
+   read node, this time following an account the native account didn't follow.
 5. Kills a validator and restarts it. A read node that started with an empty
    database replays the chain from block 1 on the build the whole time; it has
    to keep making progress (a debug build replays too slowly to reach the tip
@@ -55,9 +62,21 @@ cached only after it built a chain and passed a rollout.
 
 It fails on any of those, on a shard going longer than `--max-stall` without a
 block, on a node exiting on its own (found when it is next stopped, including
-before a planned restart), and on a panic while nodes run (panics during a
+before a planned restart), on a node that doesn't stop within 30 seconds of
+SIGTERM, and on a panic while nodes run (panics during a
 graceful stop are reported as warnings). The report goes to the job summary,
 and node logs are uploaded when it fails.
+
+## Intended API changes
+
+Ogre compares against the release mainnet runs, so a pull request that changes
+an answer on purpose (drops a field, changes a type or a count) fails it until
+that change ships in a release. List such a change in `docs/ogre-accepted.txt`
+in the same pull request: the route, the JSON path without array indexes (an
+entry covers everything under it), and why. Ogre then reports it as accepted
+instead of failing. Remove the entry once `farcasterorg/hypersnap:latest`
+includes the change, so the path is checked again. The file is outside
+`src/bin/ogre` so an entry doesn't rebuild the cached chain.
 
 ## Endpoints left out
 

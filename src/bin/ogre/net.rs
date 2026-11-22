@@ -170,7 +170,8 @@ pub struct Node {
     log: PathBuf,
     /// Panics logged while the node was being stopped.
     pub shutdown_panics: Vec<String>,
-    /// How the node exited on its own, found when it was next stopped.
+    /// How the node exited on its own, found when it was next stopped, or that
+    /// it hung on a graceful stop.
     pub crashes: Vec<String>,
 }
 
@@ -267,12 +268,19 @@ impl Node {
                 .args([sig, &child.id().to_string()])
                 .status();
         }
-        let deadline = Instant::now() + Duration::from_secs(30);
+        const GRACE: Duration = Duration::from_secs(30);
+        let deadline = Instant::now() + GRACE;
         while Instant::now() < deadline {
             if let Ok(Some(_)) = child.try_wait() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(100));
+        }
+        // An operator's restart hangs the same way during a rolling upgrade.
+        if !kill && child.try_wait().ok().flatten().is_none() {
+            self.crashes.push(format!(
+                "didn't stop within {GRACE:?} of SIGTERM and was killed"
+            ));
         }
         if image {
             // Killing the `docker run` client would leave the container running.
