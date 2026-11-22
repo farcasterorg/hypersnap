@@ -5,3 +5,5 @@
 # See docs/ogre.md.
 /v2/farcaster/user/storage-allocations .allocations[].units  no longer wraps below u64::MAX (PR 94)
 /v2/farcaster/storage/allocations      .allocations[].units  the same handler (PR 94)
+/v2/farcaster/user/storage-allocations .total_active_units   the same sum (PR 94)
+/v2/farcaster/storage/allocations      .total_active_units   the same sum (PR 94)
