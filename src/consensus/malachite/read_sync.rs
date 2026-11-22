@@ -120,9 +120,9 @@ pub struct State {
 
     connected_peers: HashSet<PeerId>,
 
-    /// Heights above the last committed block that a peer answered. The sync state machine
-    /// forgets a request once its answer arrives, so without this the window would ask again for
-    /// blocks that are on their way to the host.
+    /// Heights above the last committed block whose block was answered and sent to the host. A
+    /// request is cleared when its answer arrives, so without this the window would ask again
+    /// for blocks that are on their way to the host.
     received: BTreeSet<u64>,
 
     /// When the last block was committed.
