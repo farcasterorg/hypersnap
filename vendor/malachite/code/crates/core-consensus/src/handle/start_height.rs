@@ -69,7 +69,8 @@ async fn replay_pending_msgs<Ctx>(
 where
     Ctx: Context,
 {
-    let pending_inputs = std::mem::take(&mut state.input_queue);
+    let height = state.driver.height();
+    let pending_inputs = state.input_queue.take_at(height);
     debug!(count = pending_inputs.len(), "Replaying inputs");
 
     for pending_input in pending_inputs {

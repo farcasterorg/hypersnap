@@ -207,7 +207,11 @@ where
             );
             warn!(
                 "Voting power required: {}",
-                self.driver.validator_set().total_voting_power() * 2 / 3
+                self.params
+                    .threshold_params
+                    .quorum
+                    .min_expected(self.validator_set().total_voting_power())
+                    + 1
             );
             warn!(
                 "Total voting power of validators having voted: {}",

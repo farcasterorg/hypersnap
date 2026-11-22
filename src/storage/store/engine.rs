@@ -1659,9 +1659,12 @@ impl ShardEngine {
                     if block_event.seqnum() > crate::native_registration::FORK_EVENT_BASE
                         && block_event.seqnum() != last_block_event_seqnum + 1
                     {
-                        return Err(HubError::validation_failure(
-                            "post-fork block events must be consecutive",
-                        )
+                        return Err(HubError::validation_failure(&format!(
+                            "post-fork block events must be consecutive: expected {}, received {} from shard-zero block {}",
+                            last_block_event_seqnum + 1,
+                            block_event.seqnum(),
+                            block_event.block_number()
+                        ))
                         .into());
                     }
                     if block_event.seqnum() == last_block_event_seqnum + 1 {
@@ -2822,7 +2825,12 @@ impl ShardEngine {
 
         match proposal_result {
             Err(err) => {
-                error!("State change validation failed: {}", err);
+                error!(
+                    shard = height.shard_index,
+                    height = height.block_number,
+                    "State change validation failed: {}",
+                    err
+                );
                 result = false;
             }
             Ok((events, max_block_event_seqnum)) => {

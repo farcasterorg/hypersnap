@@ -97,6 +97,22 @@ impl<I, T> MaxQueue<I, T> {
         self.queue.is_empty()
     }
 
+    /// Leave future inputs queued during catch-up. A height jump can also
+    /// make the entire batch stale, in which case there is nothing to replay.
+    pub fn take_at(&mut self, index: I) -> Vec<T>
+    where
+        I: Default + Ord,
+    {
+        match self.highest_index.cmp(&index) {
+            std::cmp::Ordering::Greater => Vec::new(),
+            std::cmp::Ordering::Equal => std::mem::take(self).into_vec(),
+            std::cmp::Ordering::Less => {
+                *self = Self::default();
+                Vec::new()
+            }
+        }
+    }
+
     /// Returns the queue.
     pub fn into_vec(self) -> Vec<T> {
         self.queue
@@ -127,6 +143,23 @@ impl<I, T> IntoIterator for MaxQueue<I, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catch_up_replays_only_at_the_buffered_height() {
+        let mut queue = MaxQueue::new();
+        queue.push(100, "proposal");
+        queue.push(100, "vote");
+        for height in 1..100 {
+            assert!(queue.take_at(height).is_empty());
+            assert_eq!(queue.len(), 2);
+        }
+        assert_eq!(queue.take_at(100), vec!["proposal", "vote"]);
+        assert!(queue.take_at(100).is_empty());
+
+        queue.push(101, "old vote");
+        assert!(queue.take_at(102).is_empty());
+        assert!(queue.is_empty());
+    }
 
     #[test]
     fn test_max_queue() {

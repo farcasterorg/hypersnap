@@ -640,10 +640,11 @@ impl Proposer for BlockProposer {
                 return Validity::Invalid;
             }
 
-            if height != self.get_confirmed_height().increment() {
+            let confirmed_height = self.get_confirmed_height();
+            if height != confirmed_height.increment() {
                 warn!(
                     shard = height.shard_index,
-                    our_height = height.block_number,
+                    our_height = confirmed_height.block_number,
                     proposal_height = height.block_number,
                     "Cannot validate height, not the next height"
                 );
