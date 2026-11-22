@@ -1,0 +1,28 @@
+[package]
+name = "informalsystems-malachitebft-discovery-test"
+publish = false
+
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+malachitebft-network.workspace = true
+malachitebft-config.workspace = true
+malachitebft-starknet-host.workspace = true
+malachitebft-metrics.workspace = true
+
+futures.workspace = true
+libp2p-identity.workspace = true
+rand.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+malachitebft-discovery-test = { workspace = true }
+
+[lints]
+workspace = true

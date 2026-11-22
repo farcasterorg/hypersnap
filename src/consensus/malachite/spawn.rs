@@ -12,7 +12,7 @@ use std::time::Duration;
 use tracing::Span;
 
 use crate::consensus::consensus::Config;
-use crate::consensus::malachite::host::{Host, HostState};
+use crate::consensus::malachite::host::{DeferredProposals, Host, HostState};
 use crate::consensus::malachite::network_connector::{
     MalachiteNetworkActorMsg, MalachiteNetworkConnector, MalachiteNetworkEvent,
     NetworkConnectorArgs,
@@ -85,6 +85,7 @@ pub async fn spawn_host(
         gossip_tx,
         statsd,
         participation,
+        deferred_proposals: DeferredProposals::new(),
     };
     let actor_ref = Host::spawn(state).await?;
     Ok(actor_ref)

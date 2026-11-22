@@ -3,7 +3,7 @@ use crate::core::error::HubError;
 use crate::proto;
 use crate::proto::Block;
 use crate::storage::constants::RootPrefix;
-use crate::storage::db::{PageOptions, RocksDB, RocksdbError};
+use crate::storage::db::{PageOptions, RocksDB, RocksDbTransactionBatch, RocksdbError};
 use prost::Message;
 use std::sync::Arc;
 use thiserror::Error;
@@ -161,6 +161,18 @@ pub fn get_blocks_in_range(
 
 fn put_block(db: &RocksDB, block: &Block) -> Result<(), BlockStorageError> {
     let mut txn = db.txn();
+    put_block_in_txn(db, block, &mut txn)?;
+    db.commit(txn)?;
+    Ok(())
+}
+
+/// Stage `block` and its timestamp index in `txn`, so the caller can commit the block together
+/// with the state it produced.
+fn put_block_in_txn(
+    db: &RocksDB,
+    block: &Block,
+    txn: &mut RocksDbTransactionBatch,
+) -> Result<(), BlockStorageError> {
     let header = block
         .header
         .as_ref()
@@ -177,8 +189,6 @@ fn put_block(db: &RocksDB, block: &Block) -> Result<(), BlockStorageError> {
     if db.get(&timestamp_index_key)? == None {
         txn.put(timestamp_index_key, primary_key);
     }
-
-    db.commit(txn)?;
     Ok(())
 }
 
@@ -195,6 +205,14 @@ impl BlockStore {
     #[inline]
     pub fn put_block(&self, block: &Block) -> Result<(), BlockStorageError> {
         put_block(&self.db, block)
+    }
+
+    pub fn put_block_in_txn(
+        &self,
+        block: &Block,
+        txn: &mut RocksDbTransactionBatch,
+    ) -> Result<(), BlockStorageError> {
+        put_block_in_txn(&self.db, block, txn)
     }
 
     #[inline]

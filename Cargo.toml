@@ -1,10 +1,11 @@
 [workspace]
+exclude = ["vendor/malachite/code", "vendor/malachite/code/crates/*"]
 members = ["proto"]
 resolver = "2"
 
 [package]
 name = "snapchain"
-version = "0.17.15"
+version = "0.17.20"
 edition = "2021"
 default-run = "hypersnap"
 
@@ -21,8 +22,7 @@ snapchain-proto = { path = "proto" }
 tokio = { version = "1.40.0", features = ["full"] }
 tokio-stream = "0.1"
 serde = { version = "1.0", features = ["derive"] }
-atty = "0.2"
-libp2p-connection-limits = "0.5.0"
+libp2p-connection-limits = "0.6.0"
 serde_json = "1.0"
 sha2 = "0.10.6"
 tonic = { version ="0.12.3", features = ["tls", "tls-native-roots"] }
@@ -33,24 +33,24 @@ futures-core = "0.3.31"
 parking_lot = "0.12.1"
 tokio-retry2 = { version = "0.5", features = ["jitter", "tracing"] }
 clap = { version = "4.3.0", features = ["derive"] }
-libp2p = { version = "0.55.0", features = ["tokio", "gossipsub", "identify", "kad", "mdns", "dns", "noise", "macros", "tcp", "yamux", "quic", "request-response"] }
+libp2p = { version = "0.56.0", features = ["tokio", "gossipsub", "identify", "kad", "dns", "noise", "macros", "tcp", "yamux", "quic", "request-response"] }
 async-trait = "0.1.68"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter", "fmt", "json"] }
 hex = "0.4.3"
 ractor = { version = "0.14.6", default-features = false, features = ["async-trait", "tokio_runtime"] }
 bytes = "1.9.0"
-informalsystems-malachitebft-core-consensus = { path = "../malachite/code/crates/core-consensus" }
-informalsystems-malachitebft-engine = { path = "../malachite/code/crates/engine" }
-informalsystems-malachitebft-network = { path = "../malachite/code/crates/network" }
-informalsystems-malachitebft-sync = { path = "../malachite/code/crates/sync" }
-informalsystems-malachitebft-core-types = { path = "../malachite/code/crates/core-types" }
-informalsystems-malachitebft-config = { path = "../malachite/code/crates/config" }
-informalsystems-malachitebft-codec = { path = "../malachite/code/crates/codec" }
-informalsystems-malachitebft-metrics = { path = "../malachite/code/crates/metrics" }
-informalsystems-malachitebft-wal = { path = "../malachite/code/crates/wal" }
+informalsystems-malachitebft-core-consensus = { path = "vendor/malachite/code/crates/core-consensus" }
+informalsystems-malachitebft-engine = { path = "vendor/malachite/code/crates/engine" }
+informalsystems-malachitebft-network = { path = "vendor/malachite/code/crates/network" }
+informalsystems-malachitebft-sync = { path = "vendor/malachite/code/crates/sync" }
+informalsystems-malachitebft-core-types = { path = "vendor/malachite/code/crates/core-types" }
+informalsystems-malachitebft-config = { path = "vendor/malachite/code/crates/config" }
+informalsystems-malachitebft-codec = { path = "vendor/malachite/code/crates/codec" }
+informalsystems-malachitebft-metrics = { path = "vendor/malachite/code/crates/metrics" }
+informalsystems-malachitebft-wal = { path = "vendor/malachite/code/crates/wal" }
 # Same version Malachite's metrics crate uses, so our gossip counters share the
 # in-process `SharedRegistry` instance (types must unify).
-prometheus-client = "0.22"
+prometheus-client = "0.23.1"
 blake3 = "1.4.1"
 tracing = "0.1.40"
 thiserror = "1.0.66"
@@ -118,6 +118,8 @@ twox-hash = "1.6"
 
 [dev-dependencies]
 serial_test = "3.1.1"
+# Paused-clock tests for waits measured in minutes.
+tokio = { version = "1.40.0", features = ["full", "test-util"] }
 tracing-test = { version = "0.2.5", features = ["no-env-filter"] }
 insta = { version = "1.40", features = ["json"] }
 # Test-only access to JSON-RPC primitives (SerializedRequest, Response,
@@ -131,3 +133,7 @@ filetime = "0.2"
 
 [package.metadata.precommit]
 fmt = "cargo fmt --check --quiet"
+
+[patch.crates-io]
+# Our compatibility patch for the pinned Malachite broadcast transport.
+libp2p-scatter = { path = "vendor/libp2p-scatter" }

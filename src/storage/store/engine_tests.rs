@@ -33,6 +33,508 @@ mod tests {
     use informalsystems_malachitebft_core_types::Round;
     use prost::Message;
 
+    /// Certified chunks that depend on shard-zero events, across waits, restarts and torn
+    /// commits. Every case must converge to the same certified height as the node that produced
+    /// the chunk, with its storage-lending event applied exactly once.
+    mod certified_commit {
+        use super::*;
+        use crate::native_registration::{Config, FORK_EVENT_BASE};
+        use crate::proto::{Block, BlockHeader, StorageUnitType};
+        use crate::storage::db::RocksDB;
+        use crate::storage::store::account::{BlockEventStore, StorageLendStore};
+        use crate::storage::store::block::BlockStore;
+        use crate::storage::store::engine::{AheadOfCertifiedTip, CommittedStateCheck};
+        use crate::storage::store::node_local_state::{CommitCursor, LocalStateStore};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        /// Shard-zero height holding the lend event.
+        const LEND_BLOCK: u64 = 7;
+        const LENDER: u64 = FID_FOR_TEST;
+        const BORROWER: u64 = FID2_FOR_TEST;
+
+        fn fork_config() -> Config {
+            Config {
+                activation_heights: [("0".into(), 1), ("1".into(), 1)].into(),
+                ..Default::default()
+            }
+        }
+
+        fn rehash(mut event: proto::BlockEvent) -> proto::BlockEvent {
+            event.hash = blake3::hash(&event.data.as_ref().unwrap().encode_to_vec())
+                .as_bytes()
+                .to_vec();
+            event
+        }
+
+        /// The first post-fork event: a storage lend shard zero ordered at `LEND_BLOCK`. Every
+        /// node must see byte-identical copies, so the timestamps are fixed once per process.
+        fn lend_event() -> proto::BlockEvent {
+            static NOW: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            let now = *NOW.get_or_init(|| FarcasterTime::current().to_u64());
+            let lend = messages_factory::storage_lend::create_storage_lend(
+                LENDER,
+                BORROWER,
+                1,
+                StorageUnitType::UnitType2025,
+                Some(now as u32),
+                None,
+            );
+            let mut event =
+                create_merge_message_event_with_timestamp(lend, FORK_EVENT_BASE + 1, now);
+            event.data.as_mut().unwrap().block_number = LEND_BLOCK;
+            rehash(event)
+        }
+
+        fn open_db(path: &std::path::Path) -> Arc<RocksDB> {
+            let db = RocksDB::new(path.to_str().unwrap());
+            db.open().unwrap();
+            Arc::new(db)
+        }
+
+        /// Commit shard-zero block `height` with `events`, the way shard zero does: the block and
+        /// its events land in one transaction.
+        fn commit_shard_zero_block(
+            authority: &Arc<RocksDB>,
+            height: u64,
+            events: &[proto::BlockEvent],
+        ) {
+            let mut txn = RocksDbTransactionBatch::new();
+            let log = BlockEventStore::new(authority.clone());
+            for event in events {
+                log.put_block_event(event, &mut txn).unwrap();
+            }
+            let block = Block {
+                header: Some(BlockHeader {
+                    height: Some(proto::Height::new(0, height)),
+                    timestamp: height,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            BlockStore::new(authority.clone())
+                .put_block_in_txn(&block, &mut txn)
+                .unwrap();
+            authority.commit(txn).unwrap();
+        }
+
+        async fn shard_engine(db: Arc<RocksDB>, authority: &Arc<RocksDB>) -> ShardEngine {
+            let (engine, _unused_dir) = test_helper::new_engine_with_options(EngineOptions {
+                db: Some(db),
+                ..Default::default()
+            })
+            .await;
+            engine.with_native_registration(fork_config(), authority.clone())
+        }
+
+        /// Both parties of the lend exist on the data shard.
+        async fn register_parties(engine: &mut ShardEngine) {
+            for fid in [LENDER, BORROWER] {
+                register_user(
+                    fid,
+                    test_helper::default_signer(),
+                    test_helper::default_custody_address(),
+                    engine,
+                )
+                .await;
+            }
+        }
+
+        struct Reference {
+            chunk: ShardChunk,
+            /// Persisted merge events for the lend on the node that produced the chunk.
+            lend_merges: usize,
+            lent_units: u32,
+        }
+
+        fn lend_merges(engine: &ShardEngine) -> usize {
+            HubEvent::get_events(engine.db.clone(), 0, None, None)
+                .unwrap()
+                .events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        &event.body,
+                        Some(proto::hub_event::Body::MergeMessageBody(body))
+                            if body.message.as_ref().is_some_and(|m| m.msg_type() == proto::MessageType::LendStorage)
+                    )
+                })
+                .count()
+        }
+
+        fn lent_units(engine: &ShardEngine) -> u32 {
+            StorageLendStore::get_lent_storage(&engine.get_stores().storage_lend_store, LENDER)
+                .unwrap()
+                .units_for(StorageUnitType::UnitType2025)
+        }
+
+        /// A node with shard zero at `LEND_BLOCK` registers the parties and then certifies a chunk
+        /// that consumes the lend. Returns the chunk the network decided.
+        async fn certify_lend_chunk(lagging: &mut ShardEngine) -> Reference {
+            let proposer_dir = tempfile::TempDir::new().unwrap();
+            let authority = open_db(&proposer_dir.path().join("shard0"));
+            let mut proposer =
+                shard_engine(open_db(&proposer_dir.path().join("shard1")), &authority).await;
+            register_parties(&mut proposer).await;
+            // Shard zero orders the lend only now, so it is the next chunk's to consume.
+            commit_shard_zero_block(&authority, LEND_BLOCK, &[lend_event()]);
+            // The lagging node holds the same certified history up to here.
+            for height in 1..=proposer.get_confirmed_height().block_number {
+                let chunk = proposer
+                    .get_shard_chunk_by_height(proto::Height::new(1, height))
+                    .unwrap();
+                lagging.commit_certified_shard_chunk(&chunk).await.unwrap();
+            }
+            let state_change = proposer.propose_state_change(1, vec![], None);
+            let chunk =
+                test_helper::validate_and_commit_state_change(&mut proposer, &state_change).await;
+            assert_eq!(
+                proposer
+                    .get_stores()
+                    .block_event_store
+                    .max_seqnum()
+                    .unwrap(),
+                FORK_EVENT_BASE + 1,
+                "the proposal must take the lend from the shard-zero log"
+            );
+            Reference {
+                lend_merges: lend_merges(&proposer),
+                lent_units: lent_units(&proposer),
+                chunk,
+            }
+        }
+
+        fn assert_converged(engine: &mut ShardEngine, reference: &Reference) {
+            let header = reference.chunk.header.as_ref().unwrap();
+            let height = header.height.unwrap().block_number;
+            assert_eq!(
+                engine.get_last_shard_chunk().as_ref(),
+                Some(&reference.chunk)
+            );
+            assert_eq!(engine.trie_root_hash(), header.shard_root);
+            assert_eq!(
+                engine.get_stores().block_event_store.max_seqnum().unwrap(),
+                FORK_EVENT_BASE + 1
+            );
+            assert_eq!(
+                LocalStateStore::read_commit_cursor(&engine.db, 1).unwrap(),
+                Some(CommitCursor {
+                    height,
+                    block_event_seqnum: FORK_EVENT_BASE + 1
+                })
+            );
+            assert_eq!(lend_merges(engine), reference.lend_merges);
+            assert_eq!(reference.lend_merges, 1, "the lend merges exactly once");
+            assert_eq!(lent_units(engine), reference.lent_units);
+            assert_eq!(reference.lent_units, 1);
+            assert!(engine.pending_certified_chunk().is_none());
+            assert!(LocalStateStore::read_pending_certified_chunk(&engine.db, 1)
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                engine.check_committed_state().unwrap(),
+                CommittedStateCheck::Consistent
+            );
+        }
+
+        #[tokio::test]
+        async fn certified_chunk_waits_for_its_shard_zero_event() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let authority = open_db(&dir.path().join("shard0"));
+            let mut node = shard_engine(open_db(&dir.path().join("shard1")), &authority).await;
+            let reference = certify_lend_chunk(&mut node).await;
+            assert!(!node.validate_shard_chunk(&reference.chunk));
+
+            tokio::time::timeout(Duration::from_secs(3), async {
+                tokio::join!(node.commit_shard_chunk(&reference.chunk), async {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    commit_shard_zero_block(&authority, LEND_BLOCK, &[lend_event()]);
+                });
+            })
+            .await
+            .expect("chunk should commit when its event arrives");
+            assert_converged(&mut node, &reference);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn certified_chunk_waits_ninety_seconds_for_shard_zero() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let authority = open_db(&dir.path().join("shard0"));
+            let mut node = shard_engine(open_db(&dir.path().join("shard1")), &authority).await;
+            let reference = certify_lend_chunk(&mut node).await;
+            // Shard zero is syncing on its own, a few blocks at a time.
+            commit_shard_zero_block(&authority, LEND_BLOCK - 3, &[]);
+
+            let started = tokio::time::Instant::now();
+            tokio::join!(node.commit_shard_chunk(&reference.chunk), async {
+                tokio::time::sleep(Duration::from_secs(45)).await;
+                commit_shard_zero_block(&authority, LEND_BLOCK - 1, &[]);
+                tokio::time::sleep(Duration::from_secs(45)).await;
+                commit_shard_zero_block(&authority, LEND_BLOCK, &[lend_event()]);
+            });
+            assert!(started.elapsed() >= Duration::from_secs(90));
+            assert_converged(&mut node, &reference);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn restart_while_waiting_resumes_the_retained_chunk() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let authority = open_db(&dir.path().join("shard0"));
+            let shard_path = dir.path().join("shard1");
+            let db = open_db(&shard_path);
+            let mut node = shard_engine(db.clone(), &authority).await;
+            let reference = certify_lend_chunk(&mut node).await;
+            let tip = node.get_confirmed_height();
+
+            // The process dies 60 seconds into the wait.
+            assert!(tokio::time::timeout(
+                Duration::from_secs(60),
+                node.commit_shard_chunk(&reference.chunk)
+            )
+            .await
+            .is_err());
+            drop(node);
+            db.close();
+            drop(db);
+
+            let db = open_db(&shard_path);
+            let mut node = shard_engine(db, &authority).await;
+            assert_eq!(
+                node.get_confirmed_height(),
+                tip,
+                "nothing of the chunk landed"
+            );
+            assert_eq!(
+                node.check_committed_state().unwrap(),
+                CommittedStateCheck::Consistent
+            );
+            assert_eq!(
+                node.pending_certified_chunk(),
+                Some(reference.chunk.clone())
+            );
+
+            let (resumed, _) = tokio::join!(node.resume_pending_certified_chunk(), async {
+                tokio::time::sleep(Duration::from_secs(90)).await;
+                commit_shard_zero_block(&authority, LEND_BLOCK, &[lend_event()]);
+            });
+            assert!(resumed.unwrap());
+            assert_converged(&mut node, &reference);
+        }
+
+        /// A binary from before commits were atomic, or a snapshot of it, can hold the state and
+        /// events of a height whose chunk never landed. The lend is already applied: re-running
+        /// the chunk would apply it again, and so would rewinding the cursor. The node must refuse
+        /// to sign, then let the certified chunk prove the state and record it without replay.
+        #[tokio::test]
+        async fn torn_commit_is_proven_by_the_certified_chunk_not_replayed() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let authority = open_db(&dir.path().join("shard0"));
+            let shard_path = dir.path().join("shard1");
+            let db = open_db(&shard_path);
+            let mut node = shard_engine(db.clone(), &authority).await;
+            let reference = certify_lend_chunk(&mut node).await;
+            let tip = node.get_confirmed_height().block_number;
+            commit_shard_zero_block(&authority, LEND_BLOCK, &[lend_event()]);
+            node.commit_shard_chunk(&reference.chunk).await;
+
+            // Reproduce what the old two-write commit left behind when it was interrupted (or
+            // snapshotted) between its writes: state and events, no chunk, no cursor.
+            let mut tear = RocksDbTransactionBatch::new();
+            let mut chunk_key = vec![crate::storage::constants::RootPrefix::Shard as u8];
+            chunk_key.extend_from_slice(&(tip + 1).to_be_bytes());
+            tear.delete(chunk_key);
+            let mut cursor_key = vec![
+                crate::storage::constants::RootPrefix::NodeLocalState as u8,
+                6,
+            ];
+            cursor_key.extend_from_slice(&1u32.to_be_bytes());
+            tear.delete(cursor_key);
+            db.commit(tear).unwrap();
+            drop(node);
+            db.close();
+            drop(db);
+
+            let db = open_db(&shard_path);
+            let mut node = shard_engine(db, &authority).await;
+            assert_eq!(node.get_confirmed_height().block_number, tip);
+            assert_eq!(
+                node.check_committed_state().unwrap(),
+                CommittedStateCheck::AheadOfCertifiedTip(AheadOfCertifiedTip {
+                    certified_height: tip,
+                    certified_fork_seqnum: FORK_EVENT_BASE,
+                    local_fork_seqnum: FORK_EVENT_BASE + 1,
+                })
+            );
+            assert!(!node.can_sign_new_values());
+            assert!(
+                !node.validate_shard_chunk(&reference.chunk),
+                "no proposal is endorsed while the state is unproven"
+            );
+            assert!(node.validate_certified_shard_chunk(&reference.chunk));
+
+            node.commit_shard_chunk(&reference.chunk).await;
+            assert!(node.can_sign_new_values());
+            assert_converged(&mut node, &reference);
+        }
+
+        /// Replication bootstrap writes the state and the tip chunk but not the shard's event
+        /// rows. The state root proves the events were applied, so the rows are recorded from
+        /// the shard-zero log, not replayed.
+        #[tokio::test]
+        async fn missing_event_rows_under_a_proven_state_are_recorded_not_replayed() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let authority = open_db(&dir.path().join("shard0"));
+            let shard_path = dir.path().join("shard1");
+            let db = open_db(&shard_path);
+            let mut node = shard_engine(db.clone(), &authority).await;
+            let reference = certify_lend_chunk(&mut node).await;
+            commit_shard_zero_block(&authority, LEND_BLOCK, &[lend_event()]);
+            node.commit_shard_chunk(&reference.chunk).await;
+
+            let mut strip = RocksDbTransactionBatch::new();
+            let mut event_key = vec![crate::storage::constants::RootPrefix::BlockEvent as u8];
+            event_key.extend_from_slice(&(FORK_EVENT_BASE + 1).to_be_bytes());
+            strip.delete(event_key);
+            let mut cursor_key = vec![
+                crate::storage::constants::RootPrefix::NodeLocalState as u8,
+                6,
+            ];
+            cursor_key.extend_from_slice(&1u32.to_be_bytes());
+            strip.delete(cursor_key);
+            db.commit(strip).unwrap();
+            drop(node);
+            db.close();
+            drop(db);
+
+            let mut node = shard_engine(open_db(&shard_path), &authority).await;
+            assert_eq!(
+                node.check_committed_state().unwrap(),
+                CommittedStateCheck::Consistent
+            );
+            assert!(node.can_sign_new_values());
+            assert_converged(&mut node, &reference);
+        }
+
+        #[tokio::test]
+        async fn torn_state_that_no_certified_chunk_explains_is_a_hard_failure() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let authority = open_db(&dir.path().join("shard0"));
+            let db = open_db(&dir.path().join("shard1"));
+            let mut node = shard_engine(db.clone(), &authority).await;
+            let reference = certify_lend_chunk(&mut node).await;
+            // Something wrote the lend into this shard's event log without a certified chunk.
+            let mut txn = RocksDbTransactionBatch::new();
+            node.get_stores()
+                .block_event_store
+                .put_block_event(&lend_event(), &mut txn)
+                .unwrap();
+            db.commit(txn).unwrap();
+            assert!(matches!(
+                node.check_committed_state().unwrap(),
+                CommittedStateCheck::AheadOfCertifiedTip(_)
+            ));
+            let err = node
+                .commit_certified_shard_chunk(&reference.chunk)
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("restore this shard from a snapshot"),
+                "{err}"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn mismatched_event_contents_stay_a_hard_failure_after_the_wait() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let authority = open_db(&dir.path().join("shard0"));
+            let mut node = shard_engine(open_db(&dir.path().join("shard1")), &authority).await;
+            let reference = certify_lend_chunk(&mut node).await;
+            let tip = node.get_confirmed_height();
+
+            let mut other = events_factory::create_heartbeat_event(FORK_EVENT_BASE + 1);
+            other.data.as_mut().unwrap().block_number = LEND_BLOCK;
+            let other = rehash(other);
+            let (result, _) =
+                tokio::join!(node.commit_certified_shard_chunk(&reference.chunk), async {
+                    tokio::time::sleep(Duration::from_secs(90)).await;
+                    commit_shard_zero_block(&authority, LEND_BLOCK, &[other]);
+                });
+            assert!(result.is_err());
+            assert_eq!(node.get_confirmed_height(), tip);
+        }
+
+        #[tokio::test]
+        async fn event_absent_from_a_committed_shard_zero_block_is_a_hard_failure() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let authority = open_db(&dir.path().join("shard0"));
+            let mut node = shard_engine(open_db(&dir.path().join("shard1")), &authority).await;
+            let reference = certify_lend_chunk(&mut node).await;
+            commit_shard_zero_block(&authority, LEND_BLOCK, &[]);
+            let err = node
+                .commit_certified_shard_chunk(&reference.chunk)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    crate::storage::store::engine::EngineError::ForkBlockEventAbsent { .. }
+                ),
+                "{err}"
+            );
+        }
+
+        /// Proposals read the shard-zero log from the committed cursor, so a round that fails
+        /// leaves its events eligible, and a commit moves the window forward.
+        #[tokio::test]
+        async fn proposals_take_consecutive_events_from_the_log_until_committed() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let authority = open_db(&dir.path().join("shard0"));
+            let heartbeats: Vec<_> = (1..=3)
+                .map(|i| {
+                    let mut event = events_factory::create_heartbeat_event(FORK_EVENT_BASE + i);
+                    event.data.as_mut().unwrap().block_number = i;
+                    rehash(event)
+                })
+                .collect();
+            for (i, event) in heartbeats.iter().enumerate() {
+                commit_shard_zero_block(&authority, i as u64 + 1, std::slice::from_ref(event));
+            }
+            let mut node = shard_engine(open_db(&dir.path().join("shard1")), &authority).await;
+            let fork_events = |change: &crate::storage::store::engine::ShardStateChange| {
+                change
+                    .transactions
+                    .iter()
+                    .flat_map(|t| &t.system_messages)
+                    .filter_map(|m| m.block_event.as_ref().map(|e| e.seqnum()))
+                    .collect::<Vec<_>>()
+            };
+            // A mempool copy of an event is ignored in favour of the log.
+            let stale_copy = MempoolMessage::BlockEvent {
+                for_shard: 1,
+                message: heartbeats[2].clone(),
+            };
+            let first = node.propose_state_change(1, vec![stale_copy], None);
+            let all = vec![
+                FORK_EVENT_BASE + 1,
+                FORK_EVENT_BASE + 2,
+                FORK_EVENT_BASE + 3,
+            ];
+            assert_eq!(fork_events(&first), all);
+            // The round fails; nothing was taken from anywhere.
+            let retry = node.propose_state_change(1, vec![], None);
+            assert_eq!(fork_events(&retry), all);
+            test_helper::validate_and_commit_state_change(&mut node, &retry).await;
+            let next = node.propose_state_change(1, vec![], None);
+            assert!(fork_events(&next).is_empty());
+            let mut event = events_factory::create_heartbeat_event(FORK_EVENT_BASE + 4);
+            event.data.as_mut().unwrap().block_number = 4;
+            commit_shard_zero_block(&authority, 4, &[rehash(event)]);
+            let next = node.propose_state_change(1, vec![], None);
+            assert_eq!(fork_events(&next), vec![FORK_EVENT_BASE + 4]);
+        }
+    }
+
     fn from_hex(s: &str) -> Vec<u8> {
         hex::decode(s).unwrap()
     }
@@ -296,6 +798,13 @@ mod tests {
         let mut chunk = test_helper::default_shard_chunk();
 
         chunk.header.as_mut().unwrap().shard_root = invalid_hash;
+        // Bind the body to the header so the commit reaches the state-root check.
+        let version = EngineVersion::version_for(
+            &FarcasterTime::new(chunk.header.as_ref().unwrap().timestamp),
+            FarcasterNetwork::Devnet,
+        );
+        chunk.header.as_mut().unwrap().transactions_root =
+            crate::core::util::expected_transactions_root(&chunk.transactions, version);
 
         engine.commit_shard_chunk(&chunk).await;
     }

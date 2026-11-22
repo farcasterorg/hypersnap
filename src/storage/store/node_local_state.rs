@@ -43,6 +43,29 @@ pub enum DataType {
     BaseOnchainEvent = 3,
     OnchainEventsMigrationPageToken = 4,
     ShardHalt = 5,
+    CommitCursor = 6,
+    PendingCertifiedChunk = 7,
+}
+
+/// The last height a data shard committed and the last block-event seqnum that height left
+/// applied. Written in the same RocksDB transaction as the chunk and the state it produced, so
+/// on any database this code wrote, the cursor, the stored tip and the applied events agree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommitCursor {
+    pub height: u64,
+    pub block_event_seqnum: u64,
+}
+
+/// A certified chunk this node could not apply yet because it names a shard-zero event the
+/// local shard zero has not committed. Kept durably so the same chunk is retried, including
+/// after a restart, once shard zero reaches `shard_zero_height`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingCertifiedChunk {
+    pub chunk: crate::proto::ShardChunk,
+    /// Highest shard-zero block whose events the chunk consumes.
+    pub shard_zero_height: u64,
+    /// When this node first had to wait for the chunk, unix seconds. Only used for alerts.
+    pub waiting_since_unix_seconds: u64,
 }
 
 /// Why a shard stopped applying blocks.
@@ -126,6 +149,90 @@ impl LocalStateStore {
     /// previous run can't be mistaken for the current state.
     pub fn clear_shard_halt(db: &RocksDB, shard_id: u32) {
         let _ = db.del(&Self::make_shard_halt_key(shard_id));
+    }
+
+    fn make_shard_key(data_type: DataType, shard_id: u32) -> Vec<u8> {
+        let mut key = vec![RootPrefix::NodeLocalState as u8, data_type as u8];
+        key.extend_from_slice(&shard_id.to_be_bytes());
+        key
+    }
+
+    /// Stage the commit cursor in the transaction that commits `cursor.height`.
+    pub fn put_commit_cursor(
+        txn: &mut RocksDbTransactionBatch,
+        shard_id: u32,
+        cursor: CommitCursor,
+    ) {
+        let mut value = Vec::with_capacity(16);
+        value.extend_from_slice(&cursor.height.to_be_bytes());
+        value.extend_from_slice(&cursor.block_event_seqnum.to_be_bytes());
+        txn.put(
+            Self::make_shard_key(DataType::CommitCursor, shard_id),
+            value,
+        );
+    }
+
+    pub fn read_commit_cursor(
+        db: &RocksDB,
+        shard_id: u32,
+    ) -> Result<Option<CommitCursor>, LocalStateError> {
+        let Some(bytes) = db.get(&Self::make_shard_key(DataType::CommitCursor, shard_id))? else {
+            return Ok(None);
+        };
+        if bytes.len() != 16 {
+            return Err(HubError::invalid_internal_state("malformed commit cursor").into());
+        }
+        Ok(Some(CommitCursor {
+            height: u64::from_be_bytes(bytes[0..8].try_into().unwrap()),
+            block_event_seqnum: u64::from_be_bytes(bytes[8..16].try_into().unwrap()),
+        }))
+    }
+
+    pub fn put_pending_certified_chunk(
+        db: &RocksDB,
+        shard_id: u32,
+        pending: &PendingCertifiedChunk,
+    ) -> Result<(), LocalStateError> {
+        let mut value = Vec::new();
+        value.extend_from_slice(&pending.shard_zero_height.to_be_bytes());
+        value.extend_from_slice(&pending.waiting_since_unix_seconds.to_be_bytes());
+        value.extend_from_slice(&pending.chunk.encode_to_vec());
+        db.put(
+            &Self::make_shard_key(DataType::PendingCertifiedChunk, shard_id),
+            &value,
+        )?;
+        Ok(())
+    }
+
+    pub fn read_pending_certified_chunk(
+        db: &RocksDB,
+        shard_id: u32,
+    ) -> Result<Option<PendingCertifiedChunk>, LocalStateError> {
+        let Some(bytes) = db.get(&Self::make_shard_key(
+            DataType::PendingCertifiedChunk,
+            shard_id,
+        ))?
+        else {
+            return Ok(None);
+        };
+        if bytes.len() < 16 {
+            return Err(
+                HubError::invalid_internal_state("malformed pending certified chunk").into(),
+            );
+        }
+        Ok(Some(PendingCertifiedChunk {
+            shard_zero_height: u64::from_be_bytes(bytes[0..8].try_into().unwrap()),
+            waiting_since_unix_seconds: u64::from_be_bytes(bytes[8..16].try_into().unwrap()),
+            chunk: crate::proto::ShardChunk::decode(&bytes[16..])?,
+        }))
+    }
+
+    /// Stage removal of the pending chunk in the transaction that commits it.
+    pub fn delete_pending_certified_chunk(txn: &mut RocksDbTransactionBatch, shard_id: u32) {
+        txn.delete(Self::make_shard_key(
+            DataType::PendingCertifiedChunk,
+            shard_id,
+        ));
     }
 
     fn make_onchain_event_primary_key(chain: Chain) -> Vec<u8> {

@@ -204,15 +204,12 @@ Before you begin, ensure you have the following installed:
 
 ### Installation
 
-Clone the hypersnap and dependent repos and build hypersnap:
+Malachite is maintained in `vendor/malachite`; no separate Malachite checkout is needed.
+Clone Hypersnap and its signature-verifier dependency, then build:
 ```
 git clone git@github.com:CassOnMars/eth-signature-verifier.git
 cd eth-signature-verifier
 git checkout 8deb4a091982c345949dc66bf8684489d9f11889
-cd ..
-git clone git@github.com:informalsystems/malachite.git
-cd malachite
-git checkout 13bca14cd209d985c3adf101a02924acde8723a5
 cd ..
 git clone git@github.com:farcasterorg/hypersnap.git
 cd hypersnap
