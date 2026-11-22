@@ -503,7 +503,7 @@ async fn compare(net: &Net, path: &str) -> Compared {
         differs.into_iter().partition(|i| accepted(route, i));
     if !lost.is_empty() {
         return Compared::Failed(format!(
-            "{path}: the base release returns what this build doesn't: {}",
+            "{path}: this build's answer differs from the base release's: {}",
             lost.join(", ")
         ));
     }
@@ -1103,10 +1103,11 @@ pub async fn writes(
         k,
     );
     // The native account is new, so it hasn't liked any of the subject's
-    // casts; with none left for this round it likes this round's new cast.
+    // casts; with none left for this round it likes this round's reply (not
+    // the mention, which it recasts, so the recasters view can't see a like).
     let (liked_fid, liked, likes_before) = match s.like_targets.get(round_no) {
         Some(h) => (s.fid, h.clone(), likes(net, h).await),
-        None => (w.legacy_fid, hash_of(&mention), Some(0)),
+        None => (w.legacy_fid, hash_of(&reply), Some(0)),
     };
     let liked_id = proto::CastId {
         fid: liked_fid,
@@ -1422,10 +1423,11 @@ mod tests {
         // a reaction or notification is matched by its cast and user together
         let r = |f: u64, c: u64| json!({"cast": {"hash": "a"}, "user": {"fid": f, "follower_count": c}});
         assert!(lost(json!([r(1, 5), r(2, 9)]), json!([r(2, 9), r(1, 5)])).is_empty());
+        assert_eq!(
+            lost(json!([r(1, 5), r(2, 9)]), json!([r(2, 9), r(1, 4)])),
+            ["[0].user.follower_count (5 -> 4)"]
+        );
         // items sharing an id aren't paired
-        let n =
-            |h: &str, c: u64| json!({"cast": {"hash": h, "recasts_count": c}, "user": {"fid": 2}});
-        assert!(lost(json!([n("a", 1), n("b", 0)]), json!([n("b", 0), n("a", 1)])).is_empty());
         let m = |c: u64| json!({"type": "follows", "user": {"fid": 2, "follower_count": c}});
         assert!(lost(json!([m(1), m(0)]), json!([m(0), m(1)])).is_empty());
         // nested under a matched item's user

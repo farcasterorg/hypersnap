@@ -158,7 +158,7 @@ pub async fn chain(args: ChainArgs) -> Result<(), Error> {
             );
             eprintln!("{hang}");
             if let Some(path) = &args.report {
-                append(path, &format!("{hang}\n"))?;
+                append(path, &format!("\n{hang}\n"))?;
             }
         }
     }
