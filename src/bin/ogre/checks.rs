@@ -377,8 +377,14 @@ fn shape(v: &Value) -> Value {
     }
 }
 
+/// The shape of a field whose items disagree on its type.
+const MIXED: &str = "\u{0}ogre: mixed types";
+
 fn merge(a: Value, b: Value) -> Value {
+    let mixed = |v: &Value| v.as_str() == Some(MIXED);
     match (a, b) {
+        (a, _) if mixed(&a) => a,
+        (_, b) if mixed(&b) => b,
         (Value::Object(mut a), Value::Object(b)) => {
             for (k, bv) in b {
                 let m = match a.remove(&k) {
@@ -394,8 +400,7 @@ fn merge(a: Value, b: Value) -> Value {
         }
         (Value::Null, b) => b,
         (a, Value::Null) => a,
-        // Items disagree on the type: nothing to hold the other node to.
-        (a, b) if std::mem::discriminant(&a) != std::mem::discriminant(&b) => Value::Null,
+        (a, b) if std::mem::discriminant(&a) != std::mem::discriminant(&b) => MIXED.into(),
         (a, _) => a,
     }
 }
@@ -405,7 +410,10 @@ fn merge(a: Value, b: Value) -> Value {
 /// optional). Takes `shape()`s, so an array is compared by all its items.
 fn missing(base: &Value, under: &Value, path: &str, out: &mut Vec<String>) {
     match (base, under) {
+        // Nothing to hold the build to: optional, or already mixed on the base.
         (Value::Null, _) => {}
+        (Value::String(m), _) if m == MIXED => {}
+        (b, Value::String(m)) if m == MIXED => out.push(format!("{path} ({} -> mixed)", kind(b))),
         (Value::Object(b), Value::Object(u)) => {
             for (k, bv) in b {
                 match u.get(k) {
@@ -431,6 +439,7 @@ fn kind(v: &Value) -> &'static str {
         Value::Null => "null",
         Value::Bool(_) => "bool",
         Value::Number(_) => "number",
+        Value::String(s) if s == MIXED => "mixed",
         Value::String(_) => "string",
         Value::Array(_) => "array",
         Value::Object(_) => "object",
@@ -1150,6 +1159,15 @@ mod tests {
             [".reactions[].user.pfp_url"]
         );
         // items of mixed types compare the same in any order
-        assert!(gone(json!({"v": [1, "x"]}), json!({"v": ["x", 1]})).is_empty());
+        assert!(gone(json!({"v": [1, "x", 2]}), json!({"v": [1, 2, "x"]})).is_empty());
+        // but a type the base holds everywhere must hold in every build item
+        assert_eq!(
+            gone(json!({"v": [1, 2]}), json!({"v": [1, "x"]})),
+            [".v[] (number -> mixed)"]
+        );
+        assert_eq!(
+            gone(json!({"v": ["a"]}), json!({"v": ["a", 1]})),
+            [".v[] (string -> mixed)"]
+        );
     }
 }
