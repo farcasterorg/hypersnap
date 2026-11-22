@@ -706,7 +706,7 @@ fn differences(
                 other.push(format!("{path} ({} -> {} items)", b.len(), u.len()));
             }
             let (pairs, duplicated, both) = by_id(b, u);
-            // Other items than the base release's: a swapped or reversed list.
+            // Other items than the base release's: another list or another page.
             let missing = pairs.iter().filter(|j| j.is_none()).count();
             if both && missing * 2 > b.len() {
                 let d = format!("{path}: {missing} of {} items missing", b.len());
@@ -920,6 +920,10 @@ const RANKED: &str = "
 /v2/farcaster/cast/search          ranked per node by its own search index
 /v2/farcaster/user/search          the same
 /v2/farcaster/following/suggested  the base release orders ties randomly
+# get_reactions_by_cast pages likes shard by shard in each node's HashMap order.
+/v2/farcaster/reaction             the same, for its ?hash= form
+/v2/farcaster/reaction/cast        the same
+/v2/farcaster/reactions/cast       the same
 ";
 
 fn strip_volatile(route: &str, v: &Value, path: &str) -> Value {

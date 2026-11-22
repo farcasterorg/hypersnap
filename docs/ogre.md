@@ -50,9 +50,10 @@ rebuilds the chain on each run, about 4.5 minutes.
    every item carries the same fid, still pair. When none is, it's the first
    unique in the base release's items, and an item the build returns twice
    fails. When the id is unique on both sides and fewer than half of the base
-   release's items are in the build's, the list fails as other items (a
-   swapped or reversed list), except on the ranked routes in `RANKED` in
-   `src/bin/ogre/checks.rs` (search, suggestions), where that is a warning.
+   release's items are in the build's, the list fails as other items
+   (another list, or another page of it), except on the routes in `RANKED` in
+   `src/bin/ogre/checks.rs` (search, suggestions, likes by cast), whose lists
+   differ between nodes on the same release, where that is a warning.
    Any other value that differs fails too when it is surely about the
    same thing on both sides: a field of the response or of an object under it
    (`.user.username`), or of an array item paired by its id. Items paired only

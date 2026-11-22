@@ -140,14 +140,14 @@ jobs:
       # over quota, evicting Verify's. A pull request that changes Ogre's code
       # rebuilds the chain on each run (about 4.5 minutes).
       - name: Save the seeded chain
-        if: steps.chain.outputs.cache-hit != 'true' && github.event_name != 'pull_request'
+        if: steps.chain.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
         uses: actions/cache/save@v4
         with:
           path: ogre/chain
           key: ${{ steps.chain.outputs.cache-primary-key }}
 
       - name: Save the seed
-        if: steps.seed.outputs.cache-matched-key == '' && github.event_name != 'pull_request'
+        if: steps.seed.outputs.cache-matched-key == '' && github.ref == 'refs/heads/main'
         uses: actions/cache/save@v4
         with:
           path: ogre/seed.bin
