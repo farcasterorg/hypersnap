@@ -429,9 +429,22 @@ pub async fn run(args: RunArgs) -> Result<bool, Error> {
         for p in n.running_panics().into_iter().take(3) {
             r.findings.fail(format!("node {} panicked: {p}", n.i));
         }
-        if let Some(p) = n.shutdown_panics.first() {
-            r.findings
-                .warn(format!("node {} panicked while shutting down: {p}", n.i));
+        if let Some((b, p)) = n.shutdown_panics.first() {
+            let on = b
+                .as_ref()
+                .map(|b| format!(" on `{b:?}`"))
+                .unwrap_or_default();
+            r.findings.warn(format!(
+                "node {}{on} panicked while shutting down: {p}",
+                n.i
+            ));
+        }
+    }
+    if result.is_ok() {
+        for e in checks::unused_accepted() {
+            r.findings.warn(format!(
+                "src/bin/ogre/accepted.txt entry matched no difference; remove it if the base release has the change now: {e}"
+            ));
         }
     }
     let ok = r.findings.failures.is_empty();

@@ -170,8 +170,8 @@ pub struct Node {
     pub build: Option<Build>,
     child: Option<Child>,
     log: PathBuf,
-    /// Panics logged while the node was being stopped.
-    pub shutdown_panics: Vec<String>,
+    /// Panics logged while the node was being stopped, with the build it ran.
+    pub shutdown_panics: Vec<(Option<Build>, String)>,
     /// How the node exited on its own, found when it was next stopped.
     pub crashes: Vec<String>,
     /// The builds the node ran when it didn't stop within `GRACE` of SIGTERM
@@ -295,14 +295,16 @@ impl Node {
         }
         let _ = child.wait();
         let after = self.panics();
-        self.shutdown_panics.extend(after.into_iter().skip(before));
+        let build = &self.build;
+        self.shutdown_panics
+            .extend(after.into_iter().skip(before).map(|p| (build.clone(), p)));
     }
 
     /// Panics logged while the node was running.
     pub fn running_panics(&self) -> Vec<String> {
         self.panics()
             .into_iter()
-            .filter(|p| !self.shutdown_panics.contains(p))
+            .filter(|p| !self.shutdown_panics.iter().any(|(_, s)| s == p))
             .collect()
     }
 
@@ -343,6 +345,13 @@ pub struct Net {
     pub nodes: Vec<Node>,
     pub block_time: String,
     pub http: reqwest::Client,
+}
+
+/// A run that panics or returns early leaves no processes or containers behind.
+impl Drop for Net {
+    fn drop(&mut self) {
+        self.stop_all();
+    }
 }
 
 impl Net {

@@ -491,13 +491,16 @@ async fn compare(net: &Net, path: &str) -> Compared {
     if is_empty(&u_body) {
         return Compared::Failed(format!("{path}: empty, the base release returns data"));
     }
+    let route = route(path);
     let mut lost = Vec::new();
     missing(&shape(&b_body), &shape(&u_body), "", &mut lost);
-    let (b, u) = (strip_volatile(&b_body), strip_volatile(&u_body));
+    let (b, u) = (
+        strip_volatile(route, &b_body, ""),
+        strip_volatile(route, &u_body, ""),
+    );
     shrunk(&b, &u, "", "", &mut lost);
     let mut differs = Vec::new();
-    differences(&b, &u, "", &mut differs);
-    let route = route(path);
+    differences(&b, &u, "", "", true, &mut lost, &mut differs);
     let (ok, lost): (Vec<_>, Vec<_>) = lost.into_iter().partition(|i| accepted(route, i));
     let (ok_values, differs): (Vec<_>, Vec<_>) =
         differs.into_iter().partition(|i| accepted(route, i));
@@ -553,27 +556,13 @@ fn shrunk(base: &Value, under: &Value, key: &str, path: &str, out: &mut Vec<Stri
             if u.len() < b.len() {
                 out.push(format!("{path} ({} -> {} items)", b.len(), u.len()));
             }
-            // Only items whose id is unique on both sides.
-            let (bi, ui): (Vec<_>, Vec<_>) =
-                (b.iter().map(ident).collect(), u.iter().map(ident).collect());
-            let once = |ids: &[Option<String>], id: &String| {
-                ids.iter().filter(|x| x.as_ref() == Some(id)).count() == 1
-            };
-            for (i, bv) in b.iter().enumerate() {
-                let Some(id) = &bi[i] else { continue };
-                if !once(&bi, id) || !once(&ui, id) {
-                    continue;
-                }
-                if let Some(j) = ui.iter().position(|x| x.as_ref() == Some(id)) {
-                    shrunk(bv, &u[j], key, &format!("{path}[{i}]"), out);
+            for (i, j) in by_id(b, u).into_iter().enumerate() {
+                if let Some(j) = j {
+                    shrunk(&b[i], &u[j], key, &format!("{path}[{i}]"), out);
                 }
             }
         }
-        (Value::Number(b), Value::Number(u))
-            if ["count", "units"]
-                .iter()
-                .any(|s| key.to_ascii_lowercase().ends_with(s)) =>
-        {
+        (Value::Number(b), Value::Number(u)) if is_count(key) => {
             if let (Some(b), Some(u)) = (b.as_u64(), u.as_u64()) {
                 if b.abs_diff(u) > b / 50 {
                     out.push(format!("{path} ({b} -> {u})"));
@@ -582,6 +571,26 @@ fn shrunk(base: &Value, under: &Value, key: &str, path: &str, out: &mut Vec<Stri
         }
         _ => {}
     }
+}
+
+fn is_count(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.ends_with("count") || key.ends_with("units")
+}
+
+/// For each item of `b`, the item of `u` with the same id, when that id is
+/// unique on both sides.
+fn by_id(b: &[Value], u: &[Value]) -> Vec<Option<usize>> {
+    let (bi, ui): (Vec<_>, Vec<_>) = (b.iter().map(ident).collect(), u.iter().map(ident).collect());
+    let once = |ids: &[Option<String>], id: &String| {
+        ids.iter().filter(|x| x.as_ref() == Some(id)).count() == 1
+    };
+    bi.iter()
+        .map(|id| {
+            let id = id.as_ref().filter(|id| once(&bi, id) && once(&ui, id))?;
+            ui.iter().position(|x| x.as_ref() == Some(id))
+        })
+        .collect()
 }
 
 /// What identifies an array item: its hash, fid or name, or else its cast's
@@ -600,26 +609,49 @@ fn ident(v: &Value) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("/"))
 }
 
-/// Every value that differs, as `path: base -> under`.
-fn differences(base: &Value, under: &Value, path: &str, out: &mut Vec<String>) {
+/// Every value that differs, as `path: base -> under`. One that is surely
+/// about the same thing on both sides goes to `wrong`: a field of the response,
+/// of an object under it, or of an array item paired by its id (`by_id()`).
+/// Items paired only by position can be different items (nodes order ties
+/// differently, and search ranks per node), so theirs go to `other`, as do
+/// counts, which `shrunk()` holds to a tolerance.
+fn differences(
+    base: &Value,
+    under: &Value,
+    key: &str,
+    path: &str,
+    same: bool,
+    wrong: &mut Vec<String>,
+    other: &mut Vec<String>,
+) {
     match (base, under) {
         (Value::Object(b), Value::Object(u)) => {
             for (k, bv) in b {
-                differences(
-                    bv,
-                    u.get(k).unwrap_or(&Value::Null),
-                    &format!("{path}.{k}"),
-                    out,
-                );
+                let uv = u.get(k).unwrap_or(&Value::Null);
+                differences(bv, uv, k, &format!("{path}.{k}"), same, wrong, other);
             }
         }
-        (Value::Array(b), Value::Array(u)) if b.len() == u.len() => {
-            for (i, (bv, uv)) in b.iter().zip(u).enumerate() {
-                differences(bv, uv, &format!("{path}[{i}]"), out);
+        (Value::Array(b), Value::Array(u)) => {
+            for (i, j) in by_id(b, u).into_iter().enumerate() {
+                let p = format!("{path}[{i}]");
+                match j {
+                    Some(j) => differences(&b[i], &u[j], key, &p, same, wrong, other),
+                    None if b.len() == u.len() => {
+                        differences(&b[i], &u[i], key, &p, false, wrong, other)
+                    }
+                    None => {}
+                }
             }
         }
         _ if base == under => {}
-        _ => out.push(format!("{path}: {} -> {}", short(base), short(under))),
+        _ => {
+            let d = format!("{path}: {} -> {}", short(base), short(under));
+            if same && !(base.is_number() && is_count(key)) {
+                wrong.push(d)
+            } else {
+                other.push(d)
+            }
+        }
     }
 }
 
@@ -634,20 +666,50 @@ fn route(spec: &str) -> &str {
     s.split(['?', ' ']).next().unwrap_or(s)
 }
 
+/// Accepted entries that matched a difference in this run.
+static USED: std::sync::Mutex<std::collections::BTreeSet<&str>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
 /// Whether a difference found on `route` (a JSON path, then what changed) is
-/// in the accepted list. Paths match without array indexes, and an entry
-/// covers everything under its path.
+/// in the accepted list.
 fn accepted(route: &str, difference: &str) -> bool {
-    accepted_in(ACCEPTED, route, difference)
+    let entry = entry(ACCEPTED, route, difference);
+    if let Some(e) = entry {
+        USED.lock().unwrap().insert(e);
+    }
+    entry.is_some()
 }
 
-fn accepted_in(list: &str, route: &str, difference: &str) -> bool {
-    let path = unindexed(difference.split([' ', ':']).next().unwrap_or(""));
-    list.lines().any(|l| {
-        let words: Vec<&str> = l.split('#').next().unwrap_or("").split_whitespace().collect();
-        matches!(words[..], [r, p, ..] if r == route
-            && path.strip_prefix(p).is_some_and(|rest| rest.is_empty() || rest.starts_with(['.', '['])))
+/// Accepted entries no difference matched: the base release may ship the
+/// change by now, and the entry would hide a regression of it.
+pub fn unused_accepted() -> Vec<&'static str> {
+    let used = USED.lock().unwrap();
+    entries(ACCEPTED)
+        .map(|(line, _)| line)
+        .filter(|line| !used.contains(line))
+        .collect()
+}
+
+/// The `<route> <JSON path>` lines of a list, with their route and path.
+fn entries(list: &str) -> impl Iterator<Item = (&str, (&str, &str))> {
+    list.lines().filter_map(|l| {
+        let mut words = l.split('#').next().unwrap_or("").split_whitespace();
+        Some((l, (words.next()?, words.next()?)))
     })
+}
+
+/// The line of `list` that covers a difference found on `route`. Paths match
+/// without array indexes, and an entry covers everything under its path.
+fn entry<'a>(list: &'a str, route: &str, difference: &str) -> Option<&'a str> {
+    let path = unindexed(difference.split([' ', ':']).next().unwrap_or(""));
+    entries(list)
+        .find(|(_, (r, p))| {
+            *r == route
+                && path
+                    .strip_prefix(p)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with(['.', '[']))
+        })
+        .map(|(l, _)| l)
 }
 
 /// `.users[3].fid` as `.users[].fid`.
@@ -724,34 +786,43 @@ pub async fn endpoints(
     summary
 }
 
-fn strip_volatile(v: &Value) -> Value {
+/// Fields that differ between two nodes on the same release and chain, so they
+/// say nothing about the build: `<route> <JSON path>  why`, as in accepted.txt.
+const VOLATILE: &str = "
+/v1/info .version              the node's own build
+/v1/info .peerId               the node's own identity
+/v1/info .dbStats.numMessages  grows with the tip, which the nodes reach a moment apart
+/v1/info .dbStats.approxSize   an estimate of each node's own database files
+/v1/info .shardInfos           each node's own heights, delays, mempools and sizes
+# Per-process indexer counters (work done since the node started; search adds
+# the docs it opened with) and event log positions: two read nodes on the same
+# release and chain already disagree on them.
+/v2/farcaster/_status/backfill .indexers[].items_indexed
+/v2/farcaster/_status/backfill .indexers[].last_event_id
+# Where the metrics worker is against this moment's tip: one more block on
+# either node turns `ready` into `catching_up` until the worker takes it.
+/v2/farcaster/_status/backfill .metrics_backfill.phase
+/v2/farcaster/_status/backfill .metrics_backfill.shards[].next_block
+/v2/farcaster/_status/backfill .metrics_backfill.shards[].tip
+/v2/farcaster/_status/backfill .metrics_backfill.shards[].blocks_remaining
+";
+
+fn strip_volatile(route: &str, v: &Value, path: &str) -> Value {
     match v {
         Value::Object(o) => Value::Object(
             o.iter()
-                .filter(|(k, _)| {
-                    !matches!(
-                        k.as_str(),
-                        "maxHeight"
-                            | "blockDelay"
-                            | "mempoolSize"
-                            | "approxSize"
-                            | "peer_id"
-                            | "version"
-                            | "numMessages"
-                            | "dbStats"
-                            // Per-process indexer counters (work done since the
-                            // node started; search adds the docs it opened with)
-                            // and event log positions: two read nodes on the same
-                            // base release and chain already disagree on them.
-                            | "items_indexed"
-                            | "last_event_id"
-                            | "shardInfos"
-                    )
+                .filter_map(|(k, v)| {
+                    let p = format!("{path}.{k}");
+                    let keep = entry(VOLATILE, route, &p).is_none();
+                    keep.then(|| (k.clone(), strip_volatile(route, v, &p)))
                 })
-                .map(|(k, v)| (k.clone(), strip_volatile(v)))
                 .collect(),
         ),
-        Value::Array(a) => Value::Array(a.iter().map(strip_volatile).collect()),
+        Value::Array(a) => Value::Array(
+            a.iter()
+                .map(|v| strip_volatile(route, v, &format!("{path}[]")))
+                .collect(),
+        ),
         v => v.clone(),
     }
 }
@@ -1364,7 +1435,7 @@ async fn likes(net: &Net, hash: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{accepted_in, has_fid, missing, shape, shrunk, unindexed};
+    use super::{differences, entry, has_fid, missing, shape, shrunk, strip_volatile, unindexed};
     use serde_json::json;
 
     fn lost(base: serde_json::Value, under: serde_json::Value) -> Vec<String> {
@@ -1438,6 +1509,71 @@ mod tests {
             ),
             [".reactions[0].user.following_count (3 -> 0)"]
         );
+    }
+
+    fn wrong(base: serde_json::Value, under: serde_json::Value) -> (Vec<String>, usize) {
+        let (mut wrong, mut other) = (Vec::new(), Vec::new());
+        differences(&base, &under, "", "", true, &mut wrong, &mut other);
+        (wrong, other.len())
+    }
+
+    #[test]
+    fn differences_fail_on_the_same_item_only() {
+        let user = |name: &str| json!({"user": {"fid": 3, "username": name, "follower_count": 9}});
+        // a single object's value
+        assert_eq!(
+            wrong(user("a"), user("b")),
+            (vec![".user.username: \"a\" -> \"b\"".to_string()], 0)
+        );
+        // counts are left to shrunk()'s tolerance
+        assert_eq!(
+            wrong(
+                user("a"),
+                json!({"user": {"fid": 3, "username": "a", "follower_count": 8}})
+            ),
+            (vec![], 1)
+        );
+        // items paired by id, in another order
+        let item = |fid: u64, name: &str| json!({"fid": fid, "username": name});
+        assert_eq!(
+            wrong(
+                json!({"users": [item(1, "a"), item(2, "b")]}),
+                json!({"users": [item(2, "x"), item(1, "a")]})
+            ),
+            (vec![".users[1].username: \"b\" -> \"x\"".to_string()], 0)
+        );
+        // different items at the same position (another tie order) only warn
+        assert_eq!(
+            wrong(
+                json!({"users": [item(1, "a"), item(2, "b")]}),
+                json!({"users": [item(1, "a"), item(5, "e")]})
+            ),
+            (vec![], 2)
+        );
+        // and so does a field under an item paired by position
+        assert_eq!(
+            wrong(json!([{"v": [user("a")]}]), json!([{"v": [user("b")]}])),
+            (vec![], 1)
+        );
+    }
+
+    #[test]
+    fn volatile_fields_are_stripped_on_their_route() {
+        let info = json!({"version": "1", "dbStats": {"numMessages": 5, "numFidRegistrations": 2}});
+        assert_eq!(
+            strip_volatile("/v1/info", &info, ""),
+            json!({"dbStats": {"numFidRegistrations": 2}})
+        );
+        assert_eq!(strip_volatile("/v2/farcaster/user", &info, ""), info);
+        let backfill = json!({"indexers": [{"name": "search", "items_indexed": 3}], "metrics_backfill": {"phase": "ready", "shards": [{"shard": 1, "tip": 4}]}});
+        assert_eq!(
+            strip_volatile("/v2/farcaster/_status/backfill", &backfill, ""),
+            json!({"indexers": [{"name": "search"}], "metrics_backfill": {"shards": [{"shard": 1}]}})
+        );
+    }
+
+    fn accepted_in(list: &str, route: &str, difference: &str) -> bool {
+        entry(list, route, difference).is_some()
     }
 
     #[test]

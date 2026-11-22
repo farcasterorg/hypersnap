@@ -41,9 +41,14 @@ chain are cached only after they passed a rollout, and a change to the exporter
    release's, or a count (a field named `*count` or `*units`) is off by more
    than 2% either way (any change below 50); array items are matched by their
    hash or fid (a notification's or reaction's by its cast and user), since
-   nodes can order ties differently. Other different values are warnings, and fields
-   that differ between nodes on the same release (heights, peers, indexer work
-   counters) are ignored. Endpoints where the base release has no data are
+   nodes can order ties differently. Any other value that differs fails too when
+   it is surely about the same thing on both sides: a field of the response or of
+   an object under it (`.user.username`), or of an array item paired by its id.
+   Items paired only by their position can be different items (another tie
+   order, search ranking), so their differences are warnings. Fields that differ
+   between two nodes on the same release (heights, peers, indexer work counters,
+   the metrics worker's position) are ignored on the route they're on; the list
+   and the reason for each is `VOLATILE` in `src/bin/ogre/checks.rs`. Endpoints where the base release has no data are
    listed as not compared, and the run fails when fewer than `--min-compared`
    endpoints had base data (a reference node that errs can't turn every check
    into a skip). A failing endpoint is retried for 6 seconds.
@@ -77,7 +82,8 @@ that change ships in a release. List such a change in
 `src/bin/ogre/accepted.txt` in the same pull request: the route, the JSON path without array indexes (an
 entry covers everything under it), and why. Ogre then reports it as accepted
 instead of failing. Remove the entry once `farcasterorg/hypersnap:latest`
-includes the change, so the path is checked again. The chain cache key leaves
+includes the change, so the path is checked again; a run warns about an entry
+that matched no difference. The chain cache key leaves
 the file out, so an entry doesn't rebuild the cached chain.
 
 ## Endpoints left out
