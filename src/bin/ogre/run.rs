@@ -148,6 +148,14 @@ pub async fn chain(args: ChainArgs) -> Result<(), Error> {
         if let Some(c) = n.crashes.first() {
             return Err(format!("node {} {c}", n.i).into());
         }
+        if !n.hangs.is_empty() {
+            return Err(format!(
+                "node {} didn't stop within {:?} of SIGTERM and was killed",
+                n.i,
+                net::GRACE
+            )
+            .into());
+        }
     }
     let _ = std::fs::remove_dir_all(args.work.join("logs"));
     eprintln!("built the seeded chain in {:.0?}", t.elapsed());
@@ -399,6 +407,19 @@ pub async fn run(args: RunArgs) -> Result<bool, Error> {
     for n in &net.nodes {
         for c in &n.crashes {
             r.findings.fail(format!("node {} {c}", n.i));
+        }
+        // A base release that hangs is reported, not held against the build.
+        for b in &n.hangs {
+            let hang = format!(
+                "node {} on `{b:?}` didn't stop within {:?} of SIGTERM and was killed",
+                n.i,
+                net::GRACE
+            );
+            if format!("{b:?}") == format!("{:?}", args.under_test) {
+                r.findings.fail(hang);
+            } else {
+                r.findings.warn(hang);
+            }
         }
         for p in n.running_panics().into_iter().take(3) {
             r.findings.fail(format!("node {} panicked: {p}", n.i));

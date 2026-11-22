@@ -216,7 +216,8 @@ impl Subjects {
             format!("/v1/signersByFid?fid={f}"),
             format!("/v1/onChainEventsByFid?fid={f}&event_type=EVENT_TYPE_SIGNER"),
             format!("/v1/onChainIdRegistryEventByAddress?address={c}"),
-            "/v1/events?from_event_id=0".into(),
+            // The oldest events of a user shard: the same on every node, whatever its height.
+            "/v1/events?from_event_id=0&shard_index=1&page_size=100".into(),
             format!("/v2/farcaster/user?fid={f}"),
             format!("/v2/farcaster/user/bulk?fids={f},{f2}"),
             format!("/v2/farcaster/user/bulk-by-address?addresses={c}"),
@@ -509,7 +510,7 @@ async fn compare(net: &Net, path: &str) -> Compared {
     let mut notes = Vec::new();
     if !ok.is_empty() || !ok_values.is_empty() {
         notes.push(format!(
-            "accepted differences (docs/ogre-accepted.txt): {}",
+            "accepted differences (src/bin/ogre/accepted.txt): {}",
             few(&[ok, ok_values].concat())
         ));
     }
@@ -536,7 +537,7 @@ fn few(items: &[String]) -> String {
 }
 
 /// Values the build lost on the same chain: an array with fewer items than the
-/// base release's, or a count (a `*count` field) that dropped by more than 2%
+/// base release's, or a count (a `*count` or `*units` field) that dropped by more than 2%
 /// (any drop below 50). Array items are matched by their id, since nodes can
 /// order ties differently.
 fn shrunk(base: &Value, under: &Value, key: &str, path: &str, out: &mut Vec<String>) {
@@ -552,14 +553,25 @@ fn shrunk(base: &Value, under: &Value, key: &str, path: &str, out: &mut Vec<Stri
             if u.len() < b.len() {
                 out.push(format!("{path} ({} -> {} items)", b.len(), u.len()));
             }
+            // Only items whose id is unique on both sides (notifications from
+            // one account share its fid).
+            let once =
+                |a: &[Value], id: &Value| a.iter().filter(|v| ident(v) == Some(id)).count() == 1;
             for (i, bv) in b.iter().enumerate() {
                 let Some(id) = ident(bv) else { continue };
+                if !once(b, id) || !once(u, id) {
+                    continue;
+                }
                 if let Some(uv) = u.iter().find(|uv| ident(uv) == Some(id)) {
                     shrunk(bv, uv, key, &format!("{path}[{i}]"), out);
                 }
             }
         }
-        (Value::Number(b), Value::Number(u)) if key.to_ascii_lowercase().ends_with("count") => {
+        (Value::Number(b), Value::Number(u))
+            if ["count", "units"]
+                .iter()
+                .any(|s| key.to_ascii_lowercase().ends_with(s)) =>
+        {
             if let (Some(b), Some(u)) = (b.as_u64(), u.as_u64()) {
                 if u < b && b - u > b / 50 {
                     out.push(format!("{path} ({b} -> {u})"));
@@ -570,13 +582,13 @@ fn shrunk(base: &Value, under: &Value, key: &str, path: &str, out: &mut Vec<Stri
     }
 }
 
-/// What identifies an array item: its hash, fid or name, or its user's or cast's.
+/// What identifies an array item: its hash, fid or name, or its cast's or user's.
 fn ident(v: &Value) -> Option<&Value> {
     ["hash", "fid", "name"]
         .into_iter()
         .find_map(|k| v.get(k).filter(|x| x.is_string() || x.is_number()))
         .or_else(|| {
-            ["user", "cast"]
+            ["cast", "user"]
                 .into_iter()
                 .find_map(|k| v.get(k).and_then(ident))
         })
@@ -607,8 +619,8 @@ fn differences(base: &Value, under: &Value, path: &str, out: &mut Vec<String>) {
 
 /// Differences between the base release and this build that are intended:
 /// `<route> <JSON path>` lines. docs/ogre.md says when to add and remove one.
-/// It lives outside src/bin/ogre so an entry doesn't rebuild the cached chain.
-const ACCEPTED: &str = include_str!("../../../docs/ogre-accepted.txt");
+/// The chain cache key leaves it out, so an entry doesn't rebuild the chain.
+const ACCEPTED: &str = include_str!("accepted.txt");
 
 /// The route of an endpoint spec, without its query or POST body.
 fn route(spec: &str) -> &str {
@@ -1298,7 +1310,7 @@ pub async fn writes(
         ));
     }
     eprintln!(
-        "  {round}: {} messages on every node at the tip in {landed:.1?}",
+        "  {round}: checked {} messages on every node at the tip in {landed:.1?}",
         sent.len()
     );
 }
@@ -1314,12 +1326,17 @@ fn contains(hash: String) -> Check {
     })
 }
 
+/// A fid, as a number or, for native fids past 2^32, a string.
+fn fid_of(v: &Value) -> Option<u64> {
+    v.as_u64().or_else(|| v.as_str()?.parse().ok())
+}
+
 /// Whether any `fid` field in `v` is `fid`.
 fn has_fid(v: &Value, fid: u64) -> bool {
     match v {
         Value::Object(o) => o
             .iter()
-            .any(|(k, v)| (k == "fid" && v.as_u64() == Some(fid)) || has_fid(v, fid)),
+            .any(|(k, v)| (k == "fid" && fid_of(v) == Some(fid)) || has_fid(v, fid)),
         Value::Array(a) => a.iter().any(|v| has_fid(v, fid)),
         _ => false,
     }
@@ -1372,11 +1389,24 @@ mod tests {
             ]
         );
         // ids and other numbers aren't counts; counts near u64::MAX don't overflow
-        assert!(lost(json!({"fid": 9, "units": 5}), json!({"fid": 1, "units": 1})).is_empty());
+        assert!(lost(
+            json!({"fid": 9, "timestamp": 5}),
+            json!({"fid": 1, "timestamp": 1})
+        )
+        .is_empty());
         assert_eq!(
-            lost(json!({"count": u64::MAX}), json!({"count": 0})),
-            [format!(".count ({} -> 0)", u64::MAX)]
+            lost(
+                json!({"total_active_units": u64::MAX}),
+                json!({"total_active_units": 0})
+            ),
+            [format!(".total_active_units ({} -> 0)", u64::MAX)]
         );
+        // items sharing an id (notifications from one account) aren't paired
+        let n =
+            |h: &str, c: u64| json!({"cast": {"hash": h, "recasts_count": c}, "user": {"fid": 2}});
+        assert!(lost(json!([n("a", 1), n("b", 0)]), json!([n("b", 0), n("a", 1)])).is_empty());
+        let m = |c: u64| json!({"type": "follows", "user": {"fid": 2, "follower_count": c}});
+        assert!(lost(json!([m(1), m(0)]), json!([m(0), m(1)])).is_empty());
         // nested under a matched item's user
         assert_eq!(
             lost(
@@ -1405,6 +1435,8 @@ mod tests {
         let v = json!({"users": [{"object": "follow", "user": {"fid": 7}}]});
         assert!(has_fid(&v, 7));
         assert!(!has_fid(&v, 8));
+        // native fids are strings
+        assert!(has_fid(&json!([{"user": {"fid": "4294967296"}}]), 1 << 32));
     }
 
     fn gone(base: serde_json::Value, under: serde_json::Value) -> Vec<String> {

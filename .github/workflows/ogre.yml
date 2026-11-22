@@ -111,8 +111,8 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ogre/chain
-          # Any change to Ogre rebuilds the chain.
-          key: ogre-chain-v1-${{ steps.digest.outputs.sha }}-${{ hashFiles('ogre/seed.bin', 'snapchain/src/bin/ogre/**') }}
+          # Any change to Ogre but its list of accepted differences rebuilds the chain.
+          key: ogre-chain-v1-${{ steps.digest.outputs.sha }}-${{ hashFiles('ogre/seed.bin', 'snapchain/src/bin/ogre/**', '!snapchain/src/bin/ogre/accepted.txt') }}
 
       - name: Build the seeded chain on the base release
         if: steps.chain.outputs.cache-hit != 'true'

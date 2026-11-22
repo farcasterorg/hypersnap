@@ -5,4 +5,3 @@
 # See docs/ogre.md.
 /v2/farcaster/user/storage-allocations .allocations[].units  no longer wraps below u64::MAX (PR 94)
 /v2/farcaster/storage/allocations      .allocations[].units  the same handler (PR 94)
-/v2/farcaster/following/suggested      .users                ties are ordered by fid, not at random (PR 94)

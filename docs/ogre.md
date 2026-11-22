@@ -38,8 +38,8 @@ chain are cached only after they passed a rollout, and a change to the exporter
    node, and fails when the build returns an error or an empty result, drops a
    field, empties an array or changes a value's JSON type where the base release
    has data. On values, it fails when an array has fewer items than the base
-   release's, or a count (a field named `*count`) drops by more than 2% (any
-   drop below 50); array items are matched by their hash or fid, since nodes
+   release's, or a count (a field named `*count` or `*units`) drops by more
+   than 2% (any drop below 50); array items are matched by their hash or fid, since nodes
    can order ties differently. Other different values are warnings, and fields
    that differ between nodes on the same release (heights, peers, indexer work
    counters) are ignored. Endpoints where the base release has no data are
@@ -62,8 +62,9 @@ chain are cached only after they passed a rollout, and a change to the exporter
 
 It fails on any of those, on a shard going longer than `--max-stall` without a
 block, on a node exiting on its own (found when it is next stopped, including
-before a planned restart), on a node that doesn't stop within 30 seconds of
-SIGTERM, and on a panic while nodes run (panics during a
+before a planned restart), on a node of the build under test that doesn't stop
+within 30 seconds of SIGTERM (a base release node that hangs is a warning), and
+on a panic while nodes run (panics during a
 graceful stop are reported as warnings). The report goes to the job summary,
 and node logs are uploaded when it fails.
 
@@ -71,12 +72,12 @@ and node logs are uploaded when it fails.
 
 Ogre compares against the release mainnet runs, so a pull request that changes
 an answer on purpose (drops a field, changes a type or a count) fails it until
-that change ships in a release. List such a change in `docs/ogre-accepted.txt`
-in the same pull request: the route, the JSON path without array indexes (an
+that change ships in a release. List such a change in
+`src/bin/ogre/accepted.txt` in the same pull request: the route, the JSON path without array indexes (an
 entry covers everything under it), and why. Ogre then reports it as accepted
 instead of failing. Remove the entry once `farcasterorg/hypersnap:latest`
-includes the change, so the path is checked again. The file is outside
-`src/bin/ogre` so an entry doesn't rebuild the cached chain.
+includes the change, so the path is checked again. The chain cache key leaves
+the file out, so an entry doesn't rebuild the cached chain.
 
 ## Endpoints left out
 

@@ -17,6 +17,8 @@ pub const REFERENCE: usize = 8;
 /// A read node that joins with an empty database and syncs everything.
 pub const FRESH: usize = 10;
 pub const ADMIN_AUTH: &str = "ogre:ogre";
+/// How long a node gets to stop after SIGTERM before it is killed.
+pub const GRACE: Duration = Duration::from_secs(30);
 
 /// How a node is started: a hypersnap binary, or an image whose `/app/hypersnap`
 /// is run with this machine's network and the work directory mounted at the
@@ -170,9 +172,11 @@ pub struct Node {
     log: PathBuf,
     /// Panics logged while the node was being stopped.
     pub shutdown_panics: Vec<String>,
-    /// How the node exited on its own, found when it was next stopped, or that
-    /// it hung on a graceful stop.
+    /// How the node exited on its own, found when it was next stopped.
     pub crashes: Vec<String>,
+    /// The builds the node ran when it didn't stop within `GRACE` of SIGTERM
+    /// (an operator's restart hangs the same way during a rolling upgrade).
+    pub hangs: Vec<Build>,
 }
 
 impl Node {
@@ -268,7 +272,6 @@ impl Node {
                 .args([sig, &child.id().to_string()])
                 .status();
         }
-        const GRACE: Duration = Duration::from_secs(30);
         let deadline = Instant::now() + GRACE;
         while Instant::now() < deadline {
             if let Ok(Some(_)) = child.try_wait() {
@@ -276,11 +279,8 @@ impl Node {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        // An operator's restart hangs the same way during a rolling upgrade.
         if !kill && child.try_wait().ok().flatten().is_none() {
-            self.crashes.push(format!(
-                "didn't stop within {GRACE:?} of SIGTERM and was killed"
-            ));
+            self.hangs.extend(self.build.clone());
         }
         if image {
             // Killing the `docker run` client would leave the container running.
@@ -359,6 +359,7 @@ impl Net {
                 log: logs.join(format!("node-{i}.log")),
                 shutdown_panics: Vec::new(),
                 crashes: Vec::new(),
+                hangs: Vec::new(),
             })
             .collect();
         Ok(Net {
