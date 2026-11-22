@@ -20,7 +20,7 @@ pub struct HubEventBridge {
     index_tx: IndexEventSender,
     shard_id: u32,
     /// Where lost blocks are recorded for replay, and the last block height
-    /// seen (the shard tip when the bridge subscribed, before any event).
+    /// seen (before any event, the shard tip read before subscribing, or 0).
     gaps: Option<(Arc<IndexGaps>, u64)>,
     /// Whether that tip was read, so the first event can tell which blocks
     /// were committed before the bridge subscribed.
@@ -332,7 +332,7 @@ mod tests {
         );
         // Nothing missed.
         assert_eq!(lost_at_start(Some(5), BlockConfirmed, 6).await, vec![]);
-        // An unread tip doesn't replay the shard from block 1.
+        // An unread tip doesn't make the first event replay the shard.
         assert_eq!(lost_at_start(None, MergeMessage, 8).await, vec![]);
     }
 
