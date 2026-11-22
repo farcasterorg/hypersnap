@@ -38,9 +38,10 @@ chain are cached only after they passed a rollout, and a change to the exporter
    node, and fails when the build returns an error or an empty result, drops a
    field, empties an array or changes a value's JSON type where the base release
    has data. On values, it fails when an array has fewer items than the base
-   release's, or a count (a field named `*count` or `*units`) drops by more
-   than 2% (any drop below 50); array items are matched by their hash or fid, since nodes
-   can order ties differently. Other different values are warnings, and fields
+   release's, or a count (a field named `*count` or `*units`) is off by more
+   than 2% either way (any change below 50); array items are matched by their
+   hash or fid (a notification's or reaction's by its cast and user), since
+   nodes can order ties differently. Other different values are warnings, and fields
    that differ between nodes on the same release (heights, peers, indexer work
    counters) are ignored. Endpoints where the base release has no data are
    listed as not compared, and the run fails when fewer than `--min-compared`

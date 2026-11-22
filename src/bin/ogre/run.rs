@@ -148,13 +148,18 @@ pub async fn chain(args: ChainArgs) -> Result<(), Error> {
         if let Some(c) = n.crashes.first() {
             return Err(format!("node {} {c}", n.i).into());
         }
+        // Every node here runs the base release, which a pull request can't
+        // fix; the rollout then shows whether the chain it left works.
         if !n.hangs.is_empty() {
-            return Err(format!(
-                "node {} didn't stop within {:?} of SIGTERM and was killed",
+            let hang = format!(
+                "warning: node {} on the base release didn't stop within {:?} of SIGTERM and was killed",
                 n.i,
                 net::GRACE
-            )
-            .into());
+            );
+            eprintln!("{hang}");
+            if let Some(path) = &args.report {
+                append(path, &format!("{hang}\n"))?;
+            }
         }
     }
     let _ = std::fs::remove_dir_all(args.work.join("logs"));

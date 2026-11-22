@@ -536,10 +536,10 @@ fn few(items: &[String]) -> String {
     s
 }
 
-/// Values the build lost on the same chain: an array with fewer items than the
-/// base release's, or a count (a `*count` or `*units` field) that dropped by more than 2%
-/// (any drop below 50). Array items are matched by their id, since nodes can
-/// order ties differently.
+/// Values the build got wrong on the same chain: an array with fewer items than
+/// the base release's, or a count (a `*count` or `*units` field) off by more
+/// than 2% either way (any change below 50). Array items are matched by their
+/// id, since nodes can order ties differently.
 fn shrunk(base: &Value, under: &Value, key: &str, path: &str, out: &mut Vec<String>) {
     match (base, under) {
         (Value::Object(b), Value::Object(u)) => {
@@ -553,17 +553,19 @@ fn shrunk(base: &Value, under: &Value, key: &str, path: &str, out: &mut Vec<Stri
             if u.len() < b.len() {
                 out.push(format!("{path} ({} -> {} items)", b.len(), u.len()));
             }
-            // Only items whose id is unique on both sides (notifications from
-            // one account share its fid).
-            let once =
-                |a: &[Value], id: &Value| a.iter().filter(|v| ident(v) == Some(id)).count() == 1;
+            // Only items whose id is unique on both sides.
+            let (bi, ui): (Vec<_>, Vec<_>) =
+                (b.iter().map(ident).collect(), u.iter().map(ident).collect());
+            let once = |ids: &[Option<String>], id: &String| {
+                ids.iter().filter(|x| x.as_ref() == Some(id)).count() == 1
+            };
             for (i, bv) in b.iter().enumerate() {
-                let Some(id) = ident(bv) else { continue };
-                if !once(b, id) || !once(u, id) {
+                let Some(id) = &bi[i] else { continue };
+                if !once(&bi, id) || !once(&ui, id) {
                     continue;
                 }
-                if let Some(uv) = u.iter().find(|uv| ident(uv) == Some(id)) {
-                    shrunk(bv, uv, key, &format!("{path}[{i}]"), out);
+                if let Some(j) = ui.iter().position(|x| x.as_ref() == Some(id)) {
+                    shrunk(bv, &u[j], key, &format!("{path}[{i}]"), out);
                 }
             }
         }
@@ -573,7 +575,7 @@ fn shrunk(base: &Value, under: &Value, key: &str, path: &str, out: &mut Vec<Stri
                 .any(|s| key.to_ascii_lowercase().ends_with(s)) =>
         {
             if let (Some(b), Some(u)) = (b.as_u64(), u.as_u64()) {
-                if u < b && b - u > b / 50 {
+                if b.abs_diff(u) > b / 50 {
                     out.push(format!("{path} ({b} -> {u})"));
                 }
             }
@@ -582,16 +584,20 @@ fn shrunk(base: &Value, under: &Value, key: &str, path: &str, out: &mut Vec<Stri
     }
 }
 
-/// What identifies an array item: its hash, fid or name, or its cast's or user's.
-fn ident(v: &Value) -> Option<&Value> {
-    ["hash", "fid", "name"]
+/// What identifies an array item: its hash, fid or name, or else its cast's
+/// and user's together (a notification or reaction is about both).
+fn ident(v: &Value) -> Option<String> {
+    let own = ["hash", "fid", "name"]
         .into_iter()
-        .find_map(|k| v.get(k).filter(|x| x.is_string() || x.is_number()))
-        .or_else(|| {
-            ["cast", "user"]
-                .into_iter()
-                .find_map(|k| v.get(k).and_then(ident))
-        })
+        .find_map(|k| v.get(k).filter(|x| x.is_string() || x.is_number()));
+    if let Some(id) = own {
+        return Some(id.to_string());
+    }
+    let parts: Vec<String> = ["cast", "user"]
+        .into_iter()
+        .filter_map(|k| v.get(k).and_then(ident))
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("/"))
 }
 
 /// Every value that differs, as `path: base -> under`.
@@ -733,9 +739,10 @@ fn strip_volatile(v: &Value) -> Value {
                             | "version"
                             | "numMessages"
                             | "dbStats"
-                            // Work a node's indexers did since it started, and
-                            // how far along the event log they are: the same
-                            // release on the same chain differs between nodes.
+                            // Per-process indexer counters (work done since the
+                            // node started; search adds the docs it opened with)
+                            // and event log positions: two read nodes on the same
+                            // base release and chain already disagree on them.
                             | "items_indexed"
                             | "last_event_id"
                             | "shardInfos"
@@ -1263,7 +1270,13 @@ pub async fn writes(
                 "/v2/farcaster/reactions/cast?hash={}&types=recasts&limit=25",
                 hash_of(&mention)
             ),
-            Box::new(move |v: &Value| has_fid(v, native_fid)),
+            Box::new(move |v: &Value| {
+                v["reactions"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|r| r["reaction_type"] == "recast" && has_fid(&r["user"], native_fid))
+            }),
         ),
         (
             "search finds the new cast",
@@ -1401,7 +1414,15 @@ mod tests {
             ),
             [format!(".total_active_units ({} -> 0)", u64::MAX)]
         );
-        // items sharing an id (notifications from one account) aren't paired
+        // a count that went up is as wrong
+        assert_eq!(
+            lost(json!({"likes_count": 3}), json!({"likes_count": 4})),
+            [".likes_count (3 -> 4)"]
+        );
+        // a reaction or notification is matched by its cast and user together
+        let r = |f: u64, c: u64| json!({"cast": {"hash": "a"}, "user": {"fid": f, "follower_count": c}});
+        assert!(lost(json!([r(1, 5), r(2, 9)]), json!([r(2, 9), r(1, 5)])).is_empty());
+        // items sharing an id aren't paired
         let n =
             |h: &str, c: u64| json!({"cast": {"hash": h, "recasts_count": c}, "user": {"fid": 2}});
         assert!(lost(json!([n("a", 1), n("b", 0)]), json!([n("b", 0), n("a", 1)])).is_empty());

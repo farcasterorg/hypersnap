@@ -51,6 +51,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: ./snapchain
+          persist-credentials: false
 
       - uses: rui314/setup-mold@v1
 
