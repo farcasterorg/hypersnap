@@ -136,7 +136,18 @@ pub(crate) async fn repair(
             gaps.replayed(shard_id, None);
             continue;
         };
+        // The engine sends a block's events before it stores the block, so a
+        // range can end in a block the store doesn't have yet: that part waits
+        // for the next pass, rather than being read as empty and let go.
+        let stored = store.shard_store.max_block_number().unwrap_or(0);
         for (from, to) in ranges {
+            if to > stored {
+                gaps.lost(shard_id, from.max(stored + 1), to);
+            }
+            let to = to.min(stored);
+            if from > to {
+                continue;
+            }
             tracing::info!(
                 shard_id,
                 from,
@@ -260,7 +271,8 @@ mod tests {
             db,
         ));
         let gaps = IndexGaps::default();
-        gaps.lost(1, 7, 7);
+        // Blocks 8 and 9 aren't stored yet.
+        gaps.lost(1, 7, 9);
 
         repair(
             &gaps,
@@ -269,6 +281,6 @@ mod tests {
         )
         .await;
         assert_eq!(index.get_fid_by_hash(&cast.hash), Some(42));
-        assert!(gaps.is_empty());
+        assert_eq!(gaps.floor(1), Some(8));
     }
 }
