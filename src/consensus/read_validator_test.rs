@@ -171,7 +171,10 @@ mod tests {
         let shard_chunk1 = commit_shard_chunk(&mut proposer_engine, &proposer_keypair).await;
         let shard_chunk2 = commit_shard_chunk(&mut proposer_engine, &proposer_keypair).await;
         let shard_chunk3 = commit_shard_chunk(&mut proposer_engine, &proposer_keypair).await;
-        // Drop the new block if the buffer map is full
+        // A full buffer keeps the lowest blocks: a lower one replaces the highest, a higher one
+        // is dropped
+        let num_processed = process_decided_value(&mut read_validator, &shard_chunk3).await;
+        assert_eq!(num_processed, 0);
         let num_processed = process_decided_value(&mut read_validator, &shard_chunk2).await;
         assert_eq!(num_processed, 0);
         let num_processed = process_decided_value(&mut read_validator, &shard_chunk3).await;
