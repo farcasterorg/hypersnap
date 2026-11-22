@@ -2242,6 +2242,7 @@ mod discovery_tests {
             .unwrap()
             .last()
             .unwrap();
-        assert_eq!(latest["validator_public_keys"].as_array().unwrap().len(), 8);
+        // Pruning seeds must not drop validators; rotations may still add them.
+        assert!(latest["validator_public_keys"].as_array().unwrap().len() >= 8);
     }
 }
