@@ -6585,6 +6585,34 @@ mod tests {
             Some(cast2.hash.clone())
         );
 
+        // A native account's cast is found too, and an unknown hash finishes
+        // without walking every FID below 2^32.
+        let native_fid = crate::native_registration::FIRST_NATIVE_FID;
+        let native_engine = match (routing::EvenOddRouterForTest {}).route_fid(native_fid, 2) {
+            1 => &mut *engine1,
+            _ => &mut *engine2,
+        };
+        let stores = native_engine.get_stores();
+        let native_cast =
+            messages_factory::casts::create_cast_add(native_fid, "native", None, None);
+        let mut txn = RocksDbTransactionBatch::new();
+        txn.put(
+            crate::native_registration::account_key(native_fid),
+            prost::Message::encode_to_vec(&proto::NativeRegistrationRecord {
+                fid: native_fid,
+                ..Default::default()
+            }),
+        );
+        stores
+            .cast_store
+            .merge(&native_cast, &mut txn, &test_helper::default_merge_ctx())
+            .unwrap();
+        stores.db.commit(txn).unwrap();
+        assert_eq!(
+            found(service.get_cast_by_hash(&native_cast.hash, None).await),
+            Some(native_cast.hash.clone())
+        );
+
         // Removed, unknown and truncated hashes resolve to nothing.
         assert!(service
             .get_cast_by_hash(&removed.hash, None)
