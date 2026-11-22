@@ -2740,7 +2740,10 @@ impl ApiHttpHandler {
 
         match hub.get_storage_limits(fid).await {
             Some(limits) => {
-                let total: u64 = limits.iter().map(|(_, _, cap)| cap).sum();
+                // Unlimited stores report u64::MAX, so a plain sum wraps.
+                let total = limits
+                    .iter()
+                    .fold(0u64, |total, (_, _, cap)| total.saturating_add(*cap));
                 let allocations = vec![StorageAllocation {
                     object: "storage_allocation".to_string(),
                     units: total,

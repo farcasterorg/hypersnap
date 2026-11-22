@@ -137,3 +137,10 @@ fmt = "cargo fmt --check --quiet"
 [patch.crates-io]
 # Our compatibility patch for the pinned Malachite broadcast transport.
 libp2p-scatter = { path = "vendor/libp2p-scatter" }
+
+# Dependencies are optimized in dev and test builds: unoptimized signature
+# checks, hashing and RocksDB make a local devnet (Ogre) and the consensus
+# tests many times slower. This crate stays unoptimized, so rebuilding it
+# after a change takes as long as before.
+[profile.dev.package."*"]
+opt-level = 1

@@ -1,0 +1,154 @@
+name: Ogre
+
+# Rolls this build onto a 10-node devnet seeded with real mainnet accounts, the
+# way a release reaches mainnet, and checks the network keeps working: blocks,
+# every read endpoint, and new messages landing everywhere. See docs/ogre.md.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "17 4 * * *" # a fresh seed, and a chain on the newest release, daily
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# The same as Verify's, so this build reuses Verify's caches.
+env:
+  RUSTFLAGS: "-Dwarnings -A mismatched_lifetime_syntaxes"
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  # The release mainnet runs, which the devnet starts on.
+  BASE_IMAGE: farcasterorg/hypersnap:latest
+  # Mainnet node the seed is exported from.
+  SEED_SOURCE: https://haatz.quilibrium.com
+
+jobs:
+  rollout:
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: write # main deletes the Ogre caches it supersedes
+    runs-on: ${{ vars.RUNS_ON == 'true' && fromJSON(format('["runs-on={0}","runner=64cpu-linux-arm64"]', github.run_id)) || 'ubuntu-24.04-arm' }}
+    steps:
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/checkout@v4
+        with:
+          path: ./snapchain
+
+      - uses: rui314/setup-mold@v1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: snapchain
+          shared-key: verify
+          save-if: false
+
+      - name: Restore incremental build
+        uses: actions/cache/restore@v4
+        with:
+          path: snapchain/target/debug/incremental
+          key: incremental-${{ runner.arch }}-${{ hashFiles('snapchain/rust-toolchain.toml', 'snapchain/Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            incremental-${{ runner.arch }}-${{ hashFiles('snapchain/rust-toolchain.toml', 'snapchain/Cargo.lock') }}-
+            incremental-${{ runner.arch }}-
+
+      # Pulled while the build runs.
+      - name: Pull the base release
+        id: base
+        run: |
+          (for i in 1 2 3; do docker pull -q "$BASE_IMAGE" && exit 0; sleep 10; done; exit 1) > pull.log 2>&1 &
+          echo "pid=$!" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        working-directory: ./snapchain
+        env:
+          CARGO_INCREMENTAL: "1"
+        run: cargo build --profile test --bin hypersnap --bin ogre
+
+      - name: Base release digest
+        id: digest
+        run: |
+          while kill -0 ${{ steps.base.outputs.pid }} 2>/dev/null; do sleep 1; done
+          cat pull.log
+          image=$(docker inspect --format '{{index .RepoDigests 0}}' "$BASE_IMAGE")
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "sha=${image##*:}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the seed
+        id: seed
+        if: github.event_name != 'schedule'
+        uses: actions/cache/restore@v4
+        with:
+          path: ogre/seed.bin
+          key: ogre-seed-v1-${{ github.run_id }}
+          restore-keys: ogre-seed-v1-
+
+      - name: Export a seed from mainnet
+        if: steps.seed.outputs.cache-matched-key == ''
+        run: |
+          mkdir -p ogre
+          snapchain/target/debug/ogre seed --source "$SEED_SOURCE" --out ogre/seed.bin
+
+      - name: Save the seed
+        if: steps.seed.outputs.cache-matched-key == ''
+        uses: actions/cache/save@v4
+        with:
+          path: ogre/seed.bin
+          key: ogre-seed-v1-${{ github.run_id }}
+
+      - name: Restore the seeded chain
+        id: chain
+        uses: actions/cache/restore@v4
+        with:
+          path: ogre/chain
+          # Bump v1 when `ogre chain` builds a different chain.
+          key: ogre-chain-v1-${{ steps.digest.outputs.sha }}-${{ hashFiles('ogre/seed.bin', 'snapchain/src/bin/ogre/net.rs') }}
+
+      - name: Build the seeded chain on the base release
+        if: steps.chain.outputs.cache-hit != 'true'
+        run: snapchain/target/debug/ogre chain --seed ogre/seed.bin --base "docker:${{ steps.digest.outputs.image }}" --work ogre/chain
+
+      - name: Save the seeded chain
+        if: steps.chain.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ogre/chain
+          key: ${{ steps.chain.outputs.cache-primary-key }}
+
+      - name: Roll out
+        run: |
+          cp -a ogre/chain ogre/run
+          snapchain/target/debug/ogre run --seed ogre/seed.bin \
+            --base "docker:${{ steps.digest.outputs.image }}" \
+            --under-test snapchain/target/debug/hypersnap \
+            --work ogre/run --report "$GITHUB_STEP_SUMMARY"
+
+      - name: Node logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ogre-logs
+          path: ogre/run/logs
+          retention-days: 7
+
+      - name: Delete superseded Ogre caches
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SEED: ${{ steps.seed.outputs.cache-matched-key || format('ogre-seed-v1-{0}', github.run_id) }}
+          CHAIN: ${{ steps.chain.outputs.cache-primary-key }}
+        run: |
+          gh cache list --repo "$GITHUB_REPOSITORY" --key ogre- --ref refs/heads/main --limit 100 --json key --jq '.[].key' |
+            grep -vx -e "$SEED" -e "$CHAIN" | xargs -r -n1 gh cache delete --repo "$GITHUB_REPOSITORY"
