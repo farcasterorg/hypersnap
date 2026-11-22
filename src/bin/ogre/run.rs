@@ -429,7 +429,13 @@ pub async fn run(args: RunArgs) -> Result<bool, Error> {
         for p in n.running_panics().into_iter().take(3) {
             r.findings.fail(format!("node {} panicked: {p}", n.i));
         }
-        if let Some((b, p)) = n.shutdown_panics.first() {
+        // The first per build, so a base release's doesn't hide the build's.
+        let mut seen = Vec::new();
+        for (b, p) in &n.shutdown_panics {
+            if seen.contains(&format!("{b:?}")) {
+                continue;
+            }
+            seen.push(format!("{b:?}"));
             let on = b
                 .as_ref()
                 .map(|b| format!(" on `{b:?}`"))
@@ -440,7 +446,8 @@ pub async fn run(args: RunArgs) -> Result<bool, Error> {
             ));
         }
     }
-    if result.is_ok() {
+    // A failed run may not have compared the entry's route.
+    if r.findings.failures.is_empty() {
         for e in checks::unused_accepted() {
             r.findings.warn(format!(
                 "src/bin/ogre/accepted.txt entry matched no difference; remove it if the base release has the change now: {e}"

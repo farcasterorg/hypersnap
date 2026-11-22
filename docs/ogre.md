@@ -42,13 +42,15 @@ chain are cached only after they passed a rollout, and a change to the exporter
    than 2% either way (any change below 50); array items are matched by their
    hash or fid (a notification's or reaction's by its cast and user), since
    nodes can order ties differently. Any other value that differs fails too when
-   it is surely about the same thing on both sides: a field of the response or of
-   an object under it (`.user.username`), or of an array item paired by its id.
-   Items paired only by their position can be different items (another tie
-   order, search ranking), so their differences are warnings. Fields that differ
-   between two nodes on the same release (heights, peers, indexer work counters,
-   the metrics worker's position) are ignored on the route they're on; the list
-   and the reason for each is `VOLATILE` in `src/bin/ogre/checks.rs`. Endpoints where the base release has no data are
+   it is surely about the same thing on both sides: a field of the response or
+   of an object under it (`.user.username`), or of an array item paired by its
+   id. Items paired only by their position can be different items (another tie
+   order, search ranking), so their differences are warnings; that includes
+   lists of plain values (addresses, fids) and items whose id isn't unique.
+   Fields that differ between two nodes on the same release (heights, peers,
+   indexer work counters, the metrics worker's position) are ignored on the
+   route they're on; the list and the reason for each is `VOLATILE` in
+   `src/bin/ogre/checks.rs`. Endpoints where the base release has no data are
    listed as not compared, and the run fails when fewer than `--min-compared`
    endpoints had base data (a reference node that errs can't turn every check
    into a skip). A failing endpoint is retried for 6 seconds.

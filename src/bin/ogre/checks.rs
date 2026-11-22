@@ -677,11 +677,9 @@ static USED: std::sync::Mutex<std::collections::BTreeSet<&str>> =
 /// Whether a difference found on `route` (a JSON path, then what changed) is
 /// in the accepted list.
 fn accepted(route: &str, difference: &str) -> bool {
-    let entry = entry(ACCEPTED, route, difference);
-    if let Some(e) = entry {
-        USED.lock().unwrap().insert(e);
-    }
-    entry.is_some()
+    let matched = matching(ACCEPTED, route, difference);
+    USED.lock().unwrap().extend(&matched);
+    !matched.is_empty()
 }
 
 /// Accepted entries no difference matched: the base release may ship the
@@ -705,15 +703,21 @@ fn entries(list: &str) -> impl Iterator<Item = (&str, (&str, &str))> {
 /// The line of `list` that covers a difference found on `route`. Paths match
 /// without array indexes, and an entry covers everything under its path.
 fn entry<'a>(list: &'a str, route: &str, difference: &str) -> Option<&'a str> {
+    matching(list, route, difference).into_iter().next()
+}
+
+/// Every line of `list` that covers the difference.
+fn matching<'a>(list: &'a str, route: &str, difference: &str) -> Vec<&'a str> {
     let path = unindexed(difference.split([' ', ':']).next().unwrap_or(""));
     entries(list)
-        .find(|(_, (r, p))| {
+        .filter(|(_, (r, p))| {
             *r == route
                 && path
                     .strip_prefix(p)
                     .is_some_and(|rest| rest.is_empty() || rest.starts_with(['.', '[']))
         })
         .map(|(l, _)| l)
+        .collect()
 }
 
 /// `.users[3].fid` as `.users[].fid`.
@@ -798,11 +802,20 @@ const VOLATILE: &str = "
 /v1/info .dbStats.numMessages  grows with the tip, which the nodes reach a moment apart
 /v1/info .dbStats.approxSize   an estimate of each node's own database files
 /v1/info .shardInfos           each node's own heights, delays, mempools and sizes
+/v1/nativeRegistration .nextBlock          the node's own shard-0 tip
+/v1/nativeRegistration .anchorBlockHeight  the same tip
+/v1/nativeRegistration .anchorBlockHash    the same tip
 # Per-process indexer counters (work done since the node started; search adds
 # the docs it opened with) and event log positions: two read nodes on the same
 # release and chain already disagree on them.
 /v2/farcaster/_status/backfill .indexers[].items_indexed
 /v2/farcaster/_status/backfill .indexers[].last_event_id
+# Whether each node's own indexing has caught up yet, and the storage
+# generation it indexes into: node state, not data.
+/v2/farcaster/_status/backfill .indexers[].backfill_complete
+/v2/farcaster/_status/backfill .cast_hash_backfill.complete
+/v2/farcaster/_status/backfill .metrics_backfill.active_generation
+/v2/farcaster/_status/backfill .metrics_backfill.building_generation
 # Where the metrics worker is against this moment's tip: one more block on
 # either node turns `ready` into `catching_up` until the worker takes it.
 /v2/farcaster/_status/backfill .metrics_backfill.phase
