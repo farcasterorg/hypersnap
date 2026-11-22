@@ -164,12 +164,13 @@ impl NotificationsIndexer {
         let mut ranges = Vec::new();
         let mut txn = RocksDbTransactionBatch::new();
         let mut rewalk = Vec::new();
+        let mut marks = Vec::new();
         for (&shard_id, &tip) in tips {
             match heights.get(&shard_id) {
                 Some(&from) if from <= tip => ranges.push((shard_id, from, tip)),
                 Some(_) => {}
                 None => {
-                    heights.insert(shard_id, tip);
+                    marks.push((shard_id, tip));
                     txn.put(Self::height_key(shard_id), tip.to_be_bytes().to_vec());
                     let walked = try_load_shard_checkpoint(&self.db, CHECKPOINT_NAME, shard_id)
                         .map_or(true, |next| next != 0);
@@ -194,10 +195,15 @@ impl NotificationsIndexer {
             txn.delete(vec![PREFIX, BACKFILL_DONE]);
         }
         // Marks and walk resets land together: a mark stored without its reset
-        // would keep the shard from ever being walked again.
+        // would keep the shard from ever being walked again. The marks go in
+        // memory only once stored.
         match self.commit(txn) {
-            Ok(()) if !rewalk.is_empty() => self.complete.store(false, Ordering::Release),
-            Ok(()) => {}
+            Ok(()) => {
+                heights.extend(marks);
+                if !rewalk.is_empty() {
+                    self.complete.store(false, Ordering::Release);
+                }
+            }
             Err(e) => tracing::warn!(error = %e, "Couldn't store notifications index marks"),
         }
         ranges

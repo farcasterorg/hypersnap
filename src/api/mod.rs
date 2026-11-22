@@ -694,10 +694,7 @@ pub fn initialize(
     // Create bridges for each shard, gated on backfill completion
     for (shard_id, hub_event_tx) in hub_event_senders {
         let bridge = HubEventBridge::from_sender(&hub_event_tx, index_tx.clone(), shard_id)
-            .with_gaps(
-                index_gaps.clone(),
-                tips.get(&shard_id).copied().unwrap_or(0),
-            );
+            .with_gaps(index_gaps.clone(), tips.get(&shard_id).copied());
         let mut rx = backfill_done_tx.subscribe();
         let handle = tokio::spawn(async move {
             // Wait until backfill is done (checks current value first, no race)

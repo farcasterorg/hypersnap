@@ -22,6 +22,9 @@ pub struct HubEventBridge {
     /// Where lost blocks are recorded for replay, and the last block height
     /// seen (the shard tip when the bridge subscribed, before any event).
     gaps: Option<(Arc<IndexGaps>, u64)>,
+    /// Whether that tip was read, so the first event can tell which blocks
+    /// were committed before the bridge subscribed.
+    tip_known: bool,
     /// Dedicated consumers wait for their own queue instead of dropping events.
     backpressure: bool,
 }
@@ -43,14 +46,17 @@ impl HubEventBridge {
             index_tx,
             shard_id,
             gaps: None,
+            tip_known: false,
             backpressure: false,
         }
     }
 
     /// Record the blocks whose events this bridge loses in `gaps`, so they're
-    /// replayed (index_gaps.rs). `tip` is the shard's height at subscription.
-    pub fn with_gaps(mut self, gaps: Arc<IndexGaps>, tip: u64) -> Self {
-        self.gaps = Some((gaps, tip));
+    /// replayed (index_gaps.rs). `tip` is the shard's height read before the
+    /// bridge subscribed (`None` when it couldn't be read).
+    pub fn with_gaps(mut self, gaps: Arc<IndexGaps>, tip: Option<u64>) -> Self {
+        self.gaps = Some((gaps, tip.unwrap_or(0)));
+        self.tip_known = tip.is_some();
         self
     }
 
@@ -79,14 +85,29 @@ impl HubEventBridge {
         // After a lag: the last height seen before it, so the missed blocks are
         // known once the next event says where the stream picked up again.
         let mut lagged_after: Option<u64> = None;
+        let mut first = self.tip_known;
 
         loop {
             match self.event_rx.recv().await {
                 Ok(hub_event) => {
                     let height = self.extract_block_height(&hub_event);
                     if let Some((gaps, last)) = &mut self.gaps {
+                        let first = std::mem::take(&mut first);
                         if let Some(from) = lagged_after.take() {
                             gaps.lost(self.shard_id, from, height);
+                        } else if first {
+                            // The engine sends a block's events before storing
+                            // the block, so blocks past the tip may have been
+                            // sent before the bridge subscribed, and so may
+                            // the start of this one unless this event opens it.
+                            let to = if hub_event.r#type == HubEventType::BlockConfirmed as i32 {
+                                height.saturating_sub(1)
+                            } else {
+                                height
+                            };
+                            if to > *last {
+                                gaps.lost(self.shard_id, *last + 1, to);
+                            }
                         }
                         *last = height;
                     }
@@ -274,6 +295,45 @@ mod tests {
             bridge.convert_event(&event).unwrap().block_height(),
             Some(50_000_000)
         );
+    }
+
+    /// Blocks the bridge records as lost when its first event is `first` at
+    /// `height` and the tip read before it subscribed was `tip`.
+    async fn lost_at_start(tip: Option<u64>, first: HubEventType, height: u64) -> Vec<(u64, u64)> {
+        let (hub_tx, _) = broadcast::channel(8);
+        let (index_tx, _index_rx) = mpsc::channel(8);
+        let gaps = Arc::new(IndexGaps::default());
+        let bridge = HubEventBridge::from_sender(&hub_tx, index_tx, 1).with_gaps(gaps.clone(), tip);
+        let task = tokio::spawn(bridge.run());
+        let mut event = make_merge_event(make_test_message(10));
+        event.r#type = first as i32;
+        event.id =
+            crate::storage::store::account::HubEventIdGenerator::make_event_id_for_block_number(
+                height,
+            );
+        hub_tx.send(event).unwrap();
+        drop(hub_tx);
+        task.await.unwrap();
+        gaps.take().remove(&1).unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn blocks_committed_before_subscribing_are_recorded_as_lost() {
+        use HubEventType::{BlockConfirmed, MergeMessage};
+        // Blocks 6 and 7 were sent between the tip read and the subscription;
+        // block 8's events were too, up to this one.
+        assert_eq!(lost_at_start(Some(5), MergeMessage, 8).await, vec![(6, 8)]);
+        // Part of the block right after the tip was sent before subscribing.
+        assert_eq!(lost_at_start(Some(5), MergeMessage, 6).await, vec![(6, 6)]);
+        // Block 7 seen from its start: only block 6 was missed.
+        assert_eq!(
+            lost_at_start(Some(5), BlockConfirmed, 7).await,
+            vec![(6, 6)]
+        );
+        // Nothing missed.
+        assert_eq!(lost_at_start(Some(5), BlockConfirmed, 6).await, vec![]);
+        // An unread tip doesn't replay the shard from block 1.
+        assert_eq!(lost_at_start(None, MergeMessage, 8).await, vec![]);
     }
 
     #[tokio::test]
