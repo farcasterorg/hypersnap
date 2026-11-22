@@ -569,18 +569,16 @@ pub fn initialize(
     // (put-only, keyed by the message), so a cast doesn't stay unfindable by
     // hash until the next restart. The rest still catch up at startup.
     let index_gaps = Arc::new(index_gaps::IndexGaps::default());
+    // A shard whose tip can't be read is left out, rather than taken as 0
+    // (which would store 0 as the notifications index's mark for it).
     let tips: HashMap<u32, u64> = shard_stores
         .iter()
-        .map(|(&id, stores)| (id, stores.shard_store.max_block_number().unwrap_or(0)))
+        .filter_map(|(&id, stores)| Some((id, stores.shard_store.max_block_number().ok()?)))
         .collect();
     // Events still queued when the node last stopped never reached the
     // notifications index; replay from the last block it indexed to the tip.
-    for (shard_id, from) in notifications_indexer.indexed_heights() {
-        if let Some(&tip) = tips.get(&shard_id) {
-            if from <= tip {
-                index_gaps.lost(shard_id, from, tip);
-            }
-        }
+    for (shard_id, from, to) in notifications_indexer.replay_ranges(&tips) {
+        index_gaps.lost(shard_id, from, to);
     }
     index_gaps::spawn_repair(
         index_gaps.clone(),
