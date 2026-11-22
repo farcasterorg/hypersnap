@@ -43,13 +43,16 @@ chain are cached only after they passed a rollout, and a change to the exporter
    id, since nodes can order ties differently. An array's id is the first of
    `IDS` in `src/bin/ogre/checks.rs` (hash, onchain log, fid, name, signer key
    and block, then a notification's or reaction's cast and user together) that
-   is unique among its items, so per-account lists, where every item carries
-   the same fid, still pair. An item the build returns twice fails. Any other
-   value that differs fails too when it is surely about the same thing on both
-   sides: a field of the response or of an object under it (`.user.username`),
-   or of an array item paired by its id. Items paired only by their position can be different items (another tie
-   order, search ranking), so their differences are warnings; that includes
-   lists of plain values (addresses, fids) and items with no unique id.
+   every item has and that is unique on both sides, so per-account lists, where
+   every item carries the same fid, still pair. When none is, it's the first
+   unique in the base release's items, and an item the build returns twice
+   fails. Any other value that differs fails too when it is surely about the
+   same thing on both sides: a field of the response or of an object under it
+   (`.user.username`), or of an array item paired by its id. Items paired only
+   by their position can be different items (another tie order, search
+   ranking), so their differences are warnings, and so is an item repeated
+   under them; that includes lists of plain values (addresses, fids) and items
+   with no unique id.
    Fields that differ between two nodes on the same release (heights, peers,
    indexer work counters, the metrics worker's position) are ignored on the
    route they're on; the list and the reason for each is `VOLATILE` in

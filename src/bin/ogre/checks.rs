@@ -591,13 +591,14 @@ const IDS: &[&[&str]] = &[
 ];
 
 /// For each item of `b`, the item of `u` with the same id, and the ids that
-/// are unique in `b` but repeated in `u`. The id is the first candidate unique
-/// on both sides; when none is, the first unique in `b`, so an item the build
-/// returns twice is caught.
+/// are unique in `b` but repeated in `u`. The id is the first candidate every
+/// item has and that is unique on both sides; when none is, the first unique
+/// in `b`, so an item the build returns twice is caught.
 fn by_id(b: &[Value], u: &[Value]) -> (Vec<Option<usize>>, Vec<String>) {
     let unique = |ids: &[Option<String>]| {
         let present: Vec<_> = ids.iter().flatten().collect();
         !present.is_empty()
+            && present.len() == ids.len()
             && present
                 .iter()
                 .collect::<std::collections::HashSet<_>>()
