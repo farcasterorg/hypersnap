@@ -503,6 +503,15 @@ async fn scenario(
     r.note(format!(
         "every shard made a new block {resumed:.1?} after the API node answered"
     ));
+    // The fresh read node replays from here to the end of the run, a window
+    // long enough that a heavy seed block (the load holds thousands of
+    // messages per block) taking a few sync retries isn't read as a stop.
+    let fresh_from = (
+        Instant::now(),
+        net.heights(net::FRESH)
+            .await
+            .ok_or("fresh read node stopped answering")?,
+    );
     let watch = StallWatch::start(net);
     s.resolve(net).await?;
     // A new user signs up while the rest runs: mining the proof takes a while.
@@ -549,15 +558,6 @@ async fn scenario(
             t.elapsed()
         ));
     }
-
-    // The fresh read node has been replaying since the start; it is checked for
-    // progress from here to the end of the run.
-    let fresh_from = (
-        Instant::now(),
-        net.heights(net::FRESH)
-            .await
-            .ok_or("fresh read node stopped answering")?,
-    );
 
     r.phase("Read API again, on the upgraded network");
     let summary = checks::endpoints(net, s, "upgraded", args.min_compared, &mut r.findings).await;
