@@ -350,8 +350,18 @@ pub fn initialize(
     // /v2/farcaster/notifications. Live merges keep it current from the start;
     // its store walk is started from main.rs once the hyper stores are filled,
     // and until that walk finishes notifications use the old bounded scan.
-    let notifications_indexer =
-        Arc::new(crate::api::notifications_index::NotificationsIndexer::new(
+    //
+    // Blocks whose live events a bridge lost get replayed from the shard
+    // store into the indexers that can take a message twice in any order
+    // (put-only, keyed by the message), so a cast doesn't stay unfindable by
+    // hash until the next restart. Those gaps live in memory. If the node
+    // stops before they're replayed, the hash and quote indexes still catch
+    // up at the next start, as the block backfill replays every block since
+    // the previous one; the notifications index keeps its per-shard marks at
+    // or below the blocks not replayed yet, so its replay covers them.
+    let index_gaps = Arc::new(index_gaps::IndexGaps::default());
+    let notifications_indexer = Arc::new(
+        crate::api::notifications_index::NotificationsIndexer::new(
             FeatureConfig {
                 enabled: true,
                 ..Default::default()
@@ -360,7 +370,9 @@ pub fn initialize(
             hyper_shard_stores
                 .clone()
                 .unwrap_or_else(|| shard_stores.clone()),
-        ));
+        )
+        .with_gaps(index_gaps.clone()),
+    );
 
     if !user_search_indexer.is_complete() {
         let indexer = user_search_indexer.clone();
@@ -564,11 +576,6 @@ pub fn initialize(
     } else {
         None
     };
-    // Blocks whose live events a bridge lost get replayed from the shard
-    // store into the indexers that can take a message twice in any order
-    // (put-only, keyed by the message), so a cast doesn't stay unfindable by
-    // hash until the next restart. The rest still catch up at startup.
-    let index_gaps = Arc::new(index_gaps::IndexGaps::default());
     // A shard whose tip can't be read is left out, rather than taken as 0
     // (which would store 0 as the notifications index's mark for it).
     let tips: HashMap<u32, u64> = shard_stores

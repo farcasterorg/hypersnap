@@ -19,6 +19,7 @@ use crate::api::backfill::{
 };
 use crate::api::config::FeatureConfig;
 use crate::api::events::{IndexEvent, MessageEventKind};
+use crate::api::index_gaps::IndexGaps;
 use crate::api::indexer::{Indexer, IndexerError, IndexerStats};
 use crate::mempool::routing::{MessageRouter, ShardRouter};
 use crate::proto::message_data::Body;
@@ -120,6 +121,8 @@ pub struct NotificationsIndexer {
     items_indexed: AtomicU64,
     /// Per shard, the block live indexing has reached (as stored).
     heights: Mutex<HashMap<u32, u64>>,
+    /// Blocks waiting for a replay, which the stored marks stay at or below.
+    gaps: Option<Arc<IndexGaps>>,
 }
 
 impl NotificationsIndexer {
@@ -146,7 +149,17 @@ impl NotificationsIndexer {
             complete: AtomicBool::new(complete),
             items_indexed: AtomicU64::new(0),
             heights: Mutex::new(heights),
+            gaps: None,
         }
+    }
+
+    /// Keep each shard's mark at or below the lowest block in `gaps` not yet
+    /// replayed: the gaps live in memory, so blocks queued for a replay at
+    /// startup or lost by a bridge are replayed from the mark if the node
+    /// stops before the repair task got to them.
+    pub fn with_gaps(mut self, gaps: Arc<IndexGaps>) -> Self {
+        self.gaps = Some(gaps);
+        self
     }
 
     /// Blocks to replay at startup, per shard, given each shard's tip now:
@@ -215,6 +228,8 @@ impl NotificationsIndexer {
 
     /// Record live events' block heights in `txn`, committed with their entries.
     fn note_height(&self, shard_id: u32, height: u64, txn: &mut RocksDbTransactionBatch) {
+        let floor = self.gaps.as_ref().and_then(|gaps| gaps.floor(shard_id));
+        let height = floor.map_or(height, |floor| height.min(floor));
         let mut heights = self.heights.lock().unwrap();
         let known = heights.entry(shard_id).or_insert(0);
         if height > *known {
@@ -680,6 +695,72 @@ impl Indexer for NotificationsIndexer {
 mod tests {
     use super::*;
 
+    /// A shard store at `path` holding `blocks` (height, its one message).
+    fn shard_store(path: &str, shard: u32, blocks: &[(u64, &Message)]) -> Stores {
+        use crate::proto::{self, Height, ShardChunk, ShardHeader, Transaction};
+        use crate::storage::store::stores::StoreLimits;
+        use crate::storage::trie::merkle_trie::MerkleTrie;
+        use crate::utils::statsd_wrapper::StatsdClientWrapper;
+        let stores = Stores::new(
+            RocksDB::open_shard_db(path, shard),
+            shard,
+            MerkleTrie::new().unwrap(),
+            StoreLimits::default(),
+            proto::FarcasterNetwork::Devnet,
+            StatsdClientWrapper::new(
+                cadence::StatsdClient::builder("test", cadence::NopMetricSink).build(),
+                false,
+            ),
+        );
+        for &(height, message) in blocks {
+            stores
+                .shard_store
+                .put_shard_chunk(&ShardChunk {
+                    header: Some(ShardHeader {
+                        height: Some(Height {
+                            shard_index: shard,
+                            block_number: height,
+                        }),
+                        ..Default::default()
+                    }),
+                    transactions: vec![Transaction {
+                        user_messages: vec![message.clone()],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        stores
+    }
+
+    /// A like of fid 100's cast by `fid`.
+    fn like(fid: u64) -> Message {
+        crate::utils::factory::messages_factory::reactions::create_reaction_add(
+            fid,
+            crate::proto::ReactionType::Like,
+            reaction_body::Target::TargetCastId(CastId {
+                fid: 100,
+                hash: vec![9; HASH_LEN],
+            }),
+            None,
+            None,
+        )
+    }
+
+    /// Who liked fid 100's cast, per the index.
+    fn likers(index: &NotificationsIndexer) -> Vec<u64> {
+        let mut found = vec![];
+        index
+            .scan(100, None, |entry| {
+                found.push(entry.actor);
+                false
+            })
+            .unwrap();
+        found.sort();
+        found
+    }
+
     #[test]
     fn test_key_round_trip_and_order() {
         let hash = [7u8; HASH_LEN];
@@ -848,13 +929,8 @@ mod tests {
     #[tokio::test]
     async fn test_events_queued_at_stop_are_replayed_on_restart() {
         use crate::api::config::ApiConfig;
-        use crate::api::index_gaps::{repair, IndexGaps};
+        use crate::api::index_gaps::repair;
         use crate::api::worker::IndexWorkerPool;
-        use crate::proto::{self, Height, ShardChunk, ShardHeader, Transaction};
-        use crate::storage::store::stores::StoreLimits;
-        use crate::storage::trie::merkle_trie::MerkleTrie;
-        use crate::utils::factory::messages_factory::reactions::create_reaction_add;
-        use crate::utils::statsd_wrapper::StatsdClientWrapper;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_str().unwrap().to_string();
@@ -869,64 +945,11 @@ mod tests {
             )
         };
         // A like of fid 100's cast in block 2 of each shard.
-        let like = |fid| {
-            create_reaction_add(
-                fid,
-                proto::ReactionType::Like,
-                reaction_body::Target::TargetCastId(CastId {
-                    fid: 100,
-                    hash: vec![9; HASH_LEN],
-                }),
-                None,
-                None,
-            )
-        };
         let (like1, like2) = (like(11), like(12));
-        let stores: HashMap<u32, Stores> = [(1, &like1), (2, &like2)]
-            .into_iter()
-            .map(|(shard, message)| {
-                let stores = Stores::new(
-                    RocksDB::open_shard_db(&path, shard),
-                    shard,
-                    MerkleTrie::new().unwrap(),
-                    StoreLimits::default(),
-                    proto::FarcasterNetwork::Devnet,
-                    StatsdClientWrapper::new(
-                        cadence::StatsdClient::builder("test", cadence::NopMetricSink).build(),
-                        false,
-                    ),
-                );
-                stores
-                    .shard_store
-                    .put_shard_chunk(&ShardChunk {
-                        header: Some(ShardHeader {
-                            height: Some(Height {
-                                shard_index: shard,
-                                block_number: 2,
-                            }),
-                            ..Default::default()
-                        }),
-                        transactions: vec![Transaction {
-                            user_messages: vec![message.clone()],
-                            ..Default::default()
-                        }],
-                        ..Default::default()
-                    })
-                    .unwrap();
-                (shard, stores)
-            })
-            .collect();
-        let likers = |index: &NotificationsIndexer| {
-            let mut found = vec![];
-            index
-                .scan(100, None, |entry| {
-                    found.push(entry.actor);
-                    false
-                })
-                .unwrap();
-            found.sort();
-            found
-        };
+        let stores = HashMap::from([
+            (1, shard_store(&path, 1, &[(2, &like1)])),
+            (2, shard_store(&path, 2, &[(2, &like2)])),
+        ]);
 
         // First start, on an empty database: nothing to replay yet.
         let index = Arc::new(open());
@@ -965,6 +988,73 @@ mod tests {
         }
         repair(&gaps, &stores, &[index.clone() as Arc<dyn Indexer>]).await;
         assert_eq!(likers(&index), vec![11, 12]);
+    }
+
+    /// Blocks queued for a replay and blocks a bridge lost wait in memory
+    /// for the repair task, so a node that stops again before it ran must
+    /// still replay them at the next start: the mark stays below them.
+    #[tokio::test]
+    async fn test_blocks_not_replayed_yet_survive_another_stop() {
+        use crate::api::index_gaps::repair;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        let start = || {
+            let gaps = Arc::new(IndexGaps::default());
+            let index = Arc::new(
+                NotificationsIndexer::new(
+                    FeatureConfig {
+                        enabled: true,
+                        ..Default::default()
+                    },
+                    RocksDB::open_shard_db(&path, 0),
+                    HashMap::new(),
+                )
+                .with_gaps(gaps.clone()),
+            );
+            (index, gaps)
+        };
+        let replay = |index: &NotificationsIndexer, gaps: &IndexGaps, tip| {
+            let ranges = index.replay_ranges(&HashMap::from([(1, tip)]));
+            for &(shard, from, to) in &ranges {
+                gaps.lost(shard, from, to);
+            }
+            ranges
+        };
+        let block = |height| IndexEvent::block_committed(1, height, 0);
+        let (like2, like8) = (like(12), like(18));
+        let stores = HashMap::from([(1, shard_store(&path, 1, &[(2, &like2), (8, &like8)]))]);
+
+        // Block 1 is indexed; block 2's like is still queued at the stop.
+        let (index, gaps) = start();
+        assert!(replay(&index, &gaps, 0).is_empty());
+        index.process_event(&block(1)).await.unwrap();
+        drop(index);
+
+        // Blocks 1-3 are queued for a replay, and live indexing moves on to
+        // block 4 before the node stops again, ahead of the repair task.
+        let (index, gaps) = start();
+        assert_eq!(replay(&index, &gaps, 3), vec![(1, 1, 3)]);
+        index.process_event(&block(4)).await.unwrap();
+        drop(index);
+
+        // The next start still replays block 2.
+        let (index, gaps) = start();
+        assert_eq!(replay(&index, &gaps, 6), vec![(1, 1, 6)]);
+        repair(&gaps, &stores, &[index.clone() as Arc<dyn Indexer>]).await;
+        assert_eq!(likers(&index), vec![12]);
+        assert!(gaps.is_empty());
+        // With the replay done, live indexing moves the mark on. Then a
+        // bridge drops block 8's events, and the node stops after block 9.
+        index.process_event(&block(7)).await.unwrap();
+        gaps.lost(1, 8, 8);
+        index.process_event(&block(9)).await.unwrap();
+        drop(index);
+
+        let (index, gaps) = start();
+        assert_eq!(replay(&index, &gaps, 9), vec![(1, 8, 9)]);
+        repair(&gaps, &stores, &[index.clone() as Arc<dyn Indexer>]).await;
+        assert_eq!(likers(&index), vec![12, 18]);
     }
 
     /// Bytes per entry on disk and write rate, for sizing the store walk.
