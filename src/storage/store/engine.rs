@@ -51,7 +51,7 @@ use thiserror::Error;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
-const FORK_BLOCK_EVENT_WAIT: Duration = Duration::from_secs(30);
+const FORK_BLOCK_EVENT_WAIT: Duration = Duration::from_secs(90);
 const FORK_BLOCK_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Error, Debug)]
