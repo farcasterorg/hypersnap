@@ -789,8 +789,7 @@ mod tests {
         assert_eq!(checkpoint(2).unwrap(), 0);
         drop(index);
 
-        // The new mark and the pending walk survive another restart, and the
-        // walk completes the index again.
+        // The new mark and the pending walk survive another restart.
         let index = open();
         assert!(!index.is_complete());
         assert_eq!(
@@ -801,9 +800,8 @@ mod tests {
         assert!(index.is_complete());
     }
 
-    /// A finished index with no mark for a shard walks it again even when the
-    /// walk never left a checkpoint for it; a first start on an empty database
-    /// doesn't.
+    /// A shard with no mark is walked again when the walk got past any of its
+    /// FIDs or the index is finished, but not on a first start.
     #[test]
     fn test_a_shard_without_a_mark_or_checkpoint() {
         let dir = tempfile::tempdir().unwrap();
@@ -821,6 +819,13 @@ mod tests {
         let index = open();
         assert!(index.replay_ranges(&HashMap::from([(1, 0)])).is_empty());
         assert!(!index.is_complete());
+        // A walk still under way, part of the way through shard 3.
+        save_shard_checkpoint(&index.db, CHECKPOINT_NAME, 3, 500).unwrap();
+        assert!(index.replay_ranges(&HashMap::from([(3, 4)])).is_empty());
+        assert_eq!(
+            try_load_shard_checkpoint(&index.db, CHECKPOINT_NAME, 3).unwrap(),
+            0
+        );
         index.backfill().unwrap();
         assert_eq!(
             index.replay_ranges(&HashMap::from([(1, 2), (2, 3)])),
