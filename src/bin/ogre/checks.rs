@@ -632,6 +632,10 @@ fn differences(
             }
         }
         (Value::Array(b), Value::Array(u)) => {
+            // Fewer items fail in shrunk(); more are worth a look.
+            if b.len() != u.len() {
+                other.push(format!("{path} ({} -> {} items)", b.len(), u.len()));
+            }
             for (i, j) in by_id(b, u).into_iter().enumerate() {
                 let p = format!("{path}[{i}]");
                 match j {
@@ -790,7 +794,7 @@ pub async fn endpoints(
 /// say nothing about the build: `<route> <JSON path>  why`, as in accepted.txt.
 const VOLATILE: &str = "
 /v1/info .version              the node's own build
-/v1/info .peerId               the node's own identity
+/v1/info .peer_id              the node's own identity
 /v1/info .dbStats.numMessages  grows with the tip, which the nodes reach a moment apart
 /v1/info .dbStats.approxSize   an estimate of each node's own database files
 /v1/info .shardInfos           each node's own heights, delays, mempools and sizes
@@ -1550,7 +1554,9 @@ mod tests {
             ),
             (vec![], 2)
         );
-        // and so does a field under an item paired by position
+        // an array of another length is worth a warning
+        assert_eq!(wrong(json!({"v": [1]}), json!({"v": [1, 2]})), (vec![], 1));
+        // a field under an item paired by position only warns
         assert_eq!(
             wrong(json!([{"v": [user("a")]}]), json!([{"v": [user("b")]}])),
             (vec![], 1)
