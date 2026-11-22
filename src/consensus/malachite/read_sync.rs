@@ -38,9 +38,8 @@ type Timers = TimerScheduler<Timeout>;
 /// stay below its `max_num_buffered_blocks` (100) or they are dropped.
 pub(crate) const SYNC_WINDOW: u64 = 32;
 
-/// Heights that were answered but aren't committed are asked for again once nothing has been
-/// committed for this long: the answer had no block, or the host dropped it (bad certificate,
-/// failed commit, full buffer).
+/// Heights whose block reached the host but isn't committed are asked for again once nothing has
+/// been committed for this long: the host dropped the block (bad certificate, failed commit).
 const RETRY_AFTER: Duration = Duration::from_secs(5);
 
 pub type SyncRef = ActorRef<Msg>;
@@ -463,32 +462,32 @@ impl ReadSync {
             Msg::NetworkEvent(NetworkEvent::Response(request_id, peer, response)) => {
                 // Cancel the timer associated with the request for which we just received a response
                 state.timers.cancel(&Timeout::Request(request_id.clone()));
-                let requested = state.inflight.remove(&request_id);
+                // Clear the request by the height asked for, whatever the answer: a peer that
+                // answers with another height or another kind of response must not leave it
+                // pending for good. An answer that came after its request timed out matches
+                // nothing, since a newer request may be out for that height.
+                let requested = match state.inflight.remove(&request_id) {
+                    Some(InflightRequest {
+                        request: Request::ValueRequest(request),
+                        ..
+                    }) => Some(request.height),
+                    _ => None,
+                };
+                if let Some(height) = requested {
+                    state.sync.remove_pending_decided_value_request(height);
+                }
 
                 match response {
                     Response::ValueResponse(value_response) => {
-                        // The sync state machine clears the pending request by the height the
-                        // peer claims; clear the one asked for too, or a peer answering with
-                        // another height would leave it pending for good.
-                        let requested = match requested {
-                            Some(InflightRequest {
-                                request: Request::ValueRequest(request),
-                                ..
-                            }) => Some(request.height),
-                            _ => None,
-                        };
-                        if let Some(height) = requested {
-                            state.sync.remove_pending_decided_value_request(height);
-                        }
+                        self.metrics
+                            .decided_value_response_received(value_response.height.block_number);
                         // Responses come from arbitrary peers. A malformed one is dropped here and
                         // its height asked for again straight away.
                         match Self::decode_value_response(&value_response) {
                             Ok(value) => {
                                 debug!(peer_id = %peer, height = %value_response.height, "Received sync value response");
-                                // An answer that came after its request timed out isn't tracked:
-                                // a newer request may be out for that height.
-                                if let Some(height) = requested {
-                                    state.received.insert(height.block_number);
+                                if requested == Some(value_response.height) {
+                                    state.received.insert(value_response.height.block_number);
                                 }
                                 self.host.cast(ReadHostMsg::ProcessDecidedValue {
                                     value: proto::DecidedValue { value: Some(value) },
@@ -499,12 +498,6 @@ impl ReadSync {
                                 warn!(peer_id = %peer, height = %value_response.height, "Dropping malformed sync value response: {}", err);
                             }
                         }
-                        self.process_input(
-                            &myself,
-                            state,
-                            sync::Input::ValueResponse(request_id, peer, value_response),
-                        )
-                        .await?;
 
                         if state.initial_sync_first_completed() {
                             self.host.cast(ReadHostMsg::InitialSyncCompleted)?;
