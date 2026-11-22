@@ -51,8 +51,21 @@ use thiserror::Error;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
-const FORK_BLOCK_EVENT_WAIT: Duration = Duration::from_secs(90);
-const FORK_BLOCK_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// How often a certified chunk waiting on shard zero re-checks shard zero's committed height.
+const SHARD_ZERO_DEPENDENCY_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// How often that wait is reported. The wait has no deadline: the chunk is certified, so the only
+/// way forward is to apply it once shard zero has committed the block whose events it consumes.
+/// Elapsed time drives alerts, never a give-up.
+const SHARD_ZERO_DEPENDENCY_ALERT_INTERVAL: Duration = Duration::from_secs(30);
+/// Upper bound on the post-fork shard-zero events one proposal consumes. A data shard that fell
+/// behind the shard-zero log catches up over successive chunks.
+pub const MAX_FORK_EVENTS_PER_CHUNK: u64 = 256;
+
+fn unix_seconds_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
 
 #[derive(Error, Debug)]
 pub enum EngineError {
@@ -87,6 +100,20 @@ pub enum EngineError {
         "fork block event {seqnum} from block {block_number} is not committed on shard zero yet"
     )]
     MissingForkBlockEvent { seqnum: u64, block_number: u64 },
+
+    #[error(
+        "fork block event {seqnum} is absent from shard-zero block {block_number}, which this node has committed"
+    )]
+    ForkBlockEventAbsent { seqnum: u64, block_number: u64 },
+
+    #[error("certified shard chunk is malformed: {0}")]
+    MalformedCertifiedChunk(String),
+
+    #[error("committed shard state disagrees with certified history: {0}")]
+    CommittedStateDiverged(String),
+
+    #[error("unable to persist commit: {0}")]
+    CommitPersistError(String),
 
     #[error("Replicator merge error: {0}")]
     ReplicatorError(String),
@@ -207,9 +234,38 @@ pub struct ShardEngine {
     /// yet. Checked once, on the first successful commit after start, so a
     /// resolved halt stops being reported without costing a read per block.
     halt_record_checked: bool,
+    /// Set by `check_committed_state` when the database holds state past its certified tip.
+    /// Until the next certified chunk proves that state, the engine endorses nothing.
+    ahead_of_certified_tip: Option<AheadOfCertifiedTip>,
     fname_signer_address: Option<alloy_primitives::Address>,
     post_commit_tx: Option<mpsc::Sender<PostCommitMessage>>,
     pub mempool_poller: MempoolPoller,
+}
+
+/// State written by a commit whose chunk never landed: a binary from before commits were atomic
+/// crashed between the two writes, or a snapshot was taken between them. The state (and any
+/// storage-lending or key event it consumed) is already applied, so it must be proven by the next
+/// certified chunk rather than replayed a second time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AheadOfCertifiedTip {
+    /// Stored tip, the last height certified history accounts for.
+    pub certified_height: u64,
+    /// Last post-fork event the certified history up to the tip consumed.
+    pub certified_fork_seqnum: u64,
+    /// Last post-fork event the database has applied.
+    pub local_fork_seqnum: u64,
+}
+
+/// Result of checking the committed state against certified history at startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommittedStateCheck {
+    /// The stored tip, the applied event cursor and the state root agree.
+    Consistent,
+    /// Retained history does not reach a post-fork event, so the cursor could not be checked.
+    Unverifiable { reason: String },
+    /// The database holds state beyond the certified tip. The engine will not sign values until
+    /// the next certified chunk proves it.
+    AheadOfCertifiedTip(AheadOfCertifiedTip),
 }
 
 impl ShardEngine {
@@ -303,6 +359,7 @@ impl ShardEngine {
             },
             pending_txn: None,
             halt_record_checked: false,
+            ahead_of_certified_tip: None,
             fname_signer_address,
             post_commit_tx,
         })
@@ -374,6 +431,7 @@ impl ShardEngine {
         );
 
         let version = self.version_for(timestamp);
+        let messages = self.with_fork_events_from_log(messages, version)?;
         let mut snapchain_txns = MempoolPoller::create_transactions_from_mempool(messages)?
             .into_iter()
             .filter_map(|mut transaction| {
@@ -461,6 +519,55 @@ impl ShardEngine {
         self.stores
             .event_handler
             .set_current_height(height.block_number);
+    }
+
+    /// Post-fork events come from the certified shard-zero log, not the mempool: take the next
+    /// consecutive run after this shard's committed cursor, at most `MAX_FORK_EVENTS_PER_CHUNK`,
+    /// stopping at the first seqnum shard zero has not committed. Reading the log removes
+    /// nothing, so events an unsuccessful round proposed stay eligible until a chunk commits them.
+    /// Copies the mempool offers are dropped in favour of the log's.
+    fn with_fork_events_from_log(
+        &self,
+        mut messages: Vec<MempoolMessage>,
+        version: EngineVersion,
+    ) -> Result<Vec<MempoolMessage>, EngineError> {
+        let base = crate::native_registration::FORK_EVENT_BASE;
+        messages.retain(|message| {
+            !matches!(message, MempoolMessage::BlockEvent { message, .. } if message.seqnum() > base)
+        });
+        if !version.is_enabled(ProtocolFeature::ReadDataFromShardZero) {
+            return Ok(messages);
+        }
+        let next_height = self
+            .stores
+            .shard_store
+            .max_block_number()
+            .map_err(|e| HubError::internal_db_error(&e.to_string()))?
+            .saturating_add(1);
+        if !self
+            .stores
+            .native_registration
+            .active(self.shard_id, next_height)
+        {
+            return Ok(messages);
+        }
+        let Some(authority) = &self.stores.native_authority else {
+            return Ok(messages);
+        };
+        let log = crate::storage::store::account::BlockEventStore::new(authority.clone());
+        let cursor = self.stores.block_event_store.max_seqnum()?.max(base);
+        let mut proposal = Vec::with_capacity(messages.len() + 8);
+        for seqnum in cursor + 1..=cursor + MAX_FORK_EVENTS_PER_CHUNK {
+            let Some(event) = log.get_block_event_by_seqnum(seqnum)? else {
+                break;
+            };
+            proposal.push(MempoolMessage::BlockEvent {
+                for_shard: self.shard_id,
+                message: event,
+            });
+        }
+        proposal.extend(messages);
+        Ok(proposal)
     }
 
     pub fn propose_state_change(
@@ -2757,12 +2864,61 @@ impl ShardEngine {
             )
     }
 
+    /// Validate a proposal before voting for it.
     pub fn validate_shard_chunk(&mut self, shard_chunk: &ShardChunk) -> bool {
-        let Some(header) = shard_chunk.header.as_ref() else {
+        if let Some(ahead) = &self.ahead_of_certified_tip {
+            warn!(
+                shard_id = self.shard_id,
+                certified_height = ahead.certified_height,
+                "Not endorsing a proposal while committed state runs past the certified tip"
+            );
             return false;
+        }
+        matches!(self.validate_shard_chunk_result(shard_chunk), Ok(()))
+    }
+
+    /// Validate a chunk that arrives with a commit certificate (sync). A chunk whose only problem
+    /// is a shard-zero block this node has not committed yet is accepted here: the commit path
+    /// retains it and applies it once shard zero catches up, and still treats mismatched event
+    /// contents and state roots as hard failures.
+    pub fn validate_certified_shard_chunk(&mut self, shard_chunk: &ShardChunk) -> bool {
+        if self.ahead_of_certified_tip.is_some() {
+            return match self.verify_adoptable(shard_chunk) {
+                Ok(()) => true,
+                Err(err) => {
+                    error!(
+                        shard_id = self.shard_id,
+                        "Certified chunk does not prove the state past the tip: {}", err
+                    );
+                    false
+                }
+            };
+        }
+        match self.validate_shard_chunk_result(shard_chunk) {
+            Ok(()) => true,
+            Err(EngineError::MissingForkBlockEvent {
+                seqnum,
+                block_number,
+            }) if self.shard_zero_height().is_ok_and(|h| h < block_number) => {
+                info!(
+                    shard_id = self.shard_id,
+                    seqnum,
+                    shard_zero_height_needed = block_number,
+                    "Deferring a certified chunk to commit until shard zero has its events"
+                );
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn validate_shard_chunk_result(&mut self, shard_chunk: &ShardChunk) -> Result<(), EngineError> {
+        let malformed = |reason: &str| Err(EngineError::MalformedCertifiedChunk(reason.into()));
+        let Some(header) = shard_chunk.header.as_ref() else {
+            return malformed("missing header");
         };
         let Some(height) = header.height else {
-            return false;
+            return malformed("missing height");
         };
         if !self.transactions_root_matches(shard_chunk) {
             error!(
@@ -2770,7 +2926,7 @@ impl ShardEngine {
                 height = height.block_number,
                 "Shard chunk transactions do not match its header"
             );
-            return false;
+            return malformed("transactions do not match the header");
         }
         let timestamp = FarcasterTime::new(header.timestamp);
         // TODO(aditi): Something seems wrong here. The proposer shouldn't need to provide [events] and [max_block_event_seqnum] becuase those are derived from [transactions]. We probably need a different type for this. We're providing empty values here because the engine needs to compute them.
@@ -2783,7 +2939,7 @@ impl ShardEngine {
             events: vec![],
             max_block_event_seqnum: 0,
         };
-        self.validate_state_change(&state, height)
+        self.validate_state_change_result(&state, height)
     }
 
     pub fn validate_state_change(
@@ -2791,6 +2947,15 @@ impl ShardEngine {
         shard_state_change: &ShardStateChange,
         height: Height,
     ) -> bool {
+        self.validate_state_change_result(shard_state_change, height)
+            .is_ok()
+    }
+
+    fn validate_state_change_result(
+        &mut self,
+        shard_state_change: &ShardStateChange,
+        height: Height,
+    ) -> Result<(), EngineError> {
         let mut txn = RocksDbTransactionBatch::new();
 
         let now = std::time::Instant::now();
@@ -2798,7 +2963,7 @@ impl ShardEngine {
         let shard_root = &shard_state_change.new_state_root;
         // We ignore the events here, we don't know what they are yet. If state roots match, the events should match
 
-        let mut result = true;
+        let mut result = Ok(());
 
         let count_fn = self.metrics.make_count_fn();
         let count_callback = move |read_count: (u64, u64)| {
@@ -2831,7 +2996,7 @@ impl ShardEngine {
                     "State change validation failed: {}",
                     err
                 );
-                result = false;
+                result = Err(err);
             }
             Ok((events, max_block_event_seqnum)) => {
                 let block_events_hash =
@@ -2854,7 +3019,7 @@ impl ShardEngine {
         self.metrics
             .time_with_shard("validate_time", elapsed.as_millis() as u64);
 
-        if result {
+        if result.is_ok() {
             self.metrics.count("validate.true", 1, vec![]);
             self.metrics.count("validate.false", 0, vec![]);
         } else {
@@ -2873,13 +3038,16 @@ impl ShardEngine {
         }
         counts_by_type
     }
+    /// Commit one height: the chunk, its timestamp index, the state it produced, its hub events
+    /// and the applied-event cursor go into a single RocksDB transaction. Nothing is published
+    /// (hub events, post-commit hooks) unless that transaction commits.
     pub async fn commit_and_emit_events(
         &mut self,
         shard_chunk: &ShardChunk,
         mut events: Vec<HubEvent>,
         max_block_event_seqnum: u64,
         mut txn: RocksDbTransactionBatch,
-    ) {
+    ) -> Result<(), EngineError> {
         let header = shard_chunk.header.as_ref().unwrap();
         let height = header.height.as_ref().unwrap();
         let mut event_counts_by_type = Self::compute_event_counts_by_type(&events);
@@ -2903,6 +3071,20 @@ impl ShardEngine {
             .unwrap();
         events.insert(0, block_confirmed);
 
+        self.stores
+            .shard_store
+            .put_shard_chunk_in_txn(shard_chunk, &mut txn)
+            .map_err(|err| EngineError::CommitPersistError(err.to_string()))?;
+        node_local_state::LocalStateStore::put_commit_cursor(
+            &mut txn,
+            self.shard_id,
+            node_local_state::CommitCursor {
+                height: height.block_number,
+                block_event_seqnum: max_block_event_seqnum,
+            },
+        );
+        node_local_state::LocalStateStore::delete_pending_certified_chunk(&mut txn, self.shard_id);
+
         self.metrics
             .gauge("block_event_seqnum", max_block_event_seqnum);
         // Per-block HubEvent total (BlockConfirmed already inserted above, so this is
@@ -2915,24 +3097,22 @@ impl ShardEngine {
         _ = self.emit_commit_metrics(&shard_chunk, &events);
 
         let now = std::time::Instant::now();
-        self.db.commit(txn).unwrap();
+        if let Err(err) = self.db.commit(txn) {
+            // Nothing landed. Drop the staged trie changes so the engine stays at the old tip.
+            self.stores.trie.reload(&self.db)?;
+            return Err(EngineError::CommitPersistError(err.to_string()));
+        }
+        self.stores.trie.reload(&self.db)?;
         for mut event in events {
             event.timestamp = header.timestamp;
             let _ = self.senders.events_tx.send(event);
-        }
-        self.stores.trie.reload(&self.db).unwrap();
-
-        match self.stores.shard_store.put_shard_chunk(shard_chunk) {
-            Err(err) => {
-                error!("Unable to write shard chunk to store {}", err)
-            }
-            Ok(()) => {}
         }
         let elapsed = now.elapsed();
         self.metrics
             .time_with_shard("commit_time", elapsed.as_millis() as u64);
         self.post_commit(shard_chunk.header.as_ref().unwrap().clone())
             .await;
+        Ok(())
     }
 
     fn emit_commit_metrics(
@@ -3130,32 +3310,131 @@ impl ShardEngine {
         true
     }
 
-    async fn wait_for_fork_block_event(
-        &self,
-        seqnum: u64,
-        block_number: u64,
-        deadline: tokio::time::Instant,
-    ) -> Result<(), EngineError> {
+    /// Highest shard-zero block whose post-fork events `shard_chunk` consumes, if any.
+    fn shard_zero_height_needed(shard_chunk: &ShardChunk) -> Option<u64> {
+        Self::fork_events_in(&shard_chunk.transactions)
+            .map(|event| event.block_number())
+            .max()
+    }
+
+    /// Post-fork shard-zero events carried by `transactions`, in seqnum order.
+    fn fork_events_in(transactions: &[Transaction]) -> impl Iterator<Item = &BlockEvent> {
+        transactions
+            .iter()
+            .flat_map(|txn| &txn.system_messages)
+            .filter_map(|msg| msg.block_event.as_ref())
+            .filter(|event| event.seqnum() > crate::native_registration::FORK_EVENT_BASE)
+            .sorted_by_key(|event| event.seqnum())
+    }
+
+    /// Highest block shard zero has committed on this node. Shard zero commits a block's events
+    /// in the same transaction as the block, so every event of every block at or below this
+    /// height is readable from its log.
+    fn shard_zero_height(&self) -> Result<u64, EngineError> {
         let authority =
             self.stores.native_authority.as_ref().ok_or_else(|| {
                 HubError::invalid_internal_state("fork event authority unavailable")
             })?;
-        let events = crate::storage::store::account::BlockEventStore::new(authority.clone());
-        tokio::time::timeout_at(deadline, async {
-            while events.get_block_event_by_seqnum(seqnum)?.is_none() {
-                tokio::time::sleep(FORK_BLOCK_EVENT_POLL_INTERVAL).await;
-            }
-            Ok(())
-        })
-        .await
-        .unwrap_or(Err(EngineError::MissingForkBlockEvent {
-            seqnum,
-            block_number,
-        }))
+        crate::storage::store::block::BlockStore::new(authority.clone())
+            .max_block_number()
+            .map_err(|err| HubError::internal_db_error(&err.to_string()).into())
     }
 
+    /// Wait, without a deadline, until shard zero has committed `needed`. Shard zero syncs on its
+    /// own actor; this only polls its committed height. Elapsed time is reported for alerting.
+    async fn wait_for_shard_zero_height(
+        &self,
+        height: u64,
+        needed: u64,
+        waiting_since_unix_seconds: u64,
+    ) -> Result<(), EngineError> {
+        let mut next_alert = tokio::time::Instant::now() + SHARD_ZERO_DEPENDENCY_ALERT_INTERVAL;
+        loop {
+            let shard_zero_height = self.shard_zero_height()?;
+            if shard_zero_height >= needed {
+                self.metrics.gauge("commit.shard_zero_wait_seconds", 0);
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= next_alert {
+                let waited = unix_seconds_now().saturating_sub(waiting_since_unix_seconds);
+                self.metrics.gauge("commit.shard_zero_wait_seconds", waited);
+                warn!(
+                    shard_id = self.shard_id,
+                    height,
+                    shard_zero_height,
+                    shard_zero_height_needed = needed,
+                    waited_seconds = waited,
+                    "Certified chunk is still waiting for shard zero"
+                );
+                next_alert += SHARD_ZERO_DEPENDENCY_ALERT_INTERVAL;
+            }
+            tokio::time::sleep(SHARD_ZERO_DEPENDENCY_POLL_INTERVAL).await;
+        }
+    }
+
+    /// Apply a decided chunk on the consensus path. Hard failures (an event whose contents differ
+    /// from shard zero's, a state root the transactions do not reproduce, a database that
+    /// disagrees with certified history) stop the shard. A missing shard-zero dependency does not:
+    /// the chunk is retained and applied once shard zero has the events it names.
     pub async fn commit_shard_chunk(&mut self, shard_chunk: &ShardChunk) {
-        let shard_root = &shard_chunk.header.as_ref().unwrap().shard_root;
+        if let Err(err) = self.commit_certified_shard_chunk(shard_chunk).await {
+            let block_number = shard_chunk
+                .header
+                .as_ref()
+                .and_then(|header| header.height)
+                .map_or(0, |height| height.block_number);
+            // Persist before panicking. The panic below is caught by
+            // ractor, which stops the ReadHost actor but leaves the
+            // process up and unsupervised — so this `error!` is the only
+            // statement of the cause, and it scrolls out of the log while
+            // the shard stays dead and `read_sync` emits SendErr forever.
+            // The record is what an operator can still read afterwards.
+            node_local_state::LocalStateStore::record_shard_halt(
+                &self.db,
+                self.shard_id,
+                block_number,
+                &err.to_string(),
+            );
+            error!("State change commit failed: {}", err);
+            panic!("State change commit failed: {}", err);
+        }
+    }
+
+    /// Apply a certified chunk: one whose header carries a valid commit certificate. Returns an
+    /// error only for hard failures; it waits out missing shard-zero dependencies instead.
+    pub async fn commit_certified_shard_chunk(
+        &mut self,
+        shard_chunk: &ShardChunk,
+    ) -> Result<(), EngineError> {
+        let header = shard_chunk
+            .header
+            .as_ref()
+            .ok_or_else(|| EngineError::MalformedCertifiedChunk("missing header".into()))?;
+        let height = header
+            .height
+            .ok_or_else(|| EngineError::MalformedCertifiedChunk("missing height".into()))?;
+        // The certificate signs only the header; the transactions are bound to it through the
+        // transactions root. Check that before keeping the body around or waiting on it.
+        if !self.transactions_root_matches(shard_chunk) {
+            return Err(EngineError::MalformedCertifiedChunk(
+                "transactions do not match the header".into(),
+            ));
+        }
+        let confirmed = self.get_confirmed_height().block_number;
+        if self.get_last_shard_chunk().is_some() && height.block_number != confirmed + 1 {
+            return Err(EngineError::MalformedCertifiedChunk(format!(
+                "height {} does not follow the committed tip {}",
+                height.block_number, confirmed
+            )));
+        }
+
+        if self.ahead_of_certified_tip.is_some() {
+            self.adopt_certified_chunk(shard_chunk).await?;
+            self.clear_stale_halt_record();
+            return Ok(());
+        }
+
+        let shard_root = &header.shard_root;
         let transactions = &shard_chunk.transactions;
 
         let mut applied_cached_txn = false;
@@ -3169,7 +3448,7 @@ impl ShardEngine {
                     cached_txn.max_block_event_seqnum,
                     cached_txn.txn,
                 )
-                .await;
+                .await?;
             }
         } else {
             // is_cached_txn_valid emits its own miss metric when pending_txn
@@ -3189,15 +3468,12 @@ impl ShardEngine {
                     "No valid cached transaction to apply. Replaying proposal"
                 );
             }
-            let header = &shard_chunk.header.as_ref().unwrap();
-            let block_number = header.height.unwrap().block_number;
+            let block_number = height.block_number;
             let version = self.version_for(&FarcasterTime::new(header.timestamp));
 
-            let deadline = tokio::time::Instant::now() + FORK_BLOCK_EVENT_WAIT;
-            let mut txn;
-            let result = loop {
+            loop {
                 self.stores.event_handler.set_current_height(block_number);
-                txn = RocksDbTransactionBatch::new();
+                let mut txn = RocksDbTransactionBatch::new();
                 let count_fn = self.metrics.make_count_fn();
                 let count_callback = move |read_count: (u64, u64)| {
                     count_fn("trie.db_get_count.total", read_count.0, vec![]);
@@ -3213,61 +3489,127 @@ impl ShardEngine {
                     ProposalSource::Commit,
                     version,
                     &FarcasterTime::new(header.timestamp),
-                    header.height.unwrap(),
+                    height,
                 );
-                let Err(EngineError::MissingForkBlockEvent {
-                    seqnum,
-                    block_number: dependency_height,
-                }) = result
-                else {
-                    break result;
+                let (seqnum, dependency_height) = match result {
+                    Ok((events, max_block_event_seqnum)) => {
+                        self.commit_and_emit_events(
+                            shard_chunk,
+                            events,
+                            max_block_event_seqnum,
+                            txn,
+                        )
+                        .await?;
+                        break;
+                    }
+                    Err(EngineError::MissingForkBlockEvent {
+                        seqnum,
+                        block_number,
+                    }) => (seqnum, block_number),
+                    Err(err) => {
+                        // A failed replay may have staged writes in the in-memory trie.
+                        self.stores.trie.reload(&self.db)?;
+                        return Err(err);
+                    }
                 };
+                // A failed replay may have staged writes in the in-memory trie.
+                self.stores.trie.reload(&self.db)?;
+                if self.shard_zero_height()? >= dependency_height {
+                    // Shard zero has committed the block the chunk names, and the event is not
+                    // in it. Waiting cannot change that.
+                    return Err(EngineError::ForkBlockEventAbsent {
+                        seqnum,
+                        block_number: dependency_height,
+                    });
+                }
+                let needed = Self::shard_zero_height_needed(shard_chunk)
+                    .unwrap_or(dependency_height)
+                    .max(dependency_height);
+                let pending = self.retain_pending_certified_chunk(shard_chunk, needed)?;
                 warn!(
                     shard_id = self.shard_id,
                     height = block_number,
-                    dependency_height,
                     seqnum,
-                    "Waiting for shard zero before committing certified chunk"
+                    shard_zero_height_needed = needed,
+                    "Certified chunk needs a shard-zero block this node has not committed; retained it and waiting"
                 );
-                if let Err(err) = self
-                    .wait_for_fork_block_event(seqnum, dependency_height, deadline)
-                    .await
-                {
-                    break Err(err);
-                }
-                // A failed replay may have staged writes and changed the in-memory trie.
-                if let Err(err) = self.stores.trie.reload(&self.db) {
-                    break Err(err.into());
-                }
-            };
-
-            match result {
-                Err(err) => {
-                    // Persist before panicking. The panic below is caught by
-                    // ractor, which stops the ReadHost actor but leaves the
-                    // process up and unsupervised — so this `error!` is the only
-                    // statement of the cause, and it scrolls out of the log while
-                    // the shard stays dead and `read_sync` emits SendErr forever.
-                    // The record is what an operator can still read afterwards.
-                    node_local_state::LocalStateStore::record_shard_halt(
-                        &self.db,
-                        self.shard_id,
-                        block_number,
-                        &err.to_string(),
-                    );
-                    error!("State change commit failed: {}", err);
-                    panic!("State change commit failed: {}", err);
-                }
-                Ok((events, max_block_event_seqnum)) => {
-                    self.commit_and_emit_events(shard_chunk, events, max_block_event_seqnum, txn)
-                        .await;
-                }
+                self.wait_for_shard_zero_height(
+                    block_number,
+                    needed,
+                    pending.waiting_since_unix_seconds,
+                )
+                .await?;
             }
         }
 
-        // A commit got through, so any halt on record belongs to a previous run
-        // and has been resolved. Clearing it keeps the status endpoint from
-        // reporting a shard as dead after it recovered. Once per process.
+        self.clear_stale_halt_record();
+        Ok(())
+    }
+
+    /// Durably keep a certified chunk this node cannot apply yet, so the same chunk is retried
+    /// after a restart. Keeps the original wait start when the chunk is already retained.
+    fn retain_pending_certified_chunk(
+        &self,
+        shard_chunk: &ShardChunk,
+        shard_zero_height: u64,
+    ) -> Result<node_local_state::PendingCertifiedChunk, EngineError> {
+        let existing = node_local_state::LocalStateStore::read_pending_certified_chunk(
+            &self.db,
+            self.shard_id,
+        )
+        .map_err(|err| EngineError::CommitPersistError(err.to_string()))?;
+        let waiting_since_unix_seconds = match existing {
+            Some(existing) if existing.chunk == *shard_chunk => existing.waiting_since_unix_seconds,
+            _ => unix_seconds_now(),
+        };
+        let pending = node_local_state::PendingCertifiedChunk {
+            chunk: shard_chunk.clone(),
+            shard_zero_height,
+            waiting_since_unix_seconds,
+        };
+        node_local_state::LocalStateStore::put_pending_certified_chunk(
+            &self.db,
+            self.shard_id,
+            &pending,
+        )
+        .map_err(|err| EngineError::CommitPersistError(err.to_string()))?;
+        Ok(pending)
+    }
+
+    /// The certified chunk retained by an earlier run, if it is the next height to apply.
+    pub fn pending_certified_chunk(&self) -> Option<ShardChunk> {
+        let pending = node_local_state::LocalStateStore::read_pending_certified_chunk(
+            &self.db,
+            self.shard_id,
+        )
+        .ok()??;
+        let height = pending.chunk.header.as_ref()?.height?.block_number;
+        (height == self.get_confirmed_height().block_number + 1).then_some(pending.chunk)
+    }
+
+    /// Apply the certified chunk an earlier run retained, waiting for its shard-zero dependency
+    /// as long as needed. Returns whether a chunk was applied.
+    pub async fn resume_pending_certified_chunk(&mut self) -> Result<bool, EngineError> {
+        let Some(chunk) = self.pending_certified_chunk() else {
+            return Ok(false);
+        };
+        info!(
+            shard_id = self.shard_id,
+            height = chunk
+                .header
+                .as_ref()
+                .and_then(|h| h.height)
+                .map_or(0, |h| h.block_number),
+            "Resuming a certified chunk retained before restart"
+        );
+        self.commit_certified_shard_chunk(&chunk).await?;
+        Ok(true)
+    }
+
+    /// A commit got through, so any halt on record belongs to a previous run and has been
+    /// resolved. Clearing it keeps the status endpoint from reporting a shard as dead after it
+    /// recovered. Once per process.
+    fn clear_stale_halt_record(&mut self) {
         if !self.halt_record_checked {
             self.halt_record_checked = true;
             if node_local_state::LocalStateStore::read_shard_halt(&self.db, self.shard_id).is_some()
@@ -3279,6 +3621,298 @@ impl ShardEngine {
                 node_local_state::LocalStateStore::clear_shard_halt(&self.db, self.shard_id);
             }
         }
+    }
+
+    /// Whether the engine may endorse new values (propose, or vote for a proposal). False while
+    /// the database holds state the certified history has not accounted for.
+    pub fn can_sign_new_values(&self) -> bool {
+        self.ahead_of_certified_tip.is_none()
+    }
+
+    pub fn ahead_of_certified_tip(&self) -> Option<&AheadOfCertifiedTip> {
+        self.ahead_of_certified_tip.as_ref()
+    }
+
+    /// Last post-fork event consumed by certified history up to and including `tip_height`, read
+    /// from the stored chunks. `Ok(None)` means retained history ends before it says.
+    fn certified_fork_seqnum(&self, tip_height: u64) -> Result<Option<u64>, EngineError> {
+        let base = crate::native_registration::FORK_EVENT_BASE;
+        let Some(activation) = self
+            .stores
+            .native_registration
+            .activation_heights
+            .get(&self.shard_id.to_string())
+            .copied()
+        else {
+            return Ok(Some(base));
+        };
+        let mut height = tip_height;
+        loop {
+            if height < activation {
+                return Ok(Some(base));
+            }
+            let chunk = self
+                .stores
+                .shard_store
+                .get_chunk_by_height(height)
+                .map_err(|err| HubError::internal_db_error(&err.to_string()))?;
+            let Some(chunk) = chunk else {
+                return Ok(None);
+            };
+            if let Some(last) = Self::fork_events_in(&chunk.transactions)
+                .map(|event| event.seqnum())
+                .max()
+            {
+                return Ok(Some(last));
+            }
+            if height == 0 {
+                return Ok(Some(base));
+            }
+            height -= 1;
+        }
+    }
+
+    /// Check the committed state against certified history. Run on startup (which includes right
+    /// after a snapshot restore) before this shard signs anything.
+    ///
+    /// The cursor is the last block-event seqnum the shard has applied. Certified history fixes
+    /// what it must be: each certified chunk consumes post-fork events consecutively, so the tip's
+    /// value is the last post-fork event in the newest chunk that carries one. A database whose
+    /// cursor or state root runs past that holds a commit whose chunk never landed. Its effects
+    /// (for example a storage lend) are already applied, so rewriting the cursor back would apply
+    /// them twice; instead the engine refuses to sign until the next certified chunk proves the
+    /// state (see `adopt_certified_chunk`). A cursor behind certified history cannot be repaired
+    /// here.
+    pub fn check_committed_state(&mut self) -> Result<CommittedStateCheck, EngineError> {
+        self.ahead_of_certified_tip = None;
+        let Some(tip) = self.get_last_shard_chunk() else {
+            return Ok(CommittedStateCheck::Consistent);
+        };
+        let tip_header = tip.header.as_ref().ok_or_else(|| {
+            EngineError::MalformedCertifiedChunk("stored tip has no header".into())
+        })?;
+        let tip_height = tip_header
+            .height
+            .ok_or_else(|| EngineError::MalformedCertifiedChunk("stored tip has no height".into()))?
+            .block_number;
+        let base = crate::native_registration::FORK_EVENT_BASE;
+        let local_seqnum = self.stores.block_event_store.max_seqnum()?;
+        let local_fork_seqnum = local_seqnum.max(base);
+        let state_matches_tip = self.stores.trie.root_hash()? == tip_header.shard_root;
+
+        let cursor = node_local_state::LocalStateStore::read_commit_cursor(&self.db, self.shard_id)
+            .map_err(|err| EngineError::CommitPersistError(err.to_string()))?;
+        let certified_fork_seqnum = match cursor {
+            Some(cursor) if cursor.height == tip_height => {
+                Some(cursor.block_event_seqnum.max(base))
+            }
+            Some(cursor) => {
+                return Err(EngineError::CommittedStateDiverged(format!(
+                    "commit cursor is at height {} but the stored tip is {}",
+                    cursor.height, tip_height
+                )))
+            }
+            None => self.certified_fork_seqnum(tip_height)?,
+        };
+
+        let Some(certified_fork_seqnum) = certified_fork_seqnum else {
+            let reason = format!(
+                "retained history below tip {tip_height} has no post-fork event to check cursor {local_seqnum} against; if this shard was bootstrapped by replication, restore it from a snapshot (docs/snapshots.md)"
+            );
+            warn!(shard_id = self.shard_id, "{reason}");
+            return Ok(CommittedStateCheck::Unverifiable { reason });
+        };
+
+        if local_fork_seqnum < certified_fork_seqnum {
+            if !state_matches_tip {
+                return Err(EngineError::CommittedStateDiverged(format!(
+                    "applied event cursor {local_fork_seqnum} is behind certified history ({certified_fork_seqnum} at height {tip_height}); restore this shard from a snapshot"
+                )));
+            }
+            // The state is the certified tip's (replication bootstrap writes state and the tip
+            // chunk but not this shard's event rows), so those events' effects are already in
+            // it. Record them from the certified shard-zero log without applying them again.
+            self.record_events_proven_by_state(&tip, local_fork_seqnum, certified_fork_seqnum)?;
+            return Ok(CommittedStateCheck::Consistent);
+        }
+        if local_fork_seqnum == certified_fork_seqnum && state_matches_tip {
+            if cursor.is_none() {
+                // First start on a database from before the cursor existed: record the value
+                // certified history just confirmed.
+                let mut txn = RocksDbTransactionBatch::new();
+                node_local_state::LocalStateStore::put_commit_cursor(
+                    &mut txn,
+                    self.shard_id,
+                    node_local_state::CommitCursor {
+                        height: tip_height,
+                        block_event_seqnum: local_seqnum,
+                    },
+                );
+                self.db
+                    .commit(txn)
+                    .map_err(|err| EngineError::CommitPersistError(err.to_string()))?;
+            }
+            return Ok(CommittedStateCheck::Consistent);
+        }
+
+        let ahead = AheadOfCertifiedTip {
+            certified_height: tip_height,
+            certified_fork_seqnum,
+            local_fork_seqnum,
+        };
+        error!(
+            shard_id = self.shard_id,
+            certified_height = tip_height,
+            certified_fork_seqnum,
+            local_fork_seqnum,
+            state_matches_tip,
+            "Committed state runs past the certified tip; not signing until the next certified chunk proves it"
+        );
+        self.ahead_of_certified_tip = Some(ahead.clone());
+        Ok(CommittedStateCheck::AheadOfCertifiedTip(ahead))
+    }
+
+    /// Write the event rows `(from, through]` and the cursor for a database whose state root
+    /// already equals the certified tip's. Each row comes from the certified shard-zero log and
+    /// must match the copy the tip chunk carries, if it carries one. Nothing is applied.
+    fn record_events_proven_by_state(
+        &mut self,
+        tip: &ShardChunk,
+        from: u64,
+        through: u64,
+    ) -> Result<(), EngineError> {
+        let tip_height = tip.header.as_ref().unwrap().height.unwrap().block_number;
+        let authority =
+            self.stores.native_authority.as_ref().ok_or_else(|| {
+                HubError::invalid_internal_state("fork event authority unavailable")
+            })?;
+        let log = crate::storage::store::account::BlockEventStore::new(authority.clone());
+        let in_tip: HashMap<u64, &BlockEvent> = Self::fork_events_in(&tip.transactions)
+            .map(|event| (event.seqnum(), event))
+            .collect();
+        let mut txn = RocksDbTransactionBatch::new();
+        for seqnum in from + 1..=through {
+            let event = log.get_block_event_by_seqnum(seqnum)?.ok_or_else(|| {
+                EngineError::CommittedStateDiverged(format!(
+                    "certified history consumed event {seqnum}, which shard zero has not committed on this node; let shard zero sync, then restart"
+                ))
+            })?;
+            if in_tip
+                .get(&seqnum)
+                .is_some_and(|carried| **carried != event)
+            {
+                return Err(EngineError::CommittedStateDiverged(format!(
+                    "event {seqnum} in the certified tip differs from shard zero's log"
+                )));
+            }
+            self.stores
+                .block_event_store
+                .put_block_event(&event, &mut txn)?;
+        }
+        node_local_state::LocalStateStore::put_commit_cursor(
+            &mut txn,
+            self.shard_id,
+            node_local_state::CommitCursor {
+                height: tip_height,
+                block_event_seqnum: through,
+            },
+        );
+        self.db
+            .commit(txn)
+            .map_err(|err| EngineError::CommitPersistError(err.to_string()))?;
+        warn!(
+            shard_id = self.shard_id,
+            tip_height, from, through, "Recorded event rows the certified state already reflects"
+        );
+        Ok(())
+    }
+
+    /// Whether `shard_chunk`, the next certified height, accounts for exactly the state this
+    /// database holds past its tip: the state root must equal the chunk's, and the chunk's
+    /// post-fork events must be exactly the ones applied past the certified cursor, byte for byte.
+    fn verify_adoptable(&self, shard_chunk: &ShardChunk) -> Result<(), EngineError> {
+        let ahead = self
+            .ahead_of_certified_tip
+            .as_ref()
+            .ok_or_else(|| HubError::invalid_internal_state("no state to adopt"))?;
+        let header = shard_chunk
+            .header
+            .as_ref()
+            .ok_or_else(|| EngineError::MalformedCertifiedChunk("missing header".into()))?;
+        let height = header
+            .height
+            .ok_or_else(|| EngineError::MalformedCertifiedChunk("missing height".into()))?
+            .block_number;
+        if height != ahead.certified_height + 1 {
+            return Err(EngineError::CommittedStateDiverged(format!(
+                "expected certified height {} to account for the state past the tip, got {}",
+                ahead.certified_height + 1,
+                height
+            )));
+        }
+        if self.stores.trie.root_hash()? != header.shard_root {
+            return Err(EngineError::CommittedStateDiverged(format!(
+                "state past tip {} is not the state certified at height {}; restore this shard from a snapshot",
+                ahead.certified_height, height
+            )));
+        }
+        let mut expected = ahead.certified_fork_seqnum;
+        for event in Self::fork_events_in(&shard_chunk.transactions) {
+            expected += 1;
+            let applied = self
+                .stores
+                .block_event_store
+                .get_block_event_by_seqnum(event.seqnum())?;
+            if event.seqnum() != expected || applied.as_ref() != Some(event) {
+                return Err(EngineError::CommittedStateDiverged(format!(
+                    "certified height {height} consumes event {} but this database applied {}",
+                    event.seqnum(),
+                    applied.map_or("nothing there".to_string(), |e| format!(
+                        "event {}",
+                        e.seqnum()
+                    ))
+                )));
+            }
+        }
+        if expected != ahead.local_fork_seqnum {
+            return Err(EngineError::CommittedStateDiverged(format!(
+                "certified height {height} consumes events through {expected} but this database applied through {}; restore this shard from a snapshot",
+                ahead.local_fork_seqnum
+            )));
+        }
+        Ok(())
+    }
+
+    /// Record the next certified chunk over state that already reflects it, without applying its
+    /// transactions again. The chunk, its index and the cursor commit together.
+    async fn adopt_certified_chunk(&mut self, shard_chunk: &ShardChunk) -> Result<(), EngineError> {
+        self.verify_adoptable(shard_chunk)?;
+        let header = shard_chunk.header.as_ref().unwrap();
+        let height = header.height.unwrap().block_number;
+        let mut txn = RocksDbTransactionBatch::new();
+        self.stores
+            .shard_store
+            .put_shard_chunk_in_txn(shard_chunk, &mut txn)
+            .map_err(|err| EngineError::CommitPersistError(err.to_string()))?;
+        node_local_state::LocalStateStore::put_commit_cursor(
+            &mut txn,
+            self.shard_id,
+            node_local_state::CommitCursor {
+                height,
+                block_event_seqnum: self.stores.block_event_store.max_seqnum()?,
+            },
+        );
+        node_local_state::LocalStateStore::delete_pending_certified_chunk(&mut txn, self.shard_id);
+        self.db
+            .commit(txn)
+            .map_err(|err| EngineError::CommitPersistError(err.to_string()))?;
+        self.ahead_of_certified_tip = None;
+        warn!(
+            shard_id = self.shard_id,
+            height, "Certified chunk proves the state past the old tip; recorded it without replay"
+        );
+        self.post_commit(header.clone()).await;
+        Ok(())
     }
 
     pub fn simulate_message(

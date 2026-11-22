@@ -357,6 +357,12 @@ impl MessageMempoolExt for proto::Message {
     }
 }
 
+/// Post-fork shard-zero events are never queued: proposers read them from the shard-zero log.
+fn is_fork_block_event(message: &MempoolMessage) -> bool {
+    matches!(message, MempoolMessage::BlockEvent { message, .. }
+        if message.seqnum() > crate::native_registration::FORK_EVENT_BASE)
+}
+
 pub trait ValidatorMessageMempoolExt {
     fn mempool_key(&self) -> MempoolKey;
 }
@@ -963,22 +969,10 @@ impl Mempool {
                     match shard_messages.pop_first() {
                         None => break,
                         Some((key, next_message)) => {
-                            if let MempoolMessage::BlockEvent { message, for_shard } = &next_message
-                            {
-                                let stores = &self.read_node_mempool.shard_stores[for_shard];
-                                if message.seqnum() > crate::native_registration::FORK_EVENT_BASE
-                                    && !stores.native_registration.active(
-                                        *for_shard,
-                                        stores
-                                            .shard_store
-                                            .max_block_number()
-                                            .unwrap_or(0)
-                                            .saturating_add(1),
-                                    )
-                                {
-                                    shard_messages.insert(key, next_message);
-                                    break;
-                                }
+                            if is_fork_block_event(&next_message) {
+                                // Admitted before this node stopped queueing them. The proposer
+                                // reads post-fork events from the shard-zero log instead.
+                                continue;
                             }
                             self.remove_live_at_index_for_message(
                                 request.shard_id,
@@ -1224,6 +1218,12 @@ impl Mempool {
         message: MempoolMessage,
         source: MempoolSource,
     ) -> Result<(), HubError> {
+        if is_fork_block_event(&message) {
+            // Proposals take post-fork events straight from the certified shard-zero log,
+            // starting after the shard's committed cursor, and leave them there until a chunk
+            // commits them. A mempool copy would only be removed by an unsuccessful round.
+            return Ok(());
+        }
         match self.messages.get_mut(&shard_id) {
             Some(shard_messages) => {
                 if shard_messages.contains_key(&message.mempool_key()) {

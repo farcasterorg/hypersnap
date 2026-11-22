@@ -183,6 +183,21 @@ impl ShardValidator {
         self.started = true;
     }
 
+    /// Whether this node may build and sign a proposal. A data shard whose committed state runs
+    /// past its certified tip may not until a certified chunk proves that state.
+    pub fn can_propose(&self) -> bool {
+        self.shard_proposer
+            .as_ref()
+            .map_or(true, |proposer| proposer.can_propose())
+    }
+
+    /// Apply a certified chunk retained by an earlier run, before consensus starts a height.
+    pub async fn resume_pending_commit(&mut self) {
+        if let Some(shard_proposer) = &mut self.shard_proposer {
+            shard_proposer.resume_pending_commit().await;
+        }
+    }
+
     pub fn start_round(&mut self, height: Height, round: Round, proposer: Address) {
         if self.current_height.is_none() || self.current_height.unwrap() != height {
             self.height_started_at = Some(std::time::Instant::now());
@@ -298,7 +313,11 @@ impl ShardValidator {
         } else if let Some(block_proposer) = &mut self.block_proposer {
             block_proposer.add_proposed_value(full_proposal)
         } else if let Some(shard_proposer) = &mut self.shard_proposer {
-            shard_proposer.add_proposed_value(full_proposal)
+            if proposal_source == ProposalSource::Sync {
+                shard_proposer.add_certified_value(full_proposal)
+            } else {
+                shard_proposer.add_proposed_value(full_proposal)
+            }
         } else {
             panic!("No proposer set");
         };

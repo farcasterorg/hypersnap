@@ -5,7 +5,7 @@ resolver = "2"
 
 [package]
 name = "snapchain"
-version = "0.17.19"
+version = "0.17.20"
 edition = "2021"
 default-run = "hypersnap"
 
@@ -118,6 +118,8 @@ twox-hash = "1.6"
 
 [dev-dependencies]
 serial_test = "3.1.1"
+# Paused-clock tests for waits measured in minutes.
+tokio = { version = "1.40.0", features = ["full", "test-util"] }
 tracing-test = { version = "0.2.5", features = ["no-env-filter"] }
 insta = { version = "1.40", features = ["json"] }
 # Test-only access to JSON-RPC primitives (SerializedRequest, Response,

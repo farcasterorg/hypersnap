@@ -32,6 +32,8 @@ use tracing::{info, warn};
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum BootstrapMethod {
     Snapshot,
+    /// Copies state and the tip chunk but not a data shard's consumed shard-zero event rows,
+    /// so it cannot bootstrap a data shard past its fork. See docs/snapshots.md.
     Replicate,
 }
 

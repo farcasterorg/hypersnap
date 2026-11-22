@@ -42,6 +42,19 @@ impl ReadValidator {
         self.last_height = height;
     }
 
+    /// Apply a certified chunk an earlier run retained while it waited for shard zero, before
+    /// asking peers for anything newer. Waits for shard zero as long as needed.
+    pub async fn resume_pending_certified_chunk(&mut self) {
+        if let Engine::ShardEngine(engine) = &mut self.engine {
+            if let Err(err) = engine.resume_pending_certified_chunk().await {
+                error!(
+                    shard_id = self.shard_id,
+                    "Unable to apply the retained certified chunk: {}", err
+                );
+            }
+        }
+    }
+
     pub fn get_min_height(&self) -> Height {
         match &self.engine {
             Engine::BlockEngine(engine) => engine.get_min_height(),
@@ -57,15 +70,14 @@ impl ReadValidator {
                 Engine::ShardEngine(shard_engine),
                 Some(proto::decided_value::Value::Shard(shard_chunk)),
             ) => {
-                // The certificate signs only the header hash, so the transactions are bound to it
-                // solely through the state root. Check that without panicking before committing,
-                // since `commit_shard_chunk` treats a mismatch as fatal. This caches the replay, so
-                // the commit does not replay again.
-                if !shard_engine.validate_shard_chunk(shard_chunk) {
-                    error!(%height, hash = hex::encode(&shard_chunk.hash), "Dropping decided shard chunk whose transactions do not match its header");
+                // The certificate signs only the header hash; the commit checks the transactions
+                // against it (transactions root, then state root) and reports a mismatch instead of
+                // panicking. A shard-zero block this node has not committed yet is not a mismatch:
+                // the commit retains the chunk and applies it once shard zero catches up.
+                if let Err(err) = shard_engine.commit_certified_shard_chunk(shard_chunk).await {
+                    error!(%height, hash = hex::encode(&shard_chunk.hash), "Dropping decided shard chunk: {}", err);
                     return false;
                 }
-                shard_engine.commit_shard_chunk(&shard_chunk).await;
                 info!(
                     %height,
                     hash = hex::encode(&shard_chunk.hash),

@@ -171,7 +171,7 @@ impl SnapchainNode {
                 }
             };
 
-            let engine = engine.with_native_registration(
+            let mut engine = engine.with_native_registration(
                 config.native_registration.clone(),
                 block_stores.db.clone(),
             );
@@ -191,6 +191,22 @@ impl SnapchainNode {
                         err.to_string()
                     )
                 }
+            }
+
+            // Before this shard signs or serves anything: the stored tip, the applied event
+            // cursor and the state must agree with certified history. This also covers a database
+            // just restored from a snapshot, which happens before engines are opened.
+            if let Err(err) = engine.check_committed_state() {
+                crate::storage::store::node_local_state::LocalStateStore::record_shard_halt(
+                    &db,
+                    shard_id,
+                    engine.get_confirmed_height().block_number,
+                    &err.to_string(),
+                );
+                panic!(
+                    "Shard {} database disagrees with certified history: {}",
+                    shard_id, err
+                );
             }
 
             let shard_proposer = ShardProposer::new(

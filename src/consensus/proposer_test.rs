@@ -423,3 +423,116 @@ mod witness_security_regressions {
         assert_eq!(proposer.add_proposed_value(&valid), Validity::Valid);
     }
 }
+
+/// The race behind "Could not find proposed value ... Restarting Height": consensus decides a
+/// height and hears the next height's proposal before the commit reaches the engine.
+mod early_next_height_proposal {
+    use crate::consensus::proposer::{BlockProposer, Proposer};
+    use crate::core::types::{Address, Height, ShardId, SnapchainShard, WellFormedProposal};
+    use crate::core::util::{block_hash, expected_transactions_root, shard_witness_hash};
+    use crate::proto::{
+        full_proposal, Block, BlockHeader, Commits, FarcasterNetwork, FullProposal,
+        ShardChunkWitness, ShardWitness,
+    };
+    use crate::storage::store::block_engine::BlockEngine;
+    use crate::storage::store::{block_engine_test_helpers, test_helper};
+    use crate::version::version::EngineVersion;
+    use informalsystems_malachitebft_core_types::Validity;
+    use std::collections::HashMap;
+
+    /// The block `engine` would propose at `height`, as a proposal from validator 0.
+    fn propose(engine: &mut BlockEngine, height: Height) -> WellFormedProposal {
+        let state_change = engine.propose_state_change(vec![], height, None);
+        let version = EngineVersion::version_for(&state_change.timestamp, FarcasterNetwork::Devnet);
+        let shard_witness = ShardWitness {
+            shard_chunk_witnesses: vec![
+                ShardChunkWitness {
+                    height: Some(Height::new(1, height.block_number)),
+                    shard_hash: vec![1; 32],
+                    shard_root: vec![2; 32],
+                },
+                ShardChunkWitness {
+                    height: Some(Height::new(2, height.block_number)),
+                    shard_hash: vec![3; 32],
+                    shard_root: vec![4; 32],
+                },
+            ],
+        };
+        let header = BlockHeader {
+            parent_hash: vec![0; 32],
+            chain_id: FarcasterNetwork::Devnet as i32,
+            version: version.protocol_version(),
+            timestamp: state_change.timestamp.to_u64(),
+            height: Some(height),
+            shard_witnesses_hash: shard_witness_hash(&shard_witness),
+            state_root: state_change.new_state_root.clone(),
+            events_hash: state_change.events_hash.clone(),
+            transactions_root: expected_transactions_root(&state_change.transactions, version),
+        };
+        WellFormedProposal::try_from(FullProposal {
+            height: Some(height),
+            round: 0,
+            proposer: Address([0u8; 32]).to_vec(),
+            proposed_value: Some(full_proposal::ProposedValue::Block(Block {
+                hash: block_hash(&header),
+                header: Some(header),
+                shard_witness: Some(shard_witness),
+                commits: None,
+                transactions: state_change.transactions,
+                events: state_change.events,
+            })),
+        })
+        .unwrap()
+    }
+
+    fn commits_for(proposal: &WellFormedProposal) -> Commits {
+        Commits {
+            height: Some(proposal.height()),
+            value: Some(proposal.shard_hash().clone()),
+            ..Default::default()
+        }
+    }
+
+    fn block_of(proposal: &WellFormedProposal) -> Block {
+        proposal
+            .proposal()
+            .block(commits_for(proposal))
+            .expect("block proposal")
+    }
+
+    #[tokio::test]
+    async fn next_height_block_heard_before_its_parent_commits_is_kept_and_judged_after() {
+        // The network: blocks 1 and 2 as their proposers built them.
+        let (mut network, _network_dir) = block_engine_test_helpers::setup();
+        let first = propose(&mut network, Height::new(0, 1));
+        network.commit_block(&block_of(&first));
+        let second = propose(&mut network, Height::new(0, 2));
+        network.commit_block(&block_of(&second));
+
+        let (engine, _dir) = block_engine_test_helpers::setup();
+        let mut node = BlockProposer::new(
+            Address([0u8; 32]),
+            SnapchainShard::new(0),
+            HashMap::new(),
+            2,
+            FarcasterNetwork::Devnet,
+            None,
+            engine,
+            test_helper::statsd_client(),
+        );
+        assert_eq!(node.add_proposed_value(&first), Validity::Valid);
+        // Block 1 is decided but not committed yet when block 2's proposal arrives.
+        assert_eq!(node.add_proposed_value(&second), Validity::Invalid);
+        assert!(
+            node.get_proposed_value(second.shard_hash()).is_some(),
+            "a block bound to its header is kept even before it can be judged"
+        );
+
+        node.decide(commits_for(&first)).await;
+        // What the host does with a held proposal once the commit lands.
+        assert_eq!(node.add_proposed_value(&second), Validity::Valid);
+        // And the decision finds it, instead of restarting the height for sync.
+        node.decide(commits_for(&second)).await;
+        assert_eq!(node.get_confirmed_height(), Height::new(0, 2));
+    }
+}

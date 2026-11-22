@@ -2408,7 +2408,9 @@ impl BlockEngine {
 
     /// Replays `block`'s transactions against the current state and checks they produce the
     /// header's `state_root` and `events_hash`, without committing.
-    pub fn validate_block(&mut self, block: &Block) -> bool {
+    /// Whether the block's header carries the `transactions_root` its transactions require.
+    /// Needs no state, so it can bind a body to its signed header before the block is replayed.
+    pub fn transactions_root_matches(&self, block: &Block) -> bool {
         let Some(header) = block.header.as_ref() else {
             return false;
         };
@@ -2417,8 +2419,8 @@ impl BlockEngine {
         };
         let version =
             EngineVersion::version_for(&FarcasterTime::new(header.timestamp), self.network);
-        if header.transactions_root
-            != expected_transactions_root(
+        header.transactions_root
+            == expected_transactions_root(
                 &crate::native_registration::transactions_for_root(
                     &block.transactions,
                     self.stores
@@ -2427,7 +2429,16 @@ impl BlockEngine {
                 ),
                 version,
             )
-        {
+    }
+
+    pub fn validate_block(&mut self, block: &Block) -> bool {
+        let Some(header) = block.header.as_ref() else {
+            return false;
+        };
+        let Some(height) = header.height else {
+            return false;
+        };
+        if !self.transactions_root_matches(block) {
             error!(
                 height = height.block_number,
                 "Block transactions do not match its header"
@@ -2527,11 +2538,15 @@ impl BlockEngine {
                     panic!("State change commit failed: {}", err);
                 }
                 Ok(()) => {
+                    // The block, its events and the state they produce commit together. Data
+                    // shards read "shard 0 has committed height N" as "every event of block N
+                    // is in the log", and a restart must never find the events without the
+                    // block (it would re-number them) or the block without its state.
+                    self.stores
+                        .block_store
+                        .put_block_in_txn(block, &mut txn)
+                        .expect("decided block is well formed");
                     self.db.commit(txn).unwrap();
-                    let result = self.stores.block_store.put_block(block);
-                    if result.is_err() {
-                        error!("Failed to store block: {:?}", result.err());
-                    }
                     self.stores.trie.reload(&self.db).unwrap();
                     self.metrics
                         .publish_transaction_counts(&block.transactions, ProposalSource::Commit);

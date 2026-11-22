@@ -135,6 +135,27 @@ immutable. Old-snapshot cleanup reads the current pointer through authenticated
 S3, so a cached public URL cannot cause deletion of the newly published generation.
 Listing uses pagination and deletion uses batches of at most 1,000 objects.
 
+## Bootstrapping data shards after the fork
+
+Use `bootstrap_method = "Snapshot"` (the default) for any node whose data shards
+are past their native-registration activation height. Do not use `"Replicate"`
+for those shards.
+
+A data shard keeps a row for each shard-zero event it has consumed. The highest
+row is its cursor, and each certified chunk must consume the events that follow
+it, in order. Replication copies the state and the tip chunk, but not these rows.
+A replicated data shard therefore has the effects of every consumed event but
+not the cursor that records them. It fails at its first chunk that carries a
+shard-zero event, with `post-fork block events must be consecutive`.
+
+At startup, the node checks the cursor against the stored certified chunks.
+Replication stores only the tip, so this check can usually not run on a
+replicated shard. The node then logs `retained history below tip ... has no
+post-fork event to check cursor ... against` and starts. Restore that shard from
+a snapshot. A snapshot is a consistent RocksDB read snapshot, and each height
+commits in one transaction, so the snapshot contains the rows and the cursor
+that go with its state.
+
 ## Verification
 
 Tests cover consistent export during live writes, binary key/value round trips
