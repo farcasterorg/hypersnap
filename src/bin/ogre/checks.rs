@@ -556,7 +556,7 @@ fn shrunk(base: &Value, under: &Value, key: &str, path: &str, out: &mut Vec<Stri
             if u.len() < b.len() {
                 out.push(format!("{path} ({} -> {} items)", b.len(), u.len()));
             }
-            for (i, j) in by_id(b, u).into_iter().enumerate() {
+            for (i, j) in by_id(b, u).0.into_iter().enumerate() {
                 if let Some(j) = j {
                     shrunk(&b[i], &u[j], key, &format!("{path}[{i}]"), out);
                 }
@@ -578,33 +578,86 @@ fn is_count(key: &str) -> bool {
     key.ends_with("count") || key.ends_with("units")
 }
 
-/// For each item of `b`, the item of `u` with the same id, when that id is
-/// unique on both sides.
-fn by_id(b: &[Value], u: &[Value]) -> Vec<Option<usize>> {
-    let (bi, ui): (Vec<_>, Vec<_>) = (b.iter().map(ident).collect(), u.iter().map(ident).collect());
-    let once = |ids: &[Option<String>], id: &String| {
-        ids.iter().filter(|x| x.as_ref() == Some(id)).count() == 1
+/// Fields that identify an array item, most specific first. An array pairs its
+/// items by the first one that is unique among its items (see `by_id()`).
+/// Per-account lists repeat the account's `fid` on every item, so onchain
+/// events go by their log, proofs by their name, and v2 signers by their key.
+const IDS: &[&[&str]] = &[
+    &["hash"],
+    &["transactionHash", "logIndex"],
+    &["fid"],
+    &["name"],
+    &["signer_key", "block_number"],
+];
+
+/// For each item of `b`, the item of `u` with the same id, and the ids that
+/// are unique in `b` but repeated in `u`. The id is the first candidate unique
+/// on both sides; when none is, the first unique in `b`, so an item the build
+/// returns twice is caught.
+fn by_id(b: &[Value], u: &[Value]) -> (Vec<Option<usize>>, Vec<String>) {
+    let unique = |ids: &[Option<String>]| {
+        let present: Vec<_> = ids.iter().flatten().collect();
+        !present.is_empty()
+            && present
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                == present.len()
     };
-    bi.iter()
-        .map(|id| {
-            let id = id.as_ref().filter(|id| once(&bi, id) && once(&ui, id))?;
-            ui.iter().position(|x| x.as_ref() == Some(id))
+    let candidates: Vec<(Vec<_>, Vec<_>)> = (0..=IDS.len())
+        .map(|c| {
+            (
+                b.iter().map(|v| ident(v, c)).collect(),
+                u.iter().map(|v| ident(v, c)).collect(),
+            )
         })
-        .collect()
+        .collect();
+    let chosen = candidates
+        .iter()
+        .find(|(bi, ui)| unique(bi) && unique(ui))
+        .or_else(|| candidates.iter().find(|(bi, _)| unique(bi)));
+    let Some((bi, ui)) = chosen else {
+        return (vec![None; b.len()], Vec::new());
+    };
+    let mut duplicated = Vec::new();
+    let pairs = bi
+        .iter()
+        .map(|id| {
+            let id = id.as_ref()?;
+            let mut at = ui
+                .iter()
+                .enumerate()
+                .filter(|(_, x)| x.as_ref() == Some(id));
+            match (at.next(), at.next()) {
+                (Some((j, _)), None) => Some(j),
+                (Some(_), Some(_)) => {
+                    duplicated.push(id.clone());
+                    None
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    (pairs, duplicated)
 }
 
-/// What identifies an array item: its hash, fid or name, or else its cast's
-/// and user's together (a notification or reaction is about both).
-fn ident(v: &Value) -> Option<String> {
-    let own = ["hash", "fid", "name"]
-        .into_iter()
-        .find_map(|k| v.get(k).filter(|x| x.is_string() || x.is_number()));
-    if let Some(id) = own {
-        return Some(id.to_string());
+/// An item's id by candidate `c` of `IDS`; past them, its cast's and user's
+/// ids together (a notification or reaction is about both).
+fn ident(v: &Value, c: usize) -> Option<String> {
+    let field = |k: &str| v.get(k).filter(|x| x.is_string() || x.is_number());
+    if let Some(keys) = IDS.get(c) {
+        let parts: Option<Vec<String>> = keys
+            .iter()
+            .map(|k| field(k).map(|x| x.to_string()))
+            .collect();
+        return parts.map(|p| p.join("/"));
     }
     let parts: Vec<String> = ["cast", "user"]
         .into_iter()
-        .filter_map(|k| v.get(k).and_then(ident))
+        .filter_map(|k| {
+            let v = v.get(k)?;
+            (0..IDS.len()).find_map(|c| ident(v, c))
+        })
         .collect();
     (!parts.is_empty()).then(|| parts.join("/"))
 }
@@ -636,7 +689,18 @@ fn differences(
             if b.len() != u.len() {
                 other.push(format!("{path} ({} -> {} items)", b.len(), u.len()));
             }
-            for (i, j) in by_id(b, u).into_iter().enumerate() {
+            let (pairs, duplicated) = by_id(b, u);
+            // One item twice is wrong whatever the order, but only an item of
+            // the response itself is surely the same item (see below).
+            for id in &duplicated {
+                let d = format!("{path}: duplicated item {id}");
+                if same {
+                    wrong.push(d)
+                } else {
+                    other.push(d)
+                }
+            }
+            for (i, j) in pairs.into_iter().enumerate() {
                 let p = format!("{path}[{i}]");
                 match j {
                     Some(j) => differences(&b[i], &u[j], key, &p, same, wrong, other),
@@ -1573,6 +1637,70 @@ mod tests {
         assert_eq!(
             wrong(json!([{"v": [user("a")]}]), json!([{"v": [user("b")]}])),
             (vec![], 1)
+        );
+    }
+
+    #[test]
+    fn items_of_one_account_pair_by_a_finer_id() {
+        // every item carries the account's fid: onchain events go by their log
+        let event = |log: u64, key: &str| json!({"fid": 3, "transactionHash": "0xt", "logIndex": log, "signerEventBody": {"key": key}});
+        assert_eq!(
+            wrong(
+                json!({"events": [event(1, "a"), event(2, "b")]}),
+                json!({"events": [event(2, "x"), event(1, "a")]})
+            ),
+            (
+                vec![".events[1].signerEventBody.key: \"b\" -> \"x\"".to_string()],
+                0
+            )
+        );
+        // proofs by their name
+        let proof = |name: &str, owner: &str| json!({"fid": 3, "name": name, "owner": owner});
+        assert_eq!(
+            wrong(
+                json!({"proofs": [proof("a", "o"), proof("b", "o")]}),
+                json!({"proofs": [proof("a", "o"), proof("b", "x")]})
+            ),
+            (vec![".proofs[1].owner: \"o\" -> \"x\"".to_string()], 0)
+        );
+        // v2 signers by their key and block; one key added and removed
+        let signer = |key: &str, block: u64, t: u64| json!({"fid": 3, "signer_key": key, "block_number": block, "key_type": t});
+        assert_eq!(
+            wrong(
+                json!({"events": [signer("k", 1, 1), signer("k", 2, 1)]}),
+                json!({"events": [signer("k", 2, 1), signer("k", 1, 2)]})
+            ),
+            (vec![".events[0].key_type: 1 -> 2".to_string()], 0)
+        );
+        // a build with one more proof still pairs the base's by name
+        assert_eq!(
+            wrong(
+                json!({"proofs": [proof("a", "o")]}),
+                json!({"proofs": [proof("b", "o"), proof("a", "x")]})
+            ),
+            (vec![".proofs[0].owner: \"o\" -> \"x\"".to_string()], 1)
+        );
+    }
+
+    #[test]
+    fn an_item_the_build_repeats_fails() {
+        let cast = |h: &str| json!({"hash": h, "text": "t"});
+        let base = json!({"casts": (["a", "b", "c", "d", "e"].map(cast))});
+        let under = json!({"casts": (["a", "a", "b", "b", "c"].map(cast))});
+        let (failed, _) = wrong(base.clone(), under.clone());
+        assert_eq!(
+            failed,
+            [
+                ".casts: duplicated item \"a\"",
+                ".casts: duplicated item \"b\""
+            ]
+        );
+        // shrunk() can't see it: the lengths match
+        assert!(lost(base, under).is_empty());
+        // ties in another order are fine
+        assert_eq!(
+            wrong(json!(["a", "b"].map(cast)), json!(["b", "a"].map(cast))),
+            (vec![], 0)
         );
     }
 
