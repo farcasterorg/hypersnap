@@ -139,7 +139,10 @@ pub(crate) async fn repair(
         // The engine sends a block's events before it stores the block, so a
         // range can end in a block the store doesn't have yet: that part waits
         // for the next pass, rather than being read as empty and let go.
-        let stored = store.shard_store.max_block_number().unwrap_or(0);
+        let stored = store.shard_store.max_block_number().unwrap_or_else(|e| {
+            tracing::warn!(shard_id, error = %e, "Can't read the latest stored block; retrying lost index events next pass");
+            0
+        });
         for (from, to) in ranges {
             if to > stored {
                 gaps.lost(shard_id, from.max(stored + 1), to);
