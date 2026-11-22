@@ -406,6 +406,85 @@ mod tests {
         }
     }
 
+    /// A peer that claims blocks up to 10 but answers every request at once with `answer(height)`
+    /// must not be asked for a height again before that request times out (2 s).
+    async fn asks_once_per_timeout(
+        answer: impl Fn(Height, &ShardChunk) -> sync::Response<SnapchainValidatorContext>,
+    ) {
+        let (mut proposer_engine, _read_node_engine, mut gossip_rx, _system_rx, actors, keypair) =
+            setup(0).await;
+        let block_1 = commit_shard_chunk(&mut proposer_engine, &keypair).await;
+        let shard = proposer_engine.shard_id();
+        let peer = PeerId::from_libp2p(&libp2p::PeerId::random());
+        actors
+            .cast_network_event(MalachiteNetworkEvent::PeerConnected(peer))
+            .unwrap();
+        actors
+            .cast_network_event(MalachiteNetworkEvent::Message(
+                Channel::Sync,
+                peer,
+                Bytes::from(
+                    StatusMessage {
+                        peer_id: peer.to_libp2p().to_bytes(),
+                        height: Some(Height::new(shard, 10)),
+                        min_height: Some(Height::new(shard, 1)),
+                    }
+                    .encode_to_vec(),
+                ),
+            ))
+            .unwrap();
+
+        let mut rpc = sync::Behaviour::default();
+        let mut asked: HashMap<u64, usize> = HashMap::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while let Ok(Some(event)) = tokio::time::timeout_at(deadline, gossip_rx.recv()).await {
+            let GossipEvent::SyncRequest(_, sync::Request::ValueRequest(request), reply) = event
+            else {
+                continue;
+            };
+            let request_id = rpc.send_request(libp2p::PeerId::random(), Bytes::new());
+            reply.send(request_id).unwrap();
+            *asked.entry(request.height.block_number).or_default() += 1;
+            actors
+                .cast_network_event(MalachiteNetworkEvent::Sync(sync::RawMessage::Response {
+                    request_id,
+                    peer,
+                    body: SnapchainCodec
+                        .encode(&answer(request.height, &block_1))
+                        .unwrap(),
+                }))
+                .unwrap();
+        }
+        assert!(asked.len() >= 9, "asked for {asked:?}");
+        assert!(asked.values().all(|&n| n <= 2), "asked {asked:?}");
+    }
+
+    #[tokio::test]
+    async fn test_malformed_sync_answer_waits_for_the_timeout() {
+        asks_once_per_timeout(|height, chunk| {
+            let value = RawDecidedValue {
+                certificate: chunk.commits.clone().unwrap().to_commit_certificate(),
+                value_bytes: Bytes::from_static(b"not a block"),
+            };
+            sync::Response::ValueResponse(sync::ValueResponse::new(height, Some(value)))
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_wrong_height_sync_answer_waits_for_the_timeout() {
+        // Every request gets block 1, so only the request for height 1 is answered.
+        asks_once_per_timeout(|_, chunk| {
+            let value = RawDecidedValue {
+                certificate: chunk.commits.clone().unwrap().to_commit_certificate(),
+                value_bytes: Bytes::from(chunk.encode_to_vec()),
+            };
+            let height = chunk.header.as_ref().unwrap().height.unwrap();
+            sync::Response::ValueResponse(sync::ValueResponse::new(height, Some(value)))
+        })
+        .await;
+    }
+
     /// Prints blocks/s over a simulated round trip:
     /// `cargo test --lib catch_up_rate -- --ignored --nocapture`
     #[tokio::test]

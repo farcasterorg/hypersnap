@@ -127,6 +127,9 @@ pub struct State {
 
     /// When the last block was committed.
     last_progress: Instant,
+
+    /// The last height logged as having no peer to ask, so the warning isn't repeated.
+    no_peer_warned: Option<Height>,
 }
 
 impl State {
@@ -318,6 +321,13 @@ impl ReadSync {
                 .map(|peer| peer.peer_id)
                 .choose(&mut rand::thread_rng())
             else {
+                // Past every peer's tip is where the window normally ends. A height that no peer
+                // has yet some peer is past (it pruned it) leaves the node stuck, so say so once.
+                let ahead = state.sync.peers.values().any(|peer| peer.height >= height);
+                if (ahead || state.sync.peers.is_empty()) && state.no_peer_warned != Some(height) {
+                    warn!(height.sync = %height, "No peer to request sync from");
+                    state.no_peer_warned = Some(height);
+                }
                 break;
             };
             let request = sync::ValueRequest::new(height);
@@ -460,52 +470,56 @@ impl ReadSync {
             }
 
             Msg::NetworkEvent(NetworkEvent::Response(request_id, peer, response)) => {
-                // Cancel the timer associated with the request for which we just received a response
-                state.timers.cancel(&Timeout::Request(request_id.clone()));
-                // Clear the request by the height asked for, whatever the answer: a peer that
-                // answers with another height or another kind of response must not leave it
-                // pending for good. An answer that came after its request timed out matches
-                // nothing, since a newer request may be out for that height.
-                let requested = match state.inflight.remove(&request_id) {
+                // An answer that came after its request timed out matches nothing, since a newer
+                // request may be out for that height.
+                let requested = match state.inflight.get(&request_id) {
                     Some(InflightRequest {
                         request: Request::ValueRequest(request),
                         ..
                     }) => Some(request.height),
                     _ => None,
                 };
-                if let Some(height) = requested {
-                    state.sync.remove_pending_decided_value_request(height);
-                }
 
-                match response {
+                let value = match response {
                     Response::ValueResponse(value_response) => {
                         self.metrics
                             .decided_value_response_received(value_response.height.block_number);
-                        // Responses come from arbitrary peers. A malformed one is dropped here and
-                        // its height asked for again straight away.
+                        // Responses come from arbitrary peers. A malformed one is dropped here.
                         match Self::decode_value_response(&value_response) {
                             Ok(value) => {
                                 debug!(peer_id = %peer, height = %value_response.height, "Received sync value response");
-                                if requested == Some(value_response.height) {
-                                    state.received.insert(value_response.height.block_number);
-                                }
-                                self.host.cast(ReadHostMsg::ProcessDecidedValue {
-                                    value: proto::DecidedValue { value: Some(value) },
-                                    sync: myself.clone(),
-                                })?;
+                                Some((value_response.height, value))
                             }
                             Err(err) => {
                                 warn!(peer_id = %peer, height = %value_response.height, "Dropping malformed sync value response: {}", err);
+                                None
                             }
-                        }
-
-                        if state.initial_sync_first_completed() {
-                            self.host.cast(ReadHostMsg::InitialSyncCompleted)?;
                         }
                     }
                     Response::VoteSetResponse(vote_set_response) => {
                         error!(height = %vote_set_response.height, round = %vote_set_response.round, %peer ,
                             "Read node sending vote set response");
+                        None
+                    }
+                };
+
+                // Only the block asked for clears its request. Any other answer (empty,
+                // malformed, another height or kind) leaves the height pending until its timeout,
+                // so a peer that can't serve it isn't asked again once per round trip.
+                if let Some((height, value)) = value {
+                    if requested == Some(height) {
+                        state.timers.cancel(&Timeout::Request(request_id.clone()));
+                        state.inflight.remove(&request_id);
+                        state.sync.remove_pending_decided_value_request(height);
+                        state.received.insert(height.block_number);
+                    }
+                    self.host.cast(ReadHostMsg::ProcessDecidedValue {
+                        value: proto::DecidedValue { value: Some(value) },
+                        sync: myself.clone(),
+                    })?;
+
+                    if state.initial_sync_first_completed() {
+                        self.host.cast(ReadHostMsg::InitialSyncCompleted)?;
                     }
                 }
             }
@@ -602,6 +616,7 @@ impl Actor for ReadSync {
             initial_sync_completed: false,
             received: BTreeSet::new(),
             last_progress: Instant::now(),
+            no_peer_warned: None,
         })
     }
 
