@@ -41,6 +41,17 @@ pub struct Subjects {
     pub username: String,
     pub custody: String,
     pub channel_url: Option<String>,
+    /// A seeded like: liker, cast author, cast hash.
+    pub like: Option<(u64, u64, String)>,
+    /// A seeded follow: follower, followed.
+    pub follow: Option<(u64, u64)>,
+    /// Seeded X usernames and locations (user data types 8 and 7).
+    pub x_username: Option<String>,
+    pub location: Option<String>,
+    /// An event the API node stores: id, shard.
+    pub event: Option<(u64, u64)>,
+    /// The custody address of the account signed up during the run.
+    pub native_custody: Option<String>,
 }
 
 impl Subjects {
@@ -92,7 +103,40 @@ impl Subjects {
                     })) => Some(u.clone()),
                     _ => None,
                 });
+        let like = seed.messages.iter().find_map(|m| {
+            let d = m.data.as_ref().unwrap();
+            match &d.body {
+                Some(Body::ReactionBody(proto::ReactionBody {
+                    r#type: 1, // like
+                    target: Some(proto::reaction_body::Target::TargetCastId(c)),
+                })) => Some((d.fid, c.fid, format!("0x{}", hex::encode(&c.hash)))),
+                _ => None,
+            }
+        });
+        let follow = seed.messages.iter().find_map(|m| {
+            let d = m.data.as_ref().unwrap();
+            match &d.body {
+                Some(Body::LinkBody(proto::LinkBody {
+                    target: Some(proto::link_body::Target::TargetFid(t)),
+                    r#type,
+                    ..
+                })) if r#type == "follow" => Some((d.fid, *t)),
+                _ => None,
+            }
+        });
+        let user_data = |t: proto::UserDataType| {
+            seed.messages
+                .iter()
+                .find_map(|m| match &m.data.as_ref().unwrap().body {
+                    Some(Body::UserDataBody(b)) if b.r#type == t as i32 && !b.value.is_empty() => {
+                        Some(b.value.clone())
+                    }
+                    _ => None,
+                })
+        };
         Ok(Subjects {
+            x_username: user_data(proto::UserDataType::Twitter),
+            location: user_data(proto::UserDataType::Location),
             fid,
             fid2,
             cast_hash: format!("0x{}", hex::encode(&top_level.hash)),
@@ -100,6 +144,10 @@ impl Subjects {
             username,
             custody,
             channel_url,
+            like,
+            follow,
+            event: None,
+            native_custody: None,
         })
     }
 
@@ -124,18 +172,21 @@ impl Subjects {
             .ok_or("the subject has no top-level cast on the chain")?;
         self.cast_hash = first.clone();
         self.like_targets = rest.to_vec();
-        if self.like_targets.is_empty() {
-            self.like_targets.push(first.clone());
-        }
+        let (_, v) = net.get(net::API, "/v1/events?from_event_id=0").await?;
+        self.event = v["events"]
+            .get(0)
+            .and_then(|e| Some((e["id"].as_u64()?, e["shardIndex"].as_u64()?)));
         Ok(())
     }
 
+    /// Every data-backed GET read route (docs/ogre.md lists the ones left out).
     fn endpoints(&self) -> Vec<String> {
         let (f, f2, h, u) = (self.fid, self.fid2, &self.cast_hash, &self.username);
         let c = &self.custody;
         let mut v = vec![
             "/v1/info".to_string(),
             "/v1/fids?shard_id=1".into(),
+            "/v1/nativeRegistration".into(),
             format!("/v1/castById?fid={f}&hash={h}"),
             format!("/v1/castsByFid?fid={f}&pageSize=20"),
             format!("/v1/castsByMention?fid={f}"),
@@ -149,6 +200,9 @@ impl Subjects {
             format!("/v1/userNameProofByName?name={u}"),
             format!("/v1/userNameProofsByFid?fid={f}"),
             format!("/v1/fidByName?name={u}"),
+            format!("/v1/addressesByName?name={u}"),
+            format!("/v1/fidByAddress?address={c}"),
+            format!("/v1/fidAddressType?fid={f}&address={c}"),
             format!("/v1/verificationsByFid?fid={f}"),
             format!("/v1/onChainSignersByFid?fid={f}"),
             format!("/v1/signersByFid?fid={f}"),
@@ -157,30 +211,59 @@ impl Subjects {
             "/v1/events?from_event_id=0".into(),
             format!("/v2/farcaster/user?fid={f}"),
             format!("/v2/farcaster/user/bulk?fids={f},{f2}"),
+            format!("/v2/farcaster/user/bulk-by-address?addresses={c}"),
+            format!("/v2/farcaster/user/custody-address?custody_address={c}"),
             format!("/v2/farcaster/user/by-username?username={u}"),
+            format!("/v2/farcaster/user/by_username?username={u}"),
             format!("/v2/farcaster/user/search?q={u}&limit=5"),
+            "/v2/farcaster/user/fid?limit=5".into(),
+            format!("/v2/farcaster/user/best_friends?fid={f}&limit=5"),
+            format!("/v2/farcaster/user/interactions?fid={f}&target_fid={f2}"),
+            format!("/v2/farcaster/user/channels?fid={f}&limit=5"),
+            format!("/v2/farcaster/user/memberships/list?fid={f}&limit=5"),
             format!("/v2/farcaster/user/followers?fid={f}&limit=5"),
             format!("/v2/farcaster/user/following?fid={f}&limit=5"),
             format!("/v2/farcaster/followers?fid={f}&limit=5"),
             format!("/v2/farcaster/following?fid={f}&limit=5"),
+            format!("/v2/farcaster/follows?fid={f}&limit=5"),
+            format!("/v2/farcaster/followers/relevant?fid={f}&limit=5"),
+            format!("/v2/farcaster/followers/reciprocal?fid={f}&limit=5"),
+            format!("/v2/farcaster/following/suggested?fid={f}&limit=5"),
             format!("/v2/farcaster/user/verifications?fid={f}"),
             format!("/v2/farcaster/user/storage-allocations?fid={f}"),
             format!("/v2/farcaster/user/storage-usage?fid={f}"),
+            format!("/v2/farcaster/storage/allocations?fid={f}"),
+            format!("/v2/farcaster/storage/usage?fid={f}"),
+            format!("/v2/farcaster/signer?fid={f}"),
+            format!("/v2/farcaster/signers?fid={f}"),
+            format!("/v2/farcaster/signer/list?fid={f}"),
+            format!("/v2/farcaster/onchain/signers?fid={f}"),
+            format!("/v2/farcaster/onchain/id_registry_event?fid={f}"),
+            format!("/v2/farcaster/block/list?fid={f}&limit=5"),
+            format!("/v2/farcaster/mute/list?fid={f}&limit=5"),
             format!("/v2/farcaster/cast?identifier={h}&type=hash"),
             format!("/v2/farcaster/casts?casts={h}"),
             format!("/v2/farcaster/cast/bulk?hashes={h}"),
+            "/v2/farcaster/cast/search?q=the&limit=5".into(),
+            "/v2/farcaster/cast/metrics?q=the".into(),
             format!("/v2/farcaster/cast/conversation?identifier={h}&type=hash"),
             format!("/v2/farcaster/cast/quotes?identifier={h}&type=hash"),
             format!("/v2/farcaster/feed?feed_type=following&fid={f}&limit=5"),
+            format!("/v2/farcaster/feed?feed_type=filter&fids={f},{f2}&limit=5"),
             format!("/v2/farcaster/feed/following?fid={f}&limit=5"),
             format!("/v2/farcaster/feed/following?fid={f}&limit=5&with_recasts=true"),
             format!("/v2/farcaster/feed/user/casts?fid={f}&limit=5"),
             format!("/v2/farcaster/feed/user/replies_and_recasts?fid={f}&limit=5"),
             format!("/v2/farcaster/feed/user/popular?fid={f}"),
             "/v2/farcaster/feed/trending?limit=5".into(),
+            format!("/v2/farcaster/feed/for_you?fid={f}&limit=5"),
+            "/v2/farcaster/feed/topic?limit=5".into(),
+            format!("/v2/farcaster/reaction?hash={h}&types=likes&limit=5"),
+            format!("/v2/farcaster/reaction?fid={f}&type=likes&limit=5"),
             format!("/v2/farcaster/reaction/cast?hash={h}&types=likes&limit=5"),
             format!("/v2/farcaster/reactions/cast?hash={h}&types=likes&limit=5"),
             format!("/v2/farcaster/reaction/user?fid={f}&type=likes&limit=5"),
+            format!("/v2/farcaster/reactions/user?fid={f}&type=likes&limit=5"),
             format!("/v2/farcaster/notifications?fid={f}&limit=5"),
             format!(
                 "/v2/farcaster/notifications?fid={f}&limit=5&include_quotes_and_deep_replies=true"
@@ -188,15 +271,76 @@ impl Subjects {
             format!("/v2/farcaster/fname/availability?fname={u}"),
             format!("/v2/farcaster/username-proof?username={u}"),
             format!("/v2/farcaster/channel/user-active?fid={f}&limit=5"),
+            format!("/v2/farcaster/channel/user?fid={f}&limit=5"),
             "/v2/farcaster/channel/all?limit=5".into(),
+            "/v2/farcaster/channel/list?limit=5".into(),
             "/v2/farcaster/channel/trending?limit=5".into(),
+            "/v2/farcaster/_status/backfill".into(),
+            "/v2/farcaster/_status/halt".into(),
         ];
-        if let Some(url) = &self.channel_url {
-            let url = urlencode(url);
+        // Batch reads take their fids as a JSON body.
+        for b in [
+            "following",
+            "reactions",
+            "cast-interactions",
+            "cast-bodies",
+            "signers",
+            "id-registrations",
+        ] {
             v.push(format!(
-                "/v2/farcaster/feed/parent_urls?parent_urls={url}&limit=5"
+                r#"POST /v2/farcaster/batch/{b} {{"fids":[{f},{f2}]}}"#
             ));
-            v.push(format!("/v1/castsByParent?url={url}"));
+        }
+        if let Some(url) = &self.channel_url {
+            // A channel's id is its parent URL on Hypersnap.
+            let url = urlencode(url);
+            v.extend([
+                format!("/v1/castsByParent?url={url}"),
+                format!("/v1/reactionsByTarget?url={url}"),
+                format!("/v2/farcaster/feed/parent_urls?parent_urls={url}&limit=5"),
+                format!("/v2/farcaster/feed/channels?channel_ids={url}&limit=5"),
+                format!("/v2/farcaster/channel?id={url}"),
+                format!("/v2/farcaster/channel/bulk?ids={url}"),
+                format!("/v2/farcaster/channel/search?q={url}&limit=5"),
+                format!("/v2/farcaster/channel/members?channel_id={url}&limit=5"),
+                format!("/v2/farcaster/channel/member/list?channel_id={url}&limit=5"),
+                format!("/v2/farcaster/channel/followers?channel_id={url}&limit=5"),
+                format!("/v2/farcaster/channel/followers/relevant?channel_id={url}&limit=5"),
+                format!("/v2/farcaster/notifications/channel?fid={f}&channel_ids={url}&limit=5"),
+                format!("/v2/farcaster/notifications/parent_url?fid={f}&parent_urls={url}&limit=5"),
+            ]);
+        }
+        if let Some((fid, target_fid, hash)) = &self.like {
+            v.push(format!(
+                "/v1/reactionById?fid={fid}&target_fid={target_fid}&target_hash={hash}&reaction_type=Like"
+            ));
+        }
+        if let Some((fid, target_fid)) = self.follow {
+            v.push(format!(
+                "/v1/linkById?fid={fid}&target_fid={target_fid}&link_type=follow"
+            ));
+        }
+        if let Some((id, shard)) = self.event {
+            v.push(format!("/v1/eventById?event_id={id}&shard_index={shard}"));
+        }
+        if let Some(x) = &self.x_username {
+            v.push(format!(
+                "/v2/farcaster/user/by_x_username?username={}",
+                urlencode(x)
+            ));
+        }
+        if let Some(l) = &self.location {
+            v.push(format!(
+                "/v2/farcaster/user/by_location?location={}&limit=5",
+                urlencode(l)
+            ));
+        }
+        v.push(format!(
+            "/v1/signer?fid={f2}&signer=0x{}",
+            hex::encode(legacy_key().verifying_key().as_bytes())
+        ));
+        if let Some(custody) = &self.native_custody {
+            v.push(format!("/v1/nativeAccount?custody={custody}"));
         }
         v
     }
@@ -223,9 +367,42 @@ fn is_empty(v: &Value) -> bool {
     }
 }
 
-/// Paths of `base` (object keys, array items by position) that `under` lacks.
+/// One value holding every key any item of an array has, recursively, so two
+/// nodes that list the same items in another order have the same shape.
+fn shape(v: &Value) -> Value {
+    match v {
+        Value::Object(o) => Value::Object(o.iter().map(|(k, v)| (k.clone(), shape(v))).collect()),
+        Value::Array(a) => Value::Array(a.iter().map(shape).reduce(merge).into_iter().collect()),
+        v => v.clone(),
+    }
+}
+
+fn merge(a: Value, b: Value) -> Value {
+    match (a, b) {
+        (Value::Object(mut a), Value::Object(b)) => {
+            for (k, bv) in b {
+                let m = match a.remove(&k) {
+                    Some(av) => merge(av, bv),
+                    None => bv,
+                };
+                a.insert(k, m);
+            }
+            Value::Object(a)
+        }
+        (Value::Array(a), Value::Array(b)) => {
+            Value::Array(a.into_iter().chain(b).reduce(merge).into_iter().collect())
+        }
+        (Value::Null, b) => b,
+        (a, _) => a,
+    }
+}
+
+/// Paths of `base`'s shape that `under`'s lacks: object keys, items of an array
+/// the base release fills, and values whose JSON type changed (a null base is
+/// optional). Takes `shape()`s, so an array is compared by all its items.
 fn missing(base: &Value, under: &Value, path: &str, out: &mut Vec<String>) {
     match (base, under) {
+        (Value::Null, _) => {}
         (Value::Object(b), Value::Object(u)) => {
             for (k, bv) in b {
                 match u.get(k) {
@@ -234,81 +411,137 @@ fn missing(base: &Value, under: &Value, path: &str, out: &mut Vec<String>) {
                 }
             }
         }
-        (Value::Array(b), Value::Array(u)) => {
-            if let (Some(bv), Some(uv)) = (b.first(), u.first()) {
-                missing(bv, uv, &format!("{path}[0]"), out);
-            }
+        (Value::Array(b), Value::Array(u)) => match (b.first(), u.first()) {
+            (Some(bv), Some(uv)) => missing(bv, uv, &format!("{path}[]"), out),
+            (Some(_), None) => out.push(format!("{path} (empty array)")),
+            _ => {}
+        },
+        (b, u) if std::mem::discriminant(b) != std::mem::discriminant(u) => {
+            out.push(format!("{path} ({} -> {})", kind(b), kind(u)))
         }
         _ => {}
     }
 }
 
+fn kind(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+enum Compared {
+    Same,
+    Differs(String),
+    /// The base release errs or has no data here.
+    Skipped(String),
+    Failed(String),
+}
+
+async fn compare(net: &Net, path: &str) -> Compared {
+    let (under, base) = tokio::join!(net.read(net::API, path), net.read(net::REFERENCE, path));
+    let (u_status, u_body) = match under {
+        Ok(r) => r,
+        Err(e) => return Compared::Failed(format!("{path}: {e}")),
+    };
+    if u_status >= 500 {
+        return Compared::Failed(format!("{path}: HTTP {u_status} {}", short(&u_body)));
+    }
+    let (b_status, b_body) = match base {
+        Ok(r) => r,
+        Err(e) => return Compared::Skipped(format!("{path} (base release: {e})")),
+    };
+    if (200..300).contains(&b_status) && !(200..300).contains(&u_status) {
+        return Compared::Failed(format!(
+            "{path}: HTTP {u_status} (base release: {b_status}) {}",
+            short(&u_body)
+        ));
+    }
+    if !(200..300).contains(&b_status) || is_empty(&b_body) {
+        return Compared::Skipped(format!(
+            "{path} (base release: HTTP {b_status}, {})",
+            short(&b_body)
+        ));
+    }
+    if is_empty(&u_body) {
+        return Compared::Failed(format!("{path}: empty, the base release returns data"));
+    }
+    let mut gone = Vec::new();
+    missing(&shape(&b_body), &shape(&u_body), "", &mut gone);
+    if !gone.is_empty() {
+        return Compared::Failed(format!(
+            "{path}: the base release returns what this build doesn't: {}",
+            gone.join(", ")
+        ));
+    }
+    match first_difference(&strip_volatile(&b_body), &strip_volatile(&u_body), "") {
+        Some(d) => Compared::Differs(format!(
+            "{path}: same shape, different values than the base release: {d}"
+        )),
+        None => Compared::Same,
+    }
+}
+
 /// Every endpoint on the API node under test against the base reference node,
-/// on the same chain at (nearly) the same height.
-pub async fn endpoints(net: &Net, s: &Subjects, f: &mut Findings) -> String {
+/// on the same chain at (nearly) the same height. Fails when fewer than
+/// `min_compared` endpoints have base data to compare against.
+pub async fn endpoints(
+    net: &Net,
+    s: &Subjects,
+    phase: &str,
+    min_compared: usize,
+    f: &mut Findings,
+) -> String {
+    use futures::StreamExt;
+    let paths = s.endpoints();
+    let total = paths.len();
+    let results: Vec<Compared> = futures::stream::iter(paths)
+        .map(|path| async move {
+            // Indexes can trail a write by a moment: retry before failing.
+            let mut r = compare(net, &path).await;
+            for _ in 0..3 {
+                if !matches!(r, Compared::Failed(_)) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                r = compare(net, &path).await;
+            }
+            r
+        })
+        .buffered(16)
+        .collect()
+        .await;
     let (mut compared, mut skipped) = (0, Vec::new());
-    for path in s.endpoints() {
-        let (under, base) = tokio::join!(net.get(net::API, &path), net.get(net::REFERENCE, &path));
-        let (u_status, u_body) = match under {
-            Ok(r) => r,
-            Err(e) => {
-                f.fail(format!("{path}: {e}"));
-                continue;
+    for r in results {
+        match r {
+            Compared::Same => compared += 1,
+            Compared::Differs(d) => {
+                compared += 1;
+                f.warn(format!("{phase}: {d}"));
             }
-        };
-        if u_status >= 500 {
-            f.fail(format!("{path}: HTTP {u_status} {}", short(&u_body)));
-            continue;
-        }
-        let (b_status, b_body) = match base {
-            Ok(r) => r,
-            Err(e) => {
-                skipped.push(format!("{path} (base release: {e})"));
-                continue;
+            Compared::Skipped(why) => skipped.push(why),
+            Compared::Failed(why) => {
+                compared += 1;
+                f.fail(format!("{phase}: {why}"));
             }
-        };
-        if (200..300).contains(&b_status) && !(200..300).contains(&u_status) {
-            f.fail(format!(
-                "{path}: HTTP {u_status} (base release: {b_status}) {}",
-                short(&u_body)
-            ));
-            continue;
-        }
-        // Nothing to compare against: the base release errs or has no data here.
-        if !(200..300).contains(&b_status) || is_empty(&b_body) {
-            skipped.push(format!(
-                "{path} (base release: HTTP {b_status}, {})",
-                short(&b_body)
-            ));
-            continue;
-        }
-        compared += 1;
-        if is_empty(&u_body) {
-            f.fail(format!("{path}: empty, the base release returns data"));
-            continue;
-        }
-        let mut gone = Vec::new();
-        missing(&b_body, &u_body, "", &mut gone);
-        if !gone.is_empty() {
-            f.fail(format!(
-                "{path}: fields the base release returns are missing: {}",
-                gone.join(", ")
-            ));
-        } else if let Some(d) =
-            first_difference(&strip_volatile(&b_body), &strip_volatile(&u_body), "")
-        {
-            f.warn(format!(
-                "{path}: same shape, different values than the base release: {d}"
-            ));
         }
     }
     let summary = format!(
-        "{compared} endpoints compared with the base release; {} skipped because the base release has no data there",
+        "{compared} of {total} endpoints compared with the base release; {} skipped because the base release has no data there",
         skipped.len()
     );
     eprintln!("  {summary}");
+    if compared < min_compared {
+        f.fail(format!(
+            "{phase}: only {compared} endpoints had base data to compare (at least {min_compared} expected)"
+        ));
+    }
     for s in &skipped {
-        f.warn(format!("not compared: {s}"));
+        f.warn(format!("{phase}: not compared: {s}"));
     }
     summary
 }
@@ -410,6 +643,7 @@ pub async fn wait_legacy_signer(net: &Net, fid: u64) -> Result<(), Error> {
 /// accepted.
 pub struct Signup {
     pub fid: u64,
+    pub custody: String,
     pub signer: SigningKey,
     pub dropped: bool,
 }
@@ -559,6 +793,7 @@ pub async fn register_native(api: Api, custody: PrivateKeySigner) -> Result<Sign
     .ok_or("the gasless signer wasn't usable within 30s")?;
     Ok(Signup {
         fid,
+        custody: format!("0x{}", hex::encode(address)),
         signer,
         dropped,
     })
@@ -669,12 +904,6 @@ pub async fn writes(
         hash: hex::decode(&s.cast_hash[2..]).unwrap(),
     };
     let token = format!("ogre{}{}", round, std::process::id());
-    let liked = &s.like_targets[round_no % s.like_targets.len()];
-    let liked_id = proto::CastId {
-        fid: s.fid,
-        hash: hex::decode(&liked[2..]).unwrap(),
-    };
-    let likes_before = likes(net, liked).await;
 
     let (nfid, nkey) = &w.native;
     let k = Some(&w.legacy_key);
@@ -702,6 +931,16 @@ pub async fn writes(
         None,
         k,
     );
+    // The native account is new, so it hasn't liked any of the subject's
+    // casts; with none left for this round it likes this round's new cast.
+    let (liked_fid, liked, likes_before) = match s.like_targets.get(round_no) {
+        Some(h) => (s.fid, h.clone(), likes(net, h).await),
+        None => (w.legacy_fid, hash_of(&mention), Some(0)),
+    };
+    let liked_id = proto::CastId {
+        fid: liked_fid,
+        hash: hex::decode(&liked[2..]).unwrap(),
+    };
     let n = Some(nkey);
     let native_cast =
         messages_factory::casts::create_cast_add(*nfid, &format!("{token} native"), None, n);
@@ -831,7 +1070,7 @@ pub async fn writes(
         }
     }
     let liked = poll(deadline, || async {
-        match (likes_before, likes(net, liked).await) {
+        match (likes_before, likes(net, &liked).await) {
             (Some(a), Some(b)) if b > a => Some(()),
             _ => None,
         }
@@ -860,4 +1099,52 @@ async fn likes(net: &Net, hash: &str) -> Option<u64> {
     let path = format!("/v2/farcaster/cast?identifier={hash}&type=hash");
     let (_, v) = net.get(net::API, &path).await.ok()?;
     v["cast"]["reactions"]["likes_count"].as_u64()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{missing, shape};
+    use serde_json::json;
+
+    fn gone(base: serde_json::Value, under: serde_json::Value) -> Vec<String> {
+        let mut out = Vec::new();
+        missing(&shape(&base), &shape(&under), "", &mut out);
+        out
+    }
+
+    #[test]
+    fn missing_finds_what_the_build_lost() {
+        let base = json!({"casts": [{"hash": "a", "parent": null}], "next": {"cursor": "x"}});
+        assert!(gone(base.clone(), base.clone()).is_empty());
+        // emptied array, missing key, changed type
+        assert_eq!(
+            gone(base.clone(), json!({"casts": [], "next": {"cursor": "x"}})),
+            [".casts (empty array)"]
+        );
+        assert_eq!(
+            gone(
+                base.clone(),
+                json!({"casts": [{"parent": null}], "next": null})
+            ),
+            [".casts[].hash", ".next (object -> null)"]
+        );
+        assert_eq!(gone(base, json!("oops")), [" (object -> string)"]);
+        // a null in the base release is optional
+        assert!(gone(json!({"parent": null}), json!({"parent": "h"})).is_empty());
+        assert!(gone(json!({"casts": []}), json!({"casts": [{"hash": "a"}]})).is_empty());
+    }
+
+    #[test]
+    fn missing_ignores_item_order() {
+        // the same reactions in another order; one user has no pfp
+        let a = json!({"user": {"fid": 1, "pfp_url": "p"}});
+        let b = json!({"user": {"fid": 2}});
+        let base = json!({"reactions": [a.clone(), b.clone()]});
+        assert!(gone(base.clone(), json!({"reactions": [b.clone(), a.clone()]})).is_empty());
+        // a field no item on the build side has is still missing
+        assert_eq!(
+            gone(base, json!({"reactions": [b.clone(), b]})),
+            [".reactions[].user.pfp_url"]
+        );
+    }
 }

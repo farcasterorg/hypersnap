@@ -22,6 +22,9 @@ pub struct ChainArgs {
     pub work: PathBuf,
     #[arg(long, default_value = "500ms")]
     pub block_time: String,
+    /// Markdown report (e.g. $GITHUB_STEP_SUMMARY)
+    #[arg(long)]
+    pub report: Option<PathBuf>,
 }
 
 #[derive(clap::Args)]
@@ -40,6 +43,10 @@ pub struct RunArgs {
     /// Longest a shard may go without a new block before the run fails
     #[arg(long, default_value = "30s", value_parser = humantime::parse_duration)]
     pub max_stall: Duration,
+    /// Fewest endpoints the base release must have data for, so a reference
+    /// node that errs or lost an index can't make every comparison a skip
+    #[arg(long, default_value = "80")]
+    pub min_compared: usize,
     /// Markdown report (e.g. $GITHUB_STEP_SUMMARY)
     #[arg(long)]
     pub report: Option<PathBuf>,
@@ -65,7 +72,15 @@ pub async fn chain(args: ChainArgs) -> Result<(), Error> {
         let mut seed = seed;
         let event = checks::legacy_signer_event(&seed, legacy_fid);
         seed.onchain_events.push(event);
-        load(&net, &seed).await?;
+        let loaded = load(&net, &seed).await;
+        if let Some(path) = &args.report {
+            let md = match &loaded {
+                Ok(md) => md.clone(),
+                Err(e) => e.to_string(),
+            };
+            append(path, &format!("## Ogre seeded chain\n\n{md}\n"))?;
+        }
+        loaded?;
         checks::wait_legacy_signer(&net, legacy_fid).await?;
         for i in [net::REFERENCE, net::API] {
             net.start(i, &args.base)?;
@@ -129,14 +144,31 @@ pub async fn chain(args: ChainArgs) -> Result<(), Error> {
     .await;
     net.stop_all();
     result?;
+    for n in &net.nodes {
+        if let Some(c) = n.crashes.first() {
+            return Err(format!("node {} {c}", n.i).into());
+        }
+    }
     let _ = std::fs::remove_dir_all(args.work.join("logs"));
     eprintln!("built the seeded chain in {:.0?}", t.elapsed());
     Ok(())
 }
 
+fn append(path: &std::path::Path, md: &str) -> Result<(), Error> {
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?
+        .write_all(md.as_bytes())?;
+    Ok(())
+}
+
 /// Submits the seed: onchain events and fname proofs to every validator (each
-/// keeps them in its own mempool until it proposes), then the messages.
-async fn load(net: &Net, seed: &Seed) -> Result<(), Error> {
+/// keeps them in its own mempool until it proposes), then the messages. Fails,
+/// with the counts, when the base release refuses more of it than the
+/// by-design refusals (ENS names, contract verifications) explain.
+async fn load(net: &Net, seed: &Seed) -> Result<String, Error> {
     use futures::StreamExt;
     use snapchain::proto::{
         admin_service_client::AdminServiceClient, hub_service_client::HubServiceClient,
@@ -163,14 +195,14 @@ async fn load(net: &Net, seed: &Seed) -> Result<(), Error> {
         }
         Ok::<_, Error>(failed)
     });
-    for f in futures::future::try_join_all(admins)
-        .await?
-        .into_iter()
-        .take(1)
-    {
-        for why in f {
-            *failed.entry(why).or_default() += 1;
-        }
+    let refused_admin = futures::future::try_join_all(admins).await?.swap_remove(0);
+    let refused_events = refused_admin
+        .iter()
+        .filter(|w| w.starts_with("onchain"))
+        .count();
+    let refused_proofs = refused_admin.len() - refused_events;
+    for why in refused_admin {
+        *failed.entry(why).or_default() += 1;
     }
     // A user shard refuses messages from a fid it hasn't seen registered.
     let fids = seed.fids().len() as u64;
@@ -211,9 +243,12 @@ async fn load(net: &Net, seed: &Seed) -> Result<(), Error> {
     // Signer events can land a block after the registration: retry those once.
     let mut retry = Vec::new();
     let mut accepted = 0;
+    // A seed can repeat a message (an account and a follow both export it).
+    let ok = |e: &str| e.contains("bad_request.duplicate");
     for (m, r) in submit(seed.messages.clone()).await {
         match r {
             Ok(()) => accepted += 1,
+            Err(e) if ok(&e) => accepted += 1,
             Err(e)
                 if e.contains("unknown fid")
                     || e.contains("invalid signer")
@@ -228,19 +263,36 @@ async fn load(net: &Net, seed: &Seed) -> Result<(), Error> {
     for (_, r) in submit(retry).await {
         match r {
             Ok(()) => accepted += 1,
+            Err(e) if ok(&e) => accepted += 1,
             Err(e) => *failed.entry(e).or_default() += 1,
         }
     }
-    eprintln!(
-        "loaded {} onchain events, {} fname proofs, {accepted}/{} messages",
+    let (events, proofs, messages) = (
         seed.onchain_events.len(),
         seed.fname_proofs.len(),
-        seed.messages.len()
+        seed.messages.len(),
     );
-    for (why, n) in failed {
-        eprintln!("  refused {n}: {why}");
+    let mut md = vec![format!(
+        "Accepted {}/{events} onchain events, {}/{proofs} fname proofs and {accepted}/{messages} messages.",
+        events - refused_events,
+        proofs - refused_proofs,
+    )];
+    md.extend(
+        failed
+            .iter()
+            .map(|(why, n)| format!("- refused {n}: {why}")),
+    );
+    let md = md.join("\n");
+    eprintln!("{md}");
+    // Mainnet seeds lose about 1% of messages and no events or proofs.
+    let short = |done: usize, all: usize| done * 10 < all * 9;
+    if short(events - refused_events, events)
+        || short(proofs - refused_proofs, proofs)
+        || short(accepted, messages)
+    {
+        return Err(format!("the base release refused more than 10% of the seed\n\n{md}").into());
     }
-    Ok(())
+    Ok(md)
 }
 
 /// Samples the API node's heights and records the longest gap between new
@@ -335,13 +387,11 @@ pub async fn run(args: RunArgs) -> Result<bool, Error> {
     if let Err(e) = &result {
         r.findings.fail(format!("stopped early: {e}"));
     }
-    for n in &mut net.nodes {
-        if let Some(status) = n.exited() {
-            r.findings.fail(format!("node {} exited: {status}", n.i));
-        }
-    }
     net.stop_all();
     for n in &net.nodes {
+        for c in &n.crashes {
+            r.findings.fail(format!("node {} {c}", n.i));
+        }
         for p in n.running_panics().into_iter().take(3) {
             r.findings.fail(format!("node {} panicked: {p}", n.i));
         }
@@ -384,12 +434,7 @@ pub async fn run(args: RunArgs) -> Result<bool, Error> {
     }
     let md = md.join("\n");
     if let Some(path) = &args.report {
-        use std::io::Write;
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?
-            .write_all(md.as_bytes())?;
+        append(path, &md)?;
     }
     eprintln!("\n{md}");
     Ok(ok)
@@ -434,7 +479,7 @@ async fn scenario(
     let signup_started = Instant::now();
 
     r.phase("Read API: every endpoint against the base reference node");
-    let summary = checks::endpoints(net, s, &mut r.findings).await;
+    let summary = checks::endpoints(net, s, "mixed", args.min_compared, &mut r.findings).await;
     r.note(summary);
 
     r.phase("Writes through the API node under test (mixed network)");
@@ -449,6 +494,7 @@ async fn scenario(
         signup.fid,
         signup_started.elapsed()
     ));
+    s.native_custody = Some(signup.custody);
     let native = (signup.fid, signup.signer);
     let w = Writers {
         legacy_fid: s.fid2,
@@ -469,6 +515,10 @@ async fn scenario(
             t.elapsed()
         ));
     }
+
+    r.phase("Read API again, on the upgraded network");
+    let summary = checks::endpoints(net, s, "upgraded", args.min_compared, &mut r.findings).await;
+    r.note(summary);
 
     r.phase("Writes through the base reference node (all validators upgraded)");
     checks::writes(net, s, &w, net::REFERENCE, "upgraded", 1, &mut r.findings).await;

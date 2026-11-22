@@ -101,24 +101,20 @@ jobs:
           mkdir -p ogre
           snapchain/target/debug/ogre seed --source "$SEED_SOURCE" --out ogre/seed.bin
 
-      - name: Save the seed
-        if: steps.seed.outputs.cache-matched-key == ''
-        uses: actions/cache/save@v4
-        with:
-          path: ogre/seed.bin
-          key: ogre-seed-v1-${{ github.run_id }}
-
       - name: Restore the seeded chain
         id: chain
         uses: actions/cache/restore@v4
         with:
           path: ogre/chain
-          # Bump v1 when `ogre chain` builds a different chain.
-          key: ogre-chain-v1-${{ steps.digest.outputs.sha }}-${{ hashFiles('ogre/seed.bin', 'snapchain/src/bin/ogre/net.rs') }}
+          # Any change to Ogre rebuilds the chain.
+          key: ogre-chain-v1-${{ steps.digest.outputs.sha }}-${{ hashFiles('ogre/seed.bin', 'snapchain/src/bin/ogre/**') }}
 
       - name: Build the seeded chain on the base release
         if: steps.chain.outputs.cache-hit != 'true'
-        run: snapchain/target/debug/ogre chain --seed ogre/seed.bin --base "docker:${{ steps.digest.outputs.image }}" --work ogre/chain
+        run: |
+          snapchain/target/debug/ogre chain --seed ogre/seed.bin \
+            --base "docker:${{ steps.digest.outputs.image }}" \
+            --work ogre/chain --report "$GITHUB_STEP_SUMMARY"
 
       - name: Save the seeded chain
         if: steps.chain.outputs.cache-hit != 'true'
@@ -135,12 +131,23 @@ jobs:
             --under-test snapchain/target/debug/hypersnap \
             --work ogre/run --report "$GITHUB_STEP_SUMMARY"
 
+      # Only a seed that built a chain and passed a rollout is reused, so one
+      # that can't doesn't fail later runs. A pull request's caches are its own.
+      - name: Save the seed
+        if: steps.seed.outputs.cache-matched-key == ''
+        uses: actions/cache/save@v4
+        with:
+          path: ogre/seed.bin
+          key: ogre-seed-v1-${{ github.run_id }}
+
       - name: Node logs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: ogre-logs
-          path: ogre/run/logs
+          path: |
+            ogre/chain/logs
+            ogre/run/logs
           retention-days: 7
 
       - name: Delete superseded Ogre caches

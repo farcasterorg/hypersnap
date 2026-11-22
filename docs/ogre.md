@@ -17,13 +17,16 @@ original hash, so the devnet stores them with their original signatures. A
 devnet accepts messages signed for mainnet. Messages signed by gasless keys are
 left out, since the API doesn't return KEY_ADD messages; ENS names, contract
 verifications and anything else that needs an L1 or L2 client is refused by the
-devnet and reported. Each run starts from the same chain; nothing is uploaded
-as a snapshot.
+devnet and reported. `ogre chain` fails when the base release refuses more than
+10% of the seed's onchain events, fname proofs or messages (a mainnet seed loses
+about 1% of its messages and nothing else); the counts go to the job summary.
+Each run starts from the same chain; nothing is uploaded as a snapshot.
 
 `ogre chain` builds that chain on the release mainnet runs
 (`farcasterorg/hypersnap:latest`) and stops it. CI caches the seed (refreshed
-daily) and the chain (per base release and seed), so a run starts from a
-stopped network, the way an operator's node is upgraded.
+daily) and the chain (per base release, seed and Ogre source), so a run starts
+from a stopped network, the way an operator's node is upgraded. A new seed is
+cached only after it built a chain and passed a rollout.
 
 `ogre run` then:
 
@@ -31,25 +34,60 @@ stopped network, the way an operator's node is upgraded.
    the build under test, and measures how long the network takes to make blocks
    again.
 2. Calls every read endpoint on the read node under test and on the base read
-   node, and fails when the build returns an error, an empty result or fewer
-   fields than the base release does. Endpoints where the base release has no
-   data are listed as not compared, and different values are warnings.
+   node, and fails when the build returns an error or an empty result, drops a
+   field, empties an array or changes a value's JSON type where the base release
+   has data. Endpoints where the base release has no data are listed as not
+   compared, and the run fails when fewer than `--min-compared` endpoints had
+   base data (a reference node that errs can't turn every check into a skip).
+   Different values are warnings. A failing endpoint is retried for 6 seconds.
 3. Signs up a native account with a gasless signer, as new users do, and sends
    casts, a reply, a mention, a like, a recast and follows from it and from a
    real seeded account, through the read node's HTTP API. It checks every node
    at the tip stores them and the API shows them: following feed, notifications,
    conversation, author feed, profile counts, like count and search.
 4. Restarts validators 1-4 on the build one at a time (a rolling upgrade),
-   then sends the writes again through the base read node.
+   compares every endpoint again, then sends the writes again through the base
+   read node.
 5. Kills a validator and restarts it. A read node that started with an empty
    database replays the chain from block 1 on the build the whole time; it has
    to keep making progress (a debug build replays too slowly to reach the tip
    in a run).
 
 It fails on any of those, on a shard going longer than `--max-stall` without a
-block, on a node exiting, and on a panic while nodes run (panics during a
+block, on a node exiting on its own (found when it is next stopped, including
+before a planned restart), and on a panic while nodes run (panics during a
 graceful stop are reported as warnings). The report goes to the job summary,
 and node logs are uploaded when it fails.
+
+## Endpoints left out
+
+Ogre calls every read route of both HTTP routers (`src/network/http_server.rs`
+and `src/api/http.rs`), including the POST batch reads, except these:
+
+- `/v1/channel*`, `/v1/isFollowingChannel`: Hypersnap's own channel messages,
+  which a seed exported from the HTTP API doesn't hold.
+- `/v1/currentPeers`, `/v1/mesh`, `/v1/mesh/ui`: each node's own peers; `mesh`
+  needs the admin login.
+- `/v2/farcaster/user/power_users`, `/v2/farcaster/user/balance`,
+  `/v2/farcaster/user/subscribed_to`, `/v2/farcaster/user/subscribers`,
+  `/v2/farcaster/user/subscriptions_created`, `/v2/farcaster/ban/list`,
+  `/v2/farcaster/channel/member/invite/list`, `/v2/farcaster/topic/trending`,
+  `/v2/farcaster/cast/conversation/summary`: fixed empty answers, no data
+  behind them.
+- `/v2/farcaster/cast/embed/crawl`: fetches the open web.
+- `/v2/farcaster/stats/daily`: its indexer is off in
+  `docker-compose.mainnet.yml`, the configuration the read nodes use.
+- Writes and managed-service stubs (`/v1/submitMessage` is what the write checks
+  use): `/v1/submitBulkMessages`, `/v1/validateMessage`, `/v2/farcaster/action`,
+  `/v2/farcaster/app_host/*`, `/v2/farcaster/auth_address/*`,
+  `/v2/farcaster/ban`, `/v2/farcaster/block`, `/v2/farcaster/channel/follow`,
+  `/v2/farcaster/channel/member`, `/v2/farcaster/channel/member/invite`,
+  `/v2/farcaster/follow`, `/v2/farcaster/frame/*`, `/v2/farcaster/fungible*`,
+  `/v2/farcaster/login/*`, `/v2/farcaster/message`, `/v2/farcaster/mute`,
+  `/v2/farcaster/nft/*`, `/v2/farcaster/notifications/mark_seen`,
+  `/v2/farcaster/notifications/seen`, `/v2/farcaster/signer/*`,
+  `/v2/farcaster/storage/buy`, `/v2/farcaster/user/follow`,
+  `/v2/farcaster/user/register`, `/v2/farcaster/user/verification`.
 
 ## Running it locally
 

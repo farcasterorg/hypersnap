@@ -170,6 +170,8 @@ pub struct Node {
     log: PathBuf,
     /// Panics logged while the node was being stopped.
     pub shutdown_panics: Vec<String>,
+    /// How the node exited on its own, found when it was next stopped.
+    pub crashes: Vec<String>,
 }
 
 impl Node {
@@ -197,10 +199,15 @@ impl Node {
             .create(true)
             .append(true)
             .open(&self.log)?;
+        const ENV: [(&str, &str); 3] = [
+            ("RUST_LOG", "warn,snapchain=info"),
+            ("RUST_BACKTRACE", "1"),
+            ("NO_COLOR", "1"),
+        ];
         let mut cmd = match build {
             Build::Binary(bin) => {
                 let mut c = Command::new(bin);
-                c.arg("--config-path").arg(&cfg);
+                c.arg("--config-path").arg(&cfg).envs(ENV);
                 c
             }
             Build::Image(image) => {
@@ -222,16 +229,16 @@ impl Node {
                 .args(["--user", &format!("{}:{}", uid(), gid())])
                 .args(["-v", &format!("{work}:{work}"), "-w", &work])
                 .args(["--ulimit", "nofile=65535:65535"])
+                .args(
+                    ENV.iter()
+                        .flat_map(|(k, v)| ["-e".to_string(), format!("{k}={v}")]),
+                )
                 .args(["--entrypoint", "/app/hypersnap", image, "--config-path"])
                 .arg(&cfg);
                 c
             }
         };
-        cmd.env("RUST_LOG", "warn,snapchain=info")
-            .env("RUST_BACKTRACE", "1")
-            .env("NO_COLOR", "1")
-            .stdout(log.try_clone()?)
-            .stderr(log);
+        cmd.stdout(log.try_clone()?).stderr(log);
         self.child = Some(cmd.spawn()?);
         self.build = Some(build.clone());
         Ok(())
@@ -242,8 +249,12 @@ impl Node {
         let Some(mut child) = self.child.take() else {
             return;
         };
+        if let Ok(Some(status)) = child.try_wait() {
+            self.crashes.push(format!("exited on its own: {status}"));
+        }
         let before = self.panics().len();
-        if let Some(Build::Image(_)) = self.build {
+        let image = matches!(self.build, Some(Build::Image(_)));
+        if image {
             let sig = if kill { "KILL" } else { "TERM" };
             let _ = Command::new("docker")
                 .args(["kill", "-s", sig, &self.container()])
@@ -263,10 +274,17 @@ impl Node {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        if child.try_wait().ok().flatten().is_none() {
+        if image {
+            // Killing the `docker run` client would leave the container running.
+            let _ = Command::new("docker")
+                .args(["rm", "-f", &self.container()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        } else if child.try_wait().ok().flatten().is_none() {
             let _ = child.kill();
-            let _ = child.wait();
         }
+        let _ = child.wait();
         let after = self.panics();
         self.shutdown_panics.extend(after.into_iter().skip(before));
     }
@@ -277,13 +295,6 @@ impl Node {
             .into_iter()
             .filter(|p| !self.shutdown_panics.contains(p))
             .collect()
-    }
-
-    /// Whether the process exited on its own (crashed).
-    pub fn exited(&mut self) -> Option<std::process::ExitStatus> {
-        self.child
-            .as_mut()
-            .and_then(|c| c.try_wait().ok().flatten())
     }
 
     pub fn log_tail(&self, lines: usize) -> String {
@@ -338,6 +349,7 @@ impl Net {
                 child: None,
                 log: logs.join(format!("node-{i}.log")),
                 shutdown_panics: Vec::new(),
+                crashes: Vec::new(),
             })
             .collect();
         Ok(Net {
@@ -368,7 +380,26 @@ impl Net {
     }
 
     pub async fn get(&self, i: usize, path: &str) -> Result<(u16, Value), Error> {
-        let r = self.http.get(self.nodes[i - 1].url(path)).send().await?;
+        self.send(self.http.get(self.nodes[i - 1].url(path))).await
+    }
+
+    /// GETs `path`, or for `POST <path> <json>` posts the body.
+    pub async fn read(&self, i: usize, spec: &str) -> Result<(u16, Value), Error> {
+        match spec.strip_prefix("POST ").and_then(|s| s.split_once(' ')) {
+            Some((path, body)) => {
+                let url = self.nodes[i - 1].url(path);
+                let req = self
+                    .http
+                    .post(url)
+                    .header("content-type", "application/json");
+                self.send(req.body(body.to_string())).await
+            }
+            None => self.get(i, spec).await,
+        }
+    }
+
+    async fn send(&self, req: reqwest::RequestBuilder) -> Result<(u16, Value), Error> {
+        let r = req.send().await?;
         let status = r.status().as_u16();
         let text = r.text().await?;
         Ok((
