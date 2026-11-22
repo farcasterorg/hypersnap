@@ -15,7 +15,6 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  MALACHITE_GIT_REF: "13bca14cd209d985c3adf101a02924acde8723a5"
   ETH_SIGNATURE_VERIFIER_GIT_REF: "8deb4a091982c345949dc66bf8684489d9f11889"
   RUSTFLAGS: "-Dwarnings -A mismatched_lifetime_syntaxes"
   CARGO_TERM_COLOR: always
@@ -31,12 +30,7 @@ jobs:
     timeout-minutes: 10
     runs-on: ${{ vars.RUNS_ON == 'true' && fromJSON(format('["runs-on={0}","runner=64cpu-linux-arm64"]', github.run_id)) || 'ubuntu-24.04-arm' }}
     steps:
-      # cargo reads the workspace's path dependencies even to format it
-      - uses: actions/checkout@v4
-        with:
-          repository: informalsystems/malachite
-          ref: ${{ env.MALACHITE_GIT_REF }}
-          path: ./malachite
+      # Only the signature verifier remains an external path dependency
       - uses: actions/checkout@v4
         with:
           repository: CassOnMars/eth-signature-verifier
@@ -74,11 +68,6 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: actions/checkout@v4
-        with:
-          repository: informalsystems/malachite
-          ref: ${{ env.MALACHITE_GIT_REF }}
-          path: ./malachite
       - uses: actions/checkout@v4
         with:
           repository: CassOnMars/eth-signature-verifier

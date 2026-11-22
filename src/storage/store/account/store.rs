@@ -594,6 +594,23 @@ impl<T: StoreDef + Clone> Store<T> {
         )
     }
 
+    /// The message this store holds for `fid` under `ts_hash`, in one read.
+    /// `None` once it's gone (removed, revoked, or superseded).
+    pub fn get_by_ts_hash(
+        &self,
+        fid: u64,
+        ts_hash: &[u8; TS_HASH_LENGTH],
+    ) -> Result<Option<Message>, HubError> {
+        get_message_with_prefix(
+            &self.db,
+            &RocksDbTransactionBatch::new(),
+            self.user_prefix(),
+            fid,
+            self.store_def.postfix(),
+            ts_hash,
+        )
+    }
+
     pub fn get_remove(
         &self,
         partial_message: &Message,

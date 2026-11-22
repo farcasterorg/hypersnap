@@ -126,7 +126,7 @@ async fn run(
                     Ok(_) => {
                         if let Some(request) = pending.take() { let _ = request.done.send(Ok(())); }
                     }
-                    Err(gossipsub::PublishError::InsufficientPeers | gossipsub::PublishError::Duplicate) => {}, // Failed attempts may enter libp2p's duplicate cache; never ACK those.
+                    Err(gossipsub::PublishError::NoPeersSubscribedToTopic | gossipsub::PublishError::AllQueuesFull(_) | gossipsub::PublishError::Duplicate) => {}, // Failed attempts may enter libp2p's duplicate cache; never ACK those.
                     Err(error) => { if let Some(request) = pending.take() { let _ = request.done.send(Err(error.to_string())); } }
                 }
             }

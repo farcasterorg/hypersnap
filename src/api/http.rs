@@ -145,6 +145,8 @@ pub trait HubQueryHandler: Send + Sync {
     /// Get notifications for a user (reactions + mentions on their casts + follows).
     /// With `include_quotes_and_deep_replies`, also replies deeper in threads
     /// under the user's casts and, when `quotes` is given, casts quoting them.
+    /// Once `index` is complete, pages come from it, reaching back through all
+    /// of the user's history instead of only their newest casts.
     async fn get_notifications(
         &self,
         fid: u64,
@@ -152,6 +154,7 @@ pub trait HubQueryHandler: Send + Sync {
         cursor: Option<&str>,
         include_quotes_and_deep_replies: bool,
         quotes: Option<&crate::api::cast_quotes_index::CastQuotesIndexer>,
+        index: Option<&crate::api::notifications_index::NotificationsIndexer>,
     ) -> Result<(Vec<crate::proto::Message>, Option<String>), String>;
 
     /// Get links by FID and link type (e.g. "follow", "block", "mute").
@@ -261,6 +264,9 @@ pub struct ApiHttpHandler {
         Arc<std::sync::RwLock<Option<Arc<crate::api::followed_bounds::FollowedBounds>>>>,
     /// Hydrated profiles kept between requests. Late-bound like `daily_stats`.
     profile_cache: Arc<std::sync::RwLock<Option<Arc<crate::api::profile_cache::ProfileCache>>>>,
+    /// Notifications index. Late-bound like `daily_stats`.
+    notifications_index:
+        Arc<std::sync::RwLock<Option<Arc<crate::api::notifications_index::NotificationsIndexer>>>>,
 }
 
 /// Emit the count, latency, total and error metrics for one request.
@@ -371,6 +377,7 @@ impl ApiHttpHandler {
             user_search: Arc::new(std::sync::RwLock::new(None)),
             followed_bounds: Arc::new(std::sync::RwLock::new(None)),
             profile_cache: Arc::new(std::sync::RwLock::new(None)),
+            notifications_index: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -392,6 +399,21 @@ impl ApiHttpHandler {
     /// The following feed's bounds, when enabled.
     pub fn followed_bounds(&self) -> Option<Arc<crate::api::followed_bounds::FollowedBounds>> {
         self.followed_bounds.read().unwrap().clone()
+    }
+
+    /// Install the notifications index (callable after construction).
+    pub fn set_notifications_index(
+        &self,
+        index: Arc<crate::api::notifications_index::NotificationsIndexer>,
+    ) {
+        *self.notifications_index.write().unwrap() = Some(index);
+    }
+
+    /// The notifications index, for starting its store walk.
+    pub fn notifications_index(
+        &self,
+    ) -> Option<Arc<crate::api::notifications_index::NotificationsIndexer>> {
+        self.notifications_index.read().unwrap().clone()
     }
 
     /// Install the user search index (callable after construction).
@@ -1905,8 +1927,14 @@ impl ApiHttpHandler {
             .await
         {
             Ok(conversation) => {
+                // Every cast in the tree descends from its root, so they all
+                // share the root's thread, one hop further per level
+                let root_thread = self.thread_root(&conversation.root.cast).await;
                 let mut cast_with_replies = match self
-                    .conversation_cast_to_cast_with_replies(&conversation.root)
+                    .conversation_cast_to_cast_with_replies(
+                        &conversation.root,
+                        root_thread.as_ref(),
+                    )
                     .await
                 {
                     Ok(cast) => cast,
@@ -1942,16 +1970,26 @@ impl ApiHttpHandler {
     fn conversation_cast_to_cast_with_replies<'a>(
         &'a self,
         conv_cast: &'a crate::api::conversations::ConversationCast,
+        root_thread: Option<&'a (Vec<u8>, usize)>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<CastWithReplies, String>> + Send + 'a>,
     > {
         Box::pin(async move {
-            let mut cast = self.message_to_cast(&conv_cast.cast).await;
+            // What `thread_root` would find walking up through the tree
+            let thread_hash = root_thread
+                .filter(|(_, hops)| hops + conv_cast.depth as usize <= MAX_THREAD_HOPS)
+                .map(|(hash, _)| hash.clone());
+            let mut cast = self
+                .message_to_cast_in_thread(&conv_cast.cast, thread_hash)
+                .await;
             self.attach_cast_metrics(&mut cast, &conv_cast.cast.hash)
                 .await?;
             let mut direct_replies = Vec::with_capacity(conv_cast.replies.len());
             for reply in &conv_cast.replies {
-                direct_replies.push(self.conversation_cast_to_cast_with_replies(reply).await?);
+                direct_replies.push(
+                    self.conversation_cast_to_cast_with_replies(reply, root_thread)
+                        .await?,
+                );
             }
             Ok(CastWithReplies {
                 cast,
@@ -2161,6 +2199,16 @@ impl ApiHttpHandler {
 
     /// Helper: convert a proto Message to an API Cast.
     async fn message_to_cast(&self, msg: &crate::proto::Message) -> Cast {
+        let thread_hash = self.thread_root(msg).await.map(|(hash, _)| hash);
+        self.message_to_cast_in_thread(msg, thread_hash).await
+    }
+
+    /// `message_to_cast` for a cast whose conversation root is known.
+    async fn message_to_cast_in_thread(
+        &self,
+        msg: &crate::proto::Message,
+        thread_hash: Option<Vec<u8>>,
+    ) -> Cast {
         let data = msg.data.as_ref();
         let fid = data.map(|d| d.fid).unwrap_or(0);
         let timestamp = data.map(|d| d.timestamp).unwrap_or(0);
@@ -2238,7 +2286,7 @@ impl ApiHttpHandler {
             })
             .unwrap_or_default();
 
-        let thread_hash = self.thread_root(msg).await.map(hex::encode);
+        let thread_hash = thread_hash.map(hex::encode);
         let (format_version, chain) =
             cast_format(msg).map_or((None, None), |(version, chain)| (Some(version), chain));
 
@@ -2272,9 +2320,10 @@ impl ApiHttpHandler {
 
     /// Hash of the conversation root above `msg`: its own hash for a
     /// top-level cast, else the top-most ancestor reached through parent cast
-    /// ids. `None` when an ancestor is missing or the chain is longer than
-    /// `MAX_THREAD_HOPS`. Each hop is one cast store lookup by FID and hash.
-    async fn thread_root(&self, msg: &crate::proto::Message) -> Option<Vec<u8>> {
+    /// ids, with the number of ancestors walked. `None` when an ancestor is
+    /// missing or the chain is longer than `MAX_THREAD_HOPS`. Each hop is one
+    /// cast store lookup by FID and hash.
+    async fn thread_root(&self, msg: &crate::proto::Message) -> Option<(Vec<u8>, usize)> {
         fn parent_of(msg: &crate::proto::Message) -> Option<crate::proto::CastId> {
             match &msg.data.as_ref()?.body {
                 Some(crate::proto::message_data::Body::CastAddBody(body)) => match &body.parent {
@@ -2286,14 +2335,14 @@ impl ApiHttpHandler {
         }
 
         let Some(mut parent) = parent_of(msg) else {
-            return Some(msg.hash.clone());
+            return Some((msg.hash.clone(), 0));
         };
         let hub = self.hub_query.read().unwrap().clone()?;
-        for _ in 0..MAX_THREAD_HOPS {
+        for hops in 1..=MAX_THREAD_HOPS {
             let ancestor = hub.get_cast_by_hash(&parent.hash, Some(parent.fid)).await?;
             match parent_of(&ancestor) {
                 Some(next) => parent = next,
-                None => return Some(ancestor.hash),
+                None => return Some((ancestor.hash, hops)),
             }
         }
         None
@@ -3403,6 +3452,7 @@ impl ApiHttpHandler {
                 cursor,
                 include_quotes_and_deep_replies,
                 self.cast_quotes_index.as_deref(),
+                self.notifications_index().as_deref(),
             )
             .await
         {
@@ -3422,6 +3472,9 @@ impl ApiHttpHandler {
                                 if include_quotes_and_deep_replies && is_quote_of(data, fid) =>
                             {
                                 "quote"
+                            }
+                            Ok(crate::proto::MessageType::CastAdd) if is_mention_of(data, fid) => {
+                                "mention"
                             }
                             Ok(crate::proto::MessageType::CastAdd) => "reply",
                             Ok(crate::proto::MessageType::LinkAdd) => "follows",
@@ -3525,7 +3578,14 @@ impl ApiHttpHandler {
 
         // Fetch more notifications than needed so we can filter
         match hub
-            .get_notifications(fid, limit * 10, cursor, false, None)
+            .get_notifications(
+                fid,
+                limit * 10,
+                cursor,
+                false,
+                None,
+                self.notifications_index().as_deref(),
+            )
             .await
         {
             Ok((messages, next_cursor)) => {
@@ -3560,6 +3620,9 @@ impl ApiHttpHandler {
                     let user = self.get_user(data.fid).await;
                     let notif_type = match crate::proto::MessageType::try_from(data.r#type) {
                         Ok(crate::proto::MessageType::ReactionAdd) => "likes",
+                        Ok(crate::proto::MessageType::CastAdd) if is_mention_of(data, fid) => {
+                            "mention"
+                        }
                         Ok(crate::proto::MessageType::CastAdd) => "reply",
                         Ok(crate::proto::MessageType::LinkAdd) => "follows",
                         _ => "mention",
@@ -3639,7 +3702,14 @@ impl ApiHttpHandler {
         let target_urls: Vec<&str> = parent_urls_param.split(',').map(|s| s.trim()).collect();
 
         match hub
-            .get_notifications(fid, limit * 10, cursor, false, None)
+            .get_notifications(
+                fid,
+                limit * 10,
+                cursor,
+                false,
+                None,
+                self.notifications_index().as_deref(),
+            )
             .await
         {
             Ok((messages, next_cursor)) => {
@@ -3673,6 +3743,9 @@ impl ApiHttpHandler {
                     let user = self.get_user(data.fid).await;
                     let notif_type = match crate::proto::MessageType::try_from(data.r#type) {
                         Ok(crate::proto::MessageType::ReactionAdd) => "likes",
+                        Ok(crate::proto::MessageType::CastAdd) if is_mention_of(data, fid) => {
+                            "mention"
+                        }
                         Ok(crate::proto::MessageType::CastAdd) => "reply",
                         Ok(crate::proto::MessageType::LinkAdd) => "follows",
                         _ => "mention",
@@ -5247,6 +5320,20 @@ fn is_recast(data: &crate::proto::MessageData) -> bool {
     )
 }
 
+/// Whether a cast mentions `fid` without being a direct reply to one of their
+/// casts: a mention notification rather than a reply. Direct replies to the
+/// user's casts stay replies even when the client added an @mention of them.
+fn is_mention_of(data: &crate::proto::MessageData, fid: u64) -> bool {
+    let Some(crate::proto::message_data::Body::CastAddBody(body)) = &data.body else {
+        return false;
+    };
+    let replies_to_fid = matches!(
+        &body.parent,
+        Some(crate::proto::cast_add_body::Parent::ParentCastId(parent)) if parent.fid == fid
+    );
+    !replies_to_fid && body.mentions.contains(&fid)
+}
+
 /// Whether a cast quotes a cast by `fid` without being a direct reply to one.
 fn is_quote_of(data: &crate::proto::MessageData, fid: u64) -> bool {
     let Some(crate::proto::message_data::Body::CastAddBody(body)) = &data.body else {
@@ -5804,6 +5891,7 @@ mod tests {
             _cursor: Option<&str>,
             _include_quotes_and_deep_replies: bool,
             _quotes: Option<&crate::api::cast_quotes_index::CastQuotesIndexer>,
+            _index: Option<&crate::api::notifications_index::NotificationsIndexer>,
         ) -> Result<(Vec<crate::proto::Message>, Option<String>), String> {
             Ok((self.notifications.clone(), None))
         }
@@ -6269,7 +6357,7 @@ mod tests {
         assert_eq!(json["cast"]["replies"]["count"], 1);
 
         let shallow = handler
-            .conversation_cast_to_cast_with_replies(&conversation_cast)
+            .conversation_cast_to_cast_with_replies(&conversation_cast, None)
             .await
             .unwrap();
         assert!(shallow.direct_replies.is_empty());
@@ -6317,6 +6405,57 @@ mod tests {
         assert_eq!(thread_hash(deep).await, root_hex);
         assert_eq!(thread_hash(orphan).await, None, "missing ancestor");
         assert_eq!(thread_hash(looped).await, None, "hop limit");
+    }
+
+    #[tokio::test]
+    async fn test_conversation_thread_hashes_match_a_walk_from_each_cast() {
+        use crate::api::conversations::ConversationCast;
+        use crate::utils::factory::messages_factory::casts;
+
+        // chain[k] has k ancestors
+        let mut chain = vec![casts::create_cast_add(1, "top", None, None)];
+        while chain.len() < MAX_THREAD_HOPS + 3 {
+            let parent = chain.last().unwrap().hash.clone();
+            let text = format!("reply {}", chain.len());
+            chain.push(casts::create_cast_with_parent(
+                1, &text, 1, &parent, None, None,
+            ));
+        }
+        let handler = ApiHttpHandler::new(None, None, None, None, None, None);
+        handler.set_hub_query(Arc::new(MockHubQuery {
+            casts: chain.clone(),
+            ..Default::default()
+        }));
+        // Two levels below roots on either side of the hop limit
+        for start in [
+            0,
+            1,
+            MAX_THREAD_HOPS - 2,
+            MAX_THREAD_HOPS - 1,
+            MAX_THREAD_HOPS,
+        ] {
+            let node = |depth: usize, replies| ConversationCast {
+                cast: chain[start + depth].clone(),
+                replies,
+                depth: depth as u32,
+            };
+            let tree = node(0, vec![node(1, vec![node(2, vec![])])]);
+            let root_thread = handler.thread_root(&tree.cast).await;
+            let mut converted = handler
+                .conversation_cast_to_cast_with_replies(&tree, root_thread.as_ref())
+                .await
+                .unwrap();
+            for depth in 0..3 {
+                let walked = handler.message_to_cast(&chain[start + depth]).await;
+                assert_eq!(
+                    converted.cast.thread_hash, walked.thread_hash,
+                    "root {start}, depth {depth}"
+                );
+                if let Some(reply) = converted.direct_replies.pop() {
+                    converted = reply;
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -6783,6 +6922,114 @@ mod tests {
             assert_eq!(notifications[0]["cast"]["hash"], "01");
             assert_eq!(notifications[1]["user"]["fid"], 123);
             assert_eq!(notifications[1]["cast"]["author"]["fid"], target_fid);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_notifications_label_mentions() {
+        let target_fid: u64 = 121;
+        let channel = "https://warpcast.com/~/channel/test";
+        let cast = |fid: u64,
+                    hash: u8,
+                    mentions: Vec<u64>,
+                    parent: Option<crate::proto::cast_add_body::Parent>| {
+            let mut msg = mock_cast(fid, vec![hash]);
+            if let Some(crate::proto::message_data::Body::CastAddBody(body)) =
+                &mut msg.data.as_mut().unwrap().body
+            {
+                body.mentions_positions = vec![0; mentions.len()];
+                body.mentions = mentions;
+                body.parent = parent;
+            }
+            msg
+        };
+        let parent_cast = |fid: u64| {
+            Some(crate::proto::cast_add_body::Parent::ParentCastId(
+                crate::proto::CastId { fid, hash: vec![9] },
+            ))
+        };
+        let parent_url = Some(crate::proto::cast_add_body::Parent::ParentUrl(
+            channel.to_string(),
+        ));
+
+        let handler = ApiHttpHandler::new(None, None, None, None, None, None);
+        handler.set_hub_query(Arc::new(MockHubQuery {
+            notifications: vec![
+                // a top-level cast tagging the user
+                cast(122, 1, vec![target_fid], None),
+                // a reply in someone else's thread tagging the user
+                cast(123, 2, vec![130, target_fid], parent_cast(130)),
+                // a channel cast tagging the user
+                cast(124, 3, vec![target_fid], parent_url),
+                // a reply to the user's cast that also tags them
+                cast(125, 4, vec![target_fid], parent_cast(target_fid)),
+                // a reply deeper in the user's thread, no tag
+                cast(126, 5, vec![], parent_cast(140)),
+                // a quote of the user's cast that also tags them
+                {
+                    let mut quote = cast(127, 6, vec![target_fid], None);
+                    if let Some(crate::proto::message_data::Body::CastAddBody(body)) =
+                        &mut quote.data.as_mut().unwrap().body
+                    {
+                        body.embeds.push(crate::proto::Embed {
+                            embed: Some(crate::proto::embed::Embed::CastId(crate::proto::CastId {
+                                fid: target_fid,
+                                hash: vec![8],
+                            })),
+                        });
+                    }
+                    quote
+                },
+            ],
+            ..Default::default()
+        }));
+
+        for flag in [false, true] {
+            let response = handler
+                .handle_notifications(target_fid, None, 10, flag)
+                .await
+                .unwrap();
+            let json = collect_json(response).await;
+            let types: Vec<(u64, &str)> = json["notifications"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|n| {
+                    (
+                        n["user"]["fid"].as_u64().unwrap(),
+                        n["type"].as_str().unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                types,
+                [
+                    (122, "mention"),
+                    (123, "mention"),
+                    (124, "mention"),
+                    (125, "reply"),
+                    (126, "reply"),
+                    (127, if flag { "quote" } else { "mention" })
+                ],
+                "include_quotes_and_deep_replies={flag}"
+            );
+        }
+
+        for response in [
+            handler
+                .handle_parent_url_notifications(target_fid, channel, None, 10)
+                .await
+                .unwrap(),
+            handler
+                .handle_channel_notifications(target_fid, channel, None, 10)
+                .await
+                .unwrap(),
+        ] {
+            let json = collect_json(response).await;
+            let notifications = json["notifications"].as_array().unwrap();
+            assert_eq!(notifications.len(), 1);
+            assert_eq!(notifications[0]["user"]["fid"], 124);
+            assert_eq!(notifications[0]["type"], "mention");
         }
     }
 }

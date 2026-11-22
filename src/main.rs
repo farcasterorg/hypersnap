@@ -104,6 +104,12 @@ async fn start_servers(
         let backfill_db = block_stores.db.clone();
         let backfill_shard_stores = shard_stores.clone();
         let backfill_hyper_stores = hyper_shard_stores.clone();
+        // The notifications index walks the hyper stores, so it starts once
+        // they're filled; reconciliation writes them without events.
+        let notifications_index = api_handler
+            .as_ref()
+            .and_then(|h| h.notifications_index())
+            .filter(|i| !i.is_complete());
         tokio::spawn(async move {
             snapchain::hyper::backfill::run_hyper_backfill(
                 &backfill_db,
@@ -128,6 +134,15 @@ async fn start_servers(
             });
             if let Err(e) = reconcile.await {
                 warn!(error = %e, "Hyper reconciliation task failed");
+            }
+            if let Some(index) = notifications_index {
+                let walk = tokio::task::spawn_blocking(move || index.backfill()).await;
+                match walk {
+                    Ok(Ok(())) => {}
+                    // Resumes from its checkpoints on the next start.
+                    Ok(Err(e)) => warn!(error = %e, "Notifications index walk stopped"),
+                    Err(e) => warn!(error = %e, "Notifications index walk task failed"),
+                }
             }
         });
     }
@@ -1000,7 +1015,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             &app_config,
             gossip_tx.clone(),
             local_peer_id,
-            mempool_tx,
+            mempool_tx.clone(),
             shutdown_tx,
             onchain_events_request_tx,
             fname_request_tx,
@@ -1065,16 +1080,23 @@ async fn run() -> Result<(), Box<dyn Error>> {
                             // Forward to appropriate consensus actors
                             node.dispatch_network_event(shard, event);
                         },
-                        SystemMessage::Mempool(_) => {},// No need to store mempool messages from other nodes in read nodes
+                        SystemMessage::Mempool(request) => {
+                            if let Err(err) = mempool_tx.try_send(request) {
+                                if let MempoolRequest::AddMessage(_, _, Some(reply)) = err.into_inner() {
+                                    let _ = reply.send(Err(snapchain::core::error::HubError::unavailable("read-node mempool unavailable")));
+                                }
+                            }
+                        },
                         SystemMessage::DecidedValueForReadNode(decided_value) => {
                             node.dispatch_decided_value(decided_value);
                         }
                         SystemMessage::ExitWithError(err) => {
                             error!("Exiting due to: {}", err);
-                            if let Some(api) = api_system {
-                                api.shutdown().await;
-                            }
+                            SHUTTING_DOWN.store(true, Ordering::SeqCst);
                             node.stop();
+                            if let Some(api) = api_system {
+                                shut_down_api(api).await;
+                            }
                             return Err(err.into());
                         }
                     }
@@ -1451,10 +1473,11 @@ async fn run() -> Result<(), Box<dyn Error>> {
                         },
                         SystemMessage::ExitWithError(err) => {
                             error!("Exiting due to: {}", err);
-                            if let Some(api) = api_system {
-                                api.shutdown().await;
-                            }
+                            SHUTTING_DOWN.store(true, Ordering::SeqCst);
                             node.stop();
+                            if let Some(api) = api_system {
+                                shut_down_api(api).await;
+                            }
                             return Err(err.into());
                         }
                     }

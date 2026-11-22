@@ -141,6 +141,62 @@ pub fn get_active_key(
     }))
 }
 
+/// Admission-only authorization. All staged writes are discarded: admission
+/// must never consume nonces, register keys, or extend sliding TTLs.
+/// The caller checks the envelope signature before calling this helper.
+pub fn verify_message_signer(
+    onchain_event_store: &OnchainEventStore,
+    db: &Arc<RocksDB>,
+    message: &proto::Message,
+) -> Result<(), crate::storage::store::engine::MessageValidationError> {
+    use crate::core::validations::error::ValidationError;
+    use crate::storage::store::engine::MessageValidationError;
+    let data = message
+        .data
+        .as_ref()
+        .ok_or(MessageValidationError::NoMessageData)?;
+    let mut scratch = RocksDbTransactionBatch::new();
+    match &data.body {
+        Some(Body::KeyAddBody(body)) => {
+            if message.signer != body.key {
+                return Err(ValidationError::InvalidSignature.into());
+            }
+            super::merge_key_add(db, onchain_event_store, message, &mut scratch, false)?;
+        }
+        Some(Body::KeyRemoveBody(_)) => {
+            super::merge_key_remove(db, onchain_event_store, message, &mut scratch)?;
+        }
+        _ => {
+            let key = get_active_key(onchain_event_store, db, &scratch, data.fid, &message.signer)
+                .map_err(|_| MessageValidationError::MissingSigner)?
+                .ok_or(MessageValidationError::MissingSigner)?;
+            if !key.admits(message.msg_type()) {
+                return Err(MessageValidationError::GaslessKeyOutOfScope {
+                    msg_type: data.r#type,
+                });
+            }
+            if let ActiveKey::Gasless { ttl_seconds, .. } = key {
+                if ttl_seconds > 0 {
+                    // A small admission grace avoids dropping a key whose latest
+                    // use is still in flight; consensus retains the exact TTL rule.
+                    super::check_and_bump_last_used_at(
+                        db,
+                        &mut scratch,
+                        data.fid,
+                        &message.signer,
+                        ttl_seconds,
+                        data.timestamp,
+                        crate::core::util::FarcasterTime::current()
+                            .to_u64()
+                            .saturating_sub(60),
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn extract_scope_and_ttl(message: &Option<proto::Message>) -> Option<(u64, u32)> {
     let key_add = match message.as_ref()?.data.as_ref()?.body.as_ref()? {
         Body::KeyAddBody(body) => body,
@@ -332,5 +388,35 @@ mod tests {
         let txn = RocksDbTransactionBatch::new();
         let result = get_active_key(&store, &rocks, &txn, 3, &pubkey).unwrap();
         assert_eq!(result, Some(ActiveKey::OnChain));
+    }
+    #[test]
+    fn admission_checks_key_scope_and_expiry_without_extending_ttl() {
+        use crate::storage::store::account::{get_last_used_at, init_last_used_at};
+        use crate::utils::factory::messages_factory;
+        let (store, db, _dir) = fresh_store();
+        let signer = signers::generate_signer();
+        let public = signer.verifying_key().to_bytes();
+        let now = crate::core::util::FarcasterTime::current().to_u64() as u32;
+        let mut txn = RocksDbTransactionBatch::new();
+        let record = sample_gasless_record(&public, vec![MessageType::CastAdd as i32], 3600);
+        put_gasless_key_record(&db, &mut txn, 42, &public, &record).unwrap();
+        init_last_used_at(&db, &mut txn, 42, &public, now - 100).unwrap();
+        db.commit(txn).unwrap();
+        let cast =
+            messages_factory::casts::create_cast_add(42, "authorized", Some(now), Some(&signer));
+        assert!(verify_message_signer(&store, &db, &cast).is_ok());
+        assert_eq!(
+            get_last_used_at(&db, &RocksDbTransactionBatch::new(), 42, &public).unwrap(),
+            Some(now - 100)
+        );
+        let link =
+            messages_factory::links::create_link_add(42, "follow", 43, Some(now), Some(&signer));
+        assert!(verify_message_signer(&store, &db, &link).is_err());
+        let mut txn = RocksDbTransactionBatch::new();
+        init_last_used_at(&db, &mut txn, 42, &public, now - 4000).unwrap();
+        db.commit(txn).unwrap();
+        assert!(verify_message_signer(&store, &db, &cast).is_err());
+        let attacker = messages_factory::casts::create_cast_add(42, "forged", Some(now), None);
+        assert!(verify_message_signer(&store, &db, &attacker).is_err());
     }
 }
