@@ -42,6 +42,9 @@ pub(crate) const SYNC_WINDOW: u64 = 32;
 /// been committed for this long: the host dropped the block (bad certificate, failed commit).
 const RETRY_AFTER: Duration = Duration::from_secs(5);
 
+/// How often a node that no peer can serve says so.
+const NO_PEER_WARN_EVERY: Duration = Duration::from_secs(30);
+
 pub type SyncRef = ActorRef<Msg>;
 
 #[derive(Clone, Debug)]
@@ -128,8 +131,8 @@ pub struct State {
     /// When the last block was committed.
     last_progress: Instant,
 
-    /// The last height logged as having no peer to ask, so the warning isn't repeated.
-    no_peer_warned: Option<Height>,
+    /// When the node last logged that no peer has the height it needs.
+    no_peer_warned: Option<Instant>,
 }
 
 impl State {
@@ -322,11 +325,16 @@ impl ReadSync {
                 .choose(&mut rand::thread_rng())
             else {
                 // Past every peer's tip is where the window normally ends. A height that no peer
-                // has yet some peer is past (it pruned it) leaves the node stuck, so say so once.
+                // has yet some peer is past (it pruned it) leaves the node stuck, so say so, at most
+                // once per `NO_PEER_WARN_EVERY`.
                 let ahead = state.sync.peers.values().any(|peer| peer.height >= height);
-                if (ahead || state.sync.peers.is_empty()) && state.no_peer_warned != Some(height) {
+                if (ahead || state.sync.peers.is_empty())
+                    && state
+                        .no_peer_warned
+                        .is_none_or(|at| at.elapsed() >= NO_PEER_WARN_EVERY)
+                {
                     warn!(height.sync = %height, "No peer to request sync from");
-                    state.no_peer_warned = Some(height);
+                    state.no_peer_warned = Some(Instant::now());
                 }
                 break;
             };
