@@ -30,7 +30,7 @@ impl StoredValidatorSets {
         Self { shard_id, sets }
     }
 
-    pub fn get_validator_set(&self, height: u64) -> SnapchainValidatorSet {
+    fn set_at(&self, height: u64) -> &StoredValidatorSet {
         let mut result = &self.sets[0];
         for config in &self.sets {
             if config.shard_ids.contains(&self.shard_id)
@@ -40,7 +40,20 @@ impl StoredValidatorSets {
                 result = config;
             }
         }
-        result.validators.clone()
+        result
+    }
+
+    pub fn get_validator_set(&self, height: u64) -> SnapchainValidatorSet {
+        self.set_at(height).validators.clone()
+    }
+
+    /// Whether `address` is in the validator set at `height`, without cloning the set.
+    pub fn contains(&self, height: u64, address: &Address) -> bool {
+        self.set_at(height)
+            .validators
+            .validators
+            .iter()
+            .any(|validator| validator.address == *address)
     }
 
     /// Every validator in any set this shard can use, across all `effective_at` heights.
