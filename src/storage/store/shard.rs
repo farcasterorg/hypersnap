@@ -3,7 +3,7 @@ use crate::core::error::HubError;
 use crate::proto;
 use crate::proto::ShardChunk;
 use crate::storage::constants::RootPrefix;
-use crate::storage::db::{PageOptions, RocksDB, RocksdbError};
+use crate::storage::db::{PageOptions, RocksDB, RocksDbTransactionBatch, RocksdbError};
 use prost::Message;
 use std::sync::Arc;
 use thiserror::Error;
@@ -154,6 +154,19 @@ pub fn get_current_header(db: &RocksDB) -> Result<Option<proto::ShardHeader>, Sh
 
 pub fn put_shard_chunk(db: &RocksDB, shard_chunk: &ShardChunk) -> Result<(), ShardStorageError> {
     let mut txn = db.txn();
+    put_shard_chunk_in_txn(db, shard_chunk, &mut txn)?;
+    db.commit(txn)?;
+    Ok(())
+}
+
+/// Stage `shard_chunk` and its timestamp index in `txn`, so the chunk becomes visible in the same
+/// RocksDB commit as the state it produced. Readers treat the stored chunk as the certified tip,
+/// so it must never be visible without that state, nor the state without it.
+pub fn put_shard_chunk_in_txn(
+    db: &RocksDB,
+    shard_chunk: &ShardChunk,
+    txn: &mut RocksDbTransactionBatch,
+) -> Result<(), ShardStorageError> {
     let header = shard_chunk
         .header
         .as_ref()
@@ -170,8 +183,6 @@ pub fn put_shard_chunk(db: &RocksDB, shard_chunk: &ShardChunk) -> Result<(), Sha
     if db.get(&timestamp_index_key)? == None {
         txn.put(timestamp_index_key, primary_key);
     }
-
-    db.commit(txn)?;
     Ok(())
 }
 
@@ -200,6 +211,14 @@ impl ShardStore {
 
     pub fn put_shard_chunk(&self, shard_chunk: &ShardChunk) -> Result<(), ShardStorageError> {
         put_shard_chunk(&self.db, shard_chunk)
+    }
+
+    pub fn put_shard_chunk_in_txn(
+        &self,
+        shard_chunk: &ShardChunk,
+        txn: &mut RocksDbTransactionBatch,
+    ) -> Result<(), ShardStorageError> {
+        put_shard_chunk_in_txn(&self.db, shard_chunk, txn)
     }
 
     pub fn get_first_shard_chunk(&self) -> Result<Option<ShardChunk>, ShardStorageError> {

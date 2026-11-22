@@ -1,0 +1,17 @@
+[package]
+name = "informalsystems-malachitebft-starknet-p2p-proto"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+prost.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true
+
+[lints]
+workspace = true

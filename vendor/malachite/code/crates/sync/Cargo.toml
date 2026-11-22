@@ -1,0 +1,33 @@
+[package]
+name = "informalsystems-malachitebft-sync"
+description = "Synchronization protocol for the Malachite BFT consensus engine"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+readme = "../../../README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+malachitebft-core-types = { workspace = true }
+malachitebft-metrics = { workspace = true }
+malachitebft-peer = { workspace = true }
+
+async-trait = { workspace = true }
+bytes = { workspace = true, features = ["serde"] }
+dashmap = { workspace = true }
+derive-where = { workspace = true }
+displaydoc = { workspace = true }
+genawaiter = { workspace = true }
+libp2p = { workspace = true, features = ["request-response", "cbor"] }
+rand = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

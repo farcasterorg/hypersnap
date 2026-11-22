@@ -16,10 +16,10 @@ use informalsystems_malachitebft_engine::util::streaming::{
 };
 use informalsystems_malachitebft_sync::RawDecidedValue;
 use prost::Message;
-use ractor::{async_trait, Actor, ActorProcessingErr, ActorRef, SpawnErr};
+use ractor::{async_trait, Actor, ActorProcessingErr, ActorRef, RpcReplyPort, SpawnErr};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::participation::Participation;
 
@@ -29,6 +29,59 @@ use super::participation::Participation;
 /// consensus actor to the application over a channel, and vice-versa.
 pub struct Host {}
 
+/// Most next-height proposals held while the previous height commits. Each round of that height
+/// has one proposer, so this only fills if the commit stalls for many rounds; past it, proposals
+/// are answered immediately, which is the old behaviour.
+pub const MAX_DEFERRED_PROPOSALS: usize = 16;
+
+/// Proposals for the height after the one this host is about to commit.
+///
+/// Consensus decides a height, waits out its commit timeout and only then tells the host. In that
+/// gap the next height's proposer, often the same node that just proposed, streams its proposal,
+/// and the host would judge it against a tip one height stale: "not the next height", invalid, a
+/// nil vote. Holding the reply until the commit lands lets the proposal be judged properly.
+pub struct DeferredProposals<R> {
+    entries: Vec<(WellFormedProposal, R)>,
+}
+
+impl<R> DeferredProposals<R> {
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    /// Hold `proposal` until the height before it commits. When full, hands it back so the
+    /// caller can answer it now.
+    pub fn defer(
+        &mut self,
+        proposal: WellFormedProposal,
+        reply: R,
+    ) -> Result<(), (WellFormedProposal, R)> {
+        if self.entries.len() >= MAX_DEFERRED_PROPOSALS {
+            return Err((proposal, reply));
+        }
+        self.entries.push((proposal, reply));
+        Ok(())
+    }
+
+    /// After `committed` lands: returns the proposals for the height after it, drops any for
+    /// heights already passed, and keeps later ones.
+    pub fn take_ready(&mut self, committed: crate::proto::Height) -> Vec<(WellFormedProposal, R)> {
+        let next = committed.increment();
+        let (ready, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.entries)
+            .into_iter()
+            .filter(|(proposal, _)| proposal.height() >= next)
+            .partition(|(proposal, _)| proposal.height() == next);
+        self.entries = rest;
+        ready
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 pub struct HostState {
     pub shard_validator: ShardValidator,
     pub network: NetworkRef<SnapchainValidatorContext>,
@@ -37,6 +90,8 @@ pub struct HostState {
     pub statsd: StatsdClientWrapper,
     pub consensus_block_time: u64, // in ms
     pub participation: Arc<Participation>,
+    pub deferred_proposals:
+        DeferredProposals<RpcReplyPort<ProposedValue<SnapchainValidatorContext>>>,
 }
 
 impl Host {
@@ -53,6 +108,36 @@ impl Host {
 }
 
 impl Host {
+    /// Validate a proposal against the current tip and answer consensus.
+    fn validate_and_reply(
+        state: &mut HostState,
+        proposal: WellFormedProposal,
+        reply_to: RpcReplyPort<ProposedValue<SnapchainValidatorContext>>,
+        received_at: tokio::time::Instant,
+    ) -> Result<(), ActorProcessingErr> {
+        let proposed_value = state
+            .shard_validator
+            .add_proposed_value(&proposal, ProposalSource::Consensus);
+        let height = proposed_value.height;
+        let round = proposed_value.round.as_i64();
+        let valid_round = proposed_value.valid_round.as_i64();
+        let is_valid = proposed_value.validity.is_valid();
+        reply_to.send(proposed_value)?;
+        let elapsed = received_at.elapsed();
+        info!(
+            height = height.to_string(),
+            shard = height.shard_index,
+            round = round,
+            at = "host_trace",
+            "Received value at with round: {}, valid_round: {}, valid: {} ({} ms)",
+            round,
+            valid_round,
+            is_valid,
+            elapsed.as_millis()
+        );
+        Ok(())
+    }
+
     async fn handle_msg(
         &self,
         _myself: ActorRef<HostMsg<SnapchainValidatorContext>>,
@@ -61,6 +146,9 @@ impl Host {
     ) -> Result<(), ActorProcessingErr> {
         match msg {
             HostMsg::ConsensusReady(consensus_ref) => {
+                // A certified chunk retained by an earlier run goes first, so the height
+                // consensus starts at is the one after it.
+                state.shard_validator.resume_pending_commit().await;
                 // Start height
                 state.shard_validator.start(); // Call each time?
                 let height = state.shard_validator.get_current_height().increment();
@@ -107,6 +195,16 @@ impl Host {
                 timeout,
                 reply_to,
             } => {
+                if !state.shard_validator.can_propose() {
+                    // Dropping `reply_to` leaves consensus to its propose timeout: nothing is
+                    // built or signed on state certified history has not accounted for.
+                    warn!(
+                        height = height.to_string(),
+                        round = round.as_i64(),
+                        "Not proposing: committed state runs past the certified tip"
+                    );
+                    return Ok(());
+                }
                 let now = tokio::time::Instant::now();
                 let value = state
                     .shard_validator
@@ -213,26 +311,29 @@ impl Host {
                         );
                     }
                     Ok(proposal) => {
-                        let proposed_value = state
+                        // The tip is `confirmed`; a proposal for `confirmed + 2` means the
+                        // decision for `confirmed + 1` may already be on its way here.
+                        let after_pending = state
                             .shard_validator
-                            .add_proposed_value(&proposal, ProposalSource::Consensus);
-                        let height = proposed_value.height;
-                        let round = proposed_value.round.as_i64();
-                        let valid_round = proposed_value.valid_round.as_i64();
-                        let is_valid = proposed_value.validity.is_valid();
-                        reply_to.send(proposed_value)?;
-                        let elapsed = now.elapsed();
-                        info!(
-                            height = height.to_string(),
-                            shard = height.shard_index,
-                            round = round,
-                            at = "host_trace",
-                            "Received value at with round: {}, valid_round: {}, valid: {} ({} ms)",
-                            round,
-                            valid_round,
-                            is_valid,
-                            elapsed.as_millis()
-                        );
+                            .get_current_height()
+                            .increment()
+                            .increment();
+                        if proposal.height() == after_pending {
+                            match state.deferred_proposals.defer(proposal, reply_to) {
+                                Ok(()) => {
+                                    debug!(
+                                        height = %after_pending,
+                                        held = state.deferred_proposals.len(),
+                                        "Holding a proposal until the height before it commits"
+                                    );
+                                }
+                                Err((proposal, reply_to)) => {
+                                    Self::validate_and_reply(state, proposal, reply_to, now)?
+                                }
+                            }
+                        } else {
+                            Self::validate_and_reply(state, proposal, reply_to, now)?;
+                        }
                     }
                     Err(err) => {
                         error!("Received invalid proposal part from {from}: {err}");
@@ -287,6 +388,19 @@ impl Host {
                 let commits = Commits::from_commit_certificate(&certificate);
                 //commit
                 state.shard_validator.decide(commits.clone()).await;
+                // The tip has moved, so proposals held for the next height can be judged now.
+                // Consensus buffers values for a height it has not started yet.
+                for (proposal, reply_to) in state.deferred_proposals.take_ready(certificate.height)
+                {
+                    if let Err(err) = Self::validate_and_reply(
+                        state,
+                        proposal,
+                        reply_to,
+                        tokio::time::Instant::now(),
+                    ) {
+                        warn!("Unable to answer a held proposal: {}", err);
+                    }
+                }
                 state
                     .participation
                     .advance_to(certificate.height.increment().as_u64());
@@ -491,5 +605,73 @@ impl Actor for Host {
             error!("Error processing message: {e}");
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DeferredProposals, MAX_DEFERRED_PROPOSALS};
+    use crate::core::types::{Address, WellFormedProposal};
+    use crate::core::util::shard_chunk_hash;
+    use crate::proto::{full_proposal, FullProposal, Height, ShardChunk, ShardHeader};
+
+    fn proposal(block_number: u64, round: i64) -> WellFormedProposal {
+        let header = ShardHeader {
+            height: Some(Height::new(1, block_number)),
+            timestamp: round as u64,
+            ..Default::default()
+        };
+        WellFormedProposal::try_from(FullProposal {
+            height: header.height,
+            round,
+            proposer: Address([0u8; 32]).to_vec(),
+            proposed_value: Some(full_proposal::ProposedValue::Shard(ShardChunk {
+                hash: shard_chunk_hash(&header),
+                header: Some(header),
+                transactions: vec![],
+                commits: None,
+            })),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn held_proposals_are_released_when_the_height_before_them_commits() {
+        let mut held = DeferredProposals::new();
+        held.defer(proposal(11, 0), "eleven").unwrap();
+        held.defer(proposal(11, 1), "eleven, later round").unwrap();
+        held.defer(proposal(12, 0), "twelve").unwrap();
+        held.defer(proposal(9, 0), "stale").unwrap();
+
+        assert!(held.take_ready(Height::new(1, 9)).is_empty());
+        let ready: Vec<_> = held
+            .take_ready(Height::new(1, 10))
+            .into_iter()
+            .map(|(_, reply)| reply)
+            .collect();
+        assert_eq!(ready, vec!["eleven", "eleven, later round"]);
+        assert_eq!(
+            held.len(),
+            1,
+            "a later height stays held; a passed one is dropped"
+        );
+        let ready: Vec<_> = held
+            .take_ready(Height::new(1, 11))
+            .into_iter()
+            .map(|(_, reply)| reply)
+            .collect();
+        assert_eq!(ready, vec!["twelve"]);
+        assert_eq!(held.len(), 0);
+    }
+
+    #[test]
+    fn holding_is_bounded() {
+        let mut held = DeferredProposals::new();
+        for round in 0..MAX_DEFERRED_PROPOSALS as i64 {
+            held.defer(proposal(11, round), round).unwrap();
+        }
+        let (returned, reply) = held.defer(proposal(11, 99), 99).unwrap_err();
+        assert_eq!(returned.round().as_i64(), 99);
+        assert_eq!(reply, 99);
     }
 }

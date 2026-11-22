@@ -35,6 +35,29 @@ const BASE_PORT_FOR_TEST: u32 = 9382;
 /// the publisher hasn't yet formed a mesh with subscribed peers — the first
 /// few `publish` calls can return `InsufficientPeers` and are only warn-logged
 /// and dropped by `SnapchainGossip::publish`.
+// Stand-in for the node's admission consumer in network-only relay tests.
+fn mock_mempool_verdicts(
+    mut receiver: mpsc::Receiver<SystemMessage>,
+) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    let accept = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let verdict = accept.clone();
+    tokio::spawn(async move {
+        while let Some(message) = receiver.recv().await {
+            if let SystemMessage::Mempool(MempoolRequest::AddMessage(_, _, Some(reply))) = message {
+                let answer = if verdict.load(std::sync::atomic::Ordering::SeqCst) {
+                    Ok(())
+                } else {
+                    Err(crate::core::error::HubError::validation_failure(
+                        "test admission rejection",
+                    ))
+                };
+                let _ = reply.send(answer);
+            }
+        }
+    });
+    accept
+}
+
 async fn publish_until_received(
     publisher_tx: mpsc::Sender<GossipEvent<SnapchainValidatorContext>>,
     receiver: &mut mpsc::Receiver<SystemMessage>,
@@ -149,7 +172,8 @@ async fn test_gossip_communication() {
 
     // Create channels for system messages
     let (system_tx1, _) = mpsc::channel::<SystemMessage>(100);
-    let (system_tx2, _) = mpsc::channel::<SystemMessage>(100);
+    let (system_tx2, system_rx2) = mpsc::channel::<SystemMessage>(100);
+    mock_mempool_verdicts(system_rx2);
     let (system_tx3, mut system_rx3) = mpsc::channel::<SystemMessage>(100);
 
     // Create gossip instances
@@ -868,15 +892,21 @@ async fn test_read_node_relays_mempool_gossip() {
 
     // read_node_1 and validator only bootstrap to read_node_2, never to each
     // other. read_node_2 has no bootstrap (it'll be dialled by the others).
-    let read_node_1_config = Config::new(read_node_1_addr.clone(), read_node_2_addr.clone())
+    let mut read_node_1_config = Config::new(read_node_1_addr.clone(), read_node_2_addr.clone())
         .with_contact_info_interval(Duration::from_millis(100));
-    let read_node_2_config = Config::new(read_node_2_addr.clone(), "".to_string())
+    let mut read_node_2_config = Config::new(read_node_2_addr.clone(), "".to_string())
         .with_contact_info_interval(Duration::from_millis(100));
-    let validator_config = Config::new(validator_addr.clone(), read_node_2_addr.clone())
+    let mut validator_config = Config::new(validator_addr.clone(), read_node_2_addr.clone())
         .with_contact_info_interval(Duration::from_millis(100));
 
+    // Keep the topology a chain: discovery would otherwise connect the endpoints.
+    read_node_1_config.discovery.enabled = false;
+    read_node_2_config.discovery.enabled = false;
+    validator_config.discovery.enabled = false;
+
     let (read_node_1_system_tx, _) = mpsc::channel::<SystemMessage>(100);
-    let (read_node_2_system_tx, _) = mpsc::channel::<SystemMessage>(100);
+    let (read_node_2_system_tx, read_node_2_system_rx) = mpsc::channel::<SystemMessage>(100);
+    let accept = mock_mempool_verdicts(read_node_2_system_rx);
     let (validator_system_tx, mut validator_system_rx) = mpsc::channel::<SystemMessage>(100);
 
     let mut read_node_1_gossip = SnapchainGossip::create(
@@ -923,7 +953,7 @@ async fn test_read_node_relays_mempool_gossip() {
 
     let cast_add = messages_factory::casts::create_cast_add(789, "multi-hop", None, None);
     let received = publish_until_received(
-        read_node_1_tx,
+        read_node_1_tx.clone(),
         &mut validator_system_rx,
         cast_add,
         Duration::from_secs(15),
@@ -932,6 +962,18 @@ async fn test_read_node_relays_mempool_gossip() {
     assert!(
         received,
         "validator did not receive mempool gossip relayed through read_node_2 within deadline"
+    );
+    accept.store(false, std::sync::atomic::Ordering::SeqCst);
+    let rejected = messages_factory::casts::create_cast_add(789, "rejected", None, None);
+    assert!(
+        !publish_until_received(
+            read_node_1_tx,
+            &mut validator_system_rx,
+            rejected,
+            Duration::from_secs(3)
+        )
+        .await,
+        "rejected gossip reached the third peer"
     );
 }
 

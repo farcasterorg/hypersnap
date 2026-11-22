@@ -346,4 +346,30 @@ mod tests {
             other => panic!("expected KeyClaimedByDifferentFid, got {other:?}"),
         }
     }
+    #[test]
+    fn admission_does_not_register_keys_or_consume_nonces() {
+        use crate::storage::store::account::{get_user_nonce, verify_message_signer};
+        let world = new_world();
+        let fixture = fresh_fixture(11, 22);
+        register_custody(&world, fixture.fid, &fixture.fid_custody);
+        register_custody(&world, fixture.request_fid, &fixture.app_custody);
+        let message = fixture.build();
+        assert!(verify_message_signer(&world.store, &world.db, &message).is_ok());
+        assert!(get_gasless_key_record(
+            &world.db,
+            &RocksDbTransactionBatch::new(),
+            fixture.fid,
+            &fixture.envelope_signer_pubkey
+        )
+        .unwrap()
+        .is_none());
+        assert!(
+            get_user_nonce(&world.db, &RocksDbTransactionBatch::new(), fixture.fid)
+                .unwrap()
+                .is_none()
+        );
+        let mut forged = fixture;
+        forged.fid_custody = PrivateKeySigner::random();
+        assert!(verify_message_signer(&world.store, &world.db, &forged.build()).is_err());
+    }
 }

@@ -67,6 +67,7 @@ impl ReadHost {
     ) -> Result<(), ActorProcessingErr> {
         match msg {
             ReadHostMsg::Started { sync } => {
+                state.validator.resume_pending_certified_chunk().await;
                 state.validator.initialize_height();
                 sync.cast(read_sync::Msg::Decided(state.validator.last_height))?
             }

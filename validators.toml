@@ -300,3 +300,58 @@ bootstrap_peers = [
   # wake
   "/ip4/51.79.77.116/udp/3382/quic-v1/p2p/12D3KooWCAdNQJvE9eH258D55b6zodhLoW2B8xRJEtayozGX1Jud",
 ]
+
+
+# Shard 0: snapshot 50_971_518; observed rate 0.992008817856 blocks/second.
+[[consensus.validator_sets]]
+effective_at = 50_971_518
+shard_ids = [ 0 ]
+validator_public_keys = [
+  "ae46d4ae50bee1a9cf6d798ddddd1d7f54c8314eaf85ac0efa3bf685c9506119", # cassie (haatz.quilibrium.com)
+  "3f9335279a61dc06eb2f097333bf9b7f1aac8760fa44c9fe38c68052d163b143", # kmacb.eth
+  "c37026ce39c58c55d11265bd4e348717dfe008f4da888bc67f0feb9a38fa87c3", # derekhoiem
+  "0149adb8c10672b17a86fb0b9247433d12b7e22c1b888499d3be5cde5171c463", # infinitehomie
+  "7882148cc2608d13d096ea6d68891deb99000612a9f136e55af440d49173ce0d", # arfonzo
+  "7b0e914a8bca87888dd9297a8defc71802ba261c399527263713a2caa8b3967a", # mvr
+  "22e82d8886c9c73fe8dd5b6c1df474100f5d9289e7352ea590361d23837074d0", # wake 1
+  "3d635884ab98dd455dd151379ea812ff1a69e9967d8f1bdd828b8651b7af71ae", # wake 2
+  "2c7ccc48fa95dc81838d13506036a27c3bed972871fdf11bd7782b930bf394d8", # wake 3
+  "ec2937c83922ff75785ab2d552f177f83fc72cf6aaf8aee7e330e6d4c338bd50", # schmidtiest
+  "11d29550dd4024f3cd79fa1871d4ea01659c650a4aee9f06969a3b4f53da7242", # feli
+]
+
+# Shard 2: snapshot 51_481_322; observed rate 0.994475138122 blocks/second.
+[[consensus.validator_sets]]
+effective_at = 51_481_322
+shard_ids = [ 2 ]
+validator_public_keys = [
+  "ae46d4ae50bee1a9cf6d798ddddd1d7f54c8314eaf85ac0efa3bf685c9506119", # cassie (haatz.quilibrium.com)
+  "3f9335279a61dc06eb2f097333bf9b7f1aac8760fa44c9fe38c68052d163b143", # kmacb.eth
+  "c37026ce39c58c55d11265bd4e348717dfe008f4da888bc67f0feb9a38fa87c3", # derekhoiem
+  "0149adb8c10672b17a86fb0b9247433d12b7e22c1b888499d3be5cde5171c463", # infinitehomie
+  "7882148cc2608d13d096ea6d68891deb99000612a9f136e55af440d49173ce0d", # arfonzo
+  "7b0e914a8bca87888dd9297a8defc71802ba261c399527263713a2caa8b3967a", # mvr
+  "22e82d8886c9c73fe8dd5b6c1df474100f5d9289e7352ea590361d23837074d0", # wake 1
+  "3d635884ab98dd455dd151379ea812ff1a69e9967d8f1bdd828b8651b7af71ae", # wake 2
+  "2c7ccc48fa95dc81838d13506036a27c3bed972871fdf11bd7782b930bf394d8", # wake 3
+  "ec2937c83922ff75785ab2d552f177f83fc72cf6aaf8aee7e330e6d4c338bd50", # schmidtiest
+  "11d29550dd4024f3cd79fa1871d4ea01659c650a4aee9f06969a3b4f53da7242", # feli
+]
+
+# Shard 1: snapshot 51_639_354; observed rate 0.995024875622 blocks/second.
+[[consensus.validator_sets]]
+effective_at = 51_639_354
+shard_ids = [ 1 ]
+validator_public_keys = [
+  "ae46d4ae50bee1a9cf6d798ddddd1d7f54c8314eaf85ac0efa3bf685c9506119", # cassie (haatz.quilibrium.com)
+  "3f9335279a61dc06eb2f097333bf9b7f1aac8760fa44c9fe38c68052d163b143", # kmacb.eth
+  "c37026ce39c58c55d11265bd4e348717dfe008f4da888bc67f0feb9a38fa87c3", # derekhoiem
+  "0149adb8c10672b17a86fb0b9247433d12b7e22c1b888499d3be5cde5171c463", # infinitehomie
+  "7882148cc2608d13d096ea6d68891deb99000612a9f136e55af440d49173ce0d", # arfonzo
+  "7b0e914a8bca87888dd9297a8defc71802ba261c399527263713a2caa8b3967a", # mvr
+  "22e82d8886c9c73fe8dd5b6c1df474100f5d9289e7352ea590361d23837074d0", # wake 1
+  "3d635884ab98dd455dd151379ea812ff1a69e9967d8f1bdd828b8651b7af71ae", # wake 2
+  "2c7ccc48fa95dc81838d13506036a27c3bed972871fdf11bd7782b930bf394d8", # wake 3
+  "ec2937c83922ff75785ab2d552f177f83fc72cf6aaf8aee7e330e6d4c338bd50", # schmidtiest
+  "11d29550dd4024f3cd79fa1871d4ea01659c650a4aee9f06969a3b4f53da7242", # feli
+]
