@@ -4309,7 +4309,8 @@ impl ApiHttpHandler {
         }
 
         let mut ranked: Vec<(u64, u32)> = candidate_counts.into_iter().collect();
-        ranked.sort_by(|a, b| b.1.cmp(&a.1));
+        // Ties by fid, so the same request returns the same accounts.
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         ranked.truncate(limit);
 
         let fids: Vec<u64> = ranked.iter().map(|(f, _)| *f).collect();

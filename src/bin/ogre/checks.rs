@@ -393,6 +393,9 @@ fn merge(a: Value, b: Value) -> Value {
             Value::Array(a.into_iter().chain(b).reduce(merge).into_iter().collect())
         }
         (Value::Null, b) => b,
+        (a, Value::Null) => a,
+        // Items disagree on the type: nothing to hold the other node to.
+        (a, b) if std::mem::discriminant(&a) != std::mem::discriminant(&b) => Value::Null,
         (a, _) => a,
     }
 }
@@ -1146,5 +1149,7 @@ mod tests {
             gone(base, json!({"reactions": [b.clone(), b]})),
             [".reactions[].user.pfp_url"]
         );
+        // items of mixed types compare the same in any order
+        assert!(gone(json!({"v": [1, "x"]}), json!({"v": ["x", 1]})).is_empty());
     }
 }

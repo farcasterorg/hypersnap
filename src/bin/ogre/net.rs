@@ -281,7 +281,8 @@ impl Node {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
-        } else if child.try_wait().ok().flatten().is_none() {
+        }
+        if child.try_wait().ok().flatten().is_none() {
             let _ = child.kill();
         }
         let _ = child.wait();

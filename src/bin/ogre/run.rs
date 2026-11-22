@@ -217,9 +217,17 @@ async fn load(net: &Net, seed: &Seed) -> Result<String, Error> {
             break;
         }
         if Instant::now() > deadline {
-            return Err(
-                format!("only {registered:?} of {fids} accounts registered within 60s").into(),
-            );
+            let why: Vec<_> = failed
+                .iter()
+                .map(|(w, n)| format!("- refused {n}: {w}"))
+                .collect();
+            return Err(format!(
+                "only {registered:?} of {fids} accounts registered within 60s; refused {refused_events}/{} onchain events and {refused_proofs}/{} fname proofs\n\n{}",
+                seed.onchain_events.len(),
+                seed.fname_proofs.len(),
+                why.join("\n")
+            )
+            .into());
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
