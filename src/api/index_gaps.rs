@@ -157,8 +157,10 @@ pub(crate) async fn repair(
             let mut next = from;
             while next <= to {
                 let end = (next + REPAIR_BATCH_BLOCKS - 1).min(to);
-                // ponytail: reads the shard store on the async runtime; the
-                // ranges are the few blocks a bridge lost, not a full backfill.
+                // ponytail: reads and indexes on the async runtime, yielding
+                // between batches; a long range (a node down for hours) holds a
+                // runtime thread one batch at a time. spawn_blocking if it shows.
+                tokio::task::yield_now().await;
                 let messages: Vec<_> = match store.shard_store.get_shard_chunks(next, Some(end + 1))
                 {
                     Ok(chunks) => chunks
@@ -173,7 +175,11 @@ pub(crate) async fn repair(
                     }
                 };
                 if !messages.is_empty() {
-                    let events = [IndexEvent::messages(messages, shard_id, end)];
+                    // Height 0: a replay mustn't move the notifications index's
+                    // mark; only live events processed in order may. A lost
+                    // block can sit above blocks still queued in its worker,
+                    // which a mark moved past it would skip after a restart.
+                    let events = [IndexEvent::messages(messages, shard_id, 0)];
                     for indexer in indexers.iter().filter(|i| i.is_enabled()) {
                         if let Err(e) = indexer.process_batch(&events).await {
                             tracing::warn!(shard_id, indexer = indexer.name(), error = %e,

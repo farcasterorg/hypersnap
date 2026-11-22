@@ -664,6 +664,7 @@ impl Indexer for NotificationsIndexer {
                 _ => false,
             };
             if let (true, Some(height)) = (marks, event.block_height()) {
+                // The gap repair replays with height 0 so it never moves a mark.
                 if height > 0 {
                     self.note_height(event.shard_id(), height, &mut txn);
                 }
@@ -1055,6 +1056,55 @@ mod tests {
         assert_eq!(replay(&index, &gaps, 9), vec![(1, 8, 9)]);
         repair(&gaps, &stores, &[index.clone() as Arc<dyn Indexer>]).await;
         assert_eq!(likers(&index), vec![12, 18]);
+    }
+
+    /// The gap repair replays a dropped block while the worker still has
+    /// earlier blocks queued. The mark must stay below those, or they're
+    /// skipped if the node stops before the worker gets to them.
+    #[tokio::test]
+    async fn test_gap_repair_doesnt_move_the_mark_past_queued_blocks() {
+        use crate::api::index_gaps::repair;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        let start = || {
+            let gaps = Arc::new(IndexGaps::default());
+            let index = Arc::new(
+                NotificationsIndexer::new(
+                    FeatureConfig {
+                        enabled: true,
+                        ..Default::default()
+                    },
+                    RocksDB::open_shard_db(&path, 0),
+                    HashMap::new(),
+                )
+                .with_gaps(gaps.clone()),
+            );
+            (index, gaps)
+        };
+        let like150 = like(15);
+        let stores = HashMap::from([(1, shard_store(&path, 1, &[(150, &like150)]))]);
+
+        // The worker has indexed block 119, with 120..149 still queued, when
+        // a bridge drops block 150's events and the repair replays them.
+        let (index, gaps) = start();
+        assert!(index.replay_ranges(&HashMap::from([(1, 0)])).is_empty());
+        index
+            .process_event(&IndexEvent::block_committed(1, 119, 0))
+            .await
+            .unwrap();
+        gaps.lost(1, 150, 150);
+        repair(&gaps, &stores, &[index.clone() as Arc<dyn Indexer>]).await;
+        assert_eq!(likers(&index), vec![15]);
+        assert!(gaps.is_empty());
+        // The node stops before the worker got to 120..149.
+        drop(index);
+
+        let (index, _) = start();
+        assert_eq!(
+            index.replay_ranges(&HashMap::from([(1, 150)])),
+            vec![(1, 119, 150)]
+        );
     }
 
     /// Bytes per entry on disk and write rate, for sizing the store walk.
