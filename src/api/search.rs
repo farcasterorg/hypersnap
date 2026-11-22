@@ -402,14 +402,45 @@ impl SearchIndexer {
     /// restored shard-0 brings another node's search cursors, which don't
     /// describe this index: kept, a walk they mark complete would never fill
     /// it. Without it, `open` resets the cursors and the walk rebuilds it.
+    /// The index directory is emptied, not removed, so a custom `index_path`
+    /// that is its own mount point still works. The legacy one, always made
+    /// by a rename next to it, is removed: left empty, `open` would serve it.
     pub fn discard_for_restore(config: &SearchConfig, rocksdb_dir: &Path) -> std::io::Result<()> {
         let index_path = config.resolved_index_path(rocksdb_dir);
         let mut legacy_path = index_path.clone().into_os_string();
         legacy_path.push(".legacy");
-        for path in [index_path, PathBuf::from(legacy_path)] {
-            match std::fs::remove_dir_all(&path) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
-                _ => {}
+        let legacy_path = PathBuf::from(legacy_path);
+        let entries = match std::fs::read_dir(&index_path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            entries => entries?.collect::<std::io::Result<Vec<_>>>()?,
+        };
+        let entries: Vec<_> = entries
+            .into_iter()
+            // A volume root's lost+found may not be ours to delete.
+            .filter(|entry| entry.file_name() != "lost+found")
+            .collect();
+        if entries.is_empty() && !legacy_path.exists() {
+            return Ok(());
+        }
+        tracing::info!(
+            path = %index_path.display(),
+            legacy = %legacy_path.display(),
+            "Deleting the search index before a snapshot restore"
+        );
+        if !config.backfill_on_startup {
+            tracing::warn!(
+                "[api.search] backfill_on_startup is off: search history won't be rebuilt until it is enabled"
+            );
+        }
+        match std::fs::remove_dir_all(&legacy_path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+        for entry in entries {
+            if entry.file_type()?.is_dir() {
+                std::fs::remove_dir_all(entry.path())?;
+            } else {
+                std::fs::remove_file(entry.path())?;
             }
         }
         Ok(())

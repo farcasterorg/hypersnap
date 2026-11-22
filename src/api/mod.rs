@@ -1633,6 +1633,8 @@ mod search_backfill_tests {
                 index_live(local.path(), 13, "live #gm").await;
             }
             restore_snapshot(local.path());
+            // Left behind, even empty, it would be served until the walk ends.
+            assert!(!local.path().join("search_index.legacy").exists());
 
             let db = RocksDB::open_shard_db(local.path().to_str().unwrap(), 0);
             let search = open_search(&db);
@@ -1653,6 +1655,35 @@ mod search_backfill_tests {
             assert_eq!(fids(&search, "#gm"), vec![10]);
             assert!(!local.path().join("search_index.legacy").exists());
         }
+    }
+
+    /// A custom `index_path` may be its own mount point: discard empties it
+    /// instead of removing it, and `open` still resets the cursors.
+    #[tokio::test]
+    async fn restore_empties_a_custom_index_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = tempfile::tempdir().unwrap();
+        let config = SearchConfig {
+            enabled: true,
+            backfill_on_startup: true,
+            memory_budget_mb: 50,
+            index_path: index.path().to_str().unwrap().to_string(),
+            ..Default::default()
+        };
+        let db = RocksDB::open_shard_db(dir.path().to_str().unwrap(), 0);
+        drop(SearchIndexer::open(config.clone(), &db, &[1]).unwrap());
+        backfill::save_shard_checkpoint(&db, SEARCH_BACKFILL_CHECKPOINT, 1, u64::MAX).unwrap();
+
+        SearchIndexer::discard_for_restore(&config, dir.path()).unwrap();
+        assert!(index.path().is_dir());
+        assert_eq!(std::fs::read_dir(index.path()).unwrap().count(), 0);
+
+        let search = SearchIndexer::open(config, &db, &[1]).unwrap();
+        assert!(!search.stats().backfill_complete);
+        assert_eq!(
+            backfill::load_shard_checkpoint(&db, SEARCH_BACKFILL_CHECKPOINT, 1),
+            0
+        );
     }
 
     /// Restarting with the index its cursors were saved for must not rebuild it.
