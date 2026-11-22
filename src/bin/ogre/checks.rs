@@ -500,7 +500,10 @@ async fn compare(net: &Net, path: &str) -> Compared {
     );
     shrunk(&b, &u, "", "", &mut lost);
     let mut differs = Vec::new();
-    differences(&b, &u, "", "", true, &mut lost, &mut differs);
+    let ranked = RANKED
+        .lines()
+        .any(|l| l.split_whitespace().next() == Some(route));
+    differences(&b, &u, "", "", true, ranked, &mut lost, &mut differs);
     let (ok, lost): (Vec<_>, Vec<_>) = lost.into_iter().partition(|i| accepted(route, i));
     let (ok_values, differs): (Vec<_>, Vec<_>) =
         differs.into_iter().partition(|i| accepted(route, i));
@@ -590,11 +593,12 @@ const IDS: &[&[&str]] = &[
     &["signer_key", "block_number"],
 ];
 
-/// For each item of `b`, the item of `u` with the same id, and the ids that
-/// are unique in `b` but repeated in `u`. The id is the first candidate every
-/// item has and that is unique on both sides; when none is, the first unique
-/// in `b`, so an item the build returns twice is caught.
-fn by_id(b: &[Value], u: &[Value]) -> (Vec<Option<usize>>, Vec<String>) {
+/// For each item of `b`, the item of `u` with the same id; the ids that are
+/// unique in `b` but repeated in `u`; and whether the id is unique on both
+/// sides. The id is the first candidate every item has and that is unique on
+/// both sides; when none is, the first unique in `b`, so an item the build
+/// returns twice is caught.
+fn by_id(b: &[Value], u: &[Value]) -> (Vec<Option<usize>>, Vec<String>, bool) {
     let unique = |ids: &[Option<String>]| {
         let present: Vec<_> = ids.iter().flatten().collect();
         !present.is_empty()
@@ -613,12 +617,10 @@ fn by_id(b: &[Value], u: &[Value]) -> (Vec<Option<usize>>, Vec<String>) {
             )
         })
         .collect();
-    let chosen = candidates
-        .iter()
-        .find(|(bi, ui)| unique(bi) && unique(ui))
-        .or_else(|| candidates.iter().find(|(bi, _)| unique(bi)));
+    let both = candidates.iter().find(|(bi, ui)| unique(bi) && unique(ui));
+    let chosen = both.or_else(|| candidates.iter().find(|(bi, _)| unique(bi)));
     let Some((bi, ui)) = chosen else {
-        return (vec![None; b.len()], Vec::new());
+        return (vec![None; b.len()], Vec::new(), false);
     };
     let mut duplicated = Vec::new();
     let pairs = bi
@@ -639,7 +641,7 @@ fn by_id(b: &[Value], u: &[Value]) -> (Vec<Option<usize>>, Vec<String>) {
             }
         })
         .collect();
-    (pairs, duplicated)
+    (pairs, duplicated, both.is_some())
 }
 
 /// An item's id by candidate `c` of `IDS`; past them, its cast's and user's
@@ -668,13 +670,17 @@ fn ident(v: &Value, c: usize) -> Option<String> {
 /// of an object under it, or of an array item paired by its id (`by_id()`).
 /// Items paired only by position can be different items (nodes order ties
 /// differently, and search ranks per node), so theirs go to `other`, as do
-/// counts, which `shrunk()` holds to a tolerance.
+/// counts, which `shrunk()` holds to a tolerance. An array of the same item
+/// whose items pair by an id unique on both sides fails when fewer than half
+/// of the base release's items are in the build's, unless the route is
+/// `ranked` (see `RANKED`).
 fn differences(
     base: &Value,
     under: &Value,
     key: &str,
     path: &str,
     same: bool,
+    ranked: bool,
     wrong: &mut Vec<String>,
     other: &mut Vec<String>,
 ) {
@@ -682,7 +688,16 @@ fn differences(
         (Value::Object(b), Value::Object(u)) => {
             for (k, bv) in b {
                 let uv = u.get(k).unwrap_or(&Value::Null);
-                differences(bv, uv, k, &format!("{path}.{k}"), same, wrong, other);
+                differences(
+                    bv,
+                    uv,
+                    k,
+                    &format!("{path}.{k}"),
+                    same,
+                    ranked,
+                    wrong,
+                    other,
+                );
             }
         }
         (Value::Array(b), Value::Array(u)) => {
@@ -690,7 +705,17 @@ fn differences(
             if b.len() != u.len() {
                 other.push(format!("{path} ({} -> {} items)", b.len(), u.len()));
             }
-            let (pairs, duplicated) = by_id(b, u);
+            let (pairs, duplicated, both) = by_id(b, u);
+            // Other items than the base release's: a swapped or reversed list.
+            let missing = pairs.iter().filter(|j| j.is_none()).count();
+            if both && missing * 2 > b.len() {
+                let d = format!("{path}: {missing} of {} items missing", b.len());
+                if same && !ranked {
+                    wrong.push(d)
+                } else {
+                    other.push(d)
+                }
+            }
             // One item twice is wrong whatever the order, but only an item of
             // the response itself is surely the same item (see below).
             for id in &duplicated {
@@ -704,9 +729,9 @@ fn differences(
             for (i, j) in pairs.into_iter().enumerate() {
                 let p = format!("{path}[{i}]");
                 match j {
-                    Some(j) => differences(&b[i], &u[j], key, &p, same, wrong, other),
+                    Some(j) => differences(&b[i], &u[j], key, &p, same, ranked, wrong, other),
                     None if b.len() == u.len() => {
-                        differences(&b[i], &u[i], key, &p, false, wrong, other)
+                        differences(&b[i], &u[i], key, &p, false, ranked, wrong, other)
                     }
                     None => {}
                 }
@@ -887,6 +912,14 @@ const VOLATILE: &str = "
 /v2/farcaster/_status/backfill .metrics_backfill.shards[].next_block
 /v2/farcaster/_status/backfill .metrics_backfill.shards[].tip
 /v2/farcaster/_status/backfill .metrics_backfill.shards[].blocks_remaining
+";
+
+/// Routes whose lists may hold other items on each node, so missing items
+/// there are warnings: `<route>  why`.
+const RANKED: &str = "
+/v2/farcaster/cast/search          ranked per node by its own search index
+/v2/farcaster/user/search          the same
+/v2/farcaster/following/suggested  the base release orders ties randomly
 ";
 
 fn strip_volatile(route: &str, v: &Value, path: &str) -> Value {
@@ -1595,7 +1628,7 @@ mod tests {
 
     fn wrong(base: serde_json::Value, under: serde_json::Value) -> (Vec<String>, usize) {
         let (mut wrong, mut other) = (Vec::new(), Vec::new());
-        differences(&base, &under, "", "", true, &mut wrong, &mut other);
+        differences(&base, &under, "", "", true, false, &mut wrong, &mut other);
         (wrong, other.len())
     }
 
@@ -1703,6 +1736,24 @@ mod tests {
             wrong(json!(["a", "b"].map(cast)), json!(["b", "a"].map(cast))),
             (vec![], 0)
         );
+    }
+
+    #[test]
+    fn a_list_of_other_items_fails_unless_ranked() {
+        let user = |fid: u64| json!({"fid": fid, "username": "u"});
+        let base = json!({"users": ([1, 2, 3, 4, 5].map(user))});
+        // swapped for another list of the same length (followers <-> following)
+        let under = json!({"users": ([1, 2, 6, 7, 8].map(user))});
+        let missing = vec![".users: 3 of 5 items missing".to_string()];
+        assert_eq!(wrong(base.clone(), under.clone()).0, missing);
+        assert!(lost(base.clone(), under.clone()).is_empty());
+        // half found is enough: timing at the tip can push a few out
+        let (failed, _) = wrong(base.clone(), json!({"users": ([1, 2, 3, 7, 8].map(user))}));
+        assert!(failed.is_empty());
+        // a ranked route only warns
+        let (mut w, mut o) = (Vec::new(), Vec::new());
+        differences(&base, &under, "", "", true, true, &mut w, &mut o);
+        assert!(w.is_empty() && o.contains(&missing[0]));
     }
 
     #[test]

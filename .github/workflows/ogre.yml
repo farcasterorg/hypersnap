@@ -117,30 +117,37 @@ jobs:
 
       - name: Build the seeded chain on the base release
         if: steps.chain.outputs.cache-hit != 'true'
+        env:
+          IMAGE: ${{ steps.digest.outputs.image }}
         run: |
           snapchain/target/debug/ogre chain --seed ogre/seed.bin \
-            --base "docker:${{ steps.digest.outputs.image }}" \
+            --base "docker:$IMAGE" \
             --work ogre/chain --report "$GITHUB_STEP_SUMMARY"
 
       - name: Roll out
+        env:
+          IMAGE: ${{ steps.digest.outputs.image }}
         run: |
           cp -a ogre/chain ogre/run
           snapchain/target/debug/ogre run --seed ogre/seed.bin \
-            --base "docker:${{ steps.digest.outputs.image }}" \
+            --base "docker:$IMAGE" \
             --under-test snapchain/target/debug/hypersnap \
             --work ogre/run --report "$GITHUB_STEP_SUMMARY"
 
       # Only a seed and chain that passed a rollout are reused, so one that
-      # can't doesn't fail later runs. A pull request's caches are its own.
+      # can't doesn't fail later runs. Only main and the nightly save them: a
+      # chain is ~285 MiB, and pull requests' copies pushed the repo's caches
+      # over quota, evicting Verify's. A pull request that changes Ogre's code
+      # rebuilds the chain on each run (about 4.5 minutes).
       - name: Save the seeded chain
-        if: steps.chain.outputs.cache-hit != 'true'
+        if: steps.chain.outputs.cache-hit != 'true' && github.event_name != 'pull_request'
         uses: actions/cache/save@v4
         with:
           path: ogre/chain
           key: ${{ steps.chain.outputs.cache-primary-key }}
 
       - name: Save the seed
-        if: steps.seed.outputs.cache-matched-key == ''
+        if: steps.seed.outputs.cache-matched-key == '' && github.event_name != 'pull_request'
         uses: actions/cache/save@v4
         with:
           path: ogre/seed.bin

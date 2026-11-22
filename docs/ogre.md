@@ -26,8 +26,11 @@ Each run starts from the same chain; nothing is uploaded as a snapshot.
 (`farcasterorg/hypersnap:latest`) and stops it. CI caches the seed (refreshed
 daily) and the chain (per base release, seed and Ogre source), so a run starts
 from a stopped network, the way an operator's node is upgraded. A new seed and
-chain are cached only after they passed a rollout, and a change to the exporter
-(`seed.rs`, `convert.rs`) exports a new seed.
+chain are cached only after they passed a rollout, and only by main and the
+nightly: a chain is about 285 MiB, and per-PR copies pushed the repository's
+Actions cache over its quota. A pull request that changes Ogre's code (or the
+exporter, `seed.rs`, `convert.rs`, which exports a new seed) therefore
+rebuilds the chain on each run, about 4.5 minutes.
 
 `ogre run` then:
 
@@ -46,7 +49,11 @@ chain are cached only after they passed a rollout, and a change to the exporter
    every item has and that is unique on both sides, so per-account lists, where
    every item carries the same fid, still pair. When none is, it's the first
    unique in the base release's items, and an item the build returns twice
-   fails. Any other value that differs fails too when it is surely about the
+   fails. When the id is unique on both sides and fewer than half of the base
+   release's items are in the build's, the list fails as other items (a
+   swapped or reversed list), except on the ranked routes in `RANKED` in
+   `src/bin/ogre/checks.rs` (search, suggestions), where that is a warning.
+   Any other value that differs fails too when it is surely about the
    same thing on both sides: a field of the response or of an object under it
    (`.user.username`), or of an array item paired by its id. Items paired only
    by their position can be different items (another tie order, search
