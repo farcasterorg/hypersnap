@@ -734,6 +734,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 .expect("unable to check snapshot shard databases"));
     if restore_snapshots {
         info!(pending_restore, "Loading snapshot databases");
+        // Before shard-0 is replaced, so no interrupted restore can keep it.
+        snapchain::api::SearchIndexer::discard_for_restore(
+            &app_config.api.search,
+            std::path::Path::new(&app_config.rocksdb_dir),
+        )
+        .expect("unable to remove the search index before a snapshot restore");
         download_snapshots(
             app_config.fc_network,
             &app_config.snapshot,

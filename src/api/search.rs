@@ -398,6 +398,23 @@ impl SearchIndexer {
         Ok(search)
     }
 
+    /// Delete the index (and any legacy one) before a snapshot restore. The
+    /// restored shard-0 brings another node's search cursors, which don't
+    /// describe this index: kept, a walk they mark complete would never fill
+    /// it. Without it, `open` resets the cursors and the walk rebuilds it.
+    pub fn discard_for_restore(config: &SearchConfig, rocksdb_dir: &Path) -> std::io::Result<()> {
+        let index_path = config.resolved_index_path(rocksdb_dir);
+        let mut legacy_path = index_path.clone().into_os_string();
+        legacy_path.push(".legacy");
+        for path in [index_path, PathBuf::from(legacy_path)] {
+            match std::fs::remove_dir_all(&path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     /// Create a new search indexer.
     ///
     /// # Arguments

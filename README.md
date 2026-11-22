@@ -59,6 +59,12 @@ To retain an existing index, stop the old node and copy the entire old index
 directory to `<rocksdb_dir>/search_index` before starting the updated node.
 The backfill status endpoint is `GET /v2/farcaster/_status/backfill`.
 
+A snapshot restore deletes the search index (and any `search_index.legacy`)
+before it replaces the databases, since the restored backfill cursors describe
+another node's index; search then rebuilds. A node restored by an older
+version may report search backfill as complete while its index holds only
+recent casts: stop it, delete the index directory and start it again.
+
 The cast-hash index automatically fills missing historical mappings from both
 legacy and Hyper cast stores in the background, without clearing existing data
 or blocking API startup. It checkpoints each batch and resumes after restart.
