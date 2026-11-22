@@ -1332,7 +1332,7 @@ mod tests {
         // storage lends) must not deadlock against a replication snapshot
         // opening that DB, which takes the write lock.
         use std::sync::{mpsc, Arc};
-        use std::time::Duration;
+        use std::time::{Duration, Instant};
 
         let tmp = tempfile::tempdir().unwrap();
         let db = Arc::new(RocksDB::new(tmp.path().to_str().unwrap()));
@@ -1347,10 +1347,15 @@ mod tests {
                 .for_each_iterator_by_prefix(None, None, &PageOptions::default(), |_, _| {
                     let snapshot = Arc::clone(&iterating);
                     writer = Some(std::thread::spawn(move || {
+                        // Only the lock matters here; the open itself may fail on the live WAL.
                         let _ = snapshot.open_read_only();
                     }));
-                    // Let the writer queue on the lock before the nested read.
-                    std::thread::sleep(Duration::from_millis(200));
+                    // Wait until the writer is queued on the lock, then read again.
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !iterating.inner.is_locked_exclusive() {
+                        assert!(Instant::now() < deadline, "writer never queued");
+                        std::thread::yield_now();
+                    }
                     iterating.get(b"key")?;
                     Ok(false)
                 })
