@@ -10355,6 +10355,87 @@ mod tests {
             .is_none());
     }
 
+    /// An index the old format finished has a mark on every shard, so entries
+    /// it lost were never replayed. It is walked once more, which restores
+    /// them, and only once.
+    #[tokio::test]
+    async fn test_notifications_index_from_the_old_format_is_walked_once() {
+        use crate::api::backfill::make_shard_checkpoint_key;
+        use crate::api::notifications_index::NotificationsIndexer;
+        let (stores, _service, target, actor, base) = notified_and_actor().await;
+        // A mention the old index lost.
+        let mention = messages_factory::casts::create_cast_add_rich(
+            actor,
+            "hey",
+            None,
+            vec![],
+            None,
+            vec![target],
+            Some(base),
+            None,
+        );
+        merge_into(&stores, 2, &mention);
+
+        let dir = tempfile::tempdir().unwrap();
+        let open = || {
+            let db = Arc::new(RocksDB::new(dir.path().to_str().unwrap()));
+            db.open().unwrap();
+            NotificationsIndexer::new(
+                crate::api::config::FeatureConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+                db,
+                stores.clone(),
+            )
+            .with_router(Box::new(routing::EvenOddRouterForTest {}))
+        };
+        let notifiers = |index: &NotificationsIndexer| {
+            let mut found = vec![];
+            index
+                .scan(target, None, |entry| {
+                    found.push(entry.actor);
+                    false
+                })
+                .unwrap();
+            found
+        };
+        // What the old format leaves: the walk done, and a mark on each shard.
+        {
+            let db = RocksDB::new(dir.path().to_str().unwrap());
+            db.open().unwrap();
+            let mut txn = RocksDbTransactionBatch::new();
+            txn.put(vec![0xED, 0xFD], vec![1]);
+            for shard in [1u32, 2] {
+                txn.put(
+                    make_shard_checkpoint_key("notifications_index_v1", shard),
+                    u64::MAX.to_be_bytes().to_vec(),
+                );
+                txn.put(
+                    [&[0xED, 0xFC][..], &shard.to_be_bytes()[..]].concat(),
+                    1u64.to_be_bytes().to_vec(),
+                );
+            }
+            db.commit(txn).unwrap();
+        }
+        let tips = HashMap::from([(1, 2), (2, 2)]);
+
+        let index = open();
+        assert!(!index.is_complete());
+        assert_eq!(index.replay_ranges(&tips), vec![(1, 1, 2), (2, 1, 2)]);
+        assert!(notifiers(&index).is_empty());
+        index.backfill().unwrap();
+        assert!(index.is_complete());
+        assert_eq!(notifiers(&index), vec![actor]);
+        drop(index);
+
+        let index = open();
+        assert!(index.is_complete());
+        assert_eq!(index.replay_ranges(&tips), vec![(1, 1, 2), (2, 1, 2)]);
+        // Still done, so the walk isn't started again.
+        assert!(index.is_complete());
+    }
+
     /// Until its walk is done the index isn't used, even with live entries in
     /// it; once it is, a cursor from the scan carries on in the index.
     #[tokio::test]

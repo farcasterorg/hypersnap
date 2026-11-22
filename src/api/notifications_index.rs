@@ -37,10 +37,17 @@ use std::time::{Duration, Instant};
 const PREFIX: u8 = 0xED;
 /// [prefix][0x01][notified_fid:8][timestamp:4][hash:20][kind:1][actor_fid:8] -> empty
 const ENTRY: u8 = 0x01;
-/// [prefix][0xFD] -> present once the store walk has finished.
-const BACKFILL_DONE: u8 = 0xFD;
+/// [prefix][0xFB] -> present once the store walk has finished. (0xFD held it
+/// before v2 and is left on old databases, so don't reuse it.)
+const BACKFILL_DONE: u8 = 0xFB;
 /// Per-shard walk checkpoints (next fid to walk), in the shared checkpoint table.
-const CHECKPOINT_NAME: &str = "notifications_index_v1";
+///
+/// Before v2, a shard got its first mark ([`INDEXED_HEIGHT`]) only from a live
+/// event, so events lost before then were never replayed, and every shard of a
+/// node that ran for a while has a mark by now. Renaming the walk's keys (this
+/// one, and `BACKFILL_DONE` from 0xFD) walks such an index once more to restore
+/// them. The old keys stay behind, unread.
+const CHECKPOINT_NAME: &str = "notifications_index_v2";
 
 /// Levels of a thread a reply notifies: its parent's author (a reply) and the
 /// authors of the casts above that (deeper replies), the same reach as the
