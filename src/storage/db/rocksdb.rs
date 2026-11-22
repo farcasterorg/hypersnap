@@ -1,10 +1,11 @@
 use crate::core::error::HubError;
 use crate::storage::util::increment_vec_u8;
+use parking_lot::{RwLock, RwLockReadGuard};
 use rocksdb::{Options, Transaction, TransactionDB, DB};
 use std::collections::HashMap;
 use std::fs::{self};
 use std::path::Path;
-use std::sync::{Arc, RwLock, RwLockReadGuard};
+use std::sync::Arc;
 use thiserror::Error;
 use tokio::time::Duration;
 use tracing::info;
@@ -197,7 +198,7 @@ impl RocksDB {
     }
 
     pub fn open(&self) -> Result<(), RocksdbError> {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write();
 
         // Create RocksDB options
         let mut opts = Options::default();
@@ -247,7 +248,7 @@ impl RocksDB {
     }
 
     pub fn open_read_only(&self) -> Result<Self, RocksdbError> {
-        let _wl = self.inner.write().unwrap();
+        let _wl = self.inner.write();
 
         let mut opts = Options::default();
         opts.create_if_missing(false);
@@ -270,7 +271,7 @@ impl RocksDB {
     }
 
     pub fn close(&self) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write();
         if inner.is_some() {
             let db = inner.take().unwrap();
             drop(db);
@@ -304,7 +305,11 @@ impl RocksDB {
     }
 
     pub fn db(&self) -> RwLockReadGuard<'_, Option<DBProvider>> {
-        self.inner.read().unwrap()
+        // Recursive, because iterator callbacks read the same DB again (hyper reconcile,
+        // storage lends, channels). A plain read queues behind a waiting writer, and
+        // `open_read_only` (a replication snapshot) waits for the outer read: deadlock,
+        // which then blocks every later reader and wedges the runtime.
+        self.inner.read_recursive()
     }
 
     pub fn location(&self) -> String {
@@ -1319,5 +1324,43 @@ mod tests {
         assert_eq!(result, b"value");
 
         db.destroy().unwrap();
+    }
+
+    #[test]
+    fn test_nested_read_does_not_deadlock_with_open_read_only() {
+        // An iterator callback that reads the same DB again (hyper reconcile,
+        // storage lends) must not deadlock against a replication snapshot
+        // opening that DB, which takes the write lock.
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(RocksDB::new(tmp.path().to_str().unwrap()));
+        db.open().unwrap();
+        db.put(b"key", b"value").unwrap();
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let iterating = Arc::clone(&db);
+        std::thread::spawn(move || {
+            let mut writer = None;
+            iterating
+                .for_each_iterator_by_prefix(None, None, &PageOptions::default(), |_, _| {
+                    let snapshot = Arc::clone(&iterating);
+                    writer = Some(std::thread::spawn(move || {
+                        let _ = snapshot.open_read_only();
+                    }));
+                    // Let the writer queue on the lock before the nested read.
+                    std::thread::sleep(Duration::from_millis(200));
+                    iterating.get(b"key")?;
+                    Ok(false)
+                })
+                .unwrap();
+            writer.unwrap().join().unwrap();
+            done_tx.send(()).unwrap();
+        });
+
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("nested read deadlocked against open_read_only");
     }
 }
