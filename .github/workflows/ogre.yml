@@ -10,14 +10,20 @@ on:
     branches: [main]
   schedule:
     - cron: "17 4 * * *" # a fresh seed, and a chain on the newest release, daily
+    # A release's image is published after its commit's run pulled the old one,
+    # so pull requests would rebuild the chain (~4.5 min) until the nightly.
+    # This saves a chain for the new release within two hours; with no new
+    # release it restores the cached chain and finishes in a few minutes.
+    - cron: "47 */2 * * *"
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# The nightly seed refresh has its own group, so a merge doesn't cancel it.
+# Each schedule has its own group, so a merge or the other schedule doesn't
+# cancel the nightly seed refresh.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'schedule' && 'nightly' || github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'schedule' && format('cron {0}', github.event.schedule) || github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 # The same as Verify's, so this build reuses Verify's caches.
@@ -92,14 +98,15 @@ jobs:
           echo "image=$image" >> "$GITHUB_OUTPUT"
           echo "sha=${image##*:}" >> "$GITHUB_OUTPUT"
 
-      # A change to the exporter exports a new seed; the nightly always does.
+      # A change to the exporter exports a new seed; the nightly always does,
+      # the two-hourly release check never does.
       - name: Restore the seed
         id: seed
         uses: actions/cache/restore@v4
         with:
           path: ogre/seed.bin
           key: ogre-seed-v2-${{ hashFiles('snapchain/src/bin/ogre/seed.rs', 'snapchain/src/bin/ogre/convert.rs') }}-${{ github.run_id }}
-          restore-keys: ${{ github.event_name != 'schedule' && format('ogre-seed-v2-{0}-', hashFiles('snapchain/src/bin/ogre/seed.rs', 'snapchain/src/bin/ogre/convert.rs')) || '' }}
+          restore-keys: ${{ github.event.schedule != '17 4 * * *' && format('ogre-seed-v2-{0}-', hashFiles('snapchain/src/bin/ogre/seed.rs', 'snapchain/src/bin/ogre/convert.rs')) || '' }}
 
       - name: Export a seed from mainnet
         if: steps.seed.outputs.cache-matched-key == ''

@@ -27,10 +27,13 @@ Each run starts from the same chain; nothing is uploaded as a snapshot.
 daily) and the chain (per base release, seed and Ogre source), so a run starts
 from a stopped network, the way an operator's node is upgraded. A new seed and
 chain are cached only after they passed a rollout, and only by main and the
-nightly: a chain is about 285 MiB, and per-PR copies pushed the repository's
+scheduled runs (the nightly, and a check every two hours that saves a chain for
+a release published since): a chain is about 285 MiB, and per-PR copies pushed the repository's
 Actions cache over its quota. A pull request that changes Ogre's code (or the
 exporter, `seed.rs`, `convert.rs`, which exports a new seed) therefore
-rebuilds the chain on each run, about 4.5 minutes.
+rebuilds the chain on each run, about 4.5 minutes. With the caches warm, a
+pull request's run takes about 4-6 minutes: 2 to restore the caches, under one
+to build, and one for the rollout.
 
 `ogre run` then:
 
