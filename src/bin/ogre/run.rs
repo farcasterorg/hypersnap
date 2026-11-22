@@ -503,15 +503,6 @@ async fn scenario(
     r.note(format!(
         "every shard made a new block {resumed:.1?} after the API node answered"
     ));
-    // The fresh read node replays from here to the end of the run, a window
-    // long enough that a heavy seed block (the load holds thousands of
-    // messages per block) taking a few sync retries isn't read as a stop.
-    let fresh_from = (
-        Instant::now(),
-        net.heights(net::FRESH)
-            .await
-            .ok_or("fresh read node stopped answering")?,
-    );
     let watch = StallWatch::start(net);
     s.resolve(net).await?;
     // A new user signs up while the rest runs: mining the proof takes a while.
@@ -559,6 +550,13 @@ async fn scenario(
         ));
     }
 
+    // The fresh read node has been replaying since the start; from here to
+    // the end of the run it has to make progress.
+    let before = net
+        .heights(net::FRESH)
+        .await
+        .ok_or("fresh read node stopped answering")?;
+
     r.phase("Read API again, on the upgraded network");
     let summary = checks::endpoints(net, s, "upgraded", args.min_compared, &mut r.findings).await;
     r.note(summary);
@@ -581,16 +579,25 @@ async fn scenario(
     // test: a change to how blocks apply shows up as it stopping. A debug build
     // replays slowly, so it only has to keep going, not reach the tip.
     r.phase("Fresh read node: replaying the chain from an empty database");
-    let (since, before) = fresh_from;
-    tokio::time::sleep(Duration::from_secs(10).saturating_sub(since.elapsed())).await;
-    let after = net
-        .heights(net::FRESH)
-        .await
-        .ok_or("fresh read node stopped answering")?;
-    let tip = net
-        .heights(net::API)
-        .await
-        .ok_or("API node stopped answering")?;
+    // A heavy seed block (the load packs thousands of messages per block) can
+    // take a debug build a few sync retries: a shard that hasn't moved gets a
+    // minute more before it counts as stopped.
+    let t = Instant::now();
+    let (after, tip) = loop {
+        let after = net
+            .heights(net::FRESH)
+            .await
+            .ok_or("fresh read node stopped answering")?;
+        let tip = net
+            .heights(net::API)
+            .await
+            .ok_or("API node stopped answering")?;
+        let moving = (0..3).all(|sh| after[sh] + 2 >= tip[sh] || after[sh] > before[sh]);
+        if moving || t.elapsed() > Duration::from_secs(60) {
+            break (after, tip);
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    };
     for sh in 0..3 {
         let synced = after[sh] + 2 >= tip[sh];
         if !synced && after[sh] <= before[sh] {
