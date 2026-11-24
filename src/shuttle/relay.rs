@@ -5,8 +5,7 @@ use super::{
     Error,
 };
 use crate::proto::{
-    self, hub_service_client::HubServiceClient, message_data::Body, Message, MessageData,
-    Transaction,
+    self, hub_service_client::HubServiceClient, message_data::Body, Message, Transaction,
 };
 use prost::Message as ProstMessage;
 use std::{sync::Arc, time::Duration};
@@ -634,7 +633,7 @@ mod tests {
         config
     }
     fn message() -> Message {
-        let data = MessageData {
+        let data = proto::MessageData {
             fid: 42,
             network: 1,
             r#type: 1,
