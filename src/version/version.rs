@@ -32,6 +32,7 @@ pub enum EngineVersion {
     V22 = 22,
     V23 = 23,
     V24 = 24,
+    V25 = 25,
 }
 
 pub enum ProtocolFeature {
@@ -71,6 +72,8 @@ pub enum ProtocolFeature {
     UniqueOnchainEventTrieKeys,
     // Shard and block headers commit to their transactions through `transactions_root`.
     HeaderTransactionsRoot,
+    // Validates `Embed.emoji_label` (FIP: Inline Custom Emoji).
+    InlineCustomEmoji,
 }
 
 pub struct VersionSchedule {
@@ -264,7 +267,7 @@ const ENGINE_VERSION_SCHEDULE_TESTNET: &[VersionSchedule] = [
 
 const ENGINE_VERSION_SCHEDULE_DEVNET: &[VersionSchedule] = [VersionSchedule {
     active_at: 0,
-    version: EngineVersion::V24,
+    version: EngineVersion::V25,
 }]
 .as_slice();
 
@@ -474,6 +477,16 @@ impl EngineVersion {
             ProtocolFeature::ChannelFollows => self >= &EngineVersion::V24,
             ProtocolFeature::UniqueOnchainEventTrieKeys
             | ProtocolFeature::HeaderTransactionsRoot => self >= &EngineVersion::V23,
+            // Activates `Embed.emoji_label` and its rule (see `cast::validate_embed`). Below this
+            // boundary a node treats it as older nodes treat unknown fields (see
+            // `added_field_feature`), and that rule stays so pre-activation blocks replay the same.
+            //
+            // V25 has no mainnet or testnet entry, and the number is provisional. Mainnet and
+            // testnet validators share one engine version table, so this can only be activated at
+            // a boundary every validator schedules together. Renumber it to match that rollout;
+            // never move it below the channel block locally, which would make V24 mean something
+            // different here than on the other validators.
+            ProtocolFeature::InlineCustomEmoji => self >= &EngineVersion::V25,
         }
     }
 
@@ -501,7 +514,8 @@ impl EngineVersion {
             | EngineVersion::V21
             | EngineVersion::V22
             | EngineVersion::V23
-            | EngineVersion::V24 => LATEST_PROTOCOL_VERSION,
+            | EngineVersion::V24
+            | EngineVersion::V25 => LATEST_PROTOCOL_VERSION,
         }
     }
 
@@ -1329,8 +1343,24 @@ mod version_test {
     }
 
     #[test]
+    fn test_inline_custom_emoji_activation() {
+        assert!(!EngineVersion::V24.is_enabled(ProtocolFeature::InlineCustomEmoji));
+        assert!(EngineVersion::V25.is_enabled(ProtocolFeature::InlineCustomEmoji));
+        // V25 is unscheduled on mainnet and testnet; devnet runs the latest version.
+        let far_future = FarcasterTime::from_unix_seconds(4102444800); // 2100-01-01 UTC
+        for network in [FarcasterNetwork::Mainnet, FarcasterNetwork::Testnet] {
+            assert!(!EngineVersion::version_for(&far_future, network)
+                .is_enabled(ProtocolFeature::InlineCustomEmoji));
+        }
+        assert!(
+            EngineVersion::version_for(&FarcasterTime::new(0), FarcasterNetwork::Devnet)
+                .is_enabled(ProtocolFeature::InlineCustomEmoji)
+        );
+    }
+
+    #[test]
     fn test_latest() {
-        assert_eq!(EngineVersion::latest(), EngineVersion::V24);
+        assert_eq!(EngineVersion::latest(), EngineVersion::V25);
         assert_eq!(
             EngineVersion::version_for(&FarcasterTime::current(), FarcasterNetwork::Devnet),
             EngineVersion::latest()

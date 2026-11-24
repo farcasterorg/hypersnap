@@ -51,6 +51,10 @@ A cast in a format other than plain text also has `formatVersion` in `castAddBod
 first cast of a chain. Casts in plain text have no `formatVersion`, and casts that are not in a chain
 have no `chain`.
 
+A url embed that is an inline custom emoji also has `emojiLabel`, for example
+`{ "url": "https://example.com/check.webp", "emojiLabel": "check" }`: `:check:` in the text shows that
+image inline. The `/v2` cast objects have the same field as `emoji_label`.
+
 ## castsByFid
 
 Fetch all casts for authored by an FID.

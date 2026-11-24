@@ -257,8 +257,16 @@ pub struct ChannelUserContext {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Embed {
-    Url { url: String },
-    Cast { cast_id: CastId },
+    Url {
+        url: String,
+        /// Inline custom emoji shortcode label (FIP: Inline Custom Emoji): `:label:` in the text
+        /// shows this image inline.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        emoji_label: Option<String>,
+    },
+    Cast {
+        cast_id: CastId,
+    },
 }
 
 /// Cast ID reference.

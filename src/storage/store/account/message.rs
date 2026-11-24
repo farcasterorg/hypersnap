@@ -431,40 +431,46 @@ pub fn message_bytes_decode(msg: &mut MessageProto) {
     }
 }
 
-/// The feature that defines `field` inside the `MessageData` body in field `body`, for fields added
-/// after v0.14.3. Older nodes skip such a field as unknown, so they accept and store any bytes in
-/// it. Add an arm for each field added to a message body, and clear the field in
+/// The feature that defines the field at `path` (field numbers from `MessageData` down), for fields
+/// added after v0.14.3. Older nodes skip such a field as unknown, so they accept and store any bytes
+/// in it. Add an arm for each added field, list its parents in `holds_added_field`, and clear it in
 /// `drop_unknown_data_fields`.
-fn added_field_feature(body: u32, field: u32) -> Option<ProtocolFeature> {
-    match (body, field) {
+fn added_field_feature(path: &[u32]) -> Option<ProtocolFeature> {
+    match path {
         // `cast_add_body.format_version` and `cast_add_body.chain`. TODO: store reads can stop
         // dropping them once a scan after ChainedCasts activation finds no stored cast that needs
         // it, and no node holds state from before that scan. Validation keeps dropping them, so
         // that pre-activation blocks replay the same.
-        (5, 9) | (5, 10) => Some(ProtocolFeature::ChainedCasts),
+        [5, 9] | [5, 10] => Some(ProtocolFeature::ChainedCasts),
+        // `cast_add_body.embeds[].emoji_label`, under the same rules.
+        [5, 6, 3] => Some(ProtocolFeature::InlineCustomEmoji),
         _ => None,
     }
 }
 
+/// Whether the message at `path` holds a field from `added_field_feature`.
+fn holds_added_field(path: &[u32]) -> bool {
+    matches!(path, [5] | [5, 6])
+}
+
 /// An added field that `version` does not know; with `None` (store reads), every added field.
-fn is_unknown_field(body: u32, field: u32, version: Option<EngineVersion>) -> bool {
-    added_field_feature(body, field)
+fn is_unknown_field(path: &[u32], version: Option<EngineVersion>) -> bool {
+    added_field_feature(path)
         .is_some_and(|feature| version.is_none_or(|version| !version.is_enabled(feature)))
 }
 
-/// An unknown added field whose bytes do not decode. Decoded alone, at its depth in its body, since
-/// a field decodes in a message exactly when it decodes alone.
-fn is_bad_unknown_field(
-    body: u32,
-    field: u32,
-    bytes: &[u8],
-    version: Option<EngineVersion>,
-) -> bool {
-    is_unknown_field(body, field, version) && {
-        let mut data = Vec::new();
-        encode_key(body, WireType::LengthDelimited, &mut data);
-        encode_varint(bytes.len() as u64, &mut data);
-        data.extend_from_slice(bytes);
+/// An unknown added field whose bytes do not decode. Decoded alone, at its depth in its parents,
+/// since a field decodes in a message exactly when it decodes alone.
+fn is_bad_unknown_field(path: &[u32], bytes: &[u8], version: Option<EngineVersion>) -> bool {
+    is_unknown_field(path, version) && {
+        let mut data = bytes.to_vec();
+        for &parent in path[..path.len() - 1].iter().rev() {
+            let mut wrapped = Vec::new();
+            encode_key(parent, WireType::LengthDelimited, &mut wrapped);
+            encode_varint(data.len() as u64, &mut wrapped);
+            wrapped.extend_from_slice(&data);
+            data = wrapped;
+        }
         MessageData::decode(data.as_slice()).is_err()
     }
 }
@@ -517,36 +523,42 @@ pub fn decode_message_data(
 /// `MessageData` bytes without the added fields that `version` does not know and that do not
 /// decode, or `None` if there are none to drop.
 fn drop_unknown_fields(bytes: &[u8], version: Option<EngineVersion>) -> Option<Vec<u8>> {
-    // prost's recursion budget: 100 for top-level fields, 99 inside a nested message.
+    // prost's recursion budget: 100 for top-level fields, one less in each nested message.
+    drop_unknown_fields_at(&[], bytes, 100, version)
+}
+
+/// `drop_unknown_fields` for the message at `path`, whose fields prost decodes with `depth` left.
+fn drop_unknown_fields_at(
+    path: &[u32],
+    bytes: &[u8],
+    depth: u32,
+    version: Option<EngineVersion>,
+) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut dropped = false;
-    for (tag, wire_type, field) in protobuf_fields(bytes, 100)? {
-        let mut payload = field;
-        let body = (wire_type == WireType::LengthDelimited)
+    for (tag, wire_type, field) in protobuf_fields(bytes, depth)? {
+        let path = [path, &[tag]].concat();
+        if is_bad_unknown_field(&path, field, version) {
+            dropped = true;
+            continue;
+        }
+        let kept = (wire_type == WireType::LengthDelimited && holds_added_field(&path))
             .then(|| {
+                let mut payload = field;
                 decode_key(&mut payload).ok()?;
                 decode_varint(&mut payload).ok()?;
-                protobuf_fields(payload, 99)
+                drop_unknown_fields_at(&path, payload, depth - 1, version)
             })
             .flatten();
-        match body {
-            Some(body)
-                if body
-                    .iter()
-                    .any(|(f, _, field)| is_bad_unknown_field(tag, *f, field, version)) =>
-            {
-                let kept: Vec<u8> = body
-                    .into_iter()
-                    .filter(|(f, _, field)| !is_bad_unknown_field(tag, *f, field, version))
-                    .flat_map(|(_, _, field)| field.iter().copied())
-                    .collect();
+        match kept {
+            Some(kept) => {
                 encode_key(tag, WireType::LengthDelimited, &mut out);
                 encode_varint(kept.len() as u64, &mut out);
                 out.extend_from_slice(&kept);
                 dropped = true;
             }
             // A body that doesn't split into fields stays as it is, and the decode decides.
-            _ => out.extend_from_slice(field),
+            None => out.extend_from_slice(field),
         }
     }
     dropped.then_some(out)
@@ -557,11 +569,16 @@ fn drop_unknown_fields(bytes: &[u8], version: Option<EngineVersion>) -> Option<V
 pub fn drop_unknown_data_fields(data: &mut MessageData, version: EngineVersion) {
     crate::native_registration::normalize_data(data, true);
     if let Some(Body::CastAddBody(body)) = &mut data.body {
-        if is_unknown_field(5, 9, Some(version)) {
+        if is_unknown_field(&[5, 9], Some(version)) {
             body.format_version = 0;
         }
-        if is_unknown_field(5, 10, Some(version)) {
+        if is_unknown_field(&[5, 10], Some(version)) {
             body.chain = None;
+        }
+        if is_unknown_field(&[5, 6, 3], Some(version)) {
+            for embed in &mut body.embeds {
+                embed.emoji_label.clear();
+            }
         }
     }
 }
@@ -783,6 +800,76 @@ mod tests {
             };
             assert_eq!((body.format_version, body.chain), (1, None));
         }
+    }
+
+    /// A cast body's `embeds` field: a url embed, then `extra` raw `Embed` fields.
+    fn embed_field(extra: &[u8]) -> Vec<u8> {
+        let mut embed = crate::proto::Embed {
+            embed: Some(crate::proto::embed::Embed::Url(
+                "https://example.com/e.webp".to_string(),
+            )),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        embed.extend_from_slice(extra);
+        let mut field = Vec::new();
+        encode_key(6, WireType::LengthDelimited, &mut field);
+        encode_varint(embed.len() as u64, &mut field);
+        field.extend_from_slice(&embed);
+        field
+    }
+
+    #[test]
+    fn decode_drops_bad_emoji_labels_only_where_they_are_unknown() {
+        let good: &[u8] = &[0x1a, 0x03, b'e', b'y', b'e'];
+        // `Embed.emoji_label` (field 3) as a varint, and as invalid UTF-8.
+        for bad in [&[0x18, 0x01][..], &[0x1a, 0x01, 0xff]] {
+            // A good label on the first embed and a bad one on the second.
+            let bytes = cast_data_bytes(&[embed_field(good), embed_field(bad)].concat());
+            assert!(decode_message_data(&bytes, Some(EngineVersion::V25)).is_err());
+
+            // Same result as a node that skips field 3 as unknown; the good label stays.
+            let skipped =
+                cast_data_bytes(&[embed_field(good), embed_field(&UNKNOWN_FIELD)].concat());
+            let skipped = MessageData::decode(skipped.as_slice()).unwrap();
+            for version in [Some(EngineVersion::V24), None] {
+                assert_eq!(decode_message_data(&bytes, version).unwrap(), skipped);
+            }
+            let Some(Body::CastAddBody(body)) = &skipped.body else {
+                panic!("cast body lost");
+            };
+            assert_eq!(
+                body.embeds
+                    .iter()
+                    .map(|embed| embed.emoji_label.as_str())
+                    .collect::<Vec<_>>(),
+                ["eye", ""]
+            );
+        }
+
+        // prost's skip of an unknown field is the oracle for groups inside an embed too.
+        for depth in [1, 96, 97, 98, 99] {
+            assert_eq!(
+                decode_message_data(
+                    &cast_data_bytes(&embed_field(&nested_groups(3, depth))),
+                    None
+                )
+                .is_ok(),
+                MessageData::decode(
+                    cast_data_bytes(&embed_field(&nested_groups(15, depth))).as_slice()
+                )
+                .is_ok(),
+                "embed, depth {depth}"
+            );
+        }
+        assert!(MessageData::decode(
+            cast_data_bytes(&embed_field(&nested_groups(15, 97))).as_slice()
+        )
+        .is_ok());
+        assert!(MessageData::decode(
+            cast_data_bytes(&embed_field(&nested_groups(15, 98))).as_slice()
+        )
+        .is_err());
     }
 
     #[test]

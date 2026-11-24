@@ -308,6 +308,7 @@ mod tests {
                 "quote",
                 None,
                 vec![crate::proto::Embed {
+                    emoji_label: String::new(),
                     embed: Some(crate::proto::embed::Embed::CastId(crate::proto::CastId {
                         fid: 1,
                         hash: target.clone(),

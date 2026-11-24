@@ -90,9 +90,11 @@ mod tests {
                     .into_iter()
                     .map(|e| match e {
                         EmbedUrlOrCastId::Url(url) => Embed {
+                            emoji_label: String::new(),
                             embed: Some(embed::Embed::Url(url.url)),
                         },
                         EmbedUrlOrCastId::CastId(cast_id) => Embed {
+                            emoji_label: String::new(),
                             embed: Some(embed::Embed::CastId(crate::proto::CastId {
                                 fid: cast_id.cast_id.fid,
                                 hash: hex::decode(&cast_id.cast_id.hash[2..]).unwrap(),
@@ -143,6 +145,7 @@ mod tests {
             text: "hello".to_string(),
             embeds: (0..count)
                 .map(|i| Embed {
+                    emoji_label: String::new(),
                     embed: Some(embed::Embed::Url(format!("https://example.com/{i}"))),
                 })
                 .collect(),

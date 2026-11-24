@@ -988,6 +988,119 @@ mod tests {
         }
     }
 
+    fn emoji(label: &str) -> proto::Embed {
+        proto::Embed {
+            embed: Some(proto::embed::Embed::Url(
+                "https://example.com/check.webp".to_string(),
+            )),
+            emoji_label: label.to_string(),
+        }
+    }
+
+    /// A signed cast with `embeds`, then `extra` raw bytes in its last embed.
+    fn cast_with_embeds(embeds: &[proto::Embed], extra: &[u8]) -> proto::Message {
+        let mut suffix = Vec::new();
+        for (i, embed) in embeds.iter().enumerate() {
+            let mut bytes = embed.encode_to_vec();
+            if i == embeds.len() - 1 {
+                bytes.extend_from_slice(extra);
+            }
+            prost::encoding::encode_key(6, prost::encoding::WireType::LengthDelimited, &mut suffix);
+            prost::encoding::encode_varint(bytes.len() as u64, &mut suffix);
+            suffix.extend_from_slice(&bytes);
+        }
+        cast_with_body_suffix(0, None, &suffix)
+    }
+
+    /// Pins the `InlineCustomEmoji` boundary. Below it a node accepts exactly what a node without
+    /// `Embed.emoji_label` accepts; at and above it, the label follows the FIP's rule.
+    #[test]
+    fn emoji_label_activates_at_v25() {
+        let max = "a".repeat(32);
+        for embeds in [
+            vec![emoji("check")],
+            vec![emoji("_"), emoji("0-_")],
+            vec![emoji(&max)],
+            vec![emoji("dirty"), emoji("eyes"), emoji(""), emoji("eyes")],
+        ] {
+            let msg = cast_with_embeds(&embeds, &[]);
+            for version in [
+                EngineVersion::V24,
+                EngineVersion::V25,
+                EngineVersion::latest(),
+            ] {
+                assert!(validate_with_version(&msg, version).is_ok());
+            }
+        }
+
+        // Each rule, broken once: accepted below the boundary, rejected from V25.
+        let on_quote = proto::Embed {
+            embed: Some(proto::embed::Embed::CastId(CastId {
+                fid: 1,
+                hash: vec![1; 20],
+            })),
+            emoji_label: "check".to_string(),
+        };
+        for bad in [
+            emoji("-check"),
+            emoji("Check"),
+            emoji(":check:"),
+            emoji("ch eck"),
+            emoji("caf\u{e9}"),
+            emoji(&"a".repeat(33)),
+            on_quote,
+        ] {
+            let msg = cast_with_embeds(&[emoji("ok"), bad], &[]);
+            assert!(validate_with_version(&msg, EngineVersion::V24).is_ok());
+            assert_eq!(
+                validate_with_version(&msg, EngineVersion::V25),
+                Err(ValidationError::InvalidEmojiLabel)
+            );
+        }
+
+        // Field 3 as a varint, and as invalid UTF-8.
+        for bad_field in [&[0x18, 0x01][..], &[0x1a, 0x01, 0xff]] {
+            let msg = cast_with_embeds(&[emoji("")], bad_field);
+            assert!(validate_with_version(&msg, EngineVersion::V24).is_ok());
+            assert_eq!(
+                validate_with_version(&msg, EngineVersion::V25),
+                Err(ValidationError::InvalidData)
+            );
+        }
+
+        // Sent in `data` alone, a node without the field hashes `data` without it: a signed label
+        // fails the hash, and an unsigned one is ignored. From V25 the hash covers it.
+        let mut signed = cast_with_embeds(&[emoji("check")], &[]);
+        signed.data =
+            Some(proto::MessageData::decode(signed.data_bytes.take().unwrap().as_slice()).unwrap());
+        assert_eq!(
+            validate_with_version(&signed, EngineVersion::V24),
+            Err(ValidationError::InvalidHash)
+        );
+        assert!(validate_with_version(&signed, EngineVersion::V25).is_ok());
+
+        let mut unsigned = messages_factory::casts::create_cast_add_rich(
+            1234,
+            "lfg :check:",
+            None,
+            vec![emoji("")],
+            None,
+            vec![],
+            None,
+            None,
+        );
+        if let Some(proto::message_data::Body::CastAddBody(body)) =
+            &mut unsigned.data.as_mut().unwrap().body
+        {
+            body.embeds[0].emoji_label = "check".to_string();
+        }
+        assert!(validate_with_version(&unsigned, EngineVersion::V24).is_ok());
+        assert_eq!(
+            validate_with_version(&unsigned, EngineVersion::V25),
+            Err(ValidationError::InvalidHash)
+        );
+    }
+
     #[test]
     fn test_channel_bodies_validate_stateless_fields() {
         use proto::message_data::Body;

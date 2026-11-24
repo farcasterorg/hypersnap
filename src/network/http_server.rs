@@ -192,6 +192,13 @@ pub enum EmbedUrlOrCastId {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EmbedUrl {
     pub url: String,
+    /// Inline custom emoji shortcode label (FIP: Inline Custom Emoji).
+    #[serde(
+        rename = "emojiLabel",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub emoji_label: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -2596,9 +2603,11 @@ fn map_proto_cast_add_body_to_json_cast_add_body(
                 }),
                 Some(embed::Embed::Url(url)) => EmbedUrlOrCastId::Url(EmbedUrl {
                     url: url.to_string(),
+                    emoji_label: crate::core::validations::cast::emoji_label(e),
                 }),
                 None => EmbedUrlOrCastId::Url(EmbedUrl {
                     url: "".to_string(),
+                    emoji_label: None,
                 }), // This arm never executes
             })
             .collect(),
@@ -6304,6 +6313,39 @@ mod tests {
         // Plain text and no chain: neither key.
         let body = cast_json(None);
         assert!(body.get("formatVersion").is_none() && body.get("chain").is_none());
+    }
+
+    #[test]
+    fn cast_add_json_takes_emoji_labels_from_data_bytes() {
+        use prost::Message as _;
+        let url = "https://example.com/e.webp";
+        let embed = |label: &str| proto::Embed {
+            embed: Some(proto::embed::Embed::Url(url.to_string())),
+            emoji_label: label.to_string(),
+        };
+        let mut data = sample_message_data(Body::CastAddBody(proto::CastAddBody {
+            text: "lfg :check:".to_string(),
+            embeds: vec![embed("check"), embed(""), embed("Not a label")],
+            ..Default::default()
+        }));
+        data.r#type = MessageType::CastAdd as i32;
+        let data_bytes = data.encode_to_vec();
+        // A block's `data` before InlineCustomEmoji, which has no labels.
+        if let Some(Body::CastAddBody(body)) = &mut data.body {
+            body.embeds.iter_mut().for_each(|e| e.emoji_label.clear());
+        }
+        let message = map_proto_message_to_json_message(proto::Message {
+            data: Some(data),
+            data_bytes: Some(data_bytes),
+            ..Default::default()
+        })
+        .expect("cast maps");
+        // A label that breaks the rule (a cast from before activation) is left out.
+        assert_eq!(
+            serde_json::to_value(message).expect("serialize Message")["data"]["castAddBody"]
+                ["embeds"],
+            serde_json::json!([{ "url": url, "emojiLabel": "check" }, { "url": url }, { "url": url }])
+        );
     }
 
     #[test]

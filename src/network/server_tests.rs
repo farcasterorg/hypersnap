@@ -9987,6 +9987,7 @@ mod tests {
             "look at this",
             None,
             vec![proto::Embed {
+                emoji_label: String::new(),
                 embed: Some(proto::embed::Embed::CastId(proto::CastId {
                     fid: target_fid,
                     hash: target_cast.hash.clone(),
@@ -10439,6 +10440,7 @@ mod tests {
                 &format!("quote {i}"),
                 None,
                 vec![proto::Embed {
+                    emoji_label: String::new(),
                     embed: Some(proto::embed::Embed::CastId(proto::CastId {
                         fid: target,
                         hash: cast.hash.clone(),

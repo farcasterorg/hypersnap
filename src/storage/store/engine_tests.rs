@@ -4418,6 +4418,7 @@ mod tests {
                     // Mix in a CastId embed so the count check is exercised against both variants.
                     if i == 2 {
                         Embed {
+                            emoji_label: String::new(),
                             embed: Some(proto::embed::Embed::CastId(CastId {
                                 fid: FID_FOR_TEST + 1,
                                 hash: rand::random::<[u8; 20]>().to_vec(),
@@ -4425,6 +4426,7 @@ mod tests {
                         }
                     } else {
                         Embed {
+                            emoji_label: String::new(),
                             embed: Some(proto::embed::Embed::Url(format!(
                                 "https://example.com/{i}"
                             ))),

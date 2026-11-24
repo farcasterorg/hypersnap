@@ -142,10 +142,17 @@ Adds a new Cast message.
 
 #### Embed
 
-| Field   | Type              | Label | Description |
-| ------- | ----------------- | ----- | ----------- |
-| url     | [string](#string) |       |             |
-| cast_id | [CastId](#CastId) |       |             |
+| Field       | Type              | Label | Description |
+| ----------- | ----------------- | ----- | ----------- |
+| url         | [string](#string) |       |             |
+| cast_id     | [CastId](#CastId) |       |             |
+| emoji_label | [string](#string) |       | Shortcode label of an inline custom emoji; empty for a plain embed |
+
+`emoji_label` marks a url embed as an inline custom emoji (FIP: Inline Custom Emoji): `:label:` in the
+cast's text shows the image inline, and a client that doesn't support it shows the text and the image
+below it as usual. It is validated once the `InlineCustomEmoji` feature (V25) is active: it must match
+`[a-z0-9_][a-z0-9_-]{0,31}` and sit on a url embed. Before that, nodes ignore it. Labels may repeat in
+one cast; the first matching embed wins.
 
 ### 3.2 CastRemoveBody
 

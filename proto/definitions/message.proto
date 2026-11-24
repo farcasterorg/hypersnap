@@ -134,6 +134,10 @@ message Embed {
     string url = 1;
     CastId cast_id = 2;
   }
+  // Set when this embed is an inline custom emoji (FIP: Inline Custom Emoji): the shortcode label,
+  // without colons, that `:label:` in the cast text refers to. Only on url embeds. Empty = a
+  // plain embed
+  string emoji_label = 3;
 }
 
 /** Type of cast */

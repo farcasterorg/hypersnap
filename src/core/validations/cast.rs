@@ -82,7 +82,7 @@ pub fn validate_cast_add_body(
     }
 
     for embed in &body.embeds {
-        validate_embed(embed)?;
+        validate_embed(embed, version)?;
     }
 
     for embed_url in &body.embeds_deprecated {
@@ -143,7 +143,14 @@ pub fn validate_cast_remove_body(body: &CastRemoveBody) -> Result<(), Validation
     Ok(())
 }
 
-pub fn validate_embed(embed: &Embed) -> Result<(), ValidationError> {
+pub fn validate_embed(embed: &Embed, version: EngineVersion) -> Result<(), ValidationError> {
+    if !embed.emoji_label.is_empty()
+        && version.is_enabled(ProtocolFeature::InlineCustomEmoji)
+        && !(is_valid_emoji_label(&embed.emoji_label)
+            && matches!(embed.embed, Some(embed::Embed::Url(_))))
+    {
+        return Err(ValidationError::InvalidEmojiLabel);
+    }
     match &embed.embed {
         Some(embed_type) => match embed_type {
             embed::Embed::Url(url) => validate_url(&url),
@@ -151,6 +158,22 @@ pub fn validate_embed(embed: &Embed) -> Result<(), ValidationError> {
         },
         None => Err(ValidationError::MissingEmbed),
     }
+}
+
+/// An inline custom emoji's shortcode label, `[a-z0-9_][a-z0-9_-]{0,31}` (FIP: Inline Custom Emoji).
+pub fn is_valid_emoji_label(label: &str) -> bool {
+    (1..=32).contains(&label.len())
+        && !label.starts_with('-')
+        && label
+            .bytes()
+            .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-'))
+}
+
+/// `embed`'s emoji label for API output, if it has one that the rule accepts. Casts accepted before
+/// InlineCustomEmoji activated may carry any label.
+pub fn emoji_label(embed: &Embed) -> Option<String> {
+    (matches!(embed.embed, Some(embed::Embed::Url(_))) && is_valid_emoji_label(&embed.emoji_label))
+        .then(|| embed.emoji_label.clone())
 }
 
 pub fn validate_parent(parent: &Parent) -> Result<(), ValidationError> {

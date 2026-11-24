@@ -56,6 +56,8 @@ pub enum ValidationError {
     ChainIndexOutOfRange,
     #[error("chain root must be absent at index 0 and the author's own cast otherwise")]
     ChainRootInvalid,
+    #[error("emoji label must match [a-z0-9_][a-z0-9_-]{{0,31}} and be on a url embed")]
+    InvalidEmojiLabel,
     #[error("string embeds > 2")]
     StringEmbedsExceedsLimit,
     #[error("url < 1 byte")]

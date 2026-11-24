@@ -2232,15 +2232,18 @@ impl ApiHttpHandler {
         }
 
         // Extract embeds
-        let embeds: Vec<Embed> = cast_body
+        let signed_body = signed_cast_body(msg);
+        let embeds: Vec<Embed> = signed_body
+            .as_ref()
             .map(|b| {
                 let mut result: Vec<Embed> = b
                     .embeds
                     .iter()
                     .filter_map(|e| match &e.embed {
-                        Some(crate::proto::embed::Embed::Url(url)) => {
-                            Some(Embed::Url { url: url.clone() })
-                        }
+                        Some(crate::proto::embed::Embed::Url(url)) => Some(Embed::Url {
+                            url: url.clone(),
+                            emoji_label: crate::core::validations::cast::emoji_label(e),
+                        }),
                         Some(crate::proto::embed::Embed::CastId(id)) => Some(Embed::Cast {
                             cast_id: types::CastId {
                                 fid: id.fid,
@@ -2252,15 +2255,27 @@ impl ApiHttpHandler {
                     .collect();
                 // Also include deprecated string-only embeds
                 for url in &b.embeds_deprecated {
-                    result.push(Embed::Url { url: url.clone() });
+                    result.push(Embed::Url {
+                        url: url.clone(),
+                        emoji_label: None,
+                    });
                 }
                 result
             })
             .unwrap_or_default();
 
         let thread_hash = thread_hash.map(hex::encode);
-        let (format_version, chain) =
-            cast_format(msg).map_or((None, None), |(version, chain)| (Some(version), chain));
+        let (format_version, chain) = signed_body.map_or((None, None), |body| {
+            let chain = body.chain.map(|chain| types::CastChain {
+                root: chain.root.map(|root| types::CastId {
+                    fid: root.fid,
+                    hash: hex::encode(&root.hash),
+                }),
+                index: chain.index,
+                count: chain.count,
+            });
+            (Some(body.format_version), chain)
+        });
 
         Cast {
             object: "cast".to_string(),
@@ -5235,29 +5250,19 @@ fn format_timestamp(ts: u32) -> String {
         .unwrap_or_else(|| ts.to_string())
 }
 
-/// A cast's `format_version` and `chain`, read from its signed `data_bytes` when present, like the
-/// v1 HTTP API does: a block's `data` before ChainedCasts has neither field. `None` for a message
-/// without a cast body.
-fn cast_format(msg: &crate::proto::Message) -> Option<(u32, Option<types::CastChain>)> {
+/// A cast's body, read from its signed `data_bytes` when present, like the v1 HTTP API does: a
+/// block's `data` has no fields added after the block's version (`format_version`, `chain`,
+/// `Embed.emoji_label`). `None` for a message without a cast body.
+fn signed_cast_body(msg: &crate::proto::Message) -> Option<crate::proto::CastAddBody> {
     let signed = msg
         .data_bytes
         .as_deref()
         .filter(|bytes| !bytes.is_empty())
         .and_then(|bytes| crate::storage::store::account::decode_message_data(bytes, None).ok());
-    let Some(crate::proto::message_data::Body::CastAddBody(body)) =
-        &signed.as_ref().or(msg.data.as_ref())?.body
-    else {
-        return None;
-    };
-    let chain = body.chain.as_ref().map(|chain| types::CastChain {
-        root: chain.root.as_ref().map(|root| types::CastId {
-            fid: root.fid,
-            hash: hex::encode(&root.hash),
-        }),
-        index: chain.index,
-        count: chain.count,
-    });
-    Some((body.format_version, chain))
+    match signed.or_else(|| msg.data.clone())?.body? {
+        crate::proto::message_data::Body::CastAddBody(body) => Some(body),
+        _ => None,
+    }
 }
 
 /// Whether a reaction message is a recast.
@@ -6564,6 +6569,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_emoji_labels_on_v2_casts() {
+        use crate::proto::message_data::Body;
+        use prost::Message as _;
+
+        let url = "https://example.com/e.webp";
+        let embed = |label: &str| crate::proto::Embed {
+            embed: Some(crate::proto::embed::Embed::Url(url.to_string())),
+            emoji_label: label.to_string(),
+        };
+        let quote = crate::proto::Embed {
+            embed: Some(crate::proto::embed::Embed::CastId(crate::proto::CastId {
+                fid: 8,
+                hash: vec![0x33; 20],
+            })),
+            emoji_label: "check".to_string(),
+        };
+        let mut msg = crate::utils::factory::messages_factory::casts::create_cast_add_rich(
+            7,
+            "lfg :check:",
+            None,
+            vec![embed("check"), embed(""), quote],
+            None,
+            vec![],
+            None,
+            None,
+        );
+        msg.data_bytes = Some(msg.data.as_ref().unwrap().encode_to_vec());
+        // A block's `data` before InlineCustomEmoji, which has no labels.
+        let Some(Body::CastAddBody(body)) = &mut msg.data.as_mut().unwrap().body else {
+            unreachable!()
+        };
+        body.embeds.iter_mut().for_each(|e| e.emoji_label.clear());
+
+        let hash = hex::encode(&msg.hash);
+        let handler = ApiHttpHandler::new(None, None, None, None, None, None);
+        handler.set_hub_query(Arc::new(MockHubQuery {
+            cast_lookup: Some(msg),
+            ..Default::default()
+        }));
+        let response = handler
+            .handle_cast_lookup(&hash, "hash", Some(7), None)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            collect_json(response).await["cast"]["embeds"],
+            serde_json::json!([
+                { "url": url, "emoji_label": "check" },
+                { "url": url },
+                { "cast_id": { "fid": 8, "hash": "33".repeat(20) } }
+            ])
+        );
+    }
+
+    #[tokio::test]
     async fn test_user_viewer_context_only_with_viewer_fid() {
         let (followed, follower, viewer) = (10, 11, 20);
         let handler = ApiHttpHandler::new(None, None, None, None, None, None);
@@ -6822,6 +6882,7 @@ mod tests {
             &mut quote.data.as_mut().unwrap().body
         {
             body.embeds.push(crate::proto::Embed {
+                emoji_label: String::new(),
                 embed: Some(crate::proto::embed::Embed::CastId(target_cast_id.clone())),
             });
         }
@@ -6921,6 +6982,7 @@ mod tests {
                         &mut quote.data.as_mut().unwrap().body
                     {
                         body.embeds.push(crate::proto::Embed {
+                            emoji_label: String::new(),
                             embed: Some(crate::proto::embed::Embed::CastId(crate::proto::CastId {
                                 fid: target_fid,
                                 hash: vec![8],
