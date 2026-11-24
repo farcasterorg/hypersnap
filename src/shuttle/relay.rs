@@ -475,7 +475,7 @@ fn compatible(raw: &Message, config: &Config, side: Side) -> Option<Message> {
     // Preserve signed bytes verbatim. `data` is populated only so destination
     // RPC routing can read the FID when a block carried data_bytes alone.
     let data = match message.data_bytes.as_ref() {
-        Some(bytes) => MessageData::decode(bytes.as_slice()).ok()?,
+        Some(bytes) => crate::storage::store::account::decode_message_data(bytes, None).ok()?,
         None => message.data.clone()?,
     };
     if crate::native_registration::is_native_fid(data.fid)

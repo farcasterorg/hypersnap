@@ -124,7 +124,13 @@ pub fn expected_transactions_root(
     version: EngineVersion,
 ) -> Vec<u8> {
     if version.is_enabled(ProtocolFeature::HeaderTransactionsRoot) {
-        shard_transactions_hash(transactions)
+        // A node that does not know a field added after `version` decodes `data` without it.
+        shard_transactions_hash(
+            &crate::storage::store::account::transactions_without_unknown_fields(
+                transactions,
+                version,
+            ),
+        )
     } else {
         vec![]
     }
@@ -344,6 +350,47 @@ mod tests {
             signatures: vec![],
         };
         assert!(!verify_signatures(&commits, &sets));
+    }
+
+    #[test]
+    fn test_expected_transactions_root_hashes_data_as_older_nodes_decode_it() {
+        // A node without `Embed.emoji_label` decodes a chunk's `data` without it, and its root is
+        // over that, so below InlineCustomEmoji every node hashes the label-less encoding.
+        let transactions = |label: &str| {
+            vec![proto::Transaction {
+                fid: 1,
+                user_messages: vec![proto::Message {
+                    data: Some(proto::MessageData {
+                        body: Some(proto::message_data::Body::CastAddBody(proto::CastAddBody {
+                            text: ":check:".to_string(),
+                            embeds: vec![proto::Embed {
+                                embed: Some(proto::embed::Embed::Url(
+                                    "https://example.com/check.webp".to_string(),
+                                )),
+                                emoji_label: label.to_string(),
+                            }],
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }]
+        };
+        let (labelled, as_decoded_by_older_nodes) = (transactions("check"), transactions(""));
+        assert_ne!(
+            shard_transactions_hash(&labelled),
+            shard_transactions_hash(&as_decoded_by_older_nodes)
+        );
+        assert_eq!(
+            expected_transactions_root(&labelled, EngineVersion::V24),
+            shard_transactions_hash(&as_decoded_by_older_nodes)
+        );
+        assert_eq!(
+            expected_transactions_root(&labelled, EngineVersion::V25),
+            shard_transactions_hash(&labelled)
+        );
     }
 
     #[test]

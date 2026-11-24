@@ -3188,6 +3188,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_emoji_labels_before_v25_merge_as_on_older_nodes() {
+        // Testnet runs a version below InlineCustomEmoji. A label in signed `data_bytes` merges and
+        // comes back from the store, as older nodes store those bytes; a label in `data` alone is
+        // dropped from the block, as older nodes decode it, so a cast signed without it merges.
+        let (mut engine, _tmpdir) = new_pre_v24_testnet_engine().await;
+        assert!(!engine
+            .version_for(&FarcasterTime::current())
+            .is_enabled(ProtocolFeature::InlineCustomEmoji));
+        register_user(
+            FID_FOR_TEST,
+            test_helper::default_signer(),
+            default_custody_address(),
+            &mut engine,
+        )
+        .await;
+        let embed = |label: &str| proto::Embed {
+            embed: Some(proto::embed::Embed::Url(
+                "https://example.com/check.webp".to_string(),
+            )),
+            emoji_label: label.to_string(),
+        };
+        let now = time::farcaster_time();
+        let mut signed = messages_factory::casts::create_cast_add_rich(
+            FID_FOR_TEST,
+            "lfg :check:",
+            None,
+            vec![embed("check")],
+            None,
+            vec![],
+            Some(now),
+            Some(&test_helper::default_signer()),
+        );
+        signed.data_bytes = Some(signed.data.as_ref().unwrap().encode_to_vec());
+        let mut unsigned = messages_factory::casts::create_cast_add_rich(
+            FID_FOR_TEST,
+            "lfg :eyes:",
+            None,
+            vec![embed("")],
+            None,
+            vec![],
+            Some(now + 1),
+            Some(&test_helper::default_signer()),
+        );
+        if let Some(proto::message_data::Body::CastAddBody(body)) =
+            &mut unsigned.data.as_mut().unwrap().body
+        {
+            body.embeds[0].emoji_label = "eyes".to_string();
+        }
+        commit_message(&mut engine, &signed).await;
+        commit_message(&mut engine, &unsigned).await;
+
+        let labels: Vec<String> = engine
+            .get_casts_by_fid(FID_FOR_TEST)
+            .unwrap()
+            .messages
+            .into_iter()
+            .map(|cast| match cast.data.unwrap().body {
+                Some(proto::message_data::Body::CastAddBody(body)) => {
+                    body.embeds[0].emoji_label.clone()
+                }
+                _ => panic!("not a cast"),
+            })
+            .collect();
+        assert_eq!(labels, ["check", ""]);
+    }
+
+    #[tokio::test]
     async fn test_messages_pruned_with_exceeded_storage() {
         let (mut engine, _tmpdir) = test_helper::new_engine().await;
         test_helper::register_user(

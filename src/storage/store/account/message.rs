@@ -568,6 +568,12 @@ fn drop_unknown_fields_at(
 /// `data_bytes`, and for the `data` of a block's messages.
 pub fn drop_unknown_data_fields(data: &mut MessageData, version: EngineVersion) {
     crate::native_registration::normalize_data(data, true);
+    clear_unknown_data_fields(data, version);
+}
+
+/// Clears the added fields that `version` does not know. Keep in step with
+/// `has_unknown_data_fields`.
+fn clear_unknown_data_fields(data: &mut MessageData, version: EngineVersion) {
     if let Some(Body::CastAddBody(body)) = &mut data.body {
         if is_unknown_field(&[5, 9], Some(version)) {
             body.format_version = 0;
@@ -581,6 +587,45 @@ pub fn drop_unknown_data_fields(data: &mut MessageData, version: EngineVersion) 
             }
         }
     }
+}
+
+/// Whether `data` sets an added field that `version` does not know.
+fn has_unknown_data_fields(data: &MessageData, version: EngineVersion) -> bool {
+    let Some(Body::CastAddBody(body)) = &data.body else {
+        return false;
+    };
+    (body.format_version != 0 && is_unknown_field(&[5, 9], Some(version)))
+        || (body.chain.is_some() && is_unknown_field(&[5, 10], Some(version)))
+        || (body
+            .embeds
+            .iter()
+            .any(|embed| !embed.emoji_label.is_empty())
+            && is_unknown_field(&[5, 6, 3], Some(version)))
+}
+
+/// `transactions` as a node that does not know the fields added after `version` decodes them, so
+/// a `transactions_root` over them is the one that node computes.
+pub fn transactions_without_unknown_fields(
+    transactions: &[crate::proto::Transaction],
+    version: EngineVersion,
+) -> std::borrow::Cow<'_, [crate::proto::Transaction]> {
+    let needs = transactions
+        .iter()
+        .flat_map(|t| &t.user_messages)
+        .filter_map(|m| m.data.as_ref())
+        .any(|data| has_unknown_data_fields(data, version));
+    if !needs {
+        return std::borrow::Cow::Borrowed(transactions);
+    }
+    let mut transactions = transactions.to_vec();
+    for data in transactions
+        .iter_mut()
+        .flat_map(|t| &mut t.user_messages)
+        .filter_map(|m| m.data.as_mut())
+    {
+        clear_unknown_data_fields(data, version);
+    }
+    std::borrow::Cow::Owned(transactions)
 }
 
 /// Splits protobuf bytes into (tag, wire type, field bytes including the key).

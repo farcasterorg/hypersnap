@@ -150,9 +150,10 @@ Adds a new Cast message.
 
 `emoji_label` marks a url embed as an inline custom emoji (FIP: Inline Custom Emoji): `:label:` in the
 cast's text shows the image inline, and a client that doesn't support it shows the text and the image
-below it as usual. It is validated once the `InlineCustomEmoji` feature (V25) is active: it must match
-`[a-z0-9_][a-z0-9_-]{0,31}` and sit on a url embed. Before that, nodes ignore it. Labels may repeat in
-one cast; the first matching embed wins.
+below it as usual. It is validated once the `InlineCustomEmoji` feature is active: it must match
+`[a-z0-9_][a-z0-9_-]{0,31}` and sit on a url embed. Before that, nodes ignore it as an unknown field.
+The feature is on V25, which is provisional and not yet scheduled on mainnet or testnet. Labels may
+repeat in one cast; the first matching embed wins.
 
 ### 3.2 CastRemoveBody
 

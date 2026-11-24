@@ -53,7 +53,9 @@ have no `chain`.
 
 A url embed that is an inline custom emoji also has `emojiLabel`, for example
 `{ "url": "https://example.com/check.webp", "emojiLabel": "check" }`: `:check:` in the text shows that
-image inline. The `/v2` cast objects have the same field as `emoji_label`.
+image inline. The `/v2` cast objects have the same field in `embeds` as `emoji_label`. Both leave out a
+label that breaks the `Embed.emoji_label` rule, which a cast from before
+the rule was active can carry.
 
 ## castsByFid
 
