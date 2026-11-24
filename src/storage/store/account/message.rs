@@ -604,7 +604,8 @@ fn has_unknown_data_fields(data: &MessageData, version: EngineVersion) -> bool {
 }
 
 /// `transactions` as a node that does not know the fields added after `version` decodes them, so
-/// a `transactions_root` over them is the one that node computes.
+/// a `transactions_root` over them is the one that node computes. Only user messages can hold a
+/// cast body: block events fan out no casts. If they ever do, clear those messages here too.
 pub fn transactions_without_unknown_fields(
     transactions: &[crate::proto::Transaction],
     version: EngineVersion,
@@ -915,6 +916,39 @@ mod tests {
             cast_data_bytes(&embed_field(&nested_groups(15, 98))).as_slice()
         )
         .is_err());
+    }
+
+    #[test]
+    fn has_unknown_data_fields_matches_what_clear_changes() {
+        use strum::IntoEnumIterator;
+        let cast = |format_version, chain: bool, label: &str| MessageData {
+            body: Some(Body::CastAddBody(CastAddBody {
+                format_version,
+                chain: chain.then(Default::default),
+                embeds: vec![crate::proto::Embed {
+                    emoji_label: label.to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        for data in [
+            cast(1, false, ""),
+            cast(0, true, ""),
+            cast(0, false, "check"),
+            cast(1, true, "check"),
+        ] {
+            for version in EngineVersion::iter() {
+                let mut cleared = data.clone();
+                clear_unknown_data_fields(&mut cleared, version);
+                assert_eq!(
+                    has_unknown_data_fields(&data, version),
+                    cleared != data,
+                    "{data:?} at {version:?}"
+                );
+            }
+        }
     }
 
     #[test]
