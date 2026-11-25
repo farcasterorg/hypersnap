@@ -250,7 +250,7 @@ struct BatchOutcome {
 
 #[allow(clippy::too_many_arguments)]
 async fn deliver_batch(
-    client: &reqwest::Client,
+    _client: &reqwest::Client,
     store: &NotificationStore,
     app_id: &str,
     notification_id: &str,
@@ -272,23 +272,40 @@ async fn deliver_batch(
     let token_refs: Vec<&str> = batch.members.iter().map(|(_, t)| t.as_str()).collect();
     let total = token_refs.len() as u64;
 
-    // SSRF re-check at delivery time. The token-registration receiver
-    // already validated the URL, but DNS rebinding can return a
-    // different IP than the one that resolved at registration time.
+    // SSRF re-check at delivery time, with the validated addresses pinned
+    // into a one-shot client. The token-registration receiver already
+    // validated the URL, but DNS rebinding can return a different IP than
+    // the one that resolved at registration time — and the re-check is
+    // only meaningful if the connect cannot re-resolve. Redirects are not
+    // followed, since a redirect target would never be re-checked.
     // These are NOT counted as `retryable_fids` because the URL is
     // bad at the network layer, not the application layer — a
     // synchronous retry with the same URL will produce the same
     // result.
-    if let Err(e) = crate::api::ssrf::assert_safe_url(&batch.url, ssrf_policy).await {
-        warn!(
-            url = batch.url,
-            error = %e,
-            "notification fan-out URL failed SSRF re-check; counting as failures"
-        );
-        outcome.failure_count = total;
-        return outcome;
-    }
-
+    let pinned_client = match crate::api::ssrf::resolve_safe_ips(&batch.url, ssrf_policy).await {
+        Ok((host, addrs)) => match reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .resolve_to_addrs(&host, &addrs)
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(url = batch.url, error = %e, "notification fan-out client build failed");
+                outcome.failure_count = total;
+                return outcome;
+            }
+        },
+        Err(e) => {
+            warn!(
+                url = batch.url,
+                error = %e,
+                "notification fan-out URL failed SSRF re-check; counting as failures"
+            );
+            outcome.failure_count = total;
+            return outcome;
+        }
+    };
     let body = ClientNotificationBody {
         notification_id,
         title,
@@ -297,7 +314,7 @@ async fn deliver_batch(
         tokens: token_refs,
     };
 
-    let response = match client
+    let response = match pinned_client
         .post(&batch.url)
         .header("content-type", "application/json")
         .timeout(Duration::from_secs(send_timeout_secs.max(1)))

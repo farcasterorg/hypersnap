@@ -80,6 +80,25 @@ pub enum SsrfError {
 ///   forbids any non-loopback destination, so an `http://` URL can
 ///   only succeed if it points at a loopback address.
 pub async fn assert_safe_url(url: &str, policy: SsrfPolicy) -> Result<(), SsrfError> {
+    resolve_safe_ips(url, policy).await.map(|_| ())
+}
+
+/// Like [`assert_safe_url`], but also returns the validated addresses so the
+/// caller can pin them into the HTTP client.
+///
+/// Checking a hostname and then letting the HTTP client resolve it *again* at
+/// connect time is a TOCTOU hole: attacker-controlled DNS can answer the check
+/// with a public address and the connect with a private one (DNS rebinding).
+/// Pinning the validated addresses with `reqwest::ClientBuilder::
+/// resolve_to_addrs` makes the address checked the address dialed. TLS is
+/// unaffected — the hostname is still used for SNI and certificate validation.
+///
+/// Returns the host string (reqwest's override key) and the validated socket
+/// addresses, each carrying the URL's effective port.
+pub async fn resolve_safe_ips(
+    url: &str,
+    policy: SsrfPolicy,
+) -> Result<(String, Vec<std::net::SocketAddr>), SsrfError> {
     let parsed = url::Url::parse(url).map_err(|e| SsrfError::Invalid(e.to_string()))?;
 
     let scheme = parsed.scheme();
@@ -94,6 +113,7 @@ pub async fn assert_safe_url(url: &str, policy: SsrfPolicy) -> Result<(), SsrfEr
     // `Url::host()` returns a typed enum that already separates IP
     // literals from domain names — no string parsing needed.
     let host = parsed.host().ok_or(SsrfError::NoHost)?;
+    let port = parsed.port_or_known_default().unwrap_or(443);
 
     match host {
         url::Host::Ipv4(v4) => {
@@ -103,7 +123,10 @@ pub async fn assert_safe_url(url: &str, policy: SsrfPolicy) -> Result<(), SsrfEr
                     reason,
                 });
             }
-            Ok(())
+            Ok((
+                v4.to_string(),
+                vec![std::net::SocketAddr::new(IpAddr::V4(v4), port)],
+            ))
         }
         url::Host::Ipv6(v6) => {
             if let Some(reason) = check_ipv6(&v6, policy) {
@@ -112,26 +135,28 @@ pub async fn assert_safe_url(url: &str, policy: SsrfPolicy) -> Result<(), SsrfEr
                     reason,
                 });
             }
-            Ok(())
+            Ok((
+                format!("[{}]", v6),
+                vec![std::net::SocketAddr::new(IpAddr::V6(v6), port)],
+            ))
         }
         url::Host::Domain(domain) => {
-            let port = parsed.port_or_known_default().unwrap_or(443);
             let lookup = tokio::net::lookup_host((domain, port))
                 .await
                 .map_err(|e| SsrfError::Resolve(e.to_string()))?;
 
-            let mut count = 0usize;
+            let mut addrs = Vec::new();
             for sa in lookup {
-                count += 1;
                 let ip = sa.ip();
                 if let Some(reason) = check_ip(&ip, policy) {
                     return Err(SsrfError::BlockedAddress { ip, reason });
                 }
+                addrs.push(sa);
             }
-            if count == 0 {
+            if addrs.is_empty() {
                 return Err(SsrfError::NoAddress);
             }
-            Ok(())
+            Ok((domain.to_string(), addrs))
         }
     }
 }

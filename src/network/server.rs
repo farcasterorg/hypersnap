@@ -79,11 +79,50 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep, timeout};
 use tokio_stream::wrappers::ReceiverStream;
+
+/// A `ReceiverStream` that holds a subscription semaphore permit for its
+/// whole lifetime. tonic's per-connection concurrency limit releases once
+/// response headers are sent, so without this, long-lived `subscribe`
+/// streams (forwarding tasks, 100-event channels, replay scans) would be
+/// unbounded. Dropping the stream — client hangup or stream end — releases
+/// the permit.
+pub struct PermitStream {
+    inner: ReceiverStream<Result<HubEvent, Status>>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl tokio_stream::Stream for PermitStream {
+    type Item = Result<HubEvent, Status>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::pin::Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
 use tonic::metadata::AsciiMetadataValue;
 use tonic::{Request, Response, Status};
 use tracing::{debug, error, info, warn};
 
 pub const MEMPOOL_ADD_REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Concurrent L1 validations (ENS/verifications) allowed across the RPC
+/// submit path; mirrors the gossip gate's `max_concurrent_checks`.
+pub const MAX_CONCURRENT_L1_VALIDATIONS: usize = 32;
+
+/// Per-message cap on how long an RPC-path L1 validation may run; mirrors
+/// the gossip gate's `check_timeout`.
+pub const L1_VALIDATION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Live `subscribe` streams allowed across the whole server; each holds a
+/// forwarding task, a 100-event channel and possibly a replay scan.
+pub const MAX_CONCURRENT_SUBSCRIPTIONS: usize = 512;
+
+/// Maximum messages in one `submit_bulk_messages` call. Sequential mempool
+/// admissions make oversized batches both slow (risking cancellation by the
+/// HTTP request deadline) and a cost-amplification vector.
+pub const MAX_BULK_MESSAGES: usize = 1000;
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Threads used to probe FIDs in parallel when resolving a cast by hash alone.
@@ -656,6 +695,16 @@ pub struct MyHubService {
     // the background fname connector has polled the corresponding transfer. None
     // disables on-demand recovery (e.g. when fnames are configured off).
     fname_lookup: Option<Arc<dyn FnameTransferLookup>>,
+    /// Bounds concurrent L1 (ENS/verifications) validations on the RPC
+    /// submit path. The gossip path has the full L1 gate; without a cap
+    /// here, RPC submits are an unauthenticated cost-amplification vector
+    /// against the node's upstream L1 RPC quota.
+    l1_validation_permits: Arc<tokio::sync::Semaphore>,
+    /// Bounds live `subscribe` streams. tonic's per-connection concurrency
+    /// limit releases its permit when the response headers are sent, so
+    /// without this a client can accumulate unbounded streaming tasks,
+    /// channels and replay scans.
+    subscribe_permits: Arc<tokio::sync::Semaphore>,
 }
 
 /// Opaque cursor for notifications pagination.
@@ -783,6 +832,10 @@ impl MyHubService {
             id_registry_cache,
             mesh_cache,
             fname_lookup,
+            l1_validation_permits: Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_L1_VALIDATIONS,
+            )),
+            subscribe_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SUBSCRIPTIONS)),
         };
         service
     }
@@ -967,7 +1020,41 @@ impl MyHubService {
     ) -> Result<proto::Message, HubError> {
         // We're doing the ens and address validations here for now because we don't want L1 interactions to be on the consensus critical path.
         // Eventually this will move to the fname server.
-        self.l1_validator.validate_message(&message).await?;
+        // Bounded in concurrency and time so RPC submits cannot pile up
+        // unbounded upstream L1 RPC work (the gossip path has the L1 gate;
+        // this is the equivalent guard for the RPC path). Only message types
+        // that actually hit L1 are gated, so ordinary casts/reactions never
+        // queue behind saturated validation slots.
+        if L1Validator::requires_l1_validation(&message) {
+            let _permit = match timeout(
+                L1_VALIDATION_TIMEOUT,
+                self.l1_validation_permits.clone().acquire_owned(),
+            )
+            .await
+            {
+                Ok(Ok(permit)) => permit,
+                _ => {
+                    self.statsd_client
+                        .count("rpc.l1_validation_overload", 1, vec![]);
+                    return Err(HubError::unavailable("L1 validation busy"));
+                }
+            };
+            match timeout(
+                L1_VALIDATION_TIMEOUT,
+                self.l1_validator.validate_message(&message),
+            )
+            .await
+            {
+                Ok(result) => result?,
+                Err(_) => {
+                    self.statsd_client
+                        .count("rpc.l1_validation_timeout", 1, vec![]);
+                    return Err(HubError::unavailable("L1 validation timed out"));
+                }
+            }
+        } else {
+            self.l1_validator.validate_message(&message).await?;
+        }
 
         let (tx, rx) = oneshot::channel();
 
@@ -1806,6 +1893,16 @@ impl HubService for MyHubService {
 
         let mut messages = request.into_inner().messages;
         let num_messages = messages.len();
+        // Cap batch size so the worst-case processing time fits inside the
+        // HTTP request deadline: admissions are sequential and each can wait
+        // on the mempool, so unbounded batches would be cancelled mid-way
+        // (losing per-message results) and are a cost-amplification vector.
+        if num_messages > MAX_BULK_MESSAGES {
+            return Err(Status::invalid_argument(format!(
+                "too many messages in bulk request ({} > {})",
+                num_messages, MAX_BULK_MESSAGES
+            )));
+        }
         debug!(
             "Received call to [submit_bulk_messages] RPC with {} messages",
             num_messages
@@ -2135,7 +2232,7 @@ impl HubService for MyHubService {
         }))
     }
 
-    type SubscribeStream = ReceiverStream<Result<HubEvent, Status>>;
+    type SubscribeStream = PermitStream;
     async fn subscribe(
         &self,
         request: Request<SubscribeRequest>,
@@ -2168,6 +2265,20 @@ impl HubService for MyHubService {
                 vec![self.shard_stores.get(&shard_id).cloned().unwrap()]
             }
             None => self.shard_stores.values().cloned().collect(),
+        };
+
+        // Hold a subscription permit for the whole life of the stream;
+        // tonic's per-connection concurrency limit releases once response
+        // headers are sent, so without this, long-lived subscriptions are
+        // unbounded. The permit lives inside the spawned task and is
+        // released when the client disconnects or the task ends.
+        let permit = match self.subscribe_permits.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.statsd_client
+                    .count("rpc.subscribe_overload", 1, vec![]);
+                return Err(Status::resource_exhausted("too many active subscriptions"));
+            }
         };
 
         let request = request.into_inner();
@@ -2265,7 +2376,10 @@ impl HubService for MyHubService {
             }
         });
 
-        Ok(Response::new(ReceiverStream::new(client_rx)))
+        Ok(Response::new(PermitStream {
+            inner: ReceiverStream::new(client_rx),
+            _permit: permit,
+        }))
     }
 
     async fn get_event(

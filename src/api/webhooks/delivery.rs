@@ -367,7 +367,29 @@ fn build_http_client(_config: &WebhooksConfig) -> Result<reqwest::Client, reqwes
     // Per-request timeouts are set on each call so we honour each
     // webhook's `http_timeout`. The client itself just needs to disable
     // its global default to keep the per-request timeout authoritative.
-    reqwest::Client::builder().build()
+    //
+    // Redirects are never followed: a registered URL that passes the SSRF
+    // check could otherwise 302 to an internal address, bypassing it.
+    // System proxies are disabled: a proxy would receive the destination
+    // host itself, bypassing the DNS pinning done at delivery time.
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+}
+
+/// Builds the one-shot client for a single delivery attempt, pinning the
+/// target host to the addresses that passed the SSRF check so the address
+/// validated is the address dialed (DNS-rebinding defense).
+fn build_pinned_client(
+    host: &str,
+    addrs: &[std::net::SocketAddr],
+) -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .resolve_to_addrs(host, addrs)
+        .build()
 }
 
 async fn check_rate_limit(buckets: &Mutex<HashMap<Uuid, TokenBucket>>, webhook: &Webhook) -> bool {
@@ -560,7 +582,7 @@ fn enqueue_retry(
 }
 
 async fn deliver_once(
-    client: &reqwest::Client,
+    _client: &reqwest::Client,
     config: &WebhooksConfig,
     job: &DeliveryJob,
 ) -> Result<(), DeliveryError> {
@@ -569,18 +591,25 @@ async fn deliver_once(
         None => return Err(DeliveryError::NoSecret),
     };
 
-    // Re-check the URL right before posting. The create-time check
-    // alone is not enough — DNS rebinding can return a different
-    // address than the one we resolved at create time.
-    if let Err(e) =
-        crate::api::ssrf::assert_safe_url(&job.webhook.target_url, config.ssrf_policy()).await
-    {
-        return Err(DeliveryError::UnsafeUrl(e.to_string()));
-    }
+    // Re-check the URL right before posting, and pin the validated
+    // addresses into a one-shot client. The create-time check alone is
+    // not enough — DNS rebinding can return a different address than the
+    // one we resolved at create time — and the check itself is only
+    // meaningful if the connect cannot re-resolve to something else.
+    let pinned_client =
+        match crate::api::ssrf::resolve_safe_ips(&job.webhook.target_url, config.ssrf_policy())
+            .await
+        {
+            Ok((host, addrs)) => match build_pinned_client(&host, &addrs) {
+                Ok(c) => c,
+                Err(e) => return Err(DeliveryError::Network(e.to_string())),
+            },
+            Err(e) => return Err(DeliveryError::UnsafeUrl(e.to_string())),
+        };
 
     let signature = compute_hmac_sha512_hex(&secret.value, &job.body);
 
-    let response = client
+    let response = pinned_client
         .post(&job.webhook.target_url)
         .header("content-type", "application/json")
         .header(&config.signature_header_name, signature)
@@ -593,10 +622,12 @@ async fn deliver_once(
     let status = response.status();
     if status.is_success() {
         Ok(())
-    } else if status.is_client_error() {
+    } else if status.is_client_error() || status.is_redirection() {
+        // Redirects are never followed (they would bypass the SSRF
+        // re-check), so a 3xx cannot succeed on retry either — count it
+        // as permanent instead of re-posting the event.
         Err(DeliveryError::PermanentClient(status.as_u16()))
     } else {
-        // 3xx is unusual for POST endpoints — treat as transient.
         Err(DeliveryError::TransientServer(status.as_u16()))
     }
 }

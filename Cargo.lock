@@ -7504,7 +7504,7 @@ dependencies = [
 
 [[package]]
 name = "snapchain"
-version = "0.17.19"
+version = "0.17.21"
 dependencies = [
  "alloy-contract",
  "alloy-dyn-abi",
@@ -7542,6 +7542,7 @@ dependencies = [
  "gzp",
  "hex",
  "hmac 0.12.1",
+ "http-body 1.1.0",
  "http-body-util",
  "humantime",
  "humantime-serde",

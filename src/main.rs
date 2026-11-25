@@ -1,6 +1,3 @@
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
 use informalsystems_malachitebft_metrics::{Metrics, SharedRegistry};
 use libp2p::PeerId;
 use snapchain::connectors::fname::FnameRequest;
@@ -302,7 +299,15 @@ async fn start_servers(
 
     tokio::spawn(async move {
         info!(grpc_addr = grpc_addr, "GrpcService listening",);
-        let mut server = Server::builder().add_service(HubServiceServer::from_arc(grpc_service));
+        // Concurrency and liveness limits: without them a single HTTP/2
+        // connection can hold unbounded in-flight RPCs, and dead peers keep
+        // connections (and their allocations) forever.
+        let mut server = Server::builder()
+            .concurrency_limit_per_connection(32)
+            .tcp_keepalive(Some(Duration::from_secs(60)))
+            .http2_keepalive_interval(Some(Duration::from_secs(30)))
+            .http2_keepalive_timeout(Some(Duration::from_secs(10)))
+            .add_service(HubServiceServer::from_arc(grpc_service));
 
         if admin_service.enabled() {
             let admin_service = AdminServiceServer::new(admin_service);
@@ -345,37 +350,14 @@ async fn start_servers(
         let http_service = HubHttpServiceImpl {
             service: service.clone(),
         };
-        loop {
-            match listener.accept().await {
-                Ok((stream, _)) => {
-                    let io = TokioIo::new(stream);
-                    let http_server_config = http_server_config.clone();
-                    let service_clone = http_service.clone();
-                    let api = api_handler.clone();
-                    let nodes = mesh_nodes.clone();
-                    tokio::spawn(async move {
-                        let mut router =
-                            snapchain::network::http_server::Router::new(service_clone, nodes);
-                        if let Some(handler) = api {
-                            router = router.with_api_handler(handler);
-                        }
-                        if let Err(err) = http1::Builder::new()
-                            .serve_connection(
-                                io,
-                                service_fn(|r| router.handle(r, &http_server_config)),
-                            )
-                            .await
-                        {
-                            error!("Error serving connection: {}", err);
-                        }
-                    });
-                }
-                Err(e) => {
-                    error!("Error accepting connection: {}", e);
-                    break;
-                }
-            }
-        }
+        snapchain::network::http_server::run_http_accept_loop(
+            listener,
+            http_service,
+            http_server_config,
+            mesh_nodes,
+            api_handler,
+        )
+        .await;
 
         http_shutdown_tx.send(()).await.ok();
     });

@@ -305,6 +305,16 @@ impl Drop for AbandonedRequest {
 
 /// Most users one /user/search request returns.
 const USER_SEARCH_MAX_RESULTS: usize = 100;
+
+/// Byte cap for JSON bodies on v2 write/batch endpoints, enforced while
+/// streaming. Write actions carry one signed message (tens of KB at most);
+/// batch endpoints carry id arrays capped separately below.
+const MAX_V2_BODY_BYTES: usize = 1024 * 1024;
+
+/// Maximum ids accepted by a single `/v2/farcaster/batch/*` call. Each id
+/// fans out into store scans of up to 10k rows, so unbounded arrays are a
+/// CPU/IO amplification vector.
+const MAX_BATCH_IDS: usize = 100;
 /// Prefix matches read per field before ranking by followers.
 const USER_SEARCH_SCAN_LIMIT: usize = 5_000;
 
@@ -902,17 +912,17 @@ impl ApiHttpHandler {
             || method == Method::PATCH
             || method == Method::PUT
         {
-            let body_bytes = match req.into_body().collect().await {
-                Ok(collected) => collected.to_bytes(),
-                Err(_) => {
-                    let r = Self::error_response(
-                        StatusCode::BAD_REQUEST,
-                        "Failed to read request body",
-                    );
-                    self.record_request_metric(&metric_key, start, r.status().as_u16());
-                    return Ok(r);
-                }
-            };
+            let body_bytes =
+                match crate::utils::body::collect_body_limited(req.into_body(), MAX_V2_BODY_BYTES)
+                    .await
+                {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        let r = Self::error_response(StatusCode::BAD_REQUEST, &e.to_string());
+                        self.record_request_metric(&metric_key, start, r.status().as_u16());
+                        return Ok(r);
+                    }
+                };
             let result = match (method, path.as_str()) {
                 // Batch endpoints
                 (Method::POST, "/v2/farcaster/batch/following") => {
@@ -4883,9 +4893,17 @@ impl ApiHttpHandler {
         struct BatchRequest {
             fids: Vec<u64>,
         }
-        serde_json::from_slice::<BatchRequest>(body)
+        let fids = serde_json::from_slice::<BatchRequest>(body)
             .map(|r| r.fids)
-            .map_err(|e| format!("Invalid JSON body: {}", e))
+            .map_err(|e| format!("Invalid JSON body: {}", e))?;
+        if fids.len() > MAX_BATCH_IDS {
+            return Err(format!(
+                "fids array too large ({} > {})",
+                fids.len(),
+                MAX_BATCH_IDS
+            ));
+        }
+        Ok(fids)
     }
 
     async fn handle_batch_following_batch(
