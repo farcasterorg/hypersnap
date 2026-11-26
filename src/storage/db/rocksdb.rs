@@ -662,14 +662,28 @@ impl RocksDB {
         Ok(deleted)
     }
 
-    pub fn approximate_size(&self) -> u64 {
-        WalkDir::new(self.location())
-            .into_iter()
-            .filter_map(Result::ok) // Filter out any Errs and unwrap the Ok values.
-            .filter_map(|entry| fs::metadata(entry.path()).ok()) // Attempt to get metadata, filter out Errs.
-            .filter(|metadata| metadata.is_file()) // Ensure we only consider files.
-            .map(|metadata| metadata.len()) // Extract the file size.
-            .sum() // Sum the sizes.
+    pub fn approximate_size(&self) -> std::io::Result<u64> {
+        let mut size = 0;
+        for entry in WalkDir::new(self.location()) {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => match error.io_error() {
+                    Some(io) if error.depth() > 0 && io.kind() == std::io::ErrorKind::NotFound => {
+                        continue;
+                    }
+                    _ => return Err(error.into()),
+                },
+            };
+            match fs::metadata(entry.path()) {
+                Ok(metadata) if metadata.is_file() => size += metadata.len(),
+                Ok(_) => {}
+                // Compaction can remove a file after it was listed.
+                Err(error) if entry.depth() > 0 && error.kind() == std::io::ErrorKind::NotFound => {
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(size)
     }
 
     /**
@@ -692,6 +706,7 @@ impl RocksDB {
                     count += 1;
                     iter.next();
                 }
+                iter.status().map_err(RocksdbError::from)?;
             }
             Some(DBProvider::ReadOnly(db)) => {
                 let mut iter = db.raw_iterator_opt(iter_opts.opts);
@@ -700,6 +715,7 @@ impl RocksDB {
                     count += 1;
                     iter.next();
                 }
+                iter.status().map_err(RocksdbError::from)?;
             }
             None => return Err(RocksdbError::DbNotOpen.into()),
         };
