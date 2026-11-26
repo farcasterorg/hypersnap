@@ -375,10 +375,13 @@ mod tests {
 
     async fn send_events(events_tx: broadcast::Sender<HubEvent>, num_events: u64) {
         for i in 0..num_events {
+            // Event ids encode the block height in the high bits (14 sequence
+            // bits per block); the subscribe path derives the reported
+            // block_number from the id, so use realistic ids.
             events_tx
                 .send(HubEvent {
                     r#type: HubEventType::MergeMessage as i32,
-                    id: i,
+                    id: (1u64 << 14) + i,
                     body: None,
                     block_number: 1,
                     shard_index: 1,
@@ -389,13 +392,17 @@ mod tests {
     }
 
     async fn write_events_to_db(db: Arc<RocksDB>, num_events: u64) {
+        write_events_to_db_with_base(db, num_events, 0).await;
+    }
+
+    async fn write_events_to_db_with_base(db: Arc<RocksDB>, num_events: u64, base_id: u64) {
         let mut txn = RocksDbTransactionBatch::new();
         for i in 0..num_events {
             HubEvent::put_event_transaction(
                 &mut txn,
                 &HubEvent {
                     r#type: HubEventType::MergeMessage as i32,
-                    id: i,
+                    id: base_id + i,
                     body: None,
                     block_number: 1,
                     shard_index: 1,
@@ -5422,14 +5429,19 @@ mod tests {
         let num_shard1_pre_existing_events = 10;
         let num_shard2_pre_existing_events = 20;
 
-        write_events_to_db(
+        // Realistic event ids carry the block height in the high bits (14
+        // sequence bits per block); the subscribe path derives the reported
+        // block_number from the id.
+        write_events_to_db_with_base(
             stores.get(&1u32).unwrap().shard_store.db.clone(),
             num_shard1_pre_existing_events,
+            1u64 << 14,
         )
         .await;
-        write_events_to_db(
+        write_events_to_db_with_base(
             stores.get(&2u32).unwrap().shard_store.db.clone(),
             num_shard2_pre_existing_events,
+            1u64 << 14,
         )
         .await;
 
@@ -5466,8 +5478,8 @@ mod tests {
         )
         .await;
 
-        let _ = shard1_subscriber.await;
-        let _ = shard2_subscriber.await;
+        shard1_subscriber.await.unwrap();
+        shard2_subscriber.await.unwrap();
     }
 
     #[tokio::test]
@@ -5485,14 +5497,19 @@ mod tests {
         let num_shard1_pre_existing_events = 10;
         let num_shard2_pre_existing_events = 20;
 
-        write_events_to_db(
+        // Realistic event ids carry the block height in the high bits (14
+        // sequence bits per block); the subscribe path derives the reported
+        // block_number from the id.
+        write_events_to_db_with_base(
             stores.get(&1u32).unwrap().shard_store.db.clone(),
             num_shard1_pre_existing_events,
+            1u64 << 14,
         )
         .await;
-        write_events_to_db(
+        write_events_to_db_with_base(
             stores.get(&2u32).unwrap().shard_store.db.clone(),
             num_shard2_pre_existing_events,
+            1u64 << 14,
         )
         .await;
 
@@ -5524,8 +5541,8 @@ mod tests {
         .await;
         send_events(senders.get(&2u32).unwrap().events_tx.clone(), 0).await;
 
-        let _ = shard1_subscriber.await;
-        let _ = shard2_subscriber.await;
+        shard1_subscriber.await.unwrap();
+        shard2_subscriber.await.unwrap();
     }
 
     #[tokio::test]
