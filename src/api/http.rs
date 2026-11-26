@@ -912,17 +912,31 @@ impl ApiHttpHandler {
             || method == Method::PATCH
             || method == Method::PUT
         {
-            let body_bytes =
-                match crate::utils::body::collect_body_limited(req.into_body(), MAX_V2_BODY_BYTES)
-                    .await
-                {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        let r = Self::error_response(StatusCode::BAD_REQUEST, &e.to_string());
-                        self.record_request_metric(&metric_key, start, r.status().as_u16());
-                        return Ok(r);
-                    }
-                };
+            // Reading the body gets the short public deadline even on
+            // routes whose authenticated work (notification fan-out) is
+            // allowed to run longer: a drip-fed body must not hold a
+            // connection open for the extended budget.
+            let body_bytes = match tokio::time::timeout(
+                crate::network::http_server::HTTP_REQUEST_TIMEOUT,
+                crate::utils::body::collect_body_limited(req.into_body(), MAX_V2_BODY_BYTES),
+            )
+            .await
+            {
+                Ok(Ok(bytes)) => bytes,
+                Ok(Err(e)) => {
+                    let r = Self::error_response(StatusCode::BAD_REQUEST, &e.to_string());
+                    self.record_request_metric(&metric_key, start, r.status().as_u16());
+                    return Ok(r);
+                }
+                Err(_) => {
+                    let r = Self::error_response(
+                        StatusCode::REQUEST_TIMEOUT,
+                        "request body read timed out",
+                    );
+                    self.record_request_metric(&metric_key, start, r.status().as_u16());
+                    return Ok(r);
+                }
+            };
             let result = match (method, path.as_str()) {
                 // Batch endpoints
                 (Method::POST, "/v2/farcaster/batch/following") => {
