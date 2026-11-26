@@ -596,16 +596,25 @@ async fn deliver_once(
     // not enough — DNS rebinding can return a different address than the
     // one we resolved at create time — and the check itself is only
     // meaningful if the connect cannot re-resolve to something else.
-    let pinned_client =
-        match crate::api::ssrf::resolve_safe_ips(&job.webhook.target_url, config.ssrf_policy())
-            .await
-        {
-            Ok((host, addrs)) => match build_pinned_client(&host, &addrs) {
-                Ok(c) => c,
-                Err(e) => return Err(DeliveryError::Network(e.to_string())),
-            },
-            Err(e) => return Err(DeliveryError::UnsafeUrl(e.to_string())),
-        };
+    // Resolution runs under the same deadline as the POST so a stalled
+    // resolver cannot hold the delivery worker beyond the budget.
+    let pinned_client = match tokio::time::timeout(
+        Duration::from_secs(job.webhook.http_timeout.max(1)),
+        crate::api::ssrf::resolve_safe_ips(&job.webhook.target_url, config.ssrf_policy()),
+    )
+    .await
+    {
+        Ok(Ok((host, addrs))) => match build_pinned_client(&host, &addrs) {
+            Ok(c) => c,
+            Err(e) => return Err(DeliveryError::Network(e.to_string())),
+        },
+        Ok(Err(e)) => return Err(DeliveryError::UnsafeUrl(e.to_string())),
+        Err(_) => {
+            return Err(DeliveryError::Network(
+                "DNS resolution exceeded the delivery timeout".to_string(),
+            ))
+        }
+    };
 
     let signature = compute_hmac_sha512_hex(&secret.value, &job.body);
 
