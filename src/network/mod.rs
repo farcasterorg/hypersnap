@@ -2,6 +2,7 @@ pub mod admin_server;
 pub mod discovery;
 pub mod gossip;
 pub mod http_server;
+pub mod info_stats;
 pub mod mesh;
 pub(crate) mod proposal_recovery;
 pub mod replication;

@@ -5,6 +5,8 @@
 
 rpc_address = "0.0.0.0:3383"
 http_address = "0.0.0.0:3381"
+# Seconds between attempts to refresh GetInfo size and FID totals.
+info_stats_refresh_secs = 60
 rocksdb_dir = ".rocks"
 fc_network = "Mainnet"
 # Role is inferred from the consensus key and validator schedule.

@@ -4216,7 +4216,8 @@ where
             .map_err(|e| ErrorResponse {
                 error: "Failed to get info".to_string(),
                 error_detail: Some(e.to_string()),
-                status: None,
+                status: (e.code() == tonic::Code::Unavailable)
+                    .then_some(StatusCode::SERVICE_UNAVAILABLE),
             })?;
         let proto = response.into_inner();
         map_get_info_response_to_json_info_response(proto)

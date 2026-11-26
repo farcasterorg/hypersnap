@@ -555,21 +555,23 @@ mod tests {
         );
 
         let limits = test_helper::limits::test_store_limits();
-        let (engine1, _) = test_helper::new_engine_with_options(test_helper::EngineOptions {
-            limits: Some(limits.clone()),
-            messages_request_tx: Some(msgs_request_tx.clone()),
-            channel_slot_cap_override,
-            ..Default::default()
-        })
-        .await;
-        let (engine2, _) = test_helper::new_engine_with_options(test_helper::EngineOptions {
-            limits: Some(limits.clone()),
-            messages_request_tx: Some(msgs_request_tx.clone()),
-            shard_id: 2,
-            channel_slot_cap_override,
-            ..Default::default()
-        })
-        .await;
+        let (engine1, shard1_dir) =
+            test_helper::new_engine_with_options(test_helper::EngineOptions {
+                limits: Some(limits.clone()),
+                messages_request_tx: Some(msgs_request_tx.clone()),
+                channel_slot_cap_override,
+                ..Default::default()
+            })
+            .await;
+        let (engine2, shard2_dir) =
+            test_helper::new_engine_with_options(test_helper::EngineOptions {
+                limits: Some(limits.clone()),
+                messages_request_tx: Some(msgs_request_tx.clone()),
+                shard_id: 2,
+                channel_slot_cap_override,
+                ..Default::default()
+            })
+            .await;
         let db1 = engine1.db.clone();
         let db2 = engine2.db.clone();
 
@@ -616,11 +618,12 @@ mod tests {
         let (gossip_tx, _gossip_rx) = mpsc::channel(1000);
         let (shard_decision_tx, shard_decision_rx) = broadcast::channel(1000);
         let (block_decision_tx, block_decision_rx) = broadcast::channel(1000);
-        let (block_engine, _) = block_engine_test_helpers::setup_with_options(BlockEngineOptions {
-            messages_request_tx: Some(msgs_request_tx),
-            channel_slot_cap_override,
-            ..BlockEngineOptions::default()
-        });
+        let (block_engine, block_dir) =
+            block_engine_test_helpers::setup_with_options(BlockEngineOptions {
+                messages_request_tx: Some(msgs_request_tx),
+                channel_slot_cap_override,
+                ..BlockEngineOptions::default()
+            });
         let mut block_stores = block_engine.stores();
         if let Some(config) = native_config {
             block_stores.native_registration = config;
@@ -639,7 +642,11 @@ mod tests {
             block_decision_rx,
             statsd_client.clone(),
         );
-        tokio::spawn(async move { mempool.run().await });
+        tokio::spawn(async move {
+            // GetInfo needs the actual DB directories for its size snapshot.
+            let _dirs = (shard1_dir, shard2_dir, block_dir);
+            mempool.run().await;
+        });
 
         let mut chain_clients = ChainClients {
             chain_api_map: HashMap::new(),
@@ -7007,12 +7014,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_info() {
+        use crate::network::http_server::{self, HubHttpServiceImpl, InfoResponse};
+        use crate::network::mesh::nodes::NodeRegistry;
+        use crate::proto::{
+            hub_service_client::HubServiceClient, hub_service_server::HubServiceServer,
+        };
+        use tokio::net::TcpListener;
+        use tokio_stream::wrappers::TcpListenerStream;
+        use tonic::transport::{Endpoint, Server};
+
         let (
             _stores,
             _senders,
-            [mut engine1, _engine2],
+            [mut engine1, mut engine2],
             _block_engine,
-            service,
+            mut service,
             _shard_decision_tx,
             _block_decision_tx,
         ) = make_server(None, None).await;
@@ -7030,10 +7046,28 @@ mod tests {
         )
         .await;
 
-        let response = service
-            .get_info(Request::new(proto::GetInfoRequest {}))
+        let info_stats_task = service.start_info_stats(std::time::Duration::from_secs(60));
+        service.wait_for_info_stats().await;
+        let service = Arc::new(service);
+        let grpc_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let grpc_addr = grpc_listener.local_addr().unwrap();
+        let grpc_service = HubServiceServer::from_arc(Arc::clone(&service));
+        let grpc_task = tokio::spawn(async move {
+            Server::builder()
+                .add_service(grpc_service)
+                .serve_with_incoming(TcpListenerStream::new(grpc_listener))
+                .await
+                .unwrap();
+        });
+        let channel = Endpoint::from_shared(format!("http://{grpc_addr}"))
+            .unwrap()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(5))
+            .connect()
             .await
             .unwrap();
+        let mut grpc = HubServiceClient::new(channel);
+        let response = grpc.get_info(proto::GetInfoRequest {}).await.unwrap();
         let info = response.get_ref();
         assert_eq!(info.num_shards, 2);
         assert_eq!(info.shard_infos.len(), 3); // +1 for the block shard
@@ -7072,6 +7106,60 @@ mod tests {
         assert_eq!(shard2_info.num_messages, 0);
         assert_eq!(shard2_info.max_height, 0);
         assert_eq!(block_info.mempool_size, 0);
+        let totals = info.db_stats.as_ref().unwrap();
+        assert_eq!(
+            totals.approx_size,
+            shard1_info.approx_size + shard2_info.approx_size
+        );
+        assert_eq!(totals.num_fid_registrations, 1);
+
+        test_helper::register_user(
+            SHARD2_FID,
+            test_helper::default_signer(),
+            test_helper::default_custody_address(),
+            &mut engine2,
+        )
+        .await;
+        let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_addr = http_listener.local_addr().unwrap();
+        let http_task = http_server::spawn_http_server(
+            http_listener,
+            HubHttpServiceImpl { service },
+            http_server::Config::default(),
+            Arc::new(NodeRegistry::builtin()),
+        );
+        let refreshed_live: InfoResponse = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{http_addr}/v1/info"))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let shard2_live = refreshed_live
+            .shard_infos
+            .iter()
+            .find(|shard| shard.shard_id == 2)
+            .unwrap();
+        assert!(shard2_live.max_height > 0);
+        assert!(shard2_live.num_messages > 0);
+        assert_eq!(shard2_live.num_fid_registrations, 0);
+        assert_eq!(shard2_live.approx_size, shard2_info.approx_size);
+        assert_eq!(
+            refreshed_live.db_stats.unwrap().approx_size,
+            totals.approx_size
+        );
+        http_task.abort();
+        grpc_task.abort();
+        let _ = http_task.await;
+        let _ = grpc_task.await;
+        info_stats_task.shutdown().await;
     }
 
     #[tokio::test]

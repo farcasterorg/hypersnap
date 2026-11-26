@@ -103,6 +103,8 @@ pub struct Config {
     pub admin_rpc_auth: String,
     pub rpc_address: String,
     pub http_address: String,
+    /// Delay between GetInfo statistics refresh attempts, in seconds.
+    pub info_stats_refresh_secs: u64,
     pub rocksdb_dir: String,
     pub clear_db: bool,
     pub hyper: hyper::HyperConfig,
@@ -137,6 +139,7 @@ impl Default for Config {
             admin_rpc_auth: "".to_string(),
             rpc_address: format!("0.0.0.0:{}", DEFAULT_RPC_PORT),
             http_address: format!("0.0.0.0:{}", DEFAULT_HTTP_PORT),
+            info_stats_refresh_secs: 60,
             rocksdb_dir: ".rocks".to_string(),
             clear_db: false,
             hyper: hyper::HyperConfig::default(),
@@ -222,6 +225,9 @@ pub fn load_and_merge_config(args: Vec<String>) -> Result<Config, Box<dyn Error>
     figment = figment.merge(Env::prefixed("SNAPCHAIN_").split("__"));
 
     let mut config: Config = figment.extract()?;
+    if config.info_stats_refresh_secs == 0 {
+        return Err("info_stats_refresh_secs must be positive".into());
+    }
     config
         .mempool
         .validate_fixed_rate_limit_schedule(config.consensus.num_shards)?;
