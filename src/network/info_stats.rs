@@ -159,6 +159,17 @@ impl InfoStatsCache {
         (Self { receiver, metrics }, InfoStatsTask { stop, join })
     }
 
+    pub async fn wait_for_initial_attempt(&self) {
+        let mut receiver = self.receiver.clone();
+        if receiver
+            .wait_for(|state| !matches!(state, State::Warming))
+            .await
+            .is_err()
+        {
+            tracing::error!("GetInfo statistics task stopped during startup");
+        }
+    }
+
     pub async fn get(&self) -> Result<Arc<InfoStats>, Status> {
         let mut receiver = self.receiver.clone();
         let state = time::timeout(
@@ -218,13 +229,19 @@ mod tests {
         );
         running.await.unwrap();
 
-        let mut requests = tokio::task::JoinSet::new();
         let cache = Arc::new(cache);
+        let preload_cache = Arc::clone(&cache);
+        let preload = tokio::spawn(async move {
+            preload_cache.wait_for_initial_attempt().await;
+            preload_cache.get().await.unwrap()
+        });
+        let mut requests = tokio::task::JoinSet::new();
         for _ in 0..16 {
             let cache = Arc::clone(&cache);
             requests.spawn(async move { cache.get().await.unwrap() });
         }
         tokio::task::yield_now().await;
+        assert!(!preload.is_finished());
         assert!(requests.try_join_next().is_none());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
@@ -237,6 +254,7 @@ mod tests {
 
         let snapshot = requests.join_next().await.unwrap().unwrap();
         assert_eq!(snapshot.block_size, 0);
+        assert!(Arc::ptr_eq(&snapshot, &preload.await.unwrap()));
         while let Some(result) = requests.join_next().await {
             assert!(Arc::ptr_eq(&snapshot, &result.unwrap()));
         }

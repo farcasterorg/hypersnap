@@ -7047,6 +7047,7 @@ mod tests {
         .await;
 
         let info_stats_task = service.start_info_stats(std::time::Duration::from_secs(60));
+        service.wait_for_info_stats().await;
         let service = Arc::new(service);
         let grpc_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let grpc_addr = grpc_listener.local_addr().unwrap();

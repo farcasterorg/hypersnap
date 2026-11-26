@@ -304,6 +304,7 @@ async fn start_servers(
     let grpc_shutdown_tx = shutdown_tx.clone();
 
     tokio::spawn(async move {
+        grpc_service.wait_for_info_stats().await;
         info!(grpc_addr = grpc_addr, "GrpcService listening",);
         let mut server = Server::builder().add_service(HubServiceServer::from_arc(grpc_service));
 
@@ -342,6 +343,7 @@ async fn start_servers(
         "Mesh known-node registry loaded"
     );
     tokio::spawn(async move {
+        service.wait_for_info_stats().await;
         let listener = TcpListener::bind(http_socket_addr).await.unwrap();
         info!(http_addr = http_addr, "HttpService listening",);
 

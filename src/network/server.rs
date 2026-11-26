@@ -808,6 +808,13 @@ impl MyHubService {
         task
     }
 
+    /// Let the first statistics attempt finish before accepting API traffic.
+    pub async fn wait_for_info_stats(&self) {
+        if let Some(cache) = &self.info_stats {
+            cache.wait_for_initial_attempt().await;
+        }
+    }
+
     #[cfg(test)]
     pub fn l1_validator(&self) -> &L1Validator {
         &self.l1_validator
