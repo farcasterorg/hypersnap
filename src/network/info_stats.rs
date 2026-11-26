@@ -10,6 +10,8 @@ use tokio::time::{self, Instant};
 use tonic::Status;
 
 const INITIAL_WAIT: Duration = Duration::from_secs(2);
+const LISTENER_PRELOAD_TIMEOUT: Duration = Duration::from_secs(30);
+const COLD_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 pub(super) type CollectError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -146,14 +148,16 @@ impl InfoStatsCache {
                         });
                     }
                 }
-                if let State::Ready(snapshot) = &*sender.borrow() {
+                delay = if let State::Ready(snapshot) = &*sender.borrow() {
                     task_metrics.gauge(
                         "get_info.stats_cache_age_seconds",
                         snapshot.refreshed_at.elapsed().as_secs(),
                         vec![],
                     );
-                }
-                delay = refresh_interval;
+                    refresh_interval
+                } else {
+                    refresh_interval.min(COLD_RETRY_INTERVAL)
+                };
             }
         });
         (Self { receiver, metrics }, InfoStatsTask { stop, join })
@@ -161,13 +165,22 @@ impl InfoStatsCache {
 
     pub async fn wait_for_initial_attempt(&self) {
         let mut receiver = self.receiver.clone();
-        if receiver
-            .wait_for(|state| !matches!(state, State::Warming))
-            .await
-            .is_err()
-        {
-            tracing::error!("GetInfo statistics task stopped during startup");
+        if matches!(&*receiver.borrow(), State::Warming) {
+            tracing::info!("Waiting for initial GetInfo statistics before opening listener");
         }
+        match time::timeout(
+            LISTENER_PRELOAD_TIMEOUT,
+            receiver.wait_for(|state| !matches!(state, State::Warming)),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => tracing::error!("GetInfo statistics task stopped during startup"),
+            Err(_) => tracing::warn!(
+                timeout_seconds = LISTENER_PRELOAD_TIMEOUT.as_secs(),
+                "Opening listener while GetInfo statistics are still warming up"
+            ),
+        };
     }
 
     pub async fn get(&self) -> Result<Arc<InfoStats>, Status> {
@@ -289,6 +302,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cache.get().await.unwrap().block_size, 5);
+        task.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn listener_preload_wait_is_bounded() {
+        let (_sender, receiver) = watch::channel(State::Warming);
+        let cache = InfoStatsCache {
+            receiver,
+            metrics: crate::storage::store::test_helper::statsd_client(),
+        };
+
+        let started = Instant::now();
+        cache.wait_for_initial_attempt().await;
+        assert!(started.elapsed() >= LISTENER_PRELOAD_TIMEOUT);
+        assert!(started.elapsed() < LISTENER_PRELOAD_TIMEOUT + Duration::from_secs(1));
+        assert!(matches!(&*cache.receiver.borrow(), State::Warming));
+    }
+
+    #[tokio::test]
+    async fn cold_failure_retries_before_normal_refresh_interval() {
+        let calls = AtomicUsize::new(0);
+        let (cache, task) = InfoStatsCache::start(
+            Duration::from_secs(60),
+            crate::storage::store::test_helper::statsd_client(),
+            move || {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(std::io::Error::other("first refresh failed").into())
+                } else {
+                    Ok(stats(10))
+                }
+            },
+        );
+
+        let mut state = cache.receiver.clone();
+        time::timeout(
+            Duration::from_secs(15),
+            state.wait_for(|state| matches!(state, State::Ready(_))),
+        )
+        .await
+        .expect("cold retry should succeed before the regular refresh interval")
+        .unwrap();
+        assert_eq!(cache.get().await.unwrap().block_size, 10);
         task.shutdown().await;
     }
 
