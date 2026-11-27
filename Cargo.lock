@@ -7542,6 +7542,7 @@ dependencies = [
  "gzp",
  "hex",
  "hmac 0.12.1",
+ "http-body 1.1.0",
  "http-body-util",
  "humantime",
  "humantime-serde",

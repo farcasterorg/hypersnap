@@ -96,6 +96,7 @@ aws-sdk-s3 = { version = "1.71.0", default-features = false, features = ["behavi
 hyper = { version = "1.5.1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = "0.1"
+http-body = "1.0"
 serde_qs = "0.13.0"
 base64 = "0.22.1"
 toml = "0.8.19"

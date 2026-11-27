@@ -75,7 +75,7 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep, timeout};
 use tokio_stream::wrappers::ReceiverStream;
@@ -84,6 +84,29 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, error, info, warn};
 
 pub const MEMPOOL_ADD_REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Concurrent L1 validations (ENS/verifications) allowed across the RPC
+/// submit path; mirrors the gossip gate's `max_concurrent_checks`.
+pub const MAX_CONCURRENT_L1_VALIDATIONS: usize = 32;
+
+/// Per-message cap on how long an RPC-path L1 validation may run; mirrors
+/// the gossip gate's `check_timeout`.
+pub const L1_VALIDATION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Live `subscribe` streams allowed across the whole server; each holds a
+/// forwarding task, a 100-event channel and possibly a replay scan.
+pub const MAX_CONCURRENT_SUBSCRIPTIONS: usize = 512;
+
+/// Maximum messages in one `submit_bulk_messages` call. Sequential mempool
+/// admissions make oversized batches both slow (risking cancellation by the
+/// HTTP request deadline) and a cost-amplification vector.
+pub const MAX_BULK_MESSAGES: usize = 1000;
+
+/// Wall-clock budget for processing one bulk batch. Sits under the 30s HTTP
+/// request deadline so a slow batch stops admitting new messages with a
+/// clear per-message "not processed" error instead of being cancelled
+/// mid-batch with no answer for the items already processed.
+pub const BULK_PROCESSING_BUDGET: Duration = Duration::from_secs(25);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Threads used to probe FIDs in parallel when resolving a cast by hash alone.
@@ -657,6 +680,16 @@ pub struct MyHubService {
     // the background fname connector has polled the corresponding transfer. None
     // disables on-demand recovery (e.g. when fnames are configured off).
     fname_lookup: Option<Arc<dyn FnameTransferLookup>>,
+    /// Bounds concurrent L1 (ENS/verifications) validations on the RPC
+    /// submit path. The gossip path has the full L1 gate; without a cap
+    /// here, RPC submits are an unauthenticated cost-amplification vector
+    /// against the node's upstream L1 RPC quota.
+    l1_validation_permits: Arc<tokio::sync::Semaphore>,
+    /// Bounds live `subscribe` streams. tonic's per-connection concurrency
+    /// limit releases its permit when the response headers are sent, so
+    /// without this a client can accumulate unbounded streaming tasks,
+    /// channels and replay scans.
+    subscribe_permits: Arc<tokio::sync::Semaphore>,
 }
 
 /// Opaque cursor for notifications pagination.
@@ -785,6 +818,10 @@ impl MyHubService {
             id_registry_cache,
             mesh_cache,
             fname_lookup,
+            l1_validation_permits: Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_L1_VALIDATIONS,
+            )),
+            subscribe_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SUBSCRIPTIONS)),
         };
         service
     }
@@ -995,7 +1032,40 @@ impl MyHubService {
     ) -> Result<proto::Message, HubError> {
         // We're doing the ens and address validations here for now because we don't want L1 interactions to be on the consensus critical path.
         // Eventually this will move to the fname server.
-        self.l1_validator.validate_message(&message).await?;
+        // Bounded in concurrency and time so RPC submits cannot pile up
+        // unbounded upstream L1 RPC work (the gossip path has the L1 gate;
+        // this is the equivalent guard for the RPC path). Only message types
+        // that actually hit L1 are gated, so ordinary casts/reactions never
+        // queue behind saturated validation slots. One deadline covers both
+        // queueing for a permit and the validation itself, so a saturated
+        // gate cannot stretch a single submit past the configured window.
+        if L1Validator::requires_l1_validation(&message) {
+            let deadline = Instant::now() + L1_VALIDATION_TIMEOUT;
+            let _permit = match timeout(
+                L1_VALIDATION_TIMEOUT,
+                self.l1_validation_permits.clone().acquire_owned(),
+            )
+            .await
+            {
+                Ok(Ok(permit)) => permit,
+                _ => {
+                    self.statsd_client
+                        .count("rpc.l1_validation_overload", 1, vec![]);
+                    return Err(HubError::unavailable("L1 validation busy"));
+                }
+            };
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match timeout(remaining, self.l1_validator.validate_message(&message)).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    self.statsd_client
+                        .count("rpc.l1_validation_timeout", 1, vec![]);
+                    return Err(HubError::unavailable("L1 validation timed out"));
+                }
+            }
+        } else {
+            self.l1_validator.validate_message(&message).await?;
+        }
 
         let (tx, rx) = oneshot::channel();
 
@@ -1834,6 +1904,16 @@ impl HubService for MyHubService {
 
         let mut messages = request.into_inner().messages;
         let num_messages = messages.len();
+        // Cap batch size so the worst-case processing time fits inside the
+        // HTTP request deadline: admissions are sequential and each can wait
+        // on the mempool, so unbounded batches would be cancelled mid-way
+        // (losing per-message results) and are a cost-amplification vector.
+        if num_messages > MAX_BULK_MESSAGES {
+            return Err(Status::invalid_argument(format!(
+                "too many messages in bulk request ({} > {})",
+                num_messages, MAX_BULK_MESSAGES
+            )));
+        }
         debug!(
             "Received call to [submit_bulk_messages] RPC with {} messages",
             num_messages
@@ -1866,11 +1946,29 @@ impl HubService for MyHubService {
         }
 
         let mut results = Vec::with_capacity(num_messages);
+        let batch_started = Instant::now();
 
         // 2. Process each shard's batch transactionally for validation
         for (shard_id, batch) in messages_by_shard {
             self.statsd_client
                 .count("rpc.submit_message_in_flight", batch.len() as i64, vec![]);
+
+            // If the batch budget is spent, admit nothing further and say so
+            // per message, rather than letting an outer deadline cancel the
+            // request with no answer for the unprocessed tail.
+            if batch_started.elapsed() >= BULK_PROCESSING_BUDGET {
+                self.statsd_client
+                    .count("rpc.submit_bulk_messages.budget_exhausted", 1, vec![]);
+                for msg in batch {
+                    results.push(create_error_response(
+                        msg.hash.clone(),
+                        HubError::unavailable(
+                            "batch processing budget exhausted; message not processed",
+                        ),
+                    ));
+                }
+                continue;
+            }
 
             // 3. Simulate the entire batch for the shard using our helper
             let sim_results = self
@@ -1881,6 +1979,20 @@ impl HubService for MyHubService {
             for (sim_result, msg) in sim_results.into_iter().zip(batch.into_iter()) {
                 match sim_result {
                     Ok(()) => {
+                        if batch_started.elapsed() >= BULK_PROCESSING_BUDGET {
+                            self.statsd_client.count(
+                                "rpc.submit_bulk_messages.budget_exhausted",
+                                1,
+                                vec![],
+                            );
+                            results.push(create_error_response(
+                                msg.hash.clone(),
+                                HubError::unavailable(
+                                    "batch processing budget exhausted; message not processed",
+                                ),
+                            ));
+                            continue;
+                        }
                         // 4a. If simulation succeeds, submit the message to the mempool
                         let message_hash_for_error = msg.hash.clone();
                         let result = self.submit_message_to_mempool(msg).await;
@@ -2185,6 +2297,21 @@ impl HubService for MyHubService {
             None => self.shard_stores.values().cloned().collect(),
         };
 
+        // Bound concurrent subscriptions server-wide: tonic's
+        // per-connection concurrency limit releases once response headers
+        // are sent, so without this, long-lived subscriptions (forwarding
+        // tasks, 100-event channels, replay scans) would be unbounded. The
+        // permit lives in the supervisor task below and is released only
+        // after every worker it started has finished cleanup.
+        let permit = match self.subscribe_permits.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.statsd_client
+                    .count("rpc.subscribe_overload", 1, vec![]);
+                return Err(Status::resource_exhausted("too many active subscriptions"));
+            }
+        };
+
         let request = request.into_inner();
         let events = request.event_types;
         let mut inner_events: Vec<i32> = Vec::new();
@@ -2193,6 +2320,9 @@ impl HubService for MyHubService {
         let from_id = request.from_id;
 
         tokio::spawn(async move {
+            // Held for the whole subscription: replay, live forwarding, and
+            // the final wait for worker cleanup after the client goes away.
+            let _permit = permit;
             let event_types = inner_events;
             let mut event_types_filter = Vec::new();
             event_types_filter.resize(event_types.len(), 0);
@@ -2201,13 +2331,18 @@ impl HubService for MyHubService {
             // If [from_id] is not specified, start from the latest events
             if let Some(start_id) = from_id {
                 let mut page_token = None;
-                for store in shard_stores {
+                'replay: for store in shard_stores {
                     info!(
                         "[subscribe] Replaying old events for shard {}",
                         store.shard_id
                     );
                     let mut last_chunk: Option<ShardChunk> = None;
                     loop {
+                        // A client that hung up mid-replay leaves no reader
+                        // behind; stop scanning the store for it.
+                        if server_tx.is_closed() {
+                            break 'replay;
+                        }
                         let (old_events, chunk) = Self::get_events_from_store(
                             &store,
                             start_id,
@@ -2225,7 +2360,7 @@ impl HubService for MyHubService {
                         for event in old_events.events {
                             if event_types.contains(&event.r#type) {
                                 if let Err(_) = server_tx.send(Ok(event)).await {
-                                    return;
+                                    break 'replay;
                                 }
                             }
                         }
@@ -2244,39 +2379,59 @@ impl HubService for MyHubService {
             );
 
             // TODO(aditi): It's possible that events show up between when we finish reading from the db and the subscription starts. We don't handle this case in the current hub code, but we may want to down the line.
+            let mut workers = Vec::new();
             for (shard_id, event_tx) in events_txs {
                 let mut inner_events: Vec<i32> = Vec::new();
                 inner_events.resize(event_types_filter.len(), 0);
                 inner_events.copy_from_slice(event_types_filter.as_slice());
                 let tx = server_tx.clone();
-                tokio::spawn(async move {
+                workers.push(tokio::spawn(async move {
                     let filtered_events = inner_events.clone();
                     let mut event_rx = event_tx.subscribe();
                     loop {
-                        match event_rx.recv().await {
-                            Ok(hub_event) => {
-                                if filtered_events.contains(&hub_event.r#type) {
-                                    let hub_event =
-                                        Self::rewrite_hub_event(hub_event, shard_id, None);
-                                    match tx.send(Ok(hub_event)).await {
-                                        Ok(_) => {}
-                                        Err(_) => {
-                                            // This means the client hung up
-                                            info!("[subscribe] Client hung up on RPC, stopping event stream");
-                                            break;
+                        tokio::select! {
+                            // Client hung up: the channel's only receiver is
+                            // gone. Without this arm a shard with no traffic
+                            // would park this task here forever.
+                            _ = tx.closed() => {
+                                info!("[subscribe] Client hung up on RPC, stopping event stream");
+                                break;
+                            }
+                            result = event_rx.recv() => {
+                                match result {
+                                    Ok(hub_event) => {
+                                        if filtered_events.contains(&hub_event.r#type) {
+                                            let hub_event =
+                                                Self::rewrite_hub_event(hub_event, shard_id, None);
+                                            match tx.send(Ok(hub_event)).await {
+                                                Ok(_) => {}
+                                                Err(_) => {
+                                                    // This means the client hung up
+                                                    info!("[subscribe] Client hung up on RPC, stopping event stream");
+                                                    break;
+                                                }
+                                            }
                                         }
+                                    }
+                                    Err(err) => {
+                                        error!(
+                                            { err = err.to_string() },
+                                            "[subscribe] error receiving from event stream"
+                                        )
                                     }
                                 }
                             }
-                            Err(err) => {
-                                error!(
-                                    { err = err.to_string() },
-                                    "[subscribe] error receiving from event stream"
-                                )
-                            }
                         }
                     }
-                });
+                }));
+            }
+
+            // The client is gone when the channel's receiver drops; cancel
+            // everything we started and only then end the task — which is
+            // what finally releases the subscription permit.
+            server_tx.closed().await;
+            for worker in workers {
+                let _ = worker.await;
             }
         });
 

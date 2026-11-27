@@ -24,6 +24,7 @@
 
 use crate::api::notifications::store::NotificationStore;
 use crate::api::notifications::types::NotificationDetails;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -250,7 +251,7 @@ struct BatchOutcome {
 
 #[allow(clippy::too_many_arguments)]
 async fn deliver_batch(
-    client: &reqwest::Client,
+    _client: &reqwest::Client,
     store: &NotificationStore,
     app_id: &str,
     notification_id: &str,
@@ -272,23 +273,50 @@ async fn deliver_batch(
     let token_refs: Vec<&str> = batch.members.iter().map(|(_, t)| t.as_str()).collect();
     let total = token_refs.len() as u64;
 
-    // SSRF re-check at delivery time. The token-registration receiver
-    // already validated the URL, but DNS rebinding can return a
-    // different IP than the one that resolved at registration time.
+    // SSRF re-check at delivery time, with the validated addresses pinned
+    // into a one-shot client. The token-registration receiver already
+    // validated the URL, but DNS rebinding can return a different IP than
+    // the one that resolved at registration time — and the re-check is
+    // only meaningful if the connect cannot re-resolve. Redirects are not
+    // followed, since a redirect target would never be re-checked.
     // These are NOT counted as `retryable_fids` because the URL is
     // bad at the network layer, not the application layer — a
     // synchronous retry with the same URL will produce the same
     // result.
-    if let Err(e) = crate::api::ssrf::assert_safe_url(&batch.url, ssrf_policy).await {
-        warn!(
-            url = batch.url,
-            error = %e,
-            "notification fan-out URL failed SSRF re-check; counting as failures"
-        );
-        outcome.failure_count = total;
-        return outcome;
-    }
-
+    let resolve = crate::api::ssrf::resolve_safe_ips(&batch.url, ssrf_policy);
+    let pinned_client =
+        match tokio::time::timeout(Duration::from_secs(send_timeout_secs.max(1)), resolve).await {
+            Ok(Ok((host, addrs))) => match reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .no_proxy()
+                .resolve_to_addrs(&host, &addrs)
+                .build()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(url = batch.url, error = %e, "notification fan-out client build failed");
+                    outcome.failure_count = total;
+                    return outcome;
+                }
+            },
+            Ok(Err(e)) => {
+                warn!(
+                    url = batch.url,
+                    error = %e,
+                    "notification fan-out URL failed SSRF re-check; counting as failures"
+                );
+                outcome.failure_count = total;
+                return outcome;
+            }
+            Err(_) => {
+                warn!(
+                    url = batch.url,
+                    "notification fan-out DNS resolution exceeded the send deadline"
+                );
+                outcome.failure_count = total;
+                return outcome;
+            }
+        };
     let body = ClientNotificationBody {
         notification_id,
         title,
@@ -297,7 +325,7 @@ async fn deliver_batch(
         tokens: token_refs,
     };
 
-    let response = match client
+    let response = match pinned_client
         .post(&batch.url)
         .header("content-type", "application/json")
         .timeout(Duration::from_secs(send_timeout_secs.max(1)))
@@ -338,10 +366,39 @@ async fn deliver_batch(
         return outcome;
     }
 
-    let parsed: ClientNotificationResponse = match response.json().await {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(url = batch.url, error = %e, "notification client response was not valid JSON");
+    // The response body is attacker-controlled input (the target server is
+    // a third party's), so read it under a byte cap instead of letting
+    // `.json()` buffer whatever the other side decides to send.
+    const MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
+    let mut body_bytes: Vec<u8> = Vec::new();
+    let mut stream = response.bytes_stream();
+    let read_result: Result<(), ()> = loop {
+        match stream.next().await {
+            Some(Ok(chunk)) => {
+                if body_bytes.len() + chunk.len() > MAX_RESPONSE_BODY_BYTES {
+                    break Err(());
+                }
+                body_bytes.extend_from_slice(&chunk);
+            }
+            Some(Err(_)) => break Err(()),
+            None => break Ok(()),
+        }
+    };
+    let parsed: ClientNotificationResponse = match read_result {
+        Ok(()) => match serde_json::from_slice(&body_bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(url = batch.url, error = %e, "notification client response was not valid JSON");
+                outcome.failure_count = total;
+                return outcome;
+            }
+        },
+        Err(()) => {
+            warn!(
+                url = batch.url,
+                "notification client response exceeded the {} byte cap or failed mid-stream",
+                MAX_RESPONSE_BODY_BYTES
+            );
             outcome.failure_count = total;
             return outcome;
         }

@@ -202,15 +202,14 @@ impl NotificationWebhookHandler {
 }
 
 async fn read_body(body: hyper::body::Incoming) -> Result<Bytes, String> {
-    let collected = body
-        .collect()
+    crate::utils::body::collect_body_limited(body, MAX_BODY_BYTES)
         .await
-        .map_err(|e| format!("failed to read body: {e}"))?
-        .to_bytes();
-    if collected.len() > MAX_BODY_BYTES {
-        return Err(format!("body exceeds {} bytes", MAX_BODY_BYTES));
-    }
-    Ok(collected)
+        .map_err(|e| match e {
+            crate::utils::body::BodyReadError::TooLarge(_) => {
+                format!("body exceeds {} bytes", MAX_BODY_BYTES)
+            }
+            crate::utils::body::BodyReadError::Io(e) => format!("failed to read body: {e}"),
+        })
 }
 
 fn current_unix_secs() -> u64 {

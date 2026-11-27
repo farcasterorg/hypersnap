@@ -206,7 +206,8 @@ impl AdminService for MyAdminService {
         &self,
         request: Request<RetryOnchainEventsRequest>,
     ) -> std::result::Result<Response<Empty>, Status> {
-        info!("Received call to [retry_fname_events] RPC");
+        info!("Received call to [retry_onchain_events] RPC");
+        authenticate_request(&request, &self.allowed_users)?;
         match request.into_inner().kind {
             None => {}
             Some(kind) => match kind {
@@ -239,6 +240,7 @@ impl AdminService for MyAdminService {
         request: Request<RetryFnameRequest>,
     ) -> std::result::Result<Response<Empty>, Status> {
         info!("Received call to [retry_fname_events] RPC");
+        authenticate_request(&request, &self.allowed_users)?;
 
         match request.into_inner().kind {
             None => {}

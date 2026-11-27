@@ -14,6 +14,7 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tonic::async_trait;
 use tonic::metadata::MetadataValue;
@@ -31,6 +32,19 @@ use crate::proto::{
     reaction_request, reactions_by_target_request, GetConnectedPeersRequest, Protocol,
 };
 use crate::storage::store::account::{message_bytes_decode, message_decode};
+
+/// Byte cap for a single protobuf message POSTed to `/v1/submitMessage` or
+/// `/v1/validateMessage`. The largest valid message data is 64 KiB
+/// (LinkCompactState); this allows roughly 4x for envelope, signatures and
+/// future growth while keeping per-connection memory bounded.
+pub const MAX_MESSAGE_BODY_BYTES: usize = 256 * 1024;
+
+/// Byte cap for a `/v1/submitBulkMessages` body. Matches the gossip layer's
+/// maximum transmit size so anything relayable can also be submitted.
+pub const MAX_BULK_BODY_BYTES: usize = 10 * 1024 * 1024;
+
+/// Byte cap for JSON POST/PUT bodies on the legacy HTTP API.
+pub const MAX_JSON_BODY_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Config {
@@ -6118,14 +6132,20 @@ where
     ) -> Result<proto::SubmitBulkMessagesRequest, Response<Bytes>> {
         use prost::Message;
 
-        let body_bytes = req.collect().await.map_err(|e| {
-            Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Bytes::from(format!("Internal server error: {}", e)))
-                .unwrap()
-        })?;
+        let body_bytes =
+            match crate::utils::body::collect_body_limited(req.into_body(), MAX_BULK_BODY_BYTES)
+                .await
+            {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    return Err(Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(Bytes::from(e.to_string()))
+                        .unwrap())
+                }
+            };
 
-        proto::SubmitBulkMessagesRequest::decode(body_bytes.to_bytes()).map_err(|e| {
+        proto::SubmitBulkMessagesRequest::decode(body_bytes).map_err(|e| {
             Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .body(Bytes::from(format!("Invalid protobuf data: {}", e)))
@@ -6138,21 +6158,23 @@ where
         req: Request<hyper::body::Incoming>,
     ) -> Result<proto::Message, Response<Bytes>> {
         // For POST/PUT requests, parse body
-        let body_bytes = req.collect().await;
-        if body_bytes.is_err() {
-            return Err(Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Bytes::from(format!(
-                    "Internal server error: {}",
-                    body_bytes.unwrap_err().to_string()
-                )))
-                .unwrap());
-        }
+        let body_bytes =
+            match crate::utils::body::collect_body_limited(req.into_body(), MAX_MESSAGE_BODY_BYTES)
+                .await
+            {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    return Err(Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(Bytes::from(e.to_string()))
+                        .unwrap())
+                }
+            };
 
-        match message_decode(&body_bytes.unwrap().to_bytes().slice(..)) {
+        match message_decode(&body_bytes.slice(..)) {
             Ok(parsed) => Ok(parsed),
             Err(e) => Err(Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .status(StatusCode::BAD_REQUEST)
                 .body(Bytes::from(format!("Invalid protobuf data: {}", e)))
                 .unwrap()),
         }
@@ -6174,18 +6196,20 @@ where
         }
 
         // For POST/PUT requests, parse body
-        let body_bytes = req.collect().await;
-        if body_bytes.is_err() {
-            return Err(Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Bytes::from(format!(
-                    "Internal server error: {}",
-                    body_bytes.unwrap_err().to_string()
-                )))
-                .unwrap());
-        }
+        let body_bytes =
+            match crate::utils::body::collect_body_limited(req.into_body(), MAX_JSON_BODY_BYTES)
+                .await
+            {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    return Err(Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(Bytes::from(e.to_string()))
+                        .unwrap())
+                }
+            };
 
-        match serde_json::from_slice(&body_bytes.unwrap().to_bytes().slice(..)) {
+        match serde_json::from_slice(&body_bytes.slice(..)) {
             Ok(parsed) => Ok(parsed),
             Err(e) => Err(Response::builder()
                 .status(StatusCode::BAD_REQUEST)
@@ -6195,9 +6219,113 @@ where
     }
 }
 
-/// Spawns the HTTP accept loop against an already-bound `TcpListener`. Identical
-/// in behaviour to the inline server in `start_servers` (`src/main.rs`); extracted
-/// so integration tests can boot the same code path without duplicating it.
+/// Bound on concurrent HTTP/1 connections. Each accepted socket spawns a task
+/// and buffers request bodies in memory, so unbounded acceptance is a
+/// file-descriptor and memory exhaustion vector. Connections beyond the cap
+/// are dropped at accept time.
+pub const MAX_CONCURRENT_HTTP_CONNECTIONS: usize = 2048;
+
+/// Deadline for a client to finish sending request headers. Slowloris-style
+/// trickling otherwise holds a connection slot open indefinitely. Requires a
+/// timer on the connection builder to take effect.
+pub const HTTP_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Wall-clock cap per request once headers are done: body collection plus
+/// handling. The header timeout alone leaves clients that drip-feed or never
+/// finish a body holding one of the connection slots forever; when all slots
+/// are occupied the accept loop drops connections for everyone. 30s covers
+/// every public endpoint with ample headroom.
+pub const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Cap for the authenticated frame-admin endpoints
+/// (`/v2/farcaster/frame/…`), whose notification campaign sends fan out
+/// synchronously and can legitimately take minutes. Long only because the
+/// x-api-key gate keeps the public slowloris surface on the tighter cap.
+pub const HTTP_ADMIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Builds the HTTP/1 connection handler shared by the production accept loop
+/// in `src/main.rs` and the test server below.
+pub fn serve_http_connection<S>(
+    io: TokioIo<tokio::net::TcpStream>,
+    service_clone: HubHttpServiceImpl<S>,
+    config: Config,
+    nodes: Arc<NodeRegistry>,
+    api_handler: Option<crate::api::ApiHttpHandler>,
+) -> impl Future<Output = ()> + Send + 'static
+where
+    S: HubService + 'static,
+{
+    async move {
+        let mut router = Router::new(service_clone, nodes);
+        if let Some(handler) = api_handler {
+            router = router.with_api_handler(handler);
+        }
+        if let Err(err) = http1::Builder::new()
+            .timer(hyper_util::rt::TokioTimer::new())
+            .header_read_timeout(HTTP_HEADER_READ_TIMEOUT)
+            .serve_connection(
+                io,
+                service_fn(|r| async {
+                    let request_timeout = if r.uri().path().starts_with("/v2/farcaster/frame/") {
+                        HTTP_ADMIN_REQUEST_TIMEOUT
+                    } else {
+                        HTTP_REQUEST_TIMEOUT
+                    };
+                    match tokio::time::timeout(request_timeout, router.handle(r, &config)).await {
+                        Ok(res) => res,
+                        Err(_) => Ok(Response::builder()
+                            .status(StatusCode::REQUEST_TIMEOUT)
+                            .body(Full::new(Bytes::from("request timeout")).boxed())
+                            .unwrap()),
+                    }
+                }),
+            )
+            .await
+        {
+            error!("Error serving connection: {}", err);
+        }
+    }
+}
+
+/// Accept loop shared by production and tests. Drops connections beyond
+/// [`MAX_CONCURRENT_HTTP_CONNECTIONS`] instead of spawning unbounded tasks.
+pub async fn run_http_accept_loop<S>(
+    listener: TcpListener,
+    http_service: HubHttpServiceImpl<S>,
+    config: Config,
+    nodes: Arc<NodeRegistry>,
+    api_handler: Option<crate::api::ApiHttpHandler>,
+) where
+    S: HubService + 'static,
+{
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HTTP_CONNECTIONS));
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                let Ok(permit) = slots.clone().try_acquire_owned() else {
+                    error!("HTTP connection limit reached; dropping connection");
+                    continue;
+                };
+                let io = TokioIo::new(stream);
+                let config = config.clone();
+                let service_clone = http_service.clone();
+                let nodes = nodes.clone();
+                let api_handler = api_handler.clone();
+                tokio::spawn(async move {
+                    serve_http_connection(io, service_clone, config, nodes, api_handler).await;
+                    drop(permit);
+                });
+            }
+            Err(e) => {
+                error!("Error accepting connection: {}", e);
+                break;
+            }
+        }
+    }
+}
+
+/// Spawns the HTTP accept loop against an already-bound `TcpListener`. Uses the
+/// same hardened connection handling as `start_servers` (`src/main.rs`).
 pub fn spawn_http_server<S>(
     listener: TcpListener,
     http_service: HubHttpServiceImpl<S>,
@@ -6207,31 +6335,9 @@ pub fn spawn_http_server<S>(
 where
     S: HubService + 'static,
 {
-    tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((stream, _)) => {
-                    let io = TokioIo::new(stream);
-                    let config = config.clone();
-                    let service_clone = http_service.clone();
-                    let nodes = nodes.clone();
-                    tokio::spawn(async move {
-                        let router = Router::new(service_clone, nodes);
-                        if let Err(err) = http1::Builder::new()
-                            .serve_connection(io, service_fn(|r| router.handle(r, &config)))
-                            .await
-                        {
-                            error!("Error serving connection: {}", err);
-                        }
-                    });
-                }
-                Err(e) => {
-                    error!("Error accepting connection: {}", e);
-                    break;
-                }
-            }
-        }
-    })
+    tokio::spawn(
+        async move { run_http_accept_loop(listener, http_service, config, nodes, None).await },
+    )
 }
 
 #[cfg(test)]
