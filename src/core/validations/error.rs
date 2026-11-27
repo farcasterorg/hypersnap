@@ -120,6 +120,8 @@ pub enum ValidationError {
     SolAddressMissing,
     #[error("CAIP-19 string too long")]
     Caip19TooLong,
+    #[error("pinned cast must be empty or a lowercase 0x-prefixed 20-byte hex hash")]
+    InvalidPinnedCastHash,
     #[error("blockHash must be 32 bytes")]
     InvalidBlockhashLength,
     #[error("blockHash is missing")]
