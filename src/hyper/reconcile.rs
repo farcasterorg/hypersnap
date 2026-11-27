@@ -19,7 +19,9 @@ use crate::mempool::routing::{MessageRouter, ShardRouter};
 use crate::proto::Message;
 use crate::storage::constants::{RootPrefix, UserPostfix};
 use crate::storage::db::{PageOptions, RocksDB, RocksDbTransactionBatch};
-use crate::storage::store::account::{make_user_key_with_prefix, message_decode, HASH_LENGTH};
+use crate::storage::store::account::{
+    make_user_key_with_prefix, message_decode, FIDIterator, HASH_LENGTH,
+};
 use crate::storage::store::stores::Stores;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -28,7 +30,7 @@ use tracing::{info, warn};
 
 /// Bump to run the pass again over every FID.
 const CHECKPOINT_NAME: &str = "hyper_reconcile_v1";
-/// FIDs between checkpoint writes and progress logs.
+/// Registered FIDs between checkpoint writes and progress logs.
 const FIDS_PER_CHECKPOINT: u64 = 10_000;
 /// Legacy messages checked against hyper per multi-get.
 const KEY_BATCH: usize = 512;
@@ -90,20 +92,17 @@ pub fn run_hyper_reconcile(
             .unwrap_or(0)
             .saturating_sub(RECENT_SECS);
         let mut stats = PassStats::default();
-        for fid in start_fid..=max_fid {
+        // Registered FIDs only: native FIDs start at 2^32, so a dense range
+        // would walk billions of unregistered FIDs.
+        let mut fids = FIDIterator::new(legacy.db.clone(), start_fid - 1);
+        let mut walked: u64 = 0;
+        for fid in fids.by_ref() {
             if router.route_fid(fid, num_shards) == shard_id {
                 reconcile_fid(legacy, hyper, cast_hash, fid, cutoff, &mut stats);
             }
-            if fid % FIDS_PER_CHECKPOINT == 0 || fid == max_fid {
-                crate::api::backfill::save_shard_checkpoint(
-                    api_db,
-                    CHECKPOINT_NAME,
-                    shard_id,
-                    fid + 1,
-                )
-                .unwrap_or_else(
-                    |e| warn!(shard_id, error = %e, "Failed to save reconcile checkpoint"),
-                );
+            walked += 1;
+            if walked % FIDS_PER_CHECKPOINT == 0 {
+                save_checkpoint(api_db, shard_id, fid + 1);
                 info!(
                     shard_id,
                     fid,
@@ -116,6 +115,11 @@ pub fn run_hyper_reconcile(
                 );
             }
         }
+        if let Some(e) = fids.take_error() {
+            warn!(shard_id, error = %e, "Hyper reconciliation stopped on a FID read error");
+            continue;
+        }
+        save_checkpoint(api_db, shard_id, max_fid + 1);
         info!(
             shard_id,
             scanned = stats.scanned,
@@ -125,6 +129,11 @@ pub fn run_hyper_reconcile(
             "Hyper reconciliation complete for shard"
         );
     }
+}
+
+fn save_checkpoint(api_db: &RocksDB, shard_id: u32, next_fid: u64) {
+    crate::api::backfill::save_shard_checkpoint(api_db, CHECKPOINT_NAME, shard_id, next_fid)
+        .unwrap_or_else(|e| warn!(shard_id, error = %e, "Failed to save reconcile checkpoint"));
 }
 
 /// The highest registered FID, from the last IdRegister events in key order.
@@ -329,5 +338,82 @@ mod tests {
             CastStore::get_cast_adds_by_fid(&hyper.cast_store, fid, &PageOptions::default())
                 .unwrap();
         assert_eq!(casts.messages.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_walks_only_registered_fids_into_native_range() {
+        use crate::native_registration::{account_key, FIRST_NATIVE_FID};
+        use prost::Message as _;
+
+        let (mut engine, _dir) = test_helper::new_engine().await;
+        let fid = test_helper::FID_FOR_TEST;
+        test_helper::register_user(
+            fid,
+            test_helper::default_signer(),
+            test_helper::default_custody_address(),
+            &mut engine,
+        )
+        .await;
+        let native_fid = FIRST_NATIVE_FID;
+        let unregistered = fid + 1;
+        let legacy = engine.get_stores();
+        let hyper = engine.get_hyper_stores().unwrap();
+
+        // A native account, and a legacy-only cast for it, a legacy FID and an
+        // unregistered FID.
+        let mut txn = RocksDbTransactionBatch::new();
+        txn.put(
+            account_key(native_fid),
+            crate::proto::NativeRegistrationRecord {
+                fid: native_fid,
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        );
+        let timestamp = crate::core::util::get_farcaster_time().unwrap() as u32 - 3600;
+        let mut cast = |fid| {
+            let cast =
+                messages_factory::casts::create_cast_add(fid, "legacy only", Some(timestamp), None);
+            legacy
+                .cast_store
+                .merge(&cast, &mut txn, &test_helper::default_merge_ctx())
+                .unwrap();
+            cast
+        };
+        let (legacy_cast, unregistered_cast, native_cast) =
+            (cast(fid), cast(unregistered), cast(native_fid));
+        legacy.db.commit(txn).unwrap();
+        let in_hyper = |cast: &Message| {
+            let fid = cast.data.as_ref().unwrap().fid;
+            CastStore::get_cast_add(&hyper.cast_store, fid, cast.hash.clone())
+                .unwrap()
+                .is_some()
+        };
+
+        let shard_stores = HashMap::from([(1u32, legacy.clone())]);
+        let hyper_stores = HashMap::from([(1u32, hyper.clone())]);
+        let run = |checkpoint: Option<u64>| {
+            let api_dir = tempfile::tempdir().unwrap();
+            let api_db = Arc::new(RocksDB::new(api_dir.path().to_str().unwrap()));
+            api_db.open().unwrap();
+            if let Some(next_fid) = checkpoint {
+                save_checkpoint(&api_db, 1, next_fid);
+            }
+            let cast_hash = CastHashIndexer::new(FeatureConfig::default(), api_db.clone());
+            run_hyper_reconcile(&api_db, &shard_stores, &hyper_stores, &cast_hash);
+            crate::api::backfill::load_shard_checkpoint(&api_db, CHECKPOINT_NAME, 1)
+        };
+
+        // Resuming from a checkpoint between the legacy and native ranges goes
+        // straight to the native account.
+        assert_eq!(run(Some(5_000_000)), native_fid + 1);
+        assert!(in_hyper(&native_cast));
+        assert!(!in_hyper(&legacy_cast));
+
+        // A fresh pass visits the registered legacy FID but never the
+        // unregistered one.
+        assert_eq!(run(None), native_fid + 1);
+        assert!(in_hyper(&legacy_cast));
+        assert!(!in_hyper(&unregistered_cast));
     }
 }

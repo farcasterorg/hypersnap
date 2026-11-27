@@ -45,7 +45,6 @@ use crate::storage::constants::RootPrefix;
 use crate::storage::constants::PAGE_SIZE_MAX;
 use crate::storage::db::PageOptions;
 use crate::storage::db::RocksDbTransactionBatch;
-use crate::storage::store::account::MessagesPage;
 use crate::storage::store::account::UsernameProofStore;
 use crate::storage::store::account::{
     get_app_nonce, get_gasless_key_count, get_gasless_key_record, get_last_used_at, get_user_nonce,
@@ -59,6 +58,7 @@ use crate::storage::store::account::{
 };
 use crate::storage::store::account::{make_ts_hash, message_bytes_decode, IntoI32};
 use crate::storage::store::account::{EventsPage, HubEventIdGenerator};
+use crate::storage::store::account::{FIDIterator, MessagesPage};
 use crate::storage::store::block_engine::{self, BlockStores};
 use crate::storage::store::engine::{self, Senders, ShardEngine};
 use crate::storage::store::mempool_poller::MempoolMessage;
@@ -68,6 +68,7 @@ use crate::version::version::{EngineVersion, ProtocolFeature};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use hex::ToHex;
+use itertools::Itertools;
 use moka::policy::EvictionPolicy;
 use moka::sync::{Cache, CacheBuilder};
 use serde::{Deserialize, Serialize};
@@ -86,8 +87,6 @@ use tracing::{debug, error, info, warn};
 pub const MEMPOOL_ADD_REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_millis(100);
 
-/// Threads used to probe FIDs in parallel when resolving a cast by hash alone.
-const CAST_SCAN_THREADS: u64 = 8;
 /// Cast-adds keys per multi-get while probing FIDs for a cast hash.
 const CAST_SCAN_BATCH: usize = 1024;
 
@@ -1545,39 +1544,18 @@ impl MyHubService {
 
     /// Find the author FID of a cast from its hash alone. The shard stores
     /// have no hash-keyed index, so this probes the cast-adds key of every
-    /// FID up to the highest registered one, in batched multi-gets across
-    /// scoped threads, stopping as soon as any thread finds the cast.
+    /// registered FID, one scoped thread per shard in batched multi-gets,
+    /// stopping as soon as any thread finds the cast.
     fn find_cast_fid_by_hash(&self, hash: &[u8]) -> Option<u64> {
         if hash.len() != HASH_LENGTH {
             return None;
         }
-        // IdRegister events are keyed by FID, so the last page in reverse
-        // order holds the highest registered FIDs.
-        let max_fid = self
-            .shard_stores
-            .values()
-            .filter_map(|stores| {
-                stores
-                    .onchain_event_store
-                    .get_fids(&PageOptions {
-                        page_size: Some(64),
-                        page_token: None,
-                        reverse: true,
-                    })
-                    .ok()
-            })
-            .flat_map(|(fids, _)| fids)
-            .max()?;
-
         let hash = hash.to_vec();
         let found = AtomicU64::new(0);
-        let span = max_fid.div_ceil(CAST_SCAN_THREADS);
         std::thread::scope(|scope| {
-            for i in 0..CAST_SCAN_THREADS {
+            for (&shard_id, stores) in &self.shard_stores {
                 let (hash, found) = (&hash, &found);
-                let start = 1 + i * span;
-                let end = ((i + 1) * span).min(max_fid);
-                scope.spawn(move || self.scan_cast_adds_range(hash, start, end, found));
+                scope.spawn(move || self.scan_cast_adds(shard_id, stores, hash, found));
             }
         });
         match found.load(Ordering::Relaxed) {
@@ -1586,54 +1564,31 @@ impl MyHubService {
         }
     }
 
-    /// Probe the cast-adds key for `hash` under each FID in `start..=end`,
-    /// recording the owning FID in `found`. Returns early once any scanner
-    /// has set `found`.
-    fn scan_cast_adds_range(&self, hash: &Vec<u8>, start: u64, end: u64, found: &AtomicU64) {
-        let probe = |shard_id: u32, fids: &[u64], keys: &Vec<Vec<u8>>| -> Option<u64> {
-            let stores = self.shard_stores.get(&shard_id)?;
-            let values = stores.cast_store.db().get_many(keys).ok()?;
-            values
-                .iter()
-                .position(|v| !v.is_empty())
-                .map(|idx| fids[idx])
-        };
-
-        let mut batches: HashMap<u32, (Vec<u64>, Vec<Vec<u8>>)> = HashMap::new();
-        for fid in start..=end {
+    /// Probe the cast-adds key for `hash` under each registered FID of the
+    /// shard, recording the owning FID in `found`. Iterates registered FIDs
+    /// rather than a dense range: native FIDs start at 2^32. Returns early
+    /// once any scanner has set `found`.
+    fn scan_cast_adds(&self, shard_id: u32, stores: &Stores, hash: &Vec<u8>, found: &AtomicU64) {
+        let root_prefix = stores
+            .cast_store
+            .state_context()
+            .root_prefix(RootPrefix::User);
+        let fids = FIDIterator::new(stores.db.clone(), 0)
+            .filter(|&fid| self.message_router.route_fid(fid, self.num_shards) == shard_id);
+        for batch in &fids.chunks(CAST_SCAN_BATCH) {
             if found.load(Ordering::Relaxed) != 0 {
                 return;
             }
-            let shard_id = self.message_router.route_fid(fid, self.num_shards);
-            let Some(stores) = self.shard_stores.get(&shard_id) else {
+            let fids: Vec<u64> = batch.collect();
+            let keys: Vec<Vec<u8>> = fids
+                .iter()
+                .map(|&fid| CastStoreDef::make_cast_adds_key_with_prefix(root_prefix, fid, hash))
+                .collect();
+            let Ok(values) = stores.cast_store.db().get_many(&keys) else {
                 continue;
             };
-            let root_prefix = stores
-                .cast_store
-                .state_context()
-                .root_prefix(RootPrefix::User);
-            let (fids, keys) = batches.entry(shard_id).or_default();
-            fids.push(fid);
-            keys.push(CastStoreDef::make_cast_adds_key_with_prefix(
-                root_prefix,
-                fid,
-                hash,
-            ));
-            if keys.len() >= CAST_SCAN_BATCH {
-                if let Some(owner) = probe(shard_id, fids, keys) {
-                    found.store(owner, Ordering::Relaxed);
-                    return;
-                }
-                fids.clear();
-                keys.clear();
-            }
-        }
-        for (shard_id, (fids, keys)) in &batches {
-            if keys.is_empty() || found.load(Ordering::Relaxed) != 0 {
-                continue;
-            }
-            if let Some(owner) = probe(*shard_id, fids, keys) {
-                found.store(owner, Ordering::Relaxed);
+            if let Some(idx) = values.iter().position(|v| !v.is_empty()) {
+                found.store(fids[idx], Ordering::Relaxed);
                 return;
             }
         }

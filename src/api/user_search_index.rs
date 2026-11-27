@@ -13,7 +13,7 @@ use crate::mempool::routing::{MessageRouter, ShardRouter};
 use crate::proto::message_data::Body;
 use crate::proto::{Message, MessageType, UserDataType};
 use crate::storage::db::{PageOptions, RocksDB, RocksDbTransactionBatch};
-use crate::storage::store::account::UserDataStore;
+use crate::storage::store::account::{FIDIterator, UserDataStore};
 use crate::storage::store::stores::Stores;
 use crate::storage::util::increment_vec_u8;
 use async_trait::async_trait;
@@ -158,11 +158,10 @@ impl UserSearchIndexer {
         let num_shards = stores.len() as u32;
         let router = ShardRouter {};
         for (&shard_id, shard) in stores {
-            let Some(max_fid) = crate::hyper::reconcile::max_registered_fid(shard) else {
-                continue;
-            };
             let mut txn = RocksDbTransactionBatch::new();
-            for fid in 1..=max_fid {
+            // Registered FIDs only: native FIDs start at 2^32.
+            let mut fids = FIDIterator::new(shard.db.clone(), 0);
+            for fid in fids.by_ref() {
                 if router.route_fid(fid, num_shards) != shard_id {
                     continue;
                 }
@@ -187,6 +186,9 @@ impl UserSearchIndexer {
                 }
             }
             self.commit(txn)?;
+            if let Some(e) = fids.take_error() {
+                return Err(IndexerError::Storage(e.to_string()));
+            }
         }
         self.db
             .put(&[SEARCH_PREFIX, BACKFILL_DONE], &[1])
