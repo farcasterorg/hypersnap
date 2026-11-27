@@ -76,6 +76,10 @@ pub struct ReplicationConfig {
 
     #[serde(with = "humantime_serde")]
     pub snapshot_max_age: Duration,
+
+    /// Node-wide budget for obsolete SST bytes retained by advertised replication snapshots.
+    /// A snapshot can be retired before snapshot_max_age when this budget is exceeded.
+    pub snapshot_obsolete_sst_budget_bytes: u64,
 }
 
 impl Default for ReplicationConfig {
@@ -84,6 +88,7 @@ impl Default for ReplicationConfig {
             enable: true,
             snapshot_interval: (60 * 60 * 8), // every ~8 hours (in number of blocks)
             snapshot_max_age: Duration::from_secs(60 * 60 * 24), // keep snapshots for 24 hours
+            snapshot_obsolete_sst_budget_bytes: 16 * 1024 * 1024 * 1024,
         }
     }
 }
