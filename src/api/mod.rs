@@ -1491,12 +1491,9 @@ mod search_backfill_tests {
     use crate::utils::factory::{events_factory, messages_factory};
     use crate::utils::statsd_wrapper::StatsdClientWrapper;
 
-    #[tokio::test]
-    async fn walk_leaves_live_casts_to_live_indexing_and_checkpoints_once_committed() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = RocksDB::open_shard_db(dir.path().to_str().unwrap(), 0);
-        let stores = Stores::new(
-            RocksDB::open_shard_db(dir.path().to_str().unwrap(), 1),
+    fn shard_stores(root: &std::path::Path) -> Stores {
+        Stores::new(
+            RocksDB::open_shard_db(root.to_str().unwrap(), 1),
             1,
             MerkleTrie::new().unwrap(),
             StoreLimits::default(),
@@ -1505,8 +1502,11 @@ mod search_backfill_tests {
                 cadence::StatsdClient::builder("test", cadence::NopMetricSink).build(),
                 false,
             ),
-        );
-        let search = Arc::new(
+        )
+    }
+
+    fn open_search(db: &RocksDB) -> Arc<SearchIndexer> {
+        Arc::new(
             SearchIndexer::open(
                 SearchConfig {
                     enabled: true,
@@ -1514,14 +1514,16 @@ mod search_backfill_tests {
                     memory_budget_mb: 50,
                     ..Default::default()
                 },
-                &db,
+                db,
                 &[1],
             )
             .unwrap(),
-        );
-        let before = search.backfill_before() as u32;
+        )
+    }
+
+    fn add_casts(stores: &Stores, casts: &[(u64, &str, u32)]) {
         let mut txn = RocksDbTransactionBatch::new();
-        for fid in [10, 11] {
+        for &(fid, text, timestamp) in casts {
             stores
                 .onchain_event_store
                 .merge_onchain_event(
@@ -1534,9 +1536,6 @@ mod search_backfill_tests {
                     &mut txn,
                 )
                 .unwrap();
-        }
-        // Old enough for the walk, and one live indexing already owns.
-        for (fid, text, timestamp) in [(10, "old #gm", before - 100), (11, "new #gm", before + 1)] {
             let cast = messages_factory::casts::create_cast_add(fid, text, Some(timestamp), None);
             stores
                 .cast_store
@@ -1544,6 +1543,38 @@ mod search_backfill_tests {
                 .unwrap();
         }
         stores.db.commit(txn).unwrap();
+    }
+
+    async fn wait_for_docs(search: &SearchIndexer, docs: u64) {
+        // the reader reloads shortly after the commit
+        for _ in 0..100 {
+            if search.num_docs() == docs {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(search.num_docs(), docs);
+    }
+
+    fn fids(search: &SearchIndexer, query: &str) -> Vec<u64> {
+        let found = search.search_casts(query, SearchSort::Newest, 0, 10);
+        let mut fids: Vec<_> = found.unwrap().iter().map(|r| r.fid).collect();
+        fids.sort();
+        fids
+    }
+
+    #[tokio::test]
+    async fn walk_leaves_live_casts_to_live_indexing_and_checkpoints_once_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = RocksDB::open_shard_db(dir.path().to_str().unwrap(), 0);
+        let stores = shard_stores(dir.path());
+        let search = open_search(&db);
+        let before = search.backfill_before() as u32;
+        // Old enough for the walk, and one live indexing already owns.
+        add_casts(
+            &stores,
+            &[(10, "old #gm", before - 100), (11, "new #gm", before + 1)],
+        );
 
         run_search_backfill(&db, &HashMap::from([(1, stores)]), &search).await;
 
@@ -1552,17 +1583,129 @@ mod search_backfill_tests {
             backfill::load_shard_checkpoint(&db, SEARCH_BACKFILL_CHECKPOINT, 1),
             u64::MAX
         );
-        // the reader reloads shortly after the commit
-        for _ in 0..100 {
-            if search.num_docs() > 0 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert_eq!(search.num_docs(), 1);
-        let found = search
-            .search_casts("#gm", SearchSort::Newest, 0, 10)
+        wait_for_docs(&search, 1).await;
+        assert_eq!(fids(&search, "#gm"), vec![10]);
+    }
+
+    async fn index_live(root: &std::path::Path, fid: u64, text: &str) {
+        let db = RocksDB::open_shard_db(root.to_str().unwrap(), 0);
+        let search = open_search(&db);
+        let cast = messages_factory::casts::create_cast_add(fid, text, None, None);
+        search
+            .process_event(&IndexEvent::message(cast, 1, 1))
+            .await
             .unwrap();
-        assert_eq!(found.iter().map(|r| r.fid).collect::<Vec<_>>(), vec![10]);
+    }
+
+    /// Restore shard-0 from another node, whose search cursors say the walk is
+    /// done, the way `main` does: the local search index goes first.
+    fn restore_snapshot(local: &std::path::Path) {
+        let producer = tempfile::tempdir().unwrap();
+        {
+            let db = RocksDB::open_shard_db(producer.path().to_str().unwrap(), 0);
+            drop(open_search(&db));
+            backfill::save_shard_checkpoint(&db, SEARCH_BACKFILL_CHECKPOINT, 1, u64::MAX).unwrap();
+        }
+        SearchIndexer::discard_for_restore(&SearchConfig::default(), local).unwrap();
+        let shard_0 = local.join("shard-0");
+        let _ = std::fs::remove_dir_all(&shard_0);
+        std::fs::create_dir_all(&shard_0).unwrap();
+        for file in std::fs::read_dir(producer.path().join("shard-0")).unwrap() {
+            let file = file.unwrap();
+            std::fs::copy(file.path(), shard_0.join(file.file_name())).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn restored_completed_cursors_do_not_hide_history() {
+        for (local_index, legacy_index) in [(false, false), (true, false), (true, true)] {
+            let local = tempfile::tempdir().unwrap();
+            if local_index {
+                index_live(local.path(), 12, "live #gm").await;
+            }
+            if legacy_index {
+                // Restored mid-rebuild: the legacy index's cursors are gone too.
+                std::fs::rename(
+                    local.path().join("search_index"),
+                    local.path().join("search_index.legacy"),
+                )
+                .unwrap();
+                index_live(local.path(), 13, "live #gm").await;
+            }
+            restore_snapshot(local.path());
+            // Left behind, even empty, it would be served until the walk ends.
+            assert!(!local.path().join("search_index.legacy").exists());
+
+            let db = RocksDB::open_shard_db(local.path().to_str().unwrap(), 0);
+            let search = open_search(&db);
+            assert!(!search.stats().backfill_complete);
+            assert_eq!(
+                backfill::load_shard_checkpoint(&db, SEARCH_BACKFILL_CHECKPOINT, 1),
+                0
+            );
+            let stores = shard_stores(local.path());
+            add_casts(
+                &stores,
+                &[(10, "historical #gm", search.backfill_before() as u32 - 100)],
+            );
+            run_search_backfill(&db, &HashMap::from([(1, stores)]), &search).await;
+
+            assert!(search.stats().backfill_complete);
+            wait_for_docs(&search, 1).await;
+            assert_eq!(fids(&search, "#gm"), vec![10]);
+            assert!(!local.path().join("search_index.legacy").exists());
+        }
+    }
+
+    /// A custom `index_path` may be its own mount point: discard empties it
+    /// instead of removing it, and `open` still resets the cursors.
+    #[tokio::test]
+    async fn restore_empties_a_custom_index_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = tempfile::tempdir().unwrap();
+        let config = SearchConfig {
+            enabled: true,
+            backfill_on_startup: true,
+            memory_budget_mb: 50,
+            index_path: index.path().to_str().unwrap().to_string(),
+            ..Default::default()
+        };
+        let db = RocksDB::open_shard_db(dir.path().to_str().unwrap(), 0);
+        drop(SearchIndexer::open(config.clone(), &db, &[1]).unwrap());
+        backfill::save_shard_checkpoint(&db, SEARCH_BACKFILL_CHECKPOINT, 1, u64::MAX).unwrap();
+
+        SearchIndexer::discard_for_restore(&config, dir.path()).unwrap();
+        assert!(index.path().is_dir());
+        assert_eq!(std::fs::read_dir(index.path()).unwrap().count(), 0);
+
+        let search = SearchIndexer::open(config, &db, &[1]).unwrap();
+        assert!(!search.stats().backfill_complete);
+        assert_eq!(
+            backfill::load_shard_checkpoint(&db, SEARCH_BACKFILL_CHECKPOINT, 1),
+            0
+        );
+    }
+
+    /// Restarting with the index its cursors were saved for must not rebuild it.
+    #[tokio::test]
+    async fn matching_cursors_and_index_are_reused_on_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = RocksDB::open_shard_db(dir.path().to_str().unwrap(), 0);
+        let stores = HashMap::from([(1, shard_stores(dir.path()))]);
+        let search = open_search(&db);
+        let before = search.backfill_before();
+        add_casts(&stores[&1], &[(10, "historical #gm", before as u32 - 100)]);
+        run_search_backfill(&db, &stores, &search).await;
+        wait_for_docs(&search, 1).await;
+        drop(search);
+
+        let search = open_search(&db);
+        assert!(search.stats().backfill_complete);
+        assert_eq!(search.backfill_before(), before);
+        assert_eq!(search.num_docs(), 1);
+        assert!(!dir.path().join("search_index.legacy").exists());
+        run_search_backfill(&db, &stores, &search).await;
+        assert_eq!(search.num_docs(), 1);
+        assert_eq!(fids(&search, "historical"), vec![10]);
     }
 }
