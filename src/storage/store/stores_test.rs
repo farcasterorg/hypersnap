@@ -171,4 +171,50 @@ mod tests {
         assert_eq!(result1.is_ok() || result2.is_ok(), true); // At least one succeeded
         assert_eq!(result1.is_err() || result2.is_err(), true); // At least one failed
     }
+
+    // Hyper shadow stores get a no-persist event handler that no block ever resets, so a
+    // per-block event sequence counted on it ran out after 16,384 merges since startup and
+    // every later hyper merge failed with "sequence cannot fit in event id".
+    #[test]
+    fn test_hyper_merges_do_not_exhaust_event_sequence() {
+        let stores = create_stores();
+        let hyper = stores.with_state_context(crate::hyper::StateContext::Hyper);
+        let ctx = test_helper::default_merge_ctx();
+
+        for i in 0..(1u64 << crate::storage::store::account::SEQUENCE_BITS) + 1 {
+            let message = messages_factory::reactions::create_reaction_add(
+                123,
+                ReactionType::Like,
+                Target::TargetUrl(format!("https://example.com/{i}")),
+                None,
+                None,
+            );
+            let mut txn = db::RocksDbTransactionBatch::new();
+            hyper
+                .reaction_store
+                .merge(&message, &mut txn, &ctx)
+                .unwrap_or_else(|e| panic!("hyper merge {i} failed: {e:?}"));
+            stores.db.commit(txn).unwrap();
+        }
+
+        // Hyper merges persist no events, and the canonical sequence is untouched.
+        assert!(stores.get_events(0, None, None).unwrap().events.is_empty());
+        let mut txn = db::RocksDbTransactionBatch::new();
+        let mut event = hub_events_factory::create_merge_event(
+            &messages_factory::reactions::create_reaction_add(
+                123,
+                ReactionType::Like,
+                Target::TargetUrl("canonical".to_string()),
+                None,
+                None,
+            ),
+        );
+        assert_eq!(
+            stores
+                .event_handler
+                .commit_transaction(&mut txn, &mut event)
+                .unwrap(),
+            1
+        );
+    }
 }
