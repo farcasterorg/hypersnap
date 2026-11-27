@@ -2740,7 +2740,10 @@ impl ApiHttpHandler {
 
         match hub.get_storage_limits(fid).await {
             Some(limits) => {
-                let total: u64 = limits.iter().map(|(_, _, cap)| cap).sum();
+                // Unlimited stores report u64::MAX, so a plain sum wraps.
+                let total = limits
+                    .iter()
+                    .fold(0u64, |total, (_, _, cap)| total.saturating_add(*cap));
                 let allocations = vec![StorageAllocation {
                     object: "storage_allocation".to_string(),
                     units: total,
@@ -4306,7 +4309,8 @@ impl ApiHttpHandler {
         }
 
         let mut ranked: Vec<(u64, u32)> = candidate_counts.into_iter().collect();
-        ranked.sort_by(|a, b| b.1.cmp(&a.1));
+        // Ties by fid, so the same request returns the same accounts.
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         ranked.truncate(limit);
 
         let fids: Vec<u64> = ranked.iter().map(|(f, _)| *f).collect();

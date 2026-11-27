@@ -1,0 +1,9 @@
+# Differences between the base release (farcasterorg/hypersnap:latest) and this
+# build that are intended, so Ogre doesn't fail on them. One per line: the route,
+# the JSON path (without array indexes; it covers everything under it), then why.
+# Add one with the change that causes it; remove it once a release ships it.
+# See docs/ogre.md.
+/v2/farcaster/user/storage-allocations .allocations[].units  no longer wraps below u64::MAX (PR 94)
+/v2/farcaster/storage/allocations      .allocations[].units  the same handler (PR 94)
+/v2/farcaster/user/storage-allocations .total_active_units   the same sum (PR 94)
+/v2/farcaster/storage/allocations      .total_active_units   the same sum (PR 94)
