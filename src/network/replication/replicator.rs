@@ -24,7 +24,6 @@ use std::{
     sync::{Arc, RwLock},
     time::{Duration, SystemTime},
 };
-use tokio::select;
 use tracing::{error, info};
 
 #[derive(Clone)]
@@ -168,18 +167,28 @@ pub async fn run(
     replicator: Arc<Replicator>,
     mut receive: tokio::sync::mpsc::Receiver<PostCommitMessage>,
 ) {
-    loop {
-        select! {
-            Some(msg) = receive.recv() => {
-                if let Err(e) = replicator.handle_post_commit_message(&msg) {
+    while let Some(msg) = receive.recv().await {
+        // Opening a read-only view of a large shard is blocking RocksDB I/O that can take
+        // longer than the engine's 200ms wait. Run it on the blocking pool so it never parks a
+        // runtime worker. Wait for each message before the next one, to keep snapshots in
+        // commit order.
+        let replicator = replicator.clone();
+        let handled = tokio::task::spawn_blocking(move || {
+            let result = replicator.handle_post_commit_message(&msg);
+            (result, msg.channel)
+        })
+        .await;
+
+        match handled {
+            Ok((result, channel)) => {
+                if let Err(e) = result {
                     error!("Failed to handle post commit message: {}", e);
                 }
-
-                if let Err(e) = msg.channel.send(true) {
+                if let Err(e) = channel.send(true) {
                     error!("Failed to send post commit response: {}", e);
                 }
             }
-            else => break, // Exit loop if the channel is closed
+            Err(e) => error!("Post commit handler task failed: {}", e),
         }
     }
 }
@@ -863,7 +872,6 @@ mod tests {
     use crate::utils::factory::{events_factory::create_merge_message_event, messages_factory};
 
     const SHARD_ID: u32 = 1;
-    const SNAPSHOT_HEIGHT: u64 = 1;
     const AUTHOR_FID: u64 = 8001;
     const MEMBER_FID: u64 = 8002;
 
@@ -941,21 +949,22 @@ mod tests {
         }
     }
 
+    /// Snapshot the engine at its committed height, as the post-commit hook does, and return
+    /// that height. `open_snapshot` rejects a height the database is not at.
     fn snapshot_replicator(
         engine: &crate::storage::store::engine::ShardEngine,
         network: proto::FarcasterNetwork,
         timestamp: u64,
-    ) -> Replicator {
+    ) -> (Replicator, u64) {
         let statsd = test_helper::statsd_client();
+        let height = engine.get_stores().shard_store.max_block_number().unwrap();
         let stores = Arc::new(ReplicationStores::new(
             HashMap::from([(SHARD_ID, engine.get_stores().clone())]),
             statsd.clone(),
             network,
         ));
-        stores
-            .open_snapshot(SHARD_ID, SNAPSHOT_HEIGHT, timestamp)
-            .unwrap();
-        Replicator::new(stores, statsd)
+        stores.open_snapshot(SHARD_ID, height, timestamp).unwrap();
+        (Replicator::new(stores, statsd), height)
     }
 
     #[tokio::test]
@@ -964,7 +973,7 @@ mod tests {
         let (mut source, _source_tmp) = test_helper::new_engine().await;
         replay_messages(&mut source, &messages).await;
 
-        let replicator = snapshot_replicator(
+        let (replicator, height) = snapshot_replicator(
             &source,
             proto::FarcasterNetwork::Devnet,
             messages_factory::farcaster_time() as u64,
@@ -977,7 +986,7 @@ mod tests {
         for virtual_shard in virtual_shards {
             exported.extend(
                 replicator
-                    .messages_for_trie_prefix(SHARD_ID, SNAPSHOT_HEIGHT, virtual_shard, None)
+                    .messages_for_trie_prefix(SHARD_ID, height, virtual_shard, None)
                     .unwrap()
                     .trie_messages
                     .into_iter()
@@ -1070,6 +1079,28 @@ mod tests {
         );
     }
 
+    /// Opening the read-only view does not stop commits, so the next block can land before the
+    /// view opens. The view is then past the height it would be labeled with, and it must not be
+    /// kept.
+    #[tokio::test]
+    async fn snapshot_is_rejected_when_the_view_is_not_at_the_requested_height() {
+        let messages = channel_messages();
+        let (mut source, _source_tmp) = test_helper::new_engine().await;
+        replay_messages(&mut source, &messages[..1]).await;
+        let height = source.get_stores().shard_store.max_block_number().unwrap();
+        let stores = ReplicationStores::new(
+            HashMap::from([(SHARD_ID, source.get_stores().clone())]),
+            test_helper::statsd_client(),
+            proto::FarcasterNetwork::Devnet,
+        );
+
+        assert!(stores.open_snapshot(SHARD_ID, height - 1, 0).is_err());
+        assert_eq!(stores.max_height_for_shard(SHARD_ID), None);
+
+        stores.open_snapshot(SHARD_ID, height, 0).unwrap();
+        assert_eq!(stores.max_height_for_shard(SHARD_ID), Some(height));
+    }
+
     #[tokio::test]
     async fn s4_pre_v24_snapshot_rejects_channel_cache_reads_without_state_changes() {
         let messages = channel_messages();
@@ -1086,14 +1117,15 @@ mod tests {
         // does not imply a boundary the schedule does not have. When testnet does get
         // a V24 entry this test will fail loudly rather than silently stop testing the
         // gate.
-        let replicator = snapshot_replicator(&source, proto::FarcasterNetwork::Testnet, 0);
+        let (replicator, height) =
+            snapshot_replicator(&source, proto::FarcasterNetwork::Testnet, 0);
         assert!(!EngineVersion::channel_messages_enabled_for_snapshot(
             0,
             proto::FarcasterNetwork::Testnet
         ));
         let virtual_shard = TrieKey::for_message(&messages[0])[0][0];
         let error = replicator
-            .messages_for_trie_prefix(SHARD_ID, SNAPSHOT_HEIGHT, virtual_shard, None)
+            .messages_for_trie_prefix(SHARD_ID, height, virtual_shard, None)
             .unwrap_err();
         // Must be the ACTIVATION gate, not the permanently-unsupported-type arm.
         // Those shared one error variant, so deleting all four gated arms left this
@@ -1101,8 +1133,8 @@ mod tests {
         assert!(
             matches!(
                 error,
-                ReplicationError::ChannelMessagesInactive(SHARD_ID, SNAPSHOT_HEIGHT, message_type)
-                    if message_type == messages[0].msg_type()
+                ReplicationError::ChannelMessagesInactive(SHARD_ID, error_height, message_type)
+                    if error_height == height && message_type == messages[0].msg_type()
             ),
             "expected the ChannelMessages activation gate, got {error:?}"
         );

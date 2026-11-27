@@ -140,8 +140,7 @@ impl ReplicationStores {
         &self,
         shard: u32,
         height: u64,
-        timestamp: u64,
-        read_only_db: RocksDB,
+        timestamped_store: TimestampedStore,
     ) -> Result<(), ReplicationError> {
         let stores = self.read_only_stores.write();
         if stores.is_err() {
@@ -159,7 +158,6 @@ impl ReplicationStores {
             return Ok(());
         }
 
-        let timestamped_store = self.new_timestamped_store(shard, timestamp, read_only_db);
         stores
             .get_mut(&shard)
             .unwrap()
@@ -181,13 +179,36 @@ impl ReplicationStores {
             return Err(ReplicationError::ShardStoreNotFound(shard));
         }
 
-        match stores.unwrap().db.open_read_only() {
-            Ok(read_only_db) => self.insert_snapshot(shard, height, timestamp, read_only_db),
-            Err(e) => Err(ReplicationError::InternalError(format!(
+        let read_only_db = stores.unwrap().db.open_read_only().map_err(|e| {
+            ReplicationError::InternalError(format!(
                 "Failed to open read-only database for shard {}: {}",
                 shard, e
-            ))),
+            ))
+        })?;
+        let timestamped_store = self.new_timestamped_store(shard, timestamp, read_only_db);
+
+        // Opening the read-only handle does not stop writers, so the next block can commit
+        // while it opens. A block commits its chunk and its state in one transaction, so the
+        // opened height shows whether this view is exactly `height`. Do not keep a view that
+        // is at a different height.
+        let opened_height = timestamped_store
+            .1
+            .shard_store
+            .max_block_number()
+            .map_err(|e| {
+                ReplicationError::InternalError(format!(
+                    "Failed to read the height of the read-only view of shard {}: {}",
+                    shard, e
+                ))
+            })?;
+        if opened_height != height {
+            return Err(ReplicationError::InternalError(format!(
+                "Read-only view of shard {} opened at height {}, not {}; snapshot not taken",
+                shard, opened_height, height
+            )));
         }
+
+        self.insert_snapshot(shard, height, timestamped_store)
     }
 
     pub fn close_aged_snapshots(&self, shard: u32, min_timestamp: u64) {
