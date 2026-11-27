@@ -118,7 +118,7 @@ impl EventSource for ShardEventSource {
 
 const BACKFILL_CHECKPOINT_PREFIX: u8 = 0xE3;
 
-fn make_shard_checkpoint_key(indexer_name: &str, shard_id: u32) -> Vec<u8> {
+pub(crate) fn make_shard_checkpoint_key(indexer_name: &str, shard_id: u32) -> Vec<u8> {
     let name_bytes = indexer_name.as_bytes();
     let mut key = Vec::with_capacity(1 + 1 + name_bytes.len() + 4);
     key.push(BACKFILL_CHECKPOINT_PREFIX);

@@ -14,9 +14,12 @@
 //! Until that walk has finished, notifications keep using the bounded scan of
 //! the user's newest casts.
 
-use crate::api::backfill::{save_shard_checkpoint, try_load_shard_checkpoint};
+use crate::api::backfill::{
+    make_shard_checkpoint_key, save_shard_checkpoint, try_load_shard_checkpoint,
+};
 use crate::api::config::FeatureConfig;
 use crate::api::events::{IndexEvent, MessageEventKind};
+use crate::api::index_gaps::IndexGaps;
 use crate::api::indexer::{Indexer, IndexerError, IndexerStats};
 use crate::mempool::routing::{MessageRouter, ShardRouter};
 use crate::proto::message_data::Body;
@@ -46,7 +49,8 @@ const CHECKPOINT_NAME: &str = "notifications_index_v1";
 const THREAD_DEPTH: usize = 6;
 /// Most stored replies a late cast picks up per thread level.
 const REPLIES_PER_LEVEL: usize = 100;
-/// [prefix][0xFC][shard_id:4] -> the highest block whose live events are indexed.
+/// [prefix][0xFC][shard_id:4] -> the block live indexing has reached (the
+/// newest it got events from, or the tip it started at); replays start there.
 const INDEXED_HEIGHT: u8 = 0xFC;
 /// Pending writes per commit, so a batch stays small in memory.
 const COMMIT_EVERY: usize = 10_000;
@@ -115,8 +119,10 @@ pub struct NotificationsIndexer {
     router: Box<dyn MessageRouter>,
     complete: AtomicBool,
     items_indexed: AtomicU64,
-    /// Per shard, the highest block whose live events are indexed (as stored).
+    /// Per shard, the block live indexing has reached (as stored).
     heights: Mutex<HashMap<u32, u64>>,
+    /// Blocks waiting for a replay, which the stored marks stay at or below.
+    gaps: Option<Arc<IndexGaps>>,
 }
 
 impl NotificationsIndexer {
@@ -143,26 +149,92 @@ impl NotificationsIndexer {
             complete: AtomicBool::new(complete),
             items_indexed: AtomicU64::new(0),
             heights: Mutex::new(heights),
+            gaps: None,
         }
     }
 
-    /// Per shard, the highest block whose live events were indexed before this
-    /// start. Events still queued when the node stopped were lost, so the
-    /// blocks from there to the tip are replayed (`index_gaps`).
-    pub fn indexed_heights(&self) -> HashMap<u32, u64> {
-        self.heights.lock().unwrap().clone()
+    /// Keep each shard's mark at or below the lowest block in `gaps` not yet
+    /// replayed: the gaps live in memory, so blocks queued for a replay at
+    /// startup or lost by a bridge are replayed from the mark if the node
+    /// stops before the repair task got to them.
+    pub fn with_gaps(mut self, gaps: Arc<IndexGaps>) -> Self {
+        self.gaps = Some(gaps);
+        self
+    }
+
+    /// Blocks to replay at startup, per shard, given each shard's tip now:
+    /// from the highest block whose live events were indexed to the tip.
+    /// Events still queued when the node stopped never reached the index.
+    ///
+    /// A shard with no block indexed yet starts live indexing at this tip,
+    /// which is stored right away: a node that stops before indexing any of
+    /// the shard's events (one catching up after it joined, say) replays from
+    /// there next time instead of never. If the walk had already got past any
+    /// of that shard's FIDs, their events since were lost the same way, so the
+    /// shard is walked again.
+    pub fn replay_ranges(&self, tips: &HashMap<u32, u64>) -> Vec<(u32, u64, u64)> {
+        let mut heights = self.heights.lock().unwrap();
+        let mut ranges = Vec::new();
+        let mut txn = RocksDbTransactionBatch::new();
+        let mut rewalk = Vec::new();
+        let mut marks = Vec::new();
+        for (&shard_id, &tip) in tips {
+            match heights.get(&shard_id) {
+                Some(&from) if from <= tip => ranges.push((shard_id, from, tip)),
+                Some(_) => {}
+                None => {
+                    marks.push((shard_id, tip));
+                    txn.put(Self::height_key(shard_id), tip.to_be_bytes().to_vec());
+                    let walked = try_load_shard_checkpoint(&self.db, CHECKPOINT_NAME, shard_id)
+                        .map_or(true, |next| next != 0);
+                    if walked || self.is_complete() {
+                        rewalk.push(shard_id);
+                    }
+                }
+            }
+        }
+        ranges.sort_unstable();
+        if !rewalk.is_empty() {
+            tracing::warn!(
+                ?rewalk,
+                "Notifications index has shards with no indexed block, walking them again"
+            );
+            for &shard_id in &rewalk {
+                txn.put(
+                    make_shard_checkpoint_key(CHECKPOINT_NAME, shard_id),
+                    0u64.to_be_bytes().to_vec(),
+                );
+            }
+            txn.delete(vec![PREFIX, BACKFILL_DONE]);
+        }
+        // Marks and walk resets land together: a mark stored without its reset
+        // would keep the shard from ever being walked again. The marks go in
+        // memory only once stored.
+        match self.commit(txn) {
+            Ok(()) => {
+                heights.extend(marks);
+                if !rewalk.is_empty() {
+                    self.complete.store(false, Ordering::Release);
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "Couldn't store notifications index marks"),
+        }
+        ranges
+    }
+
+    fn height_key(shard_id: u32) -> Vec<u8> {
+        [&[PREFIX, INDEXED_HEIGHT][..], &shard_id.to_be_bytes()[..]].concat()
     }
 
     /// Record live events' block heights in `txn`, committed with their entries.
     fn note_height(&self, shard_id: u32, height: u64, txn: &mut RocksDbTransactionBatch) {
+        let floor = self.gaps.as_ref().and_then(|gaps| gaps.floor(shard_id));
+        let height = floor.map_or(height, |floor| height.min(floor));
         let mut heights = self.heights.lock().unwrap();
         let known = heights.entry(shard_id).or_insert(0);
         if height > *known {
             *known = height;
-            txn.put(
-                [&[PREFIX, INDEXED_HEIGHT][..], &shard_id.to_be_bytes()[..]].concat(),
-                height.to_be_bytes().to_vec(),
-            );
+            txn.put(Self::height_key(shard_id), height.to_be_bytes().to_vec());
         }
     }
 
@@ -573,7 +645,11 @@ impl Indexer for NotificationsIndexer {
     async fn process_batch(&self, events: &[IndexEvent]) -> Result<(), IndexerError> {
         let mut txn = RocksDbTransactionBatch::new();
         for event in events {
-            let messages = match event {
+            // A block's BlockConfirmed comes before its messages, and the
+            // replay starts at the mark itself, so it can move the mark too:
+            // that keeps a shard without messages from replaying ever more
+            // blocks at each start.
+            let marks = match event {
                 IndexEvent::MessageCommitted { message, kind, .. } => {
                     self.process_message(message, *kind, &mut txn);
                     true
@@ -584,9 +660,10 @@ impl Indexer for NotificationsIndexer {
                     }
                     true
                 }
+                IndexEvent::BlockCommitted { .. } => true,
                 _ => false,
             };
-            if let (true, Some(height)) = (messages, event.block_height()) {
+            if let (true, Some(height)) = (marks, event.block_height()) {
                 if height > 0 {
                     self.note_height(event.shard_id(), height, &mut txn);
                 }
@@ -596,7 +673,7 @@ impl Indexer for NotificationsIndexer {
     }
 
     // Live writes are idempotent puts, and the replay after a restart goes by
-    // block height (`indexed_heights`), so there's no event cursor to keep.
+    // block height (`replay_ranges`), so there's no event cursor to keep.
     fn last_checkpoint(&self) -> u64 {
         0
     }
@@ -617,6 +694,72 @@ impl Indexer for NotificationsIndexer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A shard store at `path` holding `blocks` (height, its one message).
+    fn shard_store(path: &str, shard: u32, blocks: &[(u64, &Message)]) -> Stores {
+        use crate::proto::{self, Height, ShardChunk, ShardHeader, Transaction};
+        use crate::storage::store::stores::StoreLimits;
+        use crate::storage::trie::merkle_trie::MerkleTrie;
+        use crate::utils::statsd_wrapper::StatsdClientWrapper;
+        let stores = Stores::new(
+            RocksDB::open_shard_db(path, shard),
+            shard,
+            MerkleTrie::new().unwrap(),
+            StoreLimits::default(),
+            proto::FarcasterNetwork::Devnet,
+            StatsdClientWrapper::new(
+                cadence::StatsdClient::builder("test", cadence::NopMetricSink).build(),
+                false,
+            ),
+        );
+        for &(height, message) in blocks {
+            stores
+                .shard_store
+                .put_shard_chunk(&ShardChunk {
+                    header: Some(ShardHeader {
+                        height: Some(Height {
+                            shard_index: shard,
+                            block_number: height,
+                        }),
+                        ..Default::default()
+                    }),
+                    transactions: vec![Transaction {
+                        user_messages: vec![message.clone()],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        stores
+    }
+
+    /// A like of fid 100's cast by `fid`.
+    fn like(fid: u64) -> Message {
+        crate::utils::factory::messages_factory::reactions::create_reaction_add(
+            fid,
+            crate::proto::ReactionType::Like,
+            reaction_body::Target::TargetCastId(CastId {
+                fid: 100,
+                hash: vec![9; HASH_LEN],
+            }),
+            None,
+            None,
+        )
+    }
+
+    /// Who liked fid 100's cast, per the index.
+    fn likers(index: &NotificationsIndexer) -> Vec<u64> {
+        let mut found = vec![];
+        index
+            .scan(100, None, |entry| {
+                found.push(entry.actor);
+                false
+            })
+            .unwrap();
+        found.sort();
+        found
+    }
 
     #[test]
     fn test_key_round_trip_and_order() {
@@ -681,9 +824,237 @@ mod tests {
             .process_event(&IndexEvent::message(like(3), 1, 0))
             .await
             .unwrap();
+        // A block without messages moves the mark too.
+        index
+            .process_event(&IndexEvent::block_committed(1, 8, 1))
+            .await
+            .unwrap();
         drop(index);
         let reopened = open();
-        assert_eq!(reopened.indexed_heights(), HashMap::from([(2, 42), (1, 7)]));
+        assert_eq!(
+            reopened.replay_ranges(&HashMap::from([(1, 9), (2, 50)])),
+            vec![(1, 8, 9), (2, 42, 50)]
+        );
+    }
+
+    /// An index whose walk finished before any of a shard's blocks were indexed
+    /// (written before shards got a mark at startup) may have lost that shard's
+    /// events, so the shard is walked again; a shard with a mark isn't.
+    #[test]
+    fn test_a_finished_index_without_a_mark_walks_the_shard_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        let open = || {
+            NotificationsIndexer::new(
+                FeatureConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+                RocksDB::open_shard_db(&path, 0),
+                HashMap::new(),
+            )
+        };
+        let index = open();
+        index.backfill().unwrap();
+        assert!(index.is_complete());
+        // Shard 1 walked, shard 2 walked part of the way, and a mark for
+        // shard 1 only, as live indexing of shard 1 leaves.
+        save_shard_checkpoint(&index.db, CHECKPOINT_NAME, 1, u64::MAX).unwrap();
+        save_shard_checkpoint(&index.db, CHECKPOINT_NAME, 2, 500).unwrap();
+        let mut txn = RocksDbTransactionBatch::new();
+        index.note_height(1, 3, &mut txn);
+        index.commit(txn).unwrap();
+        drop(index);
+
+        let index = open();
+        assert!(index.is_complete());
+        let tips = HashMap::from([(1, 4), (2, 6)]);
+        assert_eq!(index.replay_ranges(&tips), vec![(1, 3, 4)]);
+        assert!(!index.is_complete());
+        let checkpoint = |shard| try_load_shard_checkpoint(&index.db, CHECKPOINT_NAME, shard);
+        assert_eq!(checkpoint(1).unwrap(), u64::MAX);
+        assert_eq!(checkpoint(2).unwrap(), 0);
+        drop(index);
+
+        // The new mark and the pending walk survive another restart.
+        let index = open();
+        assert!(!index.is_complete());
+        assert_eq!(
+            index.replay_ranges(&HashMap::from([(1, 5), (2, 8)])),
+            vec![(1, 3, 5), (2, 6, 8)]
+        );
+        index.backfill().unwrap();
+        assert!(index.is_complete());
+    }
+
+    /// A shard with no mark is walked again when the walk got past any of its
+    /// FIDs or the index is finished, but not on a first start.
+    #[test]
+    fn test_a_shard_without_a_mark_or_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        let open = || {
+            NotificationsIndexer::new(
+                FeatureConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+                RocksDB::open_shard_db(&path, 0),
+                HashMap::new(),
+            )
+        };
+        let index = open();
+        assert!(index.replay_ranges(&HashMap::from([(1, 0)])).is_empty());
+        assert!(!index.is_complete());
+        // A walk still under way, part of the way through shard 3.
+        save_shard_checkpoint(&index.db, CHECKPOINT_NAME, 3, 500).unwrap();
+        assert!(index.replay_ranges(&HashMap::from([(3, 4)])).is_empty());
+        assert_eq!(
+            try_load_shard_checkpoint(&index.db, CHECKPOINT_NAME, 3).unwrap(),
+            0
+        );
+        index.backfill().unwrap();
+        assert_eq!(
+            index.replay_ranges(&HashMap::from([(1, 2), (2, 3)])),
+            vec![(1, 0, 2)]
+        );
+        assert!(!index.is_complete());
+    }
+
+    /// Events still queued in the worker pool when the node stops never reach
+    /// the index, so the next start replays their blocks from the shard store.
+    /// That has to cover a shard none of whose events were indexed before the
+    /// stop too: a node catching up after it joined indexes one shard's blocks
+    /// while the other's still wait in the queue.
+    #[tokio::test]
+    async fn test_events_queued_at_stop_are_replayed_on_restart() {
+        use crate::api::config::ApiConfig;
+        use crate::api::index_gaps::repair;
+        use crate::api::worker::IndexWorkerPool;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        let open = || {
+            NotificationsIndexer::new(
+                FeatureConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+                RocksDB::open_shard_db(&path, 0),
+                HashMap::new(),
+            )
+        };
+        // A like of fid 100's cast in block 2 of each shard.
+        let (like1, like2) = (like(11), like(12));
+        let stores = HashMap::from([
+            (1, shard_store(&path, 1, &[(2, &like1)])),
+            (2, shard_store(&path, 2, &[(2, &like2)])),
+        ]);
+
+        // First start, on an empty database: nothing to replay yet.
+        let index = Arc::new(open());
+        assert!(index
+            .replay_ranges(&HashMap::from([(1, 0), (2, 0)]))
+            .is_empty());
+        // Block 2 of shard 1 is indexed; shard 2's is still queued when the
+        // pool is told to stop, so it never gets there.
+        index
+            .process_event(&IndexEvent::message(like1.clone(), 1, 2))
+            .await
+            .unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let mut pool = IndexWorkerPool::new(
+            ApiConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            rx,
+            Arc::new(RocksDB::new(":memory:")),
+        );
+        pool.register_arc(index.clone());
+        tx.send(IndexEvent::message(like2.clone(), 2, 2))
+            .await
+            .unwrap();
+        pool.shutdown_sender().send(()).unwrap();
+        pool.run().await;
+        assert_eq!(likers(&index), vec![11]);
+        drop(index);
+
+        // The next start replays what didn't make it, for both shards.
+        let index = Arc::new(open());
+        let gaps = IndexGaps::default();
+        for (shard, from, to) in index.replay_ranges(&HashMap::from([(1, 2), (2, 2)])) {
+            gaps.lost(shard, from, to);
+        }
+        repair(&gaps, &stores, &[index.clone() as Arc<dyn Indexer>]).await;
+        assert_eq!(likers(&index), vec![11, 12]);
+    }
+
+    /// Blocks queued for a replay and blocks a bridge lost wait in memory
+    /// for the repair task, so a node that stops again before it ran must
+    /// still replay them at the next start: the mark stays below them.
+    #[tokio::test]
+    async fn test_blocks_not_replayed_yet_survive_another_stop() {
+        use crate::api::index_gaps::repair;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        let start = || {
+            let gaps = Arc::new(IndexGaps::default());
+            let index = Arc::new(
+                NotificationsIndexer::new(
+                    FeatureConfig {
+                        enabled: true,
+                        ..Default::default()
+                    },
+                    RocksDB::open_shard_db(&path, 0),
+                    HashMap::new(),
+                )
+                .with_gaps(gaps.clone()),
+            );
+            (index, gaps)
+        };
+        let replay = |index: &NotificationsIndexer, gaps: &IndexGaps, tip| {
+            let ranges = index.replay_ranges(&HashMap::from([(1, tip)]));
+            for &(shard, from, to) in &ranges {
+                gaps.lost(shard, from, to);
+            }
+            ranges
+        };
+        let block = |height| IndexEvent::block_committed(1, height, 0);
+        let (like2, like8) = (like(12), like(18));
+        let stores = HashMap::from([(1, shard_store(&path, 1, &[(2, &like2), (8, &like8)]))]);
+
+        // Block 1 is indexed; block 2's like is still queued at the stop.
+        let (index, gaps) = start();
+        assert!(replay(&index, &gaps, 0).is_empty());
+        index.process_event(&block(1)).await.unwrap();
+        drop(index);
+
+        // Blocks 1-3 are queued for a replay, and live indexing moves on to
+        // block 4 before the node stops again, ahead of the repair task.
+        let (index, gaps) = start();
+        assert_eq!(replay(&index, &gaps, 3), vec![(1, 1, 3)]);
+        index.process_event(&block(4)).await.unwrap();
+        drop(index);
+
+        // The next start still replays block 2.
+        let (index, gaps) = start();
+        assert_eq!(replay(&index, &gaps, 6), vec![(1, 1, 6)]);
+        repair(&gaps, &stores, &[index.clone() as Arc<dyn Indexer>]).await;
+        assert_eq!(likers(&index), vec![12]);
+        assert!(gaps.is_empty());
+        // With the replay done, live indexing moves the mark on. Then a
+        // bridge drops block 8's events, and the node stops after block 9.
+        index.process_event(&block(7)).await.unwrap();
+        gaps.lost(1, 8, 8);
+        index.process_event(&block(9)).await.unwrap();
+        drop(index);
+
+        let (index, gaps) = start();
+        assert_eq!(replay(&index, &gaps, 9), vec![(1, 8, 9)]);
+        repair(&gaps, &stores, &[index.clone() as Arc<dyn Indexer>]).await;
+        assert_eq!(likers(&index), vec![12, 18]);
     }
 
     /// Bytes per entry on disk and write rate, for sizing the store walk.
