@@ -88,7 +88,7 @@ impl Default for ReplicationConfig {
             enable: true,
             snapshot_interval: (60 * 60 * 8), // every ~8 hours (in number of blocks)
             snapshot_max_age: Duration::from_secs(60 * 60 * 24), // keep snapshots for 24 hours
-            snapshot_obsolete_sst_budget_bytes: 16 * 1024 * 1024 * 1024,
+            snapshot_obsolete_sst_budget_bytes: 32 * 1024 * 1024 * 1024,
         }
     }
 }
