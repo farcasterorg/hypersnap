@@ -61,6 +61,9 @@ pub trait Proposer {
     fn get_min_height(&self) -> Height;
 
     fn get_proposed_value(&self, shard_hash: &ShardHash) -> Option<WellFormedProposal>;
+
+    // Whether a value proposed for the given height is cached
+    fn has_proposed_value_for_height(&self, height: Height) -> bool;
 }
 
 pub struct ProposedValues {
@@ -119,6 +122,11 @@ impl ProposedValues {
 
     pub fn count(&self) -> usize {
         self.values.len()
+    }
+
+    /// Whether a value is cached for `height`.
+    pub fn has_height(&self, height: Height) -> bool {
+        self.values_by_height.contains_key(&height)
     }
 }
 
@@ -336,6 +344,10 @@ impl Proposer for ShardProposer {
 
     fn get_proposed_value(&self, shard_hash: &ShardHash) -> Option<WellFormedProposal> {
         self.proposed_chunks.get_by_shard_hash(&shard_hash).cloned()
+    }
+
+    fn has_proposed_value_for_height(&self, height: Height) -> bool {
+        self.proposed_chunks.has_height(height)
     }
 
     async fn decide(&mut self, commits: Commits) {
@@ -777,6 +789,10 @@ impl Proposer for BlockProposer {
 
     fn get_proposed_value(&self, shard_hash: &ShardHash) -> Option<WellFormedProposal> {
         self.proposed_blocks.get_by_shard_hash(&shard_hash).cloned()
+    }
+
+    fn has_proposed_value_for_height(&self, height: Height) -> bool {
+        self.proposed_blocks.has_height(height)
     }
 
     async fn decide(&mut self, commits: Commits) {
