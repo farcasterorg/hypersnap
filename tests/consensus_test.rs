@@ -20,6 +20,7 @@ use snapchain::mempool::mempool::{
 };
 use snapchain::mempool::routing::{self, MessageRouter, ShardRouter};
 use snapchain::network::gossip::{GossipEvent, SnapchainGossip};
+use snapchain::network::info_stats::InfoStatsTask;
 use snapchain::network::server::MyHubService;
 use snapchain::node::snapchain_node::SnapchainNode;
 use snapchain::node::snapchain_read_node::SnapchainReadNode;
@@ -291,6 +292,7 @@ struct NodeForTest {
     /// Shared `MyHubService` so the HTTP smoke test can boot an HTTP server
     /// against the same underlying stores + mempool wiring as the gRPC server.
     hub_service: Arc<MyHubService>,
+    info_stats_task: Option<InfoStatsTask>,
     /// Set to true once the boot one-shot unsub/sub cycle fires for the
     /// first direct-peer `ConnectionEstablished` on this validator. Tests
     /// poll this when `direct_peers` is configured to assert the cycle ran.
@@ -316,6 +318,7 @@ impl Node for NodeForTest {
 
 impl Drop for NodeForTest {
     fn drop(&mut self) {
+        drop(self.info_stats_task.take());
         self.node.stop();
         for handle in self.handles.iter() {
             handle.abort();
@@ -731,7 +734,7 @@ impl NodeForTest {
         join_handles.push(tokio::spawn(gossip_l1_gate_worker.run()));
         let l1_rejection_count = gossip_l1_gate.l1_rejection_count_handle();
 
-        let hub_service = Arc::new(MyHubService::new(
+        let mut hub_service = MyHubService::new(
             "".to_string(),
             "".to_string(),
             vec![],
@@ -754,10 +757,13 @@ impl NodeForTest {
             "".to_string(),
             None,
             Default::default(),
-        ));
+        );
+        let info_stats_task = hub_service.start_info_stats(time::Duration::from_secs(60));
+        let hub_service = Arc::new(hub_service);
 
         let grpc_service = hub_service.clone();
         let handle = tokio::spawn(async move {
+            grpc_service.wait_for_info_stats().await;
             let grpc_socket_addr: SocketAddr = addr.parse().unwrap();
             let resp = Server::builder()
                 .add_service(HubServiceServer::from_arc(grpc_service))
@@ -879,6 +885,7 @@ impl NodeForTest {
             drop_prevote,
             dropped_prevote,
             hub_service,
+            info_stats_task: Some(info_stats_task),
             boot_resub_done,
             direct_peer_force_bounce_count,
             l1_rejection_count,
@@ -2970,12 +2977,14 @@ async fn test_http_server_smoke() {
         .await
         .unwrap();
 
+    let hub_service = network.first_live_node().hub_service();
+    hub_service.wait_for_info_stats().await;
     let http_port = get_available_port();
     let listener = tokio::net::TcpListener::bind(format!("{HOST_FOR_TEST}:{http_port}"))
         .await
         .expect("bind http listener");
     let http_service = HubHttpServiceImpl {
-        service: network.first_live_node().hub_service(),
+        service: hub_service,
     };
     let _http_handle = spawn_http_server(
         listener,

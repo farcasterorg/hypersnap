@@ -86,6 +86,7 @@ pub async fn spawn_host(
         statsd,
         participation,
         deferred_proposals: DeferredProposals::new(),
+        next_height_wake: None,
     };
     let actor_ref = Host::spawn(state).await?;
     Ok(actor_ref)

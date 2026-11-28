@@ -70,7 +70,7 @@ async fn start_servers(
     local_state_store: LocalStateStore,
     api_handler: Option<snapchain::api::ApiHttpHandler>,
     api_system_search_indexer: Option<Arc<snapchain::api::SearchIndexer>>,
-) {
+) -> snapchain::network::info_stats::InfoStatsTask {
     let grpc_addr = app_config.rpc_address.clone();
     let grpc_socket_addr: SocketAddr = grpc_addr.parse().unwrap();
 
@@ -163,7 +163,7 @@ async fn start_servers(
     // (same source as the diagnostics gate, so the two stay consistent).
     let validator_hex_keys: Vec<String> = app_config.consensus.latest_validator_public_keys();
 
-    let service = Arc::new(MyHubService::new(
+    let mut service = MyHubService::new(
         app_config.rpc_auth.clone(),
         app_config.admin_rpc_auth.clone(),
         validator_hex_keys.clone(),
@@ -182,7 +182,10 @@ async fn start_servers(
         local_peer_id.to_string(),
         fname_lookup.clone(),
         app_config.mesh.clone(),
-    ));
+    );
+    let info_stats_task =
+        service.start_info_stats(Duration::from_secs(app_config.info_stats_refresh_secs));
+    let service = Arc::new(service);
 
     // Create a separate API service backed by hyper (un-pruned) stores.
     // This ensures API consumers see full message history without pruning.
@@ -304,6 +307,7 @@ async fn start_servers(
     let grpc_shutdown_tx = shutdown_tx.clone();
 
     tokio::spawn(async move {
+        grpc_service.wait_for_info_stats().await;
         info!(grpc_addr = grpc_addr, "GrpcService listening",);
         let mut server = Server::builder().add_service(HubServiceServer::from_arc(grpc_service));
 
@@ -342,6 +346,7 @@ async fn start_servers(
         "Mesh known-node registry loaded"
     );
     tokio::spawn(async move {
+        service.wait_for_info_stats().await;
         let listener = TcpListener::bind(http_socket_addr).await.unwrap();
         info!(http_addr = http_addr, "HttpService listening",);
 
@@ -382,6 +387,7 @@ async fn start_servers(
 
         http_shutdown_tx.send(()).await.ok();
     });
+    info_stats_task
 }
 
 async fn schedule_background_jobs(
@@ -510,6 +516,7 @@ fn create_replicator(
         replication::ReplicatorSnapshotOptions {
             interval: app_config.replication.snapshot_interval,
             max_age: app_config.replication.snapshot_max_age,
+            obsolete_sst_budget_bytes: app_config.replication.snapshot_obsolete_sst_budget_bytes,
         },
     );
 
@@ -1011,7 +1018,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             app_config.l1_gate.cache_config(),
         ));
 
-        start_servers(
+        let info_stats_task = start_servers(
             &app_config,
             gossip_tx.clone(),
             local_peer_id,
@@ -1038,6 +1045,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             select! {
                 signal = &mut shutdown => {
                     info!(signal, "Received shutdown signal, shutting down");
+                    info_stats_task.shutdown().await;
                     close_gossip_connections(&gossip_tx).await;
                     if let Some(api) = api_system {
                         shut_down_api(api).await;
@@ -1047,6 +1055,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 }
                 _ = shutdown_rx.recv() => {
                     error!("Received shutdown signal, shutting down");
+                    info_stats_task.shutdown().await;
                     close_gossip_connections(&gossip_tx).await;
                     if let Some(api) = api_system {
                         shut_down_api(api).await;
@@ -1093,6 +1102,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                         SystemMessage::ExitWithError(err) => {
                             error!("Exiting due to: {}", err);
                             SHUTTING_DOWN.store(true, Ordering::SeqCst);
+                            info_stats_task.shutdown().await;
                             node.stop();
                             if let Some(api) = api_system {
                                 shut_down_api(api).await;
@@ -1365,7 +1375,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         });
         let api_search_indexer = api_system.as_ref().and_then(|s| s.search_indexer.clone());
 
-        start_servers(
+        let info_stats_task = start_servers(
             &app_config,
             gossip_tx.clone(),
             local_peer_id,
@@ -1437,6 +1447,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             select! {
                 signal = &mut shutdown => {
                     info!(signal, "Received shutdown signal, shutting down");
+                    info_stats_task.shutdown().await;
                     close_gossip_connections(&gossip_tx).await;
                     if let Some(api) = api_system {
                         shut_down_api(api).await;
@@ -1446,6 +1457,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 }
                 _ = shutdown_rx.recv() => {
                     error!("Received shutdown signal, shutting down");
+                    info_stats_task.shutdown().await;
                     close_gossip_connections(&gossip_tx).await;
                     if let Some(api) = api_system {
                         shut_down_api(api).await;
@@ -1474,6 +1486,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                         SystemMessage::ExitWithError(err) => {
                             error!("Exiting due to: {}", err);
                             SHUTTING_DOWN.store(true, Ordering::SeqCst);
+                            info_stats_task.shutdown().await;
                             node.stop();
                             if let Some(api) = api_system {
                                 shut_down_api(api).await;

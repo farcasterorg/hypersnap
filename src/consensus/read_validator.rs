@@ -272,7 +272,20 @@ impl ReadValidator {
         }
 
         let num_committed_values = if height > self.last_height.increment() {
-            if (self.buffered_blocks.len() as u32) < self.max_num_buffered_blocks {
+            // When full, keep the blocks nearest the next one to commit: catch-up fetches those,
+            // while gossip keeps adding blocks at the far tip.
+            let mut full = self.buffered_blocks.len() as u32 >= self.max_num_buffered_blocks
+                && !self.buffered_blocks.contains_key(&height);
+            if full
+                && self
+                    .buffered_blocks
+                    .last_key_value()
+                    .is_some_and(|(&last, _)| height < last)
+            {
+                self.buffered_blocks.pop_last();
+                full = false;
+            }
+            if !full {
                 self.buffered_blocks.insert(height, value);
                 0
             } else {

@@ -5,7 +5,7 @@ use malachitebft_core_driver::Driver;
 use malachitebft_core_types::*;
 
 use crate::input::Input;
-use crate::util::max_queue::MaxQueue;
+use crate::util::window_queue::WindowQueue;
 use crate::{FullProposal, FullProposalKeeper, Params, ProposedValue};
 
 /// The state maintained by consensus for processing a [`Input`][crate::Input].
@@ -22,8 +22,8 @@ where
     /// Driver for the per-round consensus state machine
     pub driver: Driver<Ctx>,
 
-    /// A queue of inputs that were received before the driver started.
-    pub input_queue: MaxQueue<Ctx::Height, Input<Ctx>>,
+    /// Inputs received for future heights, kept for a window of heights.
+    pub input_queue: WindowQueue<Ctx::Height, Input<Ctx>>,
 
     /// The proposals to decide on.
     pub full_proposal_keeper: FullProposalKeeper<Ctx>,
@@ -189,7 +189,7 @@ where
         self.full_proposal_keeper.remove_full_proposals(height)
     }
 
-    /// Queue an input for later processing, only keep inputs for the highest height seen so far.
+    /// Queue an input for later processing. Inputs are kept for the next 32 heights, so a node that starts a height late still has the proposal and the votes for that height.
     pub fn buffer_input(&mut self, height: Ctx::Height, input: Input<Ctx>) {
         self.input_queue.push(height, input);
     }

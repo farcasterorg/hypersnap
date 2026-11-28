@@ -97,8 +97,8 @@ services:
       - hypersnap
     ulimits:
       nofile:
-        soft: 65535
-        hard: 65535
+        soft: 1048576
+        hard: 1048576
 
   # Start this if you want perf metrics for your hubble node. Remember to start `grafana` as well.
   statsd:

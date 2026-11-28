@@ -1,10 +1,11 @@
-use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
 use prost::Message;
 use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
+use rand::seq::IteratorRandom;
 use rand::SeedableRng;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
@@ -30,6 +31,19 @@ pub enum Timeout {
 }
 
 type Timers = TimerScheduler<Timeout>;
+
+/// How many heights past its last committed block a read node asks peers for at once. Asking for
+/// one block per round trip held a node that was behind to about 7 blocks/s on mainnet. Blocks
+/// that arrive ahead of the next one to commit wait in the read validator's buffer, so this must
+/// stay below its `max_num_buffered_blocks` (100) or they are dropped.
+pub(crate) const SYNC_WINDOW: u64 = 32;
+
+/// Heights whose block reached the host but isn't committed are asked for again once nothing has
+/// been committed for this long: the host dropped the block (bad certificate, failed commit).
+const RETRY_AFTER: Duration = Duration::from_secs(5);
+
+/// How often a node that no peer can serve says so.
+const NO_PEER_WARN_EVERY: Duration = Duration::from_secs(30);
 
 pub type SyncRef = ActorRef<Msg>;
 
@@ -108,6 +122,17 @@ pub struct State {
     initial_sync_completed: bool,
 
     connected_peers: HashSet<PeerId>,
+
+    /// Heights above the last committed block whose block was answered and sent to the host. A
+    /// request is cleared when its answer arrives, so without this the window would ask again
+    /// for blocks that are on their way to the host.
+    received: BTreeSet<u64>,
+
+    /// When the last block was committed.
+    last_progress: Instant,
+
+    /// When the node last logged that no peer has the height it needs.
+    no_peer_warned: Option<Instant>,
 }
 
 impl State {
@@ -234,6 +259,97 @@ impl ReadSync {
         .into()
     }
 
+    /// Sends the request and starts its timeout. Returns false if the gossip layer didn't take it.
+    async fn send_value_request(
+        &self,
+        timers: &mut Timers,
+        inflight: &mut InflightRequests,
+        peer_id: PeerId,
+        value_request: sync::ValueRequest<SnapchainValidatorContext>,
+    ) -> bool {
+        let request = Request::ValueRequest(value_request);
+        let result = ractor::call!(self.gossip, |reply_to| {
+            NetworkMsg::OutgoingRequest(peer_id, request.clone(), reply_to)
+        });
+
+        match result {
+            Ok(request_id) => {
+                let request_id = OutboundRequestId::new(request_id);
+
+                timers.start_timer(
+                    Timeout::Request(request_id.clone()),
+                    self.params.request_timeout,
+                );
+
+                inflight.insert(request_id.clone(), InflightRequest { peer_id, request });
+                true
+            }
+            Err(e) => {
+                error!("Failed to send request to gossip layer: {e}");
+                false
+            }
+        }
+    }
+
+    /// Keeps a request out for every height in the window above the last committed block that a
+    /// peer has and that isn't already requested or waiting at the host, each from a random peer.
+    /// This is the only place a read node asks for blocks: the sync state machine asked for the
+    /// next height alone, once per round trip. It also asks again for heights whose request
+    /// timed out or whose block was dropped.
+    async fn fill_window(&self, state: &mut State) {
+        if !state.sync.started {
+            return;
+        }
+        let tip = state.sync.tip_height.block_number;
+        state.received.retain(|&height| height > tip);
+        if state.last_progress.elapsed() >= RETRY_AFTER {
+            state.received.clear();
+            state.last_progress = Instant::now();
+        }
+
+        let start = state.sync.sync_height;
+        for offset in 0..SYNC_WINDOW {
+            let height = start.increment_by(offset);
+            if state.sync.has_pending_decided_value_request(&height)
+                || state.received.contains(&height.block_number)
+            {
+                continue;
+            }
+            // A peer only serves blocks it still stores, from `history_min_height` up.
+            let Some(peer) = state
+                .sync
+                .peers
+                .values()
+                .filter(|peer| peer.history_min_height <= height && height <= peer.height)
+                .map(|peer| peer.peer_id)
+                .choose(&mut rand::thread_rng())
+            else {
+                // Past every peer's tip is where the window normally ends. A height that no peer
+                // has yet some peer is past (it pruned it) leaves the node stuck, so say so, at most
+                // once per `NO_PEER_WARN_EVERY`.
+                let ahead = state.sync.peers.values().any(|peer| peer.height >= height);
+                if (ahead || state.sync.peers.is_empty())
+                    && state
+                        .no_peer_warned
+                        .is_none_or(|at| at.elapsed() >= NO_PEER_WARN_EVERY)
+                {
+                    warn!(height.sync = %height, "No peer to request sync from");
+                    state.no_peer_warned = Some(Instant::now());
+                }
+                break;
+            };
+            let request = sync::ValueRequest::new(height);
+            if !self
+                .send_value_request(&mut state.timers, &mut state.inflight, peer, request)
+                .await
+            {
+                break;
+            }
+            state.sync.store_pending_decided_value_request(height, peer);
+            self.metrics.decided_value_request_sent(height.block_number);
+        }
+    }
+
     async fn handle_effect(
         &self,
         myself: &ActorRef<Msg>,
@@ -261,26 +377,8 @@ impl ReadSync {
                     "Send the value request to peer"
                 );
 
-                let request = Request::ValueRequest(value_request);
-                let result = ractor::call!(self.gossip, |reply_to| {
-                    NetworkMsg::OutgoingRequest(peer_id, request.clone(), reply_to)
-                });
-
-                match result {
-                    Ok(request_id) => {
-                        let request_id = OutboundRequestId::new(request_id);
-
-                        timers.start_timer(
-                            Timeout::Request(request_id.clone()),
-                            self.params.request_timeout,
-                        );
-
-                        inflight.insert(request_id.clone(), InflightRequest { peer_id, request });
-                    }
-                    Err(e) => {
-                        error!("Failed to send request to gossip layer: {e}");
-                    }
-                }
+                self.send_value_request(timers, inflight, peer_id, value_request)
+                    .await;
             }
 
             Effect::SendValueResponse(request_id, value_response) => {
@@ -354,9 +452,9 @@ impl ReadSync {
                 };
 
                 // Only process status messages for directly connected peers. Otherwise we try to sync with peers we're not connected to and it causes timeouts
+                // `fill_window` sends the requests this status makes possible.
                 if state.connected_peers.contains(&peer_id) {
-                    self.process_input(&myself, state, sync::Input::Status(status))
-                        .await?;
+                    state.sync.update_status(status);
                 } else {
                     info!(%peer_id, height=status.height.to_string(), "Ignoring status from non-connected peer");
                 }
@@ -380,40 +478,56 @@ impl ReadSync {
             }
 
             Msg::NetworkEvent(NetworkEvent::Response(request_id, peer, response)) => {
-                // Cancel the timer associated with the request for which we just received a response
-                state.timers.cancel(&Timeout::Request(request_id.clone()));
+                // An answer that came after its request timed out matches nothing, since a newer
+                // request may be out for that height.
+                let requested = match state.inflight.get(&request_id) {
+                    Some(InflightRequest {
+                        request: Request::ValueRequest(request),
+                        ..
+                    }) => Some(request.height),
+                    _ => None,
+                };
 
-                match response {
+                let value = match response {
                     Response::ValueResponse(value_response) => {
-                        // Responses come from arbitrary peers. A malformed one is dropped here but
-                        // still handed to the sync state machine, which clears the pending request so
-                        // the height is re-requested.
+                        self.metrics
+                            .decided_value_response_received(value_response.height.block_number);
+                        // Responses come from arbitrary peers. A malformed one is dropped here.
                         match Self::decode_value_response(&value_response) {
                             Ok(value) => {
                                 debug!(peer_id = %peer, height = %value_response.height, "Received sync value response");
-                                self.host.cast(ReadHostMsg::ProcessDecidedValue {
-                                    value: proto::DecidedValue { value: Some(value) },
-                                    sync: myself.clone(),
-                                })?;
+                                Some((value_response.height, value))
                             }
                             Err(err) => {
                                 warn!(peer_id = %peer, height = %value_response.height, "Dropping malformed sync value response: {}", err);
+                                None
                             }
-                        }
-                        self.process_input(
-                            &myself,
-                            state,
-                            sync::Input::ValueResponse(request_id, peer, value_response),
-                        )
-                        .await?;
-
-                        if state.initial_sync_first_completed() {
-                            self.host.cast(ReadHostMsg::InitialSyncCompleted)?;
                         }
                     }
                     Response::VoteSetResponse(vote_set_response) => {
                         error!(height = %vote_set_response.height, round = %vote_set_response.round, %peer ,
                             "Read node sending vote set response");
+                        None
+                    }
+                };
+
+                // Only the block asked for clears its request. Any other answer (empty,
+                // malformed, another height or kind) leaves the height pending until its timeout,
+                // so a peer that can't serve it isn't asked again once per round trip.
+                if let Some((height, value)) = value {
+                    if requested == Some(height) {
+                        state.timers.cancel(&Timeout::Request(request_id.clone()));
+                        state.inflight.remove(&request_id);
+                        state.sync.remove_pending_decided_value_request(height);
+                        state.received.insert(height.block_number);
+                    }
+                    self.host.cast(ReadHostMsg::ProcessDecidedValue {
+                        value: proto::DecidedValue { value: Some(value) },
+                        sync: myself.clone(),
+                    })?;
+
+                    if state.initial_sync_first_completed() {
+                        self.host.cast(ReadHostMsg::InitialSyncCompleted)?;
                     }
                 }
             }
@@ -425,8 +539,17 @@ impl ReadSync {
             Msg::Decided(height) => {
                 self.process_input(&myself, state, sync::Input::UpdateHeight(height))
                     .await?;
-                self.process_input(&myself, state, sync::Input::StartHeight(height.increment()))
-                    .await?;
+                // What `Input::StartHeight` does, minus its request for the next height: that
+                // block is often already on its way to the host, and `fill_window` knows it.
+                state.sync.started = true;
+                state.sync.sync_height = height.increment();
+                state.last_progress = Instant::now();
+
+                // The window's last answers arrive while the node is still behind, so check
+                // here too, not only on answers.
+                if state.initial_sync_first_completed() {
+                    self.host.cast(ReadHostMsg::InitialSyncCompleted)?;
+                }
             }
 
             Msg::GotDecidedBlock(request_id, height, block) => {
@@ -499,6 +622,9 @@ impl Actor for ReadSync {
             connected_peers: HashSet::new(),
             ticker,
             initial_sync_completed: false,
+            received: BTreeSet::new(),
+            last_progress: Instant::now(),
+            no_peer_warned: None,
         })
     }
 
@@ -520,6 +646,7 @@ impl Actor for ReadSync {
         if let Err(e) = self.handle_msg(myself, msg, state).await {
             error!("Error handling message: {e:?}");
         }
+        self.fill_window(state).await;
 
         Ok(())
     }
