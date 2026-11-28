@@ -3,7 +3,9 @@
 use crate::consensus::validator::{ProposalSource, ShardValidator};
 use crate::core::types::{CommitsExt, SnapchainValidatorContext, WellFormedProposal};
 use crate::network::gossip::GossipEvent;
-use crate::proto::{self, decided_value, full_proposal, Block, Commits, FullProposal, ShardChunk};
+use crate::proto::{
+    self, decided_value, full_proposal, Block, Commits, FullProposal, Height, ShardChunk,
+};
 use crate::utils::statsd_wrapper::StatsdClientWrapper;
 use bytes::Bytes;
 use informalsystems_malachitebft_core_consensus::ProposedValue;
@@ -18,6 +20,7 @@ use informalsystems_malachitebft_sync::RawDecidedValue;
 use prost::Message;
 use ractor::{async_trait, Actor, ActorProcessingErr, ActorRef, RpcReplyPort, SpawnErr};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -29,17 +32,20 @@ use super::participation::Participation;
 /// consensus actor to the application over a channel, and vice-versa.
 pub struct Host {}
 
-/// Most next-height proposals held while the previous height commits. Each round of that height
-/// has one proposer, so this only fills if the commit stalls for many rounds; past it, proposals
-/// are answered immediately, which is the old behaviour.
+/// The most proposals held at once. Every proposal for a future height is held until its
+/// height is next, so this fills when the network runs ahead of this node or when the commit
+/// stalls for many rounds; past it, proposals are answered immediately, which is the old
+/// behaviour.
 pub const MAX_DEFERRED_PROPOSALS: usize = 16;
 
-/// Proposals for the height after the one this host is about to commit.
+/// Proposals for future heights, held until the height before each of them commits.
 ///
 /// Consensus decides a height, waits out its commit timeout and only then tells the host. In that
 /// gap the next height's proposer, often the same node that just proposed, streams its proposal,
 /// and the host would judge it against a tip one height stale: "not the next height", invalid, a
-/// nil vote. Holding the reply until the commit lands lets the proposal be judged properly.
+/// nil vote. A node that is several heights behind would hear the same for every proposal.
+/// Holding each reply until the height before it commits lets the proposal be judged when it can
+/// be valid.
 pub struct DeferredProposals<R> {
     entries: Vec<(WellFormedProposal, R)>,
 }
@@ -51,8 +57,8 @@ impl<R> DeferredProposals<R> {
         }
     }
 
-    /// Hold `proposal` until the height before it commits. When full, hands it back so the
-    /// caller can answer it now.
+    /// Hold a proposal for a future height until the height before it commits. When full, hands
+    /// it back so the caller can answer it now.
     pub fn defer(
         &mut self,
         proposal: WellFormedProposal,
@@ -65,8 +71,8 @@ impl<R> DeferredProposals<R> {
         Ok(())
     }
 
-    /// After `committed` lands: returns the proposals for the height after it, drops any for
-    /// heights already passed, and keeps later ones.
+    /// After `committed` lands: returns the proposals for the height after it, which can be
+    /// judged now, drops any for heights already passed, and keeps later ones held.
     pub fn take_ready(&mut self, committed: crate::proto::Height) -> Vec<(WellFormedProposal, R)> {
         let next = committed.increment();
         let (ready, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.entries)
@@ -82,6 +88,34 @@ impl<R> DeferredProposals<R> {
     }
 }
 
+/// Whether a proposal for `proposal_height` must wait. Only the height after `confirmed` can be
+/// judged against the tip; every later height is held until the height before it commits.
+fn holds_proposal(proposal_height: &Height, confirmed: Height) -> bool {
+    *proposal_height > confirmed.increment()
+}
+
+/// End the wait for the next height early: a proposal for that height has just been judged.
+fn wake_next_height(state: &HostState, height: Height) {
+    if height == state.shard_validator.get_current_height().increment() {
+        if let Some(wake) = &state.next_height_wake {
+            wake.notify_one();
+        }
+    }
+}
+
+/// Wait for `delay`, or for `wake`, and then run `start`.
+pub(crate) async fn wait_for_next_height(
+    delay: Duration,
+    wake: Arc<tokio::sync::Notify>,
+    start: impl FnOnce() + Send + 'static,
+) {
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => {}
+        _ = wake.notified() => {}
+    }
+    start();
+}
+
 pub struct HostState {
     pub shard_validator: ShardValidator,
     pub network: NetworkRef<SnapchainValidatorContext>,
@@ -92,6 +126,9 @@ pub struct HostState {
     pub participation: Arc<Participation>,
     pub deferred_proposals:
         DeferredProposals<RpcReplyPort<ProposedValue<SnapchainValidatorContext>>>,
+    /// Set while the start of the next height waits out the block time. A proposal for that
+    /// height wakes it.
+    pub next_height_wake: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl Host {
@@ -311,28 +348,26 @@ impl Host {
                         );
                     }
                     Ok(proposal) => {
-                        // The tip is `confirmed`; a proposal for `confirmed + 2` means the
-                        // decision for `confirmed + 1` may already be on its way here.
-                        let after_pending = state
-                            .shard_validator
-                            .get_current_height()
-                            .increment()
-                            .increment();
-                        if proposal.height() == after_pending {
+                        // A proposal past the next height cannot be judged against the tip yet,
+                        // however far ahead it is. Hold it until the height before it commits.
+                        let height = proposal.height();
+                        if holds_proposal(&height, state.shard_validator.get_current_height()) {
                             match state.deferred_proposals.defer(proposal, reply_to) {
                                 Ok(()) => {
                                     debug!(
-                                        height = %after_pending,
+                                        height = %height,
                                         held = state.deferred_proposals.len(),
                                         "Holding a proposal until the height before it commits"
                                     );
                                 }
                                 Err((proposal, reply_to)) => {
-                                    Self::validate_and_reply(state, proposal, reply_to, now)?
+                                    Self::validate_and_reply(state, proposal, reply_to, now)?;
+                                    wake_next_height(state, height);
                                 }
                             }
                         } else {
                             Self::validate_and_reply(state, proposal, reply_to, now)?;
+                            wake_next_height(state, height);
                         }
                     }
                     Err(err) => {
@@ -463,8 +498,7 @@ impl Host {
                 let validator_set = state
                     .shard_validator
                     .get_validator_set(next_height.as_u64());
-                tokio::spawn(async move {
-                    tokio::time::sleep(delay).await;
+                let start = move || {
                     if let Err(err) =
                         consensus_ref.cast(ConsensusMsg::StartHeight(next_height, validator_set))
                     {
@@ -474,7 +508,16 @@ impl Host {
                             err.to_string()
                         );
                     };
-                });
+                };
+                if delay.is_zero() {
+                    state.next_height_wake = None;
+                    start();
+                } else {
+                    // A proposal for the next height can arrive during the wait: it ends it early.
+                    let wake = Arc::new(tokio::sync::Notify::new());
+                    state.next_height_wake = Some(wake.clone());
+                    tokio::spawn(wait_for_next_height(delay, wake, start));
+                }
             }
 
             HostMsg::GetDecidedValue { height, reply_to } => {
@@ -610,10 +653,13 @@ impl Actor for Host {
 
 #[cfg(test)]
 mod tests {
-    use super::{DeferredProposals, MAX_DEFERRED_PROPOSALS};
+    use super::{holds_proposal, wait_for_next_height, DeferredProposals, MAX_DEFERRED_PROPOSALS};
     use crate::core::types::{Address, WellFormedProposal};
     use crate::core::util::shard_chunk_hash;
     use crate::proto::{full_proposal, FullProposal, Height, ShardChunk, ShardHeader};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
 
     fn proposal(block_number: u64, round: i64) -> WellFormedProposal {
         let header = ShardHeader {
@@ -673,5 +719,58 @@ mod tests {
         let (returned, reply) = held.defer(proposal(11, 99), 99).unwrap_err();
         assert_eq!(returned.round().as_i64(), 99);
         assert_eq!(reply, 99);
+    }
+
+    #[test]
+    fn only_a_proposal_past_the_next_height_is_held() {
+        let confirmed = Height::new(1, 10);
+        assert!(!holds_proposal(&confirmed, confirmed));
+        assert!(!holds_proposal(&confirmed.increment(), confirmed));
+        assert!(holds_proposal(
+            &confirmed.increment().increment(),
+            confirmed
+        ));
+        assert!(holds_proposal(
+            &confirmed.increment().increment().increment(),
+            confirmed
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn next_height_wait_ends_as_soon_as_it_is_woken() {
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let started = Arc::new(AtomicUsize::new(0));
+        let before = tokio::time::Instant::now();
+        let task = tokio::spawn(wait_for_next_height(
+            Duration::from_secs(5),
+            wake.clone(),
+            {
+                let started = started.clone();
+                move || {
+                    started.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        ));
+        tokio::task::yield_now().await;
+        wake.notify_one();
+        task.await.unwrap();
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+        assert!(before.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn next_height_wait_lasts_the_whole_delay_when_nothing_wakes_it() {
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let started = Arc::new(AtomicUsize::new(0));
+        let before = tokio::time::Instant::now();
+        let task = tokio::spawn(wait_for_next_height(Duration::from_secs(5), wake, {
+            let started = started.clone();
+            move || {
+                started.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+        task.await.unwrap();
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+        assert!(before.elapsed() >= Duration::from_secs(5));
     }
 }

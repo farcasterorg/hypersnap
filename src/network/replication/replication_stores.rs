@@ -179,10 +179,8 @@ impl ReplicationStores {
         &self,
         shard: u32,
         height: u64,
-        timestamp: u64,
-        read_only_db: RocksDB,
+        timestamped_store: TimestampedStore,
     ) -> Result<(), ReplicationError> {
-        let snapshot = self.new_timestamped_store(shard, timestamp, read_only_db)?;
         let stores = self.read_only_stores.write();
         if stores.is_err() {
             return Err(ReplicationError::InternalError(
@@ -199,7 +197,10 @@ impl ReplicationStores {
             return Ok(());
         }
 
-        stores.get_mut(&shard).unwrap().insert(height, snapshot);
+        stores
+            .get_mut(&shard)
+            .unwrap()
+            .insert(height, timestamped_store);
 
         self.capture_snapshot_metrics(&stores);
 
@@ -217,13 +218,36 @@ impl ReplicationStores {
             return Err(ReplicationError::ShardStoreNotFound(shard));
         }
 
-        match stores.unwrap().db.open_read_only() {
-            Ok(read_only_db) => self.insert_snapshot(shard, height, timestamp, read_only_db),
-            Err(e) => Err(ReplicationError::InternalError(format!(
+        let read_only_db = stores.unwrap().db.open_read_only().map_err(|e| {
+            ReplicationError::InternalError(format!(
                 "Failed to open read-only database for shard {}: {}",
                 shard, e
-            ))),
+            ))
+        })?;
+        let timestamped_store = self.new_timestamped_store(shard, timestamp, read_only_db)?;
+
+        // Opening the read-only handle does not stop writers, so the next block can commit
+        // while it opens. A block commits its chunk and its state in one transaction, so the
+        // opened height shows whether this view is exactly `height`. Do not keep a view that
+        // is at a different height.
+        let opened_height = timestamped_store
+            .stores
+            .shard_store
+            .max_block_number()
+            .map_err(|e| {
+                ReplicationError::InternalError(format!(
+                    "Failed to read the height of the read-only view of shard {}: {}",
+                    shard, e
+                ))
+            })?;
+        if opened_height != height {
+            return Err(ReplicationError::InternalError(format!(
+                "Read-only view of shard {} opened at height {}, not {}; snapshot not taken",
+                shard, opened_height, height
+            )));
         }
+
+        self.insert_snapshot(shard, height, timestamped_store)
     }
 
     pub fn close_aged_snapshots(&self, shard: u32, min_timestamp: u64) {
@@ -376,7 +400,8 @@ impl Drop for ReplicationStores {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-    use crate::storage::store::test_helper;
+    use crate::storage::{constants::RootPrefix, store::test_helper};
+    use prost::Message;
     use rocksdb::{Options, WriteBatch, DB};
     use std::fs;
 
@@ -416,26 +441,56 @@ mod tests {
         write_generation(0);
 
         let shard = engine.shard_id();
+        let write_height = |height: u64| {
+            let mut key = vec![RootPrefix::Shard as u8];
+            key.extend_from_slice(&height.to_be_bytes());
+            let chunk = proto::ShardChunk {
+                header: Some(proto::ShardHeader {
+                    height: Some(proto::Height {
+                        shard_index: shard,
+                        block_number: height,
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            writer.put(key, chunk.encode_to_vec()).unwrap();
+            writer.flush().unwrap();
+        };
         let stores = ReplicationStores::new(
             HashMap::from([(shard, source)]),
             test_helper::statsd_client(),
             engine.network,
         );
+        write_height(1);
         stores.open_snapshot(shard, 1, 1).unwrap();
+        write_height(2);
         stores.open_snapshot(shard, 2, 2).unwrap();
         let reader = stores.get(shard, 1).unwrap();
-        let old_files = Arc::clone(&stores.read_only_stores.read().unwrap()[&shard][&1].ssts);
+        let (first_files, second_files) = {
+            let snapshots = stores.read_only_stores.read().unwrap();
+            let snapshots = &snapshots[&shard];
+            (
+                Arc::clone(&snapshots[&1].ssts),
+                Arc::clone(&snapshots[&2].ssts),
+            )
+        };
 
         write_generation(1);
+        write_height(3);
         writer.compact_range(None::<&[u8]>, None::<&[u8]>);
         stores.open_snapshot(shard, 3, 3).unwrap();
 
-        let obsolete_bytes = old_files
+        let obsolete_files: HashMap<_, _> = first_files
             .iter()
+            .chain(second_files.iter())
             .filter(|(path, _)| !path.exists())
-            .map(|(_, size)| size)
-            .sum();
-        assert!(obsolete_bytes > 0);
+            .map(|(path, size)| (path, *size))
+            .collect();
+        assert!(first_files.iter().any(|(path, _)| {
+            obsolete_files.contains_key(path) && second_files.iter().any(|(other, _)| other == path)
+        }));
+        let obsolete_bytes = obsolete_files.values().sum();
         assert!(deleted_sst_handles(&directory) > 0);
 
         // Two snapshots share the same obsolete SST bytes.

@@ -246,8 +246,18 @@ impl RocksDB {
         Ok(())
     }
 
+    /// Open a second, read-only handle on this database's files.
+    ///
+    /// This does not stop writers. A commit can land while the handle opens, so a caller that
+    /// needs the view at a known point must check what it opened (the replicator checks the
+    /// shard height).
     pub fn open_read_only(&self) -> Result<Self, RocksdbError> {
-        let _wl = self.inner.write().unwrap();
+        // A read guard keeps `close()` and `destroy()` out while the handle opens. Do not take
+        // the write guard here: a streaming snapshot export holds a read guard for hours, and
+        // std's RwLock makes every new reader wait behind a queued writer. That parks each
+        // runtime worker that touches this database, the export's uploader can no longer run,
+        // and the node deadlocks.
+        let _guard = self.inner.read().unwrap();
 
         let mut opts = Options::default();
         opts.create_if_missing(false);
@@ -931,6 +941,32 @@ mod tests {
             b"value4_new".to_vec()
         );
         assert_eq!(txn1.batch.get(&b"key5".to_vec()).unwrap().is_none(), true);
+    }
+
+    /// A streaming snapshot export holds `db()` for hours. Opening a read-only view meanwhile
+    /// must not wait for that guard: a queued writer blocks every other reader of the database,
+    /// and that deadlocked mainnet on 2026-11-27.
+    #[test]
+    fn open_read_only_does_not_wait_for_a_held_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = std::sync::Arc::new(RocksDB::new(dir.path().to_str().unwrap()));
+        db.open().unwrap();
+        db.put(b"key", b"value").unwrap();
+
+        let export_guard = db.db();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let opener = std::sync::Arc::clone(&db);
+        std::thread::spawn(move || {
+            let read_only = opener.open_read_only().unwrap();
+            done_tx.send(read_only.get(b"key").unwrap()).unwrap();
+        });
+        let value = done_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("open_read_only waited for a held read guard");
+        drop(export_guard);
+
+        // The view includes writes that are only in the WAL, not yet flushed to an SST.
+        assert_eq!(value, Some(b"value".to_vec()));
     }
 
     #[test]
