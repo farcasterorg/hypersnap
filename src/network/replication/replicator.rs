@@ -209,7 +209,7 @@ pub async fn run(
         }
     };
 
-    select! {
+    tokio::select! {
         _ = process_commits => {}
         _ = enforce_budget => {}
     }
