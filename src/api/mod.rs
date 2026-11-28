@@ -34,6 +34,7 @@ pub mod daily_stats;
 mod daily_stats_worker;
 pub mod events;
 pub mod feeds;
+pub mod followed_bounds;
 pub mod http;
 pub mod index_gaps;
 pub mod indexer;
@@ -424,8 +425,21 @@ pub fn initialize(
     // run concurrently with the bridges rather than blocking them (see below).
     let needs_backfill = !backfill_indexers.is_empty() || search_needs_block_backfill;
 
+    // Bridges wait on this until startup backfill is done.
+    let (backfill_done_tx, _) = watch::channel(false);
+
+    // Kept from live merges, so only usable once the bridges run.
+    let followed_bounds = (config.feeds.enabled && config.feeds.followed_bounds).then(|| {
+        Arc::new(followed_bounds::FollowedBounds::new(
+            backfill_done_tx.subscribe(),
+        ))
+    });
+
     // Create worker pool and register indexers
     let mut worker_pool = IndexWorkerPool::new(config.clone(), index_rx, db.clone());
+    if let Some(ref bounds) = followed_bounds {
+        worker_pool.register_arc(bounds.clone());
+    }
 
     worker_pool.register_arc(cast_hash_indexer.clone());
     worker_pool.register_arc(cast_quotes_indexer.clone());
@@ -582,14 +596,19 @@ pub fn initialize(
             }
         }
     }
+    let mut repaired = vec![
+        cast_hash_indexer.clone() as Arc<dyn Indexer>,
+        cast_quotes_indexer.clone() as Arc<dyn Indexer>,
+        notifications_indexer.clone() as Arc<dyn Indexer>,
+    ];
+    // Bounds only rise, so a replay in any order is safe
+    if let Some(ref bounds) = followed_bounds {
+        repaired.push(bounds.clone() as Arc<dyn Indexer>);
+    }
     index_gaps::spawn_repair(
         index_gaps.clone(),
         shard_stores.clone(),
-        vec![
-            cast_hash_indexer.clone() as Arc<dyn Indexer>,
-            cast_quotes_indexer.clone() as Arc<dyn Indexer>,
-            notifications_indexer.clone() as Arc<dyn Indexer>,
-        ],
+        repaired,
         shutdown_tx.subscribe(),
     );
     let social_graph_handle = social_graph_indexer.as_ref().map(|indexer| {
@@ -622,10 +641,9 @@ pub fn initialize(
         worker_pool.run().await;
     });
 
-    // Create a watch channel to gate bridges on backfill completion.
-    // Bridges subscribe to broadcast channels immediately (buffering live events),
+    // `backfill_done_tx` gates bridges on backfill completion. Bridges
+    // subscribe to broadcast channels immediately (buffering live events),
     // but wait for the backfill signal before starting to consume.
-    let (backfill_done_tx, _) = watch::channel(false);
 
     // Spawn backfill if needed — replays shard chunks (blocks) from genesis
     // so that snapshot-loaded nodes get full historical data indexed.
@@ -726,6 +744,9 @@ pub fn initialize(
 
     http_handler.set_shard_dbs(shard_dbs);
     http_handler.set_custody_index(custody_indexer);
+    if let Some(bounds) = followed_bounds {
+        http_handler.set_followed_bounds(bounds);
+    }
     http_handler.set_user_search(user_search_indexer);
     // Off, the endpoint never sees the index (and main.rs never walks it).
     if config.notifications_index {

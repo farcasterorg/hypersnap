@@ -258,6 +258,10 @@ pub struct ApiHttpHandler {
     /// Username / display-name prefix index. Late-bound like `daily_stats`.
     user_search:
         Arc<std::sync::RwLock<Option<Arc<crate::api::user_search_index::UserSearchIndexer>>>>,
+    /// Newest cast/recast bounds for the following feed. Late-bound like
+    /// `daily_stats`.
+    followed_bounds:
+        Arc<std::sync::RwLock<Option<Arc<crate::api::followed_bounds::FollowedBounds>>>>,
     /// Notifications index. Late-bound like `daily_stats`.
     notifications_index:
         Arc<std::sync::RwLock<Option<Arc<crate::api::notifications_index::NotificationsIndexer>>>>,
@@ -369,8 +373,19 @@ impl ApiHttpHandler {
             cast_probe_lock: Arc::new(tokio::sync::Mutex::new(())),
             custody_index: Arc::new(std::sync::RwLock::new(None)),
             user_search: Arc::new(std::sync::RwLock::new(None)),
+            followed_bounds: Arc::new(std::sync::RwLock::new(None)),
             notifications_index: Arc::new(std::sync::RwLock::new(None)),
         }
+    }
+
+    /// Install the following feed's bounds (callable after construction).
+    pub fn set_followed_bounds(&self, bounds: Arc<crate::api::followed_bounds::FollowedBounds>) {
+        *self.followed_bounds.write().unwrap() = Some(bounds);
+    }
+
+    /// The following feed's bounds, when enabled.
+    pub fn followed_bounds(&self) -> Option<Arc<crate::api::followed_bounds::FollowedBounds>> {
+        self.followed_bounds.read().unwrap().clone()
     }
 
     /// Install the notifications index (callable after construction).
@@ -2323,11 +2338,17 @@ impl ApiHttpHandler {
     /// Fill `viewer_context` on each cast (liked/recasted) and on its author
     /// and mentioned profiles (follow and block links in both directions), as
     /// seen by `viewer_fid`. Does nothing without a viewer.
-    async fn add_viewer_context(&self, casts: &mut [Cast], viewer_fid: Option<u64>) {
+    async fn add_viewer_context<'a>(
+        &self,
+        casts: impl IntoIterator<Item = &'a mut Cast> + Send,
+        viewer_fid: Option<u64>,
+    ) {
         let Some(viewer) = viewer_fid else { return };
         let Some(hub) = self.hub_query.read().unwrap().clone() else {
             return;
         };
+        // Authors and mentions repeat across a page; read each one's links once
+        let mut seen = HashMap::new();
         for cast in casts {
             let fid = cast.author.fid;
             let hash = hex::decode(&cast.hash).unwrap_or_default();
@@ -2338,10 +2359,10 @@ impl ApiHttpHandler {
                 liked: reacted(crate::proto::ReactionType::Like).await,
                 recasted: reacted(crate::proto::ReactionType::Recast).await,
             });
-            self.add_user_viewer_context(std::slice::from_mut(&mut cast.author), viewer_fid)
-                .await;
-            self.add_user_viewer_context(&mut cast.mentioned_profiles, viewer_fid)
-                .await;
+            for user in std::iter::once(&mut cast.author).chain(&mut cast.mentioned_profiles) {
+                user.viewer_context =
+                    Some(Self::user_viewer_context(&hub, viewer, user.fid, &mut seen).await);
+            }
         }
     }
 
@@ -2352,29 +2373,46 @@ impl ApiHttpHandler {
         let Some(hub) = self.hub_query.read().unwrap().clone() else {
             return;
         };
+        let mut seen = HashMap::new();
         for user in users {
-            user.viewer_context = Some(types::ViewerContext {
-                following: hub.has_link(viewer, "follow", user.fid).await,
-                followed_by: hub.has_link(user.fid, "follow", viewer).await,
-                blocking: hub.has_link(viewer, "block", user.fid).await,
-                blocked_by: hub.has_link(user.fid, "block", viewer).await,
-            });
+            user.viewer_context =
+                Some(Self::user_viewer_context(&hub, viewer, user.fid, &mut seen).await);
         }
     }
 
+    /// `fid`'s follow and block links with `viewer`, read once per `seen`.
+    async fn user_viewer_context(
+        hub: &Arc<dyn HubQueryHandler>,
+        viewer: u64,
+        fid: u64,
+        seen: &mut HashMap<u64, types::ViewerContext>,
+    ) -> types::ViewerContext {
+        if let Some(context) = seen.get(&fid) {
+            return context.clone();
+        }
+        let context = types::ViewerContext {
+            following: hub.has_link(viewer, "follow", fid).await,
+            followed_by: hub.has_link(fid, "follow", viewer).await,
+            blocking: hub.has_link(viewer, "block", fid).await,
+            blocked_by: hub.has_link(fid, "block", viewer).await,
+        };
+        seen.insert(fid, context.clone());
+        context
+    }
+
     /// `add_viewer_context` for a conversation tree.
-    fn add_viewer_context_to_thread<'a>(
-        &'a self,
-        node: &'a mut CastWithReplies,
+    async fn add_viewer_context_to_thread(
+        &self,
+        node: &mut CastWithReplies,
         viewer_fid: Option<u64>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
-        Box::pin(async move {
-            self.add_viewer_context(std::slice::from_mut(&mut node.cast), viewer_fid)
-                .await;
-            for reply in &mut node.direct_replies {
-                self.add_viewer_context_to_thread(reply, viewer_fid).await;
-            }
-        })
+    ) {
+        let mut casts = vec![];
+        let mut nodes = vec![node];
+        while let Some(node) = nodes.pop() {
+            casts.push(&mut node.cast);
+            nodes.extend(&mut node.direct_replies);
+        }
+        self.add_viewer_context(casts, viewer_fid).await;
     }
 
     /// Handle GET /v2/farcaster/cast?identifier=X&type=hash|url&fid=N

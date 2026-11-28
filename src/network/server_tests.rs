@@ -6359,6 +6359,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_following_feed_bounds_read_newest_cast_and_reaction() {
+        use crate::api::feeds::read_newest_timestamps;
+        use crate::api::followed_bounds::Bounds;
+        let (
+            _stores,
+            _senders,
+            [mut engine1, mut engine2],
+            _block_engine,
+            service,
+            _shard_decision_tx,
+            _block_decision_tx,
+        ) = make_server(None, None).await;
+        for (fid, engine) in [(SHARD1_FID, &mut engine1), (SHARD2_FID, &mut engine2)] {
+            test_helper::register_user(
+                fid,
+                test_helper::default_signer(),
+                test_helper::default_custody_address(),
+                engine,
+            )
+            .await;
+        }
+        let cast = messages_factory::casts::create_cast_add(SHARD1_FID, "kept", None, None);
+        let t = cast.data.as_ref().unwrap().timestamp;
+        let removed =
+            messages_factory::casts::create_cast_add(SHARD1_FID, "removed", Some(t + 1), None);
+        // The remove is the newest cast message, newer than any cast add
+        let remove = messages_factory::casts::create_cast_remove(
+            SHARD1_FID,
+            &removed.hash,
+            Some(t + 10),
+            None,
+        );
+        let like = messages_factory::reactions::create_reaction_add(
+            SHARD1_FID,
+            proto::ReactionType::Like,
+            proto::reaction_body::Target::TargetCastId(proto::CastId {
+                fid: SHARD1_FID,
+                hash: cast.hash.clone(),
+            }),
+            Some(t + 20),
+            None,
+        );
+        for message in [&cast, &removed, &remove, &like] {
+            test_helper::commit_message(&mut engine1, message).await;
+        }
+
+        let bounds = read_newest_timestamps(Arc::new(service), vec![SHARD1_FID, SHARD2_FID]).await;
+        assert_eq!(
+            bounds,
+            vec![
+                Some(Bounds {
+                    cast: Some(t + 10),
+                    recast: Some(t + 20),
+                }),
+                // Registered, never cast or reacted
+                Some(Bounds::default()),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn test_cast_apis() {
         let (
             _stores,

@@ -222,12 +222,15 @@ async fn start_servers(
         if app_config.api.feeds.enabled {
             let social_graph = handler.social_graph_indexer();
             let metrics = handler.metrics_indexer();
-            let feeds = Arc::new(snapchain::api::FeedService::new(
-                app_config.api.feeds.clone(),
-                social_graph,
-                metrics,
-                api_service.clone(),
-            ));
+            let feeds = Arc::new(
+                snapchain::api::FeedService::new(
+                    app_config.api.feeds.clone(),
+                    social_graph,
+                    metrics,
+                    api_service.clone(),
+                )
+                .with_followed_bounds(handler.followed_bounds()),
+            );
             feeds.warm_trending();
             handler.set_feeds(feeds.clone());
             handler.set_channel_feeds(feeds);

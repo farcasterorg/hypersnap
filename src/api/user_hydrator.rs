@@ -17,13 +17,23 @@ use tonic::Request;
 pub struct HubUserHydrator<S> {
     hub_service: Arc<S>,
     social_graph: Option<Arc<SocialGraphIndexer>>,
+    users: moka::future::Cache<u64, User>,
 }
+
+/// How long a hydrated user is reused. A page names the same authors and
+/// mentions many times and requests overlap; this keeps profile edits and
+/// follower counts visible within a couple of seconds.
+const USER_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl<S> HubUserHydrator<S> {
     pub fn new(hub_service: Arc<S>, social_graph: Option<Arc<SocialGraphIndexer>>) -> Self {
         Self {
             hub_service,
             social_graph,
+            users: moka::future::Cache::builder()
+                .max_capacity(100_000)
+                .time_to_live(USER_CACHE_TTL)
+                .build(),
         }
     }
 }
@@ -34,6 +44,23 @@ where
     S: proto::hub_service_server::HubService + Send + Sync + 'static,
 {
     async fn hydrate_user(&self, fid: u64) -> Option<User> {
+        Some(self.users.get_with(fid, self.load_user(fid)).await)
+    }
+
+    async fn hydrate_users(&self, fids: &[u64]) -> Vec<User> {
+        let mut users = Vec::with_capacity(fids.len());
+        for &fid in fids {
+            users.push(self.users.get_with(fid, self.load_user(fid)).await);
+        }
+        users
+    }
+}
+
+impl<S> HubUserHydrator<S>
+where
+    S: proto::hub_service_server::HubService + Send + Sync + 'static,
+{
+    async fn load_user(&self, fid: u64) -> User {
         let mut user = User {
             object: "user".to_string(),
             fid,
@@ -119,22 +146,7 @@ where
             }
         }
 
-        Some(user)
-    }
-
-    async fn hydrate_users(&self, fids: &[u64]) -> Vec<User> {
-        // Parallelize: N independent hydrations can run concurrently.
-        let futures = fids.iter().map(|&fid| async move {
-            match self.hydrate_user(fid).await {
-                Some(user) => user,
-                None => User {
-                    fid,
-                    username: format!("fid:{}", fid),
-                    ..Default::default()
-                },
-            }
-        });
-        futures::future::join_all(futures).await
+        user
     }
 }
 
