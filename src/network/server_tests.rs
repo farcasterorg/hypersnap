@@ -852,6 +852,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kept_profiles_follow_user_data_changes_through_merge_events() {
+        use crate::api::events::IndexEvent;
+        use crate::api::http::UserHydrator;
+        use crate::api::indexer::Indexer;
+        use crate::api::profile_cache::ProfileCache;
+        use crate::proto::UserDataType;
+        let (
+            _stores,
+            _senders,
+            [mut engine1, _engine2],
+            _block_engine,
+            service,
+            _shard_decision_tx,
+            _block_decision_tx,
+        ) = make_server(None, None).await;
+        test_helper::register_user(
+            SHARD1_FID,
+            test_helper::default_signer(),
+            test_helper::default_custody_address(),
+            &mut engine1,
+        )
+        .await;
+        let display = |name: &str, timestamp| {
+            messages_factory::user_data::create_user_data_add(
+                SHARD1_FID,
+                UserDataType::Display,
+                &name.to_string(),
+                timestamp,
+                None,
+            )
+        };
+        let first = display("first", None);
+        let t = first.data.as_ref().unwrap().timestamp;
+        test_helper::commit_message(&mut engine1, &first).await;
+
+        let (_live_tx, live) = tokio::sync::watch::channel(true);
+        let profiles = Arc::new(ProfileCache::new(live));
+        let hydrator = crate::api::user_hydrator::HubUserHydrator::new(Arc::new(service), None)
+            .with_profiles(Some(profiles.clone()));
+        let name = || async {
+            hydrator
+                .hydrate_user(SHARD1_FID)
+                .await
+                .unwrap()
+                .display_name
+        };
+        assert_eq!(name().await.as_deref(), Some("first"));
+
+        let second = display("second", Some(t + 1));
+        test_helper::commit_message(&mut engine1, &second).await;
+        assert_eq!(
+            name().await.as_deref(),
+            Some("first"),
+            "kept until its event"
+        );
+        profiles
+            .process_event(&IndexEvent::message(second, 1, 1))
+            .await
+            .unwrap();
+        assert_eq!(name().await.as_deref(), Some("second"));
+    }
+
+    #[tokio::test]
     async fn native_account_lookup_and_profile_hydration_use_native_custody() {
         use crate::api::webhooks::CustodyAddressLookup;
         use crate::api::{http::UserHydrator, HubQueryHandler};
@@ -6356,6 +6419,67 @@ mod tests {
             .await;
 
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_following_feed_bounds_read_newest_cast_and_reaction() {
+        use crate::api::feeds::read_newest_timestamps;
+        use crate::api::followed_bounds::Bounds;
+        let (
+            _stores,
+            _senders,
+            [mut engine1, mut engine2],
+            _block_engine,
+            service,
+            _shard_decision_tx,
+            _block_decision_tx,
+        ) = make_server(None, None).await;
+        for (fid, engine) in [(SHARD1_FID, &mut engine1), (SHARD2_FID, &mut engine2)] {
+            test_helper::register_user(
+                fid,
+                test_helper::default_signer(),
+                test_helper::default_custody_address(),
+                engine,
+            )
+            .await;
+        }
+        let cast = messages_factory::casts::create_cast_add(SHARD1_FID, "kept", None, None);
+        let t = cast.data.as_ref().unwrap().timestamp;
+        let removed =
+            messages_factory::casts::create_cast_add(SHARD1_FID, "removed", Some(t + 1), None);
+        // The remove is the newest cast message, newer than any cast add
+        let remove = messages_factory::casts::create_cast_remove(
+            SHARD1_FID,
+            &removed.hash,
+            Some(t + 10),
+            None,
+        );
+        let like = messages_factory::reactions::create_reaction_add(
+            SHARD1_FID,
+            proto::ReactionType::Like,
+            proto::reaction_body::Target::TargetCastId(proto::CastId {
+                fid: SHARD1_FID,
+                hash: cast.hash.clone(),
+            }),
+            Some(t + 20),
+            None,
+        );
+        for message in [&cast, &removed, &remove, &like] {
+            test_helper::commit_message(&mut engine1, message).await;
+        }
+
+        let bounds = read_newest_timestamps(Arc::new(service), vec![SHARD1_FID, SHARD2_FID]).await;
+        assert_eq!(
+            bounds,
+            vec![
+                Some(Bounds {
+                    cast: Some(t + 10),
+                    recast: Some(t + 20),
+                }),
+                // Registered, never cast or reacted
+                Some(Bounds::default()),
+            ]
+        );
     }
 
     #[tokio::test]

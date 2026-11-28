@@ -222,12 +222,15 @@ async fn start_servers(
         if app_config.api.feeds.enabled {
             let social_graph = handler.social_graph_indexer();
             let metrics = handler.metrics_indexer();
-            let feeds = Arc::new(snapchain::api::FeedService::new(
-                app_config.api.feeds.clone(),
-                social_graph,
-                metrics,
-                api_service.clone(),
-            ));
+            let feeds = Arc::new(
+                snapchain::api::FeedService::new(
+                    app_config.api.feeds.clone(),
+                    social_graph,
+                    metrics,
+                    api_service.clone(),
+                )
+                .with_followed_bounds(handler.followed_bounds()),
+            );
             feeds.warm_trending();
             handler.set_feeds(feeds.clone());
             handler.set_channel_feeds(feeds);
@@ -237,10 +240,10 @@ async fn start_servers(
         }
         // Wire user hydrator for populating User objects in API responses
         let social_graph_for_hydrator = handler.social_graph_indexer();
-        let hydrator = Arc::new(snapchain::api::HubUserHydrator::new(
-            api_service.clone(),
-            social_graph_for_hydrator,
-        ));
+        let hydrator = Arc::new(
+            snapchain::api::HubUserHydrator::new(api_service.clone(), social_graph_for_hydrator)
+                .with_profiles(handler.profile_cache()),
+        );
         // Hold a CustodyAddressLookup view of the hydrator before erasing
         // it as `dyn UserHydrator`, so the webhook auth verifier can reuse
         // the same hub-service-backed lookup path.
