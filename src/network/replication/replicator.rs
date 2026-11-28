@@ -167,29 +167,51 @@ pub async fn run(
     replicator: Arc<Replicator>,
     mut receive: tokio::sync::mpsc::Receiver<PostCommitMessage>,
 ) {
-    while let Some(msg) = receive.recv().await {
-        // Opening a read-only view of a large shard is blocking RocksDB I/O that can take
-        // longer than the engine's 200ms wait. Run it on the blocking pool so it never parks a
-        // runtime worker. Wait for each message before the next one, to keep snapshots in
-        // commit order.
-        let replicator = replicator.clone();
-        let handled = tokio::task::spawn_blocking(move || {
-            let result = replicator.handle_post_commit_message(&msg);
-            (result, msg.channel)
-        })
-        .await;
+    let process_commits = async {
+        while let Some(msg) = receive.recv().await {
+            // Opening a read-only view of a large shard is blocking RocksDB I/O that can take
+            // longer than the engine's 200ms wait. Run it on the blocking pool so it never parks a
+            // runtime worker. Wait for each message before the next one, to keep snapshots in
+            // commit order.
+            let replicator = replicator.clone();
+            let handled = tokio::task::spawn_blocking(move || {
+                let result = replicator.handle_post_commit_message(&msg);
+                (result, msg.channel)
+            })
+            .await;
 
-        match handled {
-            Ok((result, channel)) => {
-                if let Err(e) = result {
-                    error!("Failed to handle post commit message: {}", e);
+            match handled {
+                Ok((result, channel)) => {
+                    if let Err(e) = result {
+                        error!("Failed to handle post commit message: {}", e);
+                    }
+                    if let Err(e) = channel.send(true) {
+                        error!("Failed to send post commit response: {}", e);
+                    }
                 }
-                if let Err(e) = channel.send(true) {
-                    error!("Failed to send post commit response: {}", e);
-                }
+                Err(e) => error!("Post commit handler task failed: {}", e),
             }
-            Err(e) => error!("Post commit handler task failed: {}", e),
         }
+    };
+
+    let enforce_budget = async {
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            let stores = Arc::clone(&replicator.stores);
+            let budget = replicator.snapshot_options.obsolete_sst_budget_bytes;
+            match tokio::task::spawn_blocking(move || stores.enforce_obsolete_sst_budget(budget))
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => error!(%error, "Unable to check replication snapshot disk usage"),
+                Err(error) => error!(%error, "Replication snapshot disk check task failed"),
+            }
+        }
+    };
+
+    tokio::select! {
+        _ = process_commits => {}
+        _ = enforce_budget => {}
     }
 }
 
@@ -197,6 +219,7 @@ pub async fn run(
 pub struct ReplicatorSnapshotOptions {
     pub interval: u64,     // Interval in blocks to take snapshots
     pub max_age: Duration, // Maximum age of snapshots to keep
+    pub obsolete_sst_budget_bytes: u64,
 }
 
 impl Default for ReplicatorSnapshotOptions {
@@ -204,6 +227,8 @@ impl Default for ReplicatorSnapshotOptions {
         ReplicatorSnapshotOptions {
             interval: 1_000, // Default to taking a snapshot every 1000 blocks
             max_age: Duration::from_secs(60 * 60 * 24 * 7),
+            obsolete_sst_budget_bytes: crate::cfg::ReplicationConfig::default()
+                .snapshot_obsolete_sst_budget_bytes,
         }
     }
 }

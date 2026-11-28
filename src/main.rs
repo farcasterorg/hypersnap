@@ -513,6 +513,7 @@ fn create_replicator(
         replication::ReplicatorSnapshotOptions {
             interval: app_config.replication.snapshot_interval,
             max_age: app_config.replication.snapshot_max_age,
+            obsolete_sst_budget_bytes: app_config.replication.snapshot_obsolete_sst_budget_bytes,
         },
     );
 
