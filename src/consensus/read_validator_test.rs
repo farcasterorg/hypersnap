@@ -171,7 +171,10 @@ mod tests {
         let shard_chunk1 = commit_shard_chunk(&mut proposer_engine, &proposer_keypair).await;
         let shard_chunk2 = commit_shard_chunk(&mut proposer_engine, &proposer_keypair).await;
         let shard_chunk3 = commit_shard_chunk(&mut proposer_engine, &proposer_keypair).await;
-        // Drop the new block if the buffer map is full
+        // A full buffer keeps the lowest blocks: a lower one replaces the highest, a higher one
+        // is dropped
+        let num_processed = process_decided_value(&mut read_validator, &shard_chunk3).await;
+        assert_eq!(num_processed, 0);
         let num_processed = process_decided_value(&mut read_validator, &shard_chunk2).await;
         assert_eq!(num_processed, 0);
         let num_processed = process_decided_value(&mut read_validator, &shard_chunk3).await;
@@ -203,6 +206,19 @@ mod tests {
             shard_chunk2.header.as_ref().unwrap().height.unwrap()
         );
         assert_eq!(read_validator.buffered_blocks.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_buffered_value_sent_again_keeps_the_others() {
+        let (mut proposer_engine, _, mut read_validator, proposer_keypair, _) = setup(0).await;
+        read_validator.max_num_buffered_blocks = 2;
+        let _shard_chunk1 = commit_shard_chunk(&mut proposer_engine, &proposer_keypair).await;
+        let shard_chunk2 = commit_shard_chunk(&mut proposer_engine, &proposer_keypair).await;
+        let shard_chunk3 = commit_shard_chunk(&mut proposer_engine, &proposer_keypair).await;
+        for chunk in [&shard_chunk2, &shard_chunk3, &shard_chunk2] {
+            assert_eq!(process_decided_value(&mut read_validator, chunk).await, 0);
+        }
+        assert_eq!(read_validator.buffered_blocks.len(), 2);
     }
 
     #[tokio::test]
