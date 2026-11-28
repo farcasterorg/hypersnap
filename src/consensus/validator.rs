@@ -233,6 +233,13 @@ impl ShardValidator {
             // Don't sleep if we're syncing
             return Duration::from_secs(0);
         }
+        // The network has already proposed the next height, so this node is behind.
+        // Do not sleep, catch up.
+        if let Some(current_height) = self.current_height {
+            if self.has_proposed_value_for_height(current_height.increment()) {
+                return Duration::ZERO;
+            }
+        }
         let last_height_start_time = self.height_started_at.unwrap();
         let current_time = std::time::Instant::now();
         let duration = current_time.duration_since(last_height_start_time);
@@ -243,6 +250,17 @@ impl ShardValidator {
         } else {
             // If we're behind schedule, don't wait to start next block
             Duration::from_secs(0)
+        }
+    }
+
+    /// Whether the proposer holds a value proposed for `height`.
+    fn has_proposed_value_for_height(&self, height: Height) -> bool {
+        if let Some(block_proposer) = &self.block_proposer {
+            block_proposer.has_proposed_value_for_height(height)
+        } else if let Some(shard_proposer) = &self.shard_proposer {
+            shard_proposer.has_proposed_value_for_height(height)
+        } else {
+            panic!("No proposer set");
         }
     }
 

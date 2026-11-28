@@ -317,6 +317,111 @@ mod tests {
             .await;
         assert_eq!(validator.get_current_height(), Height::new(1, 1));
     }
+
+    /// `base` proposed for `height` instead: the same chunk with its height and hash redone.
+    fn proposal_for(base: &WellFormedProposal, height: Height) -> WellFormedProposal {
+        let mut proposal = base.proposal().clone();
+        proposal.height = Some(height);
+        let Some(full_proposal::ProposedValue::Shard(chunk)) = &mut proposal.proposed_value else {
+            panic!("expected shard chunk");
+        };
+        let header = chunk.header.as_mut().unwrap();
+        header.height = Some(height);
+        chunk.hash = shard_chunk_hash(header);
+        WellFormedProposal::try_from(proposal).unwrap()
+    }
+
+    /// A shard validator that decided height 1 from consensus, so its next height is 2,
+    /// with the proposal it decided.
+    async fn validator_after_first_height() -> (
+        crate::consensus::validator::ShardValidator,
+        WellFormedProposal,
+        tempfile::TempDir,
+    ) {
+        use crate::consensus::consensus::ValidatorSetConfig;
+        use crate::consensus::validator::{ProposalSource, ShardValidator};
+        use crate::storage::db::RocksDB;
+        use crate::storage::store::node_local_state::LocalStateStore;
+        use informalsystems_malachitebft_core_types::Round;
+        use libp2p::identity::ed25519::Keypair;
+        use std::sync::Arc;
+
+        let (proposer, decided, dir) = new_shard_proposer().await;
+        let key = Keypair::generate();
+        let address = Address(key.public().to_bytes());
+        let db = RocksDB::new(dir.path().join("local.db").to_str().unwrap());
+        db.open().unwrap();
+        let mut validator = ShardValidator::new(
+            address.clone(),
+            SnapchainShard::new(1),
+            vec![ValidatorSetConfig {
+                effective_at: 0,
+                validator_public_keys: vec![address.to_hex()],
+                shard_ids: vec![1],
+            }],
+            None,
+            Some(proposer),
+            LocalStateStore::new(Arc::new(db)),
+            test_helper::statsd_client(),
+        );
+        validator.start_round(Height::new(1, 1), Round::new(0), address);
+        assert!(validator
+            .add_proposed_value(&decided, ProposalSource::Consensus)
+            .validity
+            .is_valid());
+        validator
+            .decide(Commits {
+                height: Some(Height::new(1, 1)),
+                value: Some(decided.shard_hash().clone()),
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(validator.get_current_height(), Height::new(1, 1));
+        (validator, decided, dir)
+    }
+
+    #[tokio::test]
+    async fn test_next_height_is_not_delayed_once_its_value_is_cached() {
+        use crate::consensus::validator::ProposalSource;
+        use std::time::Duration;
+
+        let (mut validator, decided, _dir) = validator_after_first_height().await;
+        let next = proposal_for(&decided, Height::new(1, 2));
+        assert!(validator
+            .add_proposed_value(&next, ProposalSource::Consensus)
+            .validity
+            .is_valid());
+        assert_eq!(
+            validator.next_height_delay(60_000),
+            Duration::ZERO,
+            "the network has proposed the next height: catch up instead of sleeping"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_next_height_keeps_its_block_time_without_a_cached_value() {
+        use std::time::Duration;
+
+        let (validator, _decided, _dir) = validator_after_first_height().await;
+        assert!(
+            validator.next_height_delay(60_000) > Duration::ZERO,
+            "nothing was proposed for the next height yet: keep the block time"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_next_height_keeps_its_block_time_for_a_later_value_only() {
+        use crate::consensus::validator::ProposalSource;
+        use std::time::Duration;
+
+        let (mut validator, decided, _dir) = validator_after_first_height().await;
+        let later = proposal_for(&decided, Height::new(1, 3));
+        validator.add_proposed_value(&later, ProposalSource::Consensus);
+        assert!(
+            validator.next_height_delay(60_000) > Duration::ZERO,
+            "a value for the height after the next one does not mean the network is on it"
+        );
+    }
 }
 
 mod witness_security_regressions {
