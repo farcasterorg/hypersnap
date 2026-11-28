@@ -11,6 +11,7 @@ use crate::mempool::l1_validator::L1Validator;
 use crate::mempool::mempool::{MempoolRequest, MempoolSource};
 use crate::mempool::routing;
 use crate::network::gossip::GossipEvent;
+use crate::network::info_stats::{InfoStats, InfoStatsCache, InfoStatsTask};
 use crate::network::mesh::cache::MeshCache;
 use crate::network::mesh::crawl::crawl_mesh;
 use crate::network::mesh::view::{build_validator_peer_ids, classify_mesh_view, ValidatorPeerIds};
@@ -40,7 +41,6 @@ use crate::proto::{
     TrieNodeMetadataResponse, UserDataRequest, UserNameProof, UserNameType, UsernameProofRequest,
     UsernameProofsResponse, ValidationResponse, VerificationRequest,
 };
-use crate::storage::constants::OnChainEventPostfix;
 use crate::storage::constants::RootPrefix;
 use crate::storage::constants::PAGE_SIZE_MAX;
 use crate::storage::db::PageOptions;
@@ -85,8 +85,6 @@ use tracing::{debug, error, info, warn};
 
 pub const MEMPOOL_ADD_REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_millis(100);
-/// How long `get_info` reuses a store's size and fid registration count.
-const STORE_STATS_TTL: Duration = Duration::from_secs(60);
 
 /// Threads used to probe FIDs in parallel when resolving a cast by hash alone.
 const CAST_SCAN_THREADS: u64 = 8;
@@ -635,6 +633,7 @@ pub struct MyHubService {
     /// Validator `PeerId` index, derived from the configured validator set's
     /// public keys. Used to classify connected peers in the mesh view.
     validator_peer_ids: ValidatorPeerIds,
+    info_stats: Option<InfoStatsCache>,
     block_stores: BlockStores,
     shard_stores: HashMap<u32, Stores>,
     /// Hyper shadow stores for API queries (includes pruned messages).
@@ -650,10 +649,6 @@ pub struct MyHubService {
     version: String,
     peer_id: String,
     id_registry_cache: Cache<Vec<u8>, OnChainEvent>,
-    /// `get_info`'s approximate size and fid registration count per shard
-    /// (0 for the block store). Reading them walks the database directory
-    /// and counts every registration, so they are reused for a while.
-    store_stats: Cache<u32, (u64, u64)>,
     /// Short-TTL cache for the admin mesh view / topology responses. Consulted
     /// only *after* the admin auth check in each handler.
     mesh_cache: MeshCache,
@@ -774,6 +769,7 @@ impl MyHubService {
             admin_allowed_users,
             validator_peer_ids,
             network,
+            info_stats: None,
             block_stores,
             shard_senders,
             shard_stores,
@@ -787,33 +783,36 @@ impl MyHubService {
             version,
             peer_id,
             id_registry_cache,
-            store_stats: CacheBuilder::new(64).time_to_live(STORE_STATS_TTL).build(),
             mesh_cache,
             fname_lookup,
         };
         service
     }
 
-    /// A store's approximate size and fid registration count, reused for
-    /// [`STORE_STATS_TTL`].
-    fn store_stats(
-        &self,
-        shard_id: u32,
-        db: &crate::storage::db::RocksDB,
-    ) -> Result<(u64, u64), Status> {
-        self.store_stats
-            .try_get_with(shard_id, || {
-                let fid_registrations = if shard_id == 0 {
-                    0
-                } else {
-                    db.count_keys_at_prefix(vec![
-                        RootPrefix::OnChainEvent as u8,
-                        OnChainEventPostfix::IdRegisterByFid as u8,
-                    ])? as u64
-                };
-                Ok::<_, HubError>((db.approximate_size(), fid_registrations))
-            })
-            .map_err(|err| Status::internal(err.to_string()))
+    pub fn start_info_stats(&mut self, refresh_interval: Duration) -> InfoStatsTask {
+        assert!(
+            self.info_stats.is_none(),
+            "GetInfo statistics already started"
+        );
+        let block_db = Arc::clone(&self.block_stores.block_store.db);
+        let shard_dbs = self
+            .shard_stores
+            .iter()
+            .map(|(&id, stores)| (id, Arc::clone(&stores.db)))
+            .collect();
+        let (cache, task) =
+            InfoStatsCache::start(refresh_interval, self.statsd_client.clone(), move || {
+                InfoStats::collect(&block_db, &shard_dbs)
+            });
+        self.info_stats = Some(cache);
+        task
+    }
+
+    /// Let the first statistics attempt finish before accepting API traffic.
+    pub async fn wait_for_info_stats(&self) {
+        if let Some(cache) = &self.info_stats {
+            cache.wait_for_initial_attempt().await;
+        }
     }
 
     #[cfg(test)]
@@ -2012,10 +2011,14 @@ impl HubService for MyHubService {
         &self,
         _request: Request<GetInfoRequest>,
     ) -> Result<Response<GetInfoResponse>, Status> {
-        let mut total_fid_registrations = 0;
-        let mut total_approx_size = 0;
+        let stats = self
+            .info_stats
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("GetInfo statistics task is not configured"))?
+            .get()
+            .await?;
         let mut total_num_messages = 0;
-        let mut shard_infos = Vec::new();
+        let mut shard_infos = Vec::with_capacity(self.shard_stores.len() + 1);
 
         let (size_req, size_res) = oneshot::channel();
         let _ = self
@@ -2030,13 +2033,15 @@ impl HubService for MyHubService {
             });
 
         let current_time = get_farcaster_time().unwrap_or(0);
+        let block_header =
+            crate::storage::store::block::get_current_header(&self.block_stores.block_store.db)
+                .unwrap_or_default();
         let block_info = proto::ShardInfo {
             shard_id: 0,
-            max_height: self
-                .block_stores
-                .block_store
-                .max_block_number()
-                .unwrap_or(0),
+            max_height: block_header
+                .as_ref()
+                .and_then(|header| header.height.as_ref())
+                .map_or(0, |height| height.block_number),
             num_messages: self
                 .block_stores
                 .trie
@@ -2047,24 +2052,10 @@ impl HubService for MyHubService {
                 )
                 .map_err(|err| Status::internal(err.to_string()))?,
             num_onchain_events: 0,
-            // TODO(aditi): [num_onchain_events] is making the endpoint really slow, enable once there's a faster implementation
-            // num_onchain_events: self
-            //     .block_stores
-            //     .db
-            //     .count_keys_at_prefix(vec![
-            //         RootPrefix::OnChainEvent as u8,
-            //         OnChainEventPostfix::OnChainEvents as u8,
-            //     ])
-            //     .map_err(|err| Status::from_error(Box::new(err)))?
-            //     as u64,
             num_fid_registrations: 0,
-            approx_size: self.store_stats(0, &self.block_stores.block_store.db)?.0,
-            block_delay: current_time.saturating_sub(
-                self.block_stores
-                    .block_store
-                    .max_block_timestamp()
-                    .unwrap_or(0),
-            ),
+            approx_size: stats.block_size,
+            block_delay: current_time
+                .saturating_sub(block_header.as_ref().map_or(0, |header| header.timestamp)),
             mempool_size: 0,
         };
         shard_infos.push(block_info);
@@ -2085,23 +2076,27 @@ impl HubService for MyHubService {
         };
 
         for (shard_index, shard_store) in self.shard_stores.iter() {
-            let (shard_approx_size, shard_fid_registrations) =
-                self.store_stats(*shard_index, &shard_store.db)?;
+            let shard_stats = &stats.shards[shard_index];
             let shard_num_messages = shard_store
                 .trie
                 .get_count(&shard_store.db, &mut RocksDbTransactionBatch::new(), &[])
                 .map_err(|err| Status::internal(err.to_string()))?;
-
-            let max_block_time = shard_store.shard_store.max_block_timestamp().unwrap_or(0);
+            let header =
+                crate::storage::store::shard::get_current_header(&shard_store.shard_store.db)
+                    .unwrap_or_default();
 
             let info = proto::ShardInfo {
                 shard_id: *shard_index,
-                max_height: shard_store.shard_store.max_block_number().unwrap_or(0),
+                max_height: header
+                    .as_ref()
+                    .and_then(|header| header.height.as_ref())
+                    .map_or(0, |height| height.block_number),
                 num_messages: shard_num_messages,
                 num_onchain_events: 0, // TODO(aditi): Populating this is making the endpoint slow, enable once there's a faster implementation
-                num_fid_registrations: shard_fid_registrations,
-                approx_size: shard_approx_size,
-                block_delay: current_time.saturating_sub(max_block_time),
+                num_fid_registrations: shard_stats.num_fid_registrations,
+                approx_size: shard_stats.approx_size,
+                block_delay: current_time
+                    .saturating_sub(header.map_or(0, |header| header.timestamp)),
                 // If there is no value in the map, it likely means we could not communicate with the mempool
                 // Returning 0 would mean the clients would think the mempool is empty
                 // So, return a high value
@@ -2109,8 +2104,6 @@ impl HubService for MyHubService {
             };
             shard_infos.push(info);
             total_num_messages += shard_num_messages;
-            total_fid_registrations += shard_fid_registrations;
-            total_approx_size += shard_approx_size;
         }
 
         let current_farcaster_time = FarcasterTime::new(current_time);
@@ -2120,9 +2113,9 @@ impl HubService for MyHubService {
 
         Ok(Response::new(GetInfoResponse {
             db_stats: Some(DbStats {
-                num_fid_registrations: total_fid_registrations,
+                num_fid_registrations: stats.totals.num_fid_registrations,
                 num_messages: total_num_messages,
-                approx_size: total_approx_size,
+                approx_size: stats.totals.approx_size,
             }),
             shard_infos,
             num_shards: self.num_shards,

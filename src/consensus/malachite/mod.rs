@@ -8,6 +8,8 @@ pub mod spawn;
 pub mod spawn_read_node;
 
 #[cfg(test)]
+mod input_queue_test;
+#[cfg(test)]
 mod network_connector_test;
 #[cfg(test)]
 mod proposal_recovery_test;

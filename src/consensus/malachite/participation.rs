@@ -25,11 +25,7 @@ impl Participation {
     }
 
     fn is_member_at(&self, height: u64) -> bool {
-        self.validator_sets
-            .get_validator_set(height)
-            .validators
-            .iter()
-            .any(|validator| validator.address == self.address)
+        self.validator_sets.contains(height, &self.address)
     }
 
     pub fn accepts_height(&self, height: u64) -> bool {
@@ -137,5 +133,68 @@ mod tests {
         participation.advance_to(200);
         assert!(!participation.is_active());
         assert!(!participation.accepts_height(200));
+    }
+
+    #[test]
+    fn cached_activity_follows_local_height_across_rotations() {
+        let local = Keypair::generate();
+        let other = Keypair::generate();
+        let key = |key: &Keypair| hex::encode(key.public().to_bytes());
+        let sets = || {
+            StoredValidatorSets::new(
+                1,
+                [
+                    (0, vec![key(&local), key(&other)]),
+                    (100, vec![key(&other)]),
+                    (200, vec![key(&local), key(&other)]),
+                ]
+                .into_iter()
+                .map(|(effective_at, validator_public_keys)| {
+                    StoredValidatorSet::new(
+                        ShardId::new(1),
+                        &ValidatorSetConfig {
+                            effective_at,
+                            validator_public_keys,
+                            shard_ids: vec![1],
+                        },
+                    )
+                })
+                .collect(),
+            )
+        };
+        let address = Address(local.public().to_bytes());
+
+        // Starting state comes from the constructor, with no `advance_to`.
+        assert!(Participation::new(address.clone(), sets(), 50).is_active());
+        assert!(!Participation::new(address.clone(), sets(), 150).is_active());
+        assert!(Participation::new(address.clone(), sets(), 200).is_active());
+
+        let participation = Participation::new(address, sets(), 98);
+        assert!(participation.is_active());
+        assert!(participation.accepts_height(99));
+        assert!(!participation.accepts_height(100));
+        assert!(participation.accepts_height(200));
+
+        participation.advance_to(99);
+        assert!(participation.is_active());
+        participation.advance_to(100);
+        assert!(!participation.is_active());
+        assert!(!participation.accepts_height(99));
+        assert!(!participation.accepts_height(200));
+
+        // A lower height is ignored and does not refresh the cached answer.
+        participation.advance_to(50);
+        assert!(!participation.is_active());
+
+        participation.advance_to(199);
+        assert!(!participation.is_active());
+        participation.advance_to(200);
+        assert!(participation.is_active());
+        assert!(participation.accepts_height(200));
+        assert!(participation.accepts_height(u64::MAX));
+        assert!(!participation.accepts_height(150));
+
+        participation.advance_to(100);
+        assert!(participation.is_active(), "local height never regresses");
     }
 }

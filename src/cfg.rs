@@ -76,6 +76,10 @@ pub struct ReplicationConfig {
 
     #[serde(with = "humantime_serde")]
     pub snapshot_max_age: Duration,
+
+    /// Node-wide budget for obsolete SST bytes retained by advertised replication snapshots.
+    /// A snapshot can be retired before snapshot_max_age when this budget is exceeded.
+    pub snapshot_obsolete_sst_budget_bytes: u64,
 }
 
 impl Default for ReplicationConfig {
@@ -84,6 +88,7 @@ impl Default for ReplicationConfig {
             enable: true,
             snapshot_interval: (60 * 60 * 8), // every ~8 hours (in number of blocks)
             snapshot_max_age: Duration::from_secs(60 * 60 * 24), // keep snapshots for 24 hours
+            snapshot_obsolete_sst_budget_bytes: 32 * 1024 * 1024 * 1024,
         }
     }
 }
@@ -103,6 +108,8 @@ pub struct Config {
     pub admin_rpc_auth: String,
     pub rpc_address: String,
     pub http_address: String,
+    /// Delay between GetInfo statistics refresh attempts, in seconds.
+    pub info_stats_refresh_secs: u64,
     pub rocksdb_dir: String,
     pub clear_db: bool,
     pub hyper: hyper::HyperConfig,
@@ -137,6 +144,7 @@ impl Default for Config {
             admin_rpc_auth: "".to_string(),
             rpc_address: format!("0.0.0.0:{}", DEFAULT_RPC_PORT),
             http_address: format!("0.0.0.0:{}", DEFAULT_HTTP_PORT),
+            info_stats_refresh_secs: 60,
             rocksdb_dir: ".rocks".to_string(),
             clear_db: false,
             hyper: hyper::HyperConfig::default(),
@@ -222,6 +230,9 @@ pub fn load_and_merge_config(args: Vec<String>) -> Result<Config, Box<dyn Error>
     figment = figment.merge(Env::prefixed("SNAPCHAIN_").split("__"));
 
     let mut config: Config = figment.extract()?;
+    if config.info_stats_refresh_secs == 0 {
+        return Err("info_stats_refresh_secs must be positive".into());
+    }
     config
         .mempool
         .validate_fixed_rate_limit_schedule(config.consensus.num_shards)?;

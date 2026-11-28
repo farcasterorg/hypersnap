@@ -1,13 +1,16 @@
 #[cfg(test)]
 mod tests {
 
-    use std::time::Duration;
+    use std::collections::{HashMap, HashSet};
+    use std::time::{Duration, Instant};
 
     use crate::consensus::consensus::{Config, SystemMessage, ValidatorSetConfig};
     use crate::consensus::malachite::network_connector::MalachiteNetworkEvent;
+    use crate::consensus::malachite::read_sync::SYNC_WINDOW;
+    use crate::consensus::malachite::snapchain_codec::SnapchainCodec;
     use crate::consensus::malachite::spawn_read_node::MalachiteReadNodeActors;
     use crate::consensus::read_validator::Engine;
-    use crate::core::types::{Address, SnapchainValidatorContext};
+    use crate::core::types::{Address, CommitsExt, SnapchainValidatorContext};
     use crate::network::gossip::GossipEvent;
     use crate::proto::{self, Height, ShardChunk, StatusMessage};
     use crate::storage::store::engine::ShardEngine;
@@ -16,9 +19,10 @@ mod tests {
         EngineOptions, FID_FOR_TEST,
     };
     use bytes::Bytes;
+    use informalsystems_malachitebft_codec::Codec;
     use informalsystems_malachitebft_metrics::SharedRegistry;
     use informalsystems_malachitebft_network::{Channel, PeerIdExt};
-    use informalsystems_malachitebft_sync::PeerId;
+    use informalsystems_malachitebft_sync::{self as sync, PeerId, RawDecidedValue};
     use libp2p::identity::ed25519::Keypair;
     use prost::Message;
     use tokio::sync::mpsc;
@@ -253,6 +257,247 @@ mod tests {
             read_node_engine.get_confirmed_height(),
             shard_chunk3.header.as_ref().unwrap().height.unwrap()
         );
+    }
+
+    /// Plays a peer that has `num_blocks` more blocks than the read node and answers each sync
+    /// request after `latency`, the way a peer across the internet does. Returns how long the
+    /// read node took to commit them all, the most requests it had out at once and how many it
+    /// sent. With `drop_first`, the first request for each height is never answered.
+    async fn catch_up(
+        num_blocks: u64,
+        latency: Duration,
+        drop_first: bool,
+    ) -> (Duration, usize, usize) {
+        let (
+            mut proposer_engine,
+            read_node_engine,
+            mut gossip_rx,
+            _system_rx,
+            actors,
+            proposer_keypair,
+        ) = setup(0).await;
+        let mut chunks = HashMap::new();
+        for _ in 0..num_blocks {
+            let chunk = commit_shard_chunk(&mut proposer_engine, &proposer_keypair).await;
+            chunks.insert(
+                chunk.header.as_ref().unwrap().height.unwrap().block_number,
+                chunk,
+            );
+        }
+        let tip = proposer_engine.get_confirmed_height();
+
+        let peer = PeerId::from_libp2p(&libp2p::PeerId::random());
+        actors
+            .cast_network_event(MalachiteNetworkEvent::PeerConnected(peer))
+            .unwrap();
+        let start = Instant::now();
+        actors
+            .cast_network_event(MalachiteNetworkEvent::Message(
+                Channel::Sync,
+                peer,
+                Bytes::from(
+                    StatusMessage {
+                        peer_id: peer.to_libp2p().to_bytes(),
+                        height: Some(tip),
+                        min_height: Some(Height::new(tip.shard_index, 1)),
+                    }
+                    .encode_to_vec(),
+                ),
+            ))
+            .unwrap();
+
+        // Only used to mint request ids, which libp2p doesn't let anything else create.
+        let mut rpc = sync::Behaviour::default();
+        let (answer_tx, mut answer_rx) = mpsc::channel(1000);
+        let (mut in_flight, mut max_in_flight, mut sent) = (0, 0, 0);
+        let mut asked = HashSet::new();
+        while read_node_engine.get_confirmed_height() < tip {
+            assert!(start.elapsed() < Duration::from_secs(120), "sync stalled");
+            tokio::select! {
+                Some(event) = gossip_rx.recv() => {
+                    let GossipEvent::SyncRequest(_, sync::Request::ValueRequest(request), reply) = event else {
+                        continue;
+                    };
+                    let request_id = rpc.send_request(libp2p::PeerId::random(), Bytes::new());
+                    reply.send(request_id).unwrap();
+                    sent += 1;
+                    if asked.insert(request.height.block_number) && drop_first {
+                        continue;
+                    }
+                    in_flight += 1;
+                    max_in_flight = max_in_flight.max(in_flight);
+                    let answer_tx = answer_tx.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(latency).await;
+                        let _ = answer_tx.send((request_id, request.height)).await;
+                    });
+                }
+                Some((request_id, height)) = answer_rx.recv() => {
+                    in_flight -= 1;
+                    let chunk = &chunks[&height.block_number];
+                    let value = RawDecidedValue {
+                        certificate: chunk.commits.clone().unwrap().to_commit_certificate(),
+                        value_bytes: Bytes::from(chunk.encode_to_vec()),
+                    };
+                    let response =
+                        sync::Response::ValueResponse(sync::ValueResponse::new(height, Some(value)));
+                    actors
+                        .cast_network_event(MalachiteNetworkEvent::Sync(sync::RawMessage::Response {
+                            request_id,
+                            peer,
+                            body: SnapchainCodec.encode(&response).unwrap(),
+                        }))
+                        .unwrap();
+                }
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+        }
+        (start.elapsed(), max_in_flight, sent)
+    }
+
+    #[tokio::test]
+    async fn test_catch_up_keeps_requests_in_flight() {
+        // One request per round trip would take at least 100 x 50 ms = 5 s.
+        let (elapsed, max_in_flight, _) = catch_up(100, Duration::from_millis(50), false).await;
+        assert!(
+            (16..=SYNC_WINDOW as usize).contains(&max_in_flight),
+            "{max_in_flight} requests in flight"
+        );
+        assert!(elapsed < Duration::from_secs(4), "caught up in {elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn test_catch_up_asks_again_after_a_timeout() {
+        // Each height is asked for again once its request times out, and only then.
+        let (_, _, sent) = catch_up(40, Duration::from_millis(10), true).await;
+        assert_eq!(sent, 2 * 40);
+    }
+
+    #[tokio::test]
+    async fn test_no_sync_request_to_a_peer_that_pruned_the_height() {
+        let (_proposer_engine, read_node_engine, mut gossip_rx, _system_rx, actors, _) =
+            setup(0).await;
+        let peer = PeerId::from_libp2p(&libp2p::PeerId::random());
+        actors
+            .cast_network_event(MalachiteNetworkEvent::PeerConnected(peer))
+            .unwrap();
+        // The peer is at 10 but only keeps blocks from 5, and the read node needs block 1.
+        actors
+            .cast_network_event(MalachiteNetworkEvent::Message(
+                Channel::Sync,
+                peer,
+                Bytes::from(
+                    StatusMessage {
+                        peer_id: peer.to_libp2p().to_bytes(),
+                        height: Some(Height::new(read_node_engine.shard_id(), 10)),
+                        min_height: Some(Height::new(read_node_engine.shard_id(), 5)),
+                    }
+                    .encode_to_vec(),
+                ),
+            ))
+            .unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while let Ok(Some(event)) = tokio::time::timeout_at(deadline, gossip_rx.recv()).await {
+            assert!(
+                !matches!(event, GossipEvent::SyncRequest(..)),
+                "asked a peer for a block it pruned"
+            );
+        }
+    }
+
+    /// A peer that claims blocks up to 10 but answers every request at once with `answer(height)`
+    /// must not be asked for a height again before that request times out (2 s).
+    async fn asks_once_per_timeout(
+        answer: impl Fn(Height, &ShardChunk) -> sync::Response<SnapchainValidatorContext>,
+    ) {
+        let (mut proposer_engine, _read_node_engine, mut gossip_rx, _system_rx, actors, keypair) =
+            setup(0).await;
+        let block_1 = commit_shard_chunk(&mut proposer_engine, &keypair).await;
+        let shard = proposer_engine.shard_id();
+        let peer = PeerId::from_libp2p(&libp2p::PeerId::random());
+        actors
+            .cast_network_event(MalachiteNetworkEvent::PeerConnected(peer))
+            .unwrap();
+        actors
+            .cast_network_event(MalachiteNetworkEvent::Message(
+                Channel::Sync,
+                peer,
+                Bytes::from(
+                    StatusMessage {
+                        peer_id: peer.to_libp2p().to_bytes(),
+                        height: Some(Height::new(shard, 10)),
+                        min_height: Some(Height::new(shard, 1)),
+                    }
+                    .encode_to_vec(),
+                ),
+            ))
+            .unwrap();
+
+        let mut rpc = sync::Behaviour::default();
+        let mut asked: HashMap<u64, usize> = HashMap::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while let Ok(Some(event)) = tokio::time::timeout_at(deadline, gossip_rx.recv()).await {
+            let GossipEvent::SyncRequest(_, sync::Request::ValueRequest(request), reply) = event
+            else {
+                continue;
+            };
+            let request_id = rpc.send_request(libp2p::PeerId::random(), Bytes::new());
+            reply.send(request_id).unwrap();
+            *asked.entry(request.height.block_number).or_default() += 1;
+            actors
+                .cast_network_event(MalachiteNetworkEvent::Sync(sync::RawMessage::Response {
+                    request_id,
+                    peer,
+                    body: SnapchainCodec
+                        .encode(&answer(request.height, &block_1))
+                        .unwrap(),
+                }))
+                .unwrap();
+        }
+        assert!(asked.len() >= 9, "asked for {asked:?}");
+        assert!(asked.values().all(|&n| n <= 2), "asked {asked:?}");
+    }
+
+    #[tokio::test]
+    async fn test_malformed_sync_answer_waits_for_the_timeout() {
+        asks_once_per_timeout(|height, chunk| {
+            let value = RawDecidedValue {
+                certificate: chunk.commits.clone().unwrap().to_commit_certificate(),
+                value_bytes: Bytes::from_static(b"not a block"),
+            };
+            sync::Response::ValueResponse(sync::ValueResponse::new(height, Some(value)))
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_wrong_height_sync_answer_waits_for_the_timeout() {
+        // Every request gets block 1, so only the request for height 1 is answered.
+        asks_once_per_timeout(|_, chunk| {
+            let value = RawDecidedValue {
+                certificate: chunk.commits.clone().unwrap().to_commit_certificate(),
+                value_bytes: Bytes::from(chunk.encode_to_vec()),
+            };
+            let height = chunk.header.as_ref().unwrap().height.unwrap();
+            sync::Response::ValueResponse(sync::ValueResponse::new(height, Some(value)))
+        })
+        .await;
+    }
+
+    /// Prints blocks/s over a simulated round trip:
+    /// `cargo test --lib catch_up_rate -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn catch_up_rate() {
+        for latency in [0, 50, 100, 200] {
+            let (elapsed, max_in_flight, _) =
+                catch_up(300, Duration::from_millis(latency), false).await;
+            println!(
+                "{latency} ms round trip: {:.1} blocks/s, up to {max_in_flight} requests in flight",
+                300.0 / elapsed.as_secs_f64()
+            );
+        }
     }
 
     #[tokio::test]

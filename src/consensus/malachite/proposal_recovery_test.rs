@@ -248,3 +248,190 @@ fn reproposal_needs_six_verified_old_prevotes_then_commits_without_original_prop
     }
     assert!(state.driver.step_is_commit());
 }
+
+#[test]
+fn buffered_inputs_survive_a_vote_for_a_higher_height() {
+    let keys: Vec<_> = (0..8).map(|_| Keypair::generate()).collect();
+    let validators = SnapchainValidatorSet::new(
+        keys.iter()
+            .map(|key| SnapchainValidator::new(SnapchainShard::new(2), key.public(), None, 0))
+            .collect(),
+    );
+    let height = Height::new(2, 51085101);
+    let next_height = height.increment();
+    let context = Ctx::new(keys[0].clone());
+    let proposer_at = |at: Height| {
+        context
+            .select_proposer(&validators, at, Round::new(0))
+            .address()
+            .clone()
+    };
+    // Neither height's round-zero proposer: that node would owe a value, not a vote.
+    let local = keys
+        .iter()
+        .find(|key| {
+            let address = Address(key.public().to_bytes());
+            address != proposer_at(height) && address != proposer_at(next_height)
+        })
+        .unwrap();
+    let local_address = Address(local.public().to_bytes());
+    let voters: Vec<_> = keys
+        .iter()
+        .filter(|key| Address(key.public().to_bytes()) != local_address)
+        .take(6)
+        .collect();
+    // A round-zero proposal is signed by its height's round-zero proposer and
+    // carries no proof-of-lock round.
+    let proposal_at = |at: Height, hash: ShardHash| {
+        let proposer = proposer_at(at);
+        let key = keys
+            .iter()
+            .find(|key| Address(key.public().to_bytes()) == proposer)
+            .unwrap();
+        let header = Proposal {
+            height: at,
+            round: Round::new(0),
+            pol_round: Round::Nil,
+            shard_hash: hash,
+            proposer: proposer.clone(),
+        };
+        SignedProposal::new(header.clone(), Signature(key.sign(&header.to_sign_bytes())))
+    };
+    let mut state = State::new(
+        Ctx::new(local.clone()),
+        Params {
+            initial_height: height,
+            initial_validator_set: validators.clone(),
+            address: local_address.clone(),
+            threshold_params: Default::default(),
+            value_payload: ValuePayload::ProposalAndParts,
+            vote_sync_mode: Default::default(),
+        },
+    );
+    let metrics = Metrics::register(&SharedRegistry::new(Registry::default(), None));
+
+    // The node decides `height` on a round-zero proposal with six votes of eight.
+    let hash = ShardHash {
+        shard_index: 2,
+        hash: vec![42; 32],
+    };
+    process(
+        &mut state,
+        local,
+        &metrics,
+        Input::StartHeight(height, validators.clone()),
+    );
+    process(
+        &mut state,
+        local,
+        &metrics,
+        Input::Proposal(proposal_at(height, hash.clone())),
+    );
+    process(
+        &mut state,
+        local,
+        &metrics,
+        Input::ProposedValue(
+            ProposedValue {
+                height,
+                round: Round::new(0),
+                valid_round: Round::Nil,
+                proposer: proposer_at(height),
+                value: hash.clone(),
+                validity: Validity::Valid,
+            },
+            ValueOrigin::Consensus,
+        ),
+    );
+    for kind in [VoteType::Prevote, VoteType::Precommit] {
+        for key in &voters {
+            process(
+                &mut state,
+                local,
+                &metrics,
+                Input::Vote(signed_vote(
+                    key,
+                    height,
+                    Round::new(0),
+                    kind,
+                    NilOrVal::Val(hash.clone()),
+                )),
+            );
+        }
+    }
+    assert!(state.driver.step_is_commit());
+
+    // The network moves to `next_height` while this node still waits to start it:
+    // its proposal, its value and six precommits for it arrive, then one vote for
+    // the height after.
+    let next_hash = ShardHash {
+        shard_index: 2,
+        hash: vec![43; 32],
+    };
+    process(
+        &mut state,
+        local,
+        &metrics,
+        Input::Proposal(proposal_at(next_height, next_hash.clone())),
+    );
+    process(
+        &mut state,
+        local,
+        &metrics,
+        Input::ProposedValue(
+            ProposedValue {
+                height: next_height,
+                round: Round::new(0),
+                valid_round: Round::Nil,
+                proposer: proposer_at(next_height),
+                value: next_hash.clone(),
+                validity: Validity::Valid,
+            },
+            ValueOrigin::Consensus,
+        ),
+    );
+    for key in &voters {
+        process(
+            &mut state,
+            local,
+            &metrics,
+            Input::Vote(signed_vote(
+                key,
+                next_height,
+                Round::new(0),
+                VoteType::Precommit,
+                NilOrVal::Val(next_hash.clone()),
+            )),
+        );
+    }
+    process(
+        &mut state,
+        local,
+        &metrics,
+        Input::Vote(signed_vote(
+            voters[0],
+            next_height.increment(),
+            Round::new(0),
+            VoteType::Prevote,
+            NilOrVal::Nil,
+        )),
+    );
+
+    // Starting `next_height` replays what was held: the node votes at once.
+    let published = process(
+        &mut state,
+        local,
+        &metrics,
+        Input::StartHeight(next_height, validators),
+    );
+    assert!(
+        published
+            .iter()
+            .any(|msg| matches!(msg, SignedConsensusMsg::Vote(v)
+            if v.message.height == next_height
+                && v.message.round == Round::new(0)
+                && v.message.vote_type == VoteType::Prevote
+                && v.message.shard_hash == NilOrVal::Val(next_hash.clone()))),
+        "the buffered inputs for the next height must survive a vote for the height after it"
+    );
+}

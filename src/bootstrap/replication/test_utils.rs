@@ -266,6 +266,7 @@ pub mod replication_test_utils {
             ReplicatorSnapshotOptions {
                 interval: 1,
                 max_age: Duration::from_secs(10),
+                ..Default::default()
             },
         ));
 
